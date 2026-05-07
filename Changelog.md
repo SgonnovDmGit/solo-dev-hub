@@ -16,6 +16,10 @@
   Репозиторий приватный до v1.0.0 public-flip'а — `latest.json` без auth не
   отдаётся, autoupdate приостановлен на v0.25.x. Pubkey уже свежий
   (сгенерирован в T-000059).
+- **T-000060 | Release flow на master/dev split**: все коммиты цикла идут
+  на `dev`, релиз = fast-forward в `master` + тег. Hotfix'ы прямо в
+  `master`, потом `git rebase master` на `dev`. Документировано в
+  `docs/RELEASING.md` секцией "Ветки" + suggested git aliases.
 
 ## [0.24.2] — 2026-05-07
 

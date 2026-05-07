@@ -2,22 +2,65 @@
 
 Процесс релиза Solo Dev Hub после 0.15.0 — через GitHub Actions pipeline. Локальная `npm run tauri build` больше не нужна для production-релизов.
 
+## Ветки
+
+- **`master`** — стабильная. HEAD всегда соответствует последнему опубликованному тегу (или равен ему). Прямые коммиты — только hotfix'ы.
+- **`dev`** — активная разработка. Все коммиты текущего релизного цикла идут сюда.
+
+### Закрытие релизного цикла → fast-forward в master
+
+После всех закрепляющих шагов на `dev` (см. **Обычный релиз** ниже + global Release closure checklist):
+
+```bash
+git checkout master
+git merge --ff-only dev          # подтягиваем накопленное
+git tag vX.Y.Z
+git push origin master vX.Y.Z    # тег триггерит CI release
+```
+
+Если `--ff-only` не проходит (master ушёл вперёд из-за hotfix'а) → сначала `git checkout dev && git rebase master`, потом снова fast-forward.
+
+### Hotfix во время цикла
+
+Hotfix кладётся напрямую на `master`, тег patch-версии:
+
+```bash
+git checkout master
+# правки + commit
+git tag vX.Y.{Z+1} && git push origin master vX.Y.{Z+1}
+git checkout dev && git rebase master   # подтягиваем хотфикс обратно в dev
+```
+
+### Полезные aliases (`~/.gitconfig` → секция `[alias]`)
+
+```ini
+[alias]
+    release-ff  = !git checkout master && git merge --ff-only dev
+    hotfix-back = !git checkout dev && git rebase master
+    push-all    = push origin master dev
+```
+
 ## Обычный релиз
 
-1. Убедиться что `master` в чистом состоянии, CI зелёный (если PR-workflow есть).
+Все шаги 1-5 выполняются на ветке `dev`. Шаг 6 переводит готовое в `master` и тегирует.
+
+1. Убедиться что `dev` в чистом состоянии, тесты зелёные (`cargo test --lib`, `npm test`, `npm run check`). На `master` нет коммитов после последнего тега, иначе сначала `git rebase master` на `dev`.
 2. **Bump версии** в 3 файлах:
    - `package.json` (`"version": "..."`)
    - `src-tauri/Cargo.toml` (`version = "..."`)
    - `src-tauri/tauri.conf.json` (`"version": "..."`)
 3. **Обновить `Changelog.md`** — переместить накопленное из `## [Unreleased]` в новую секцию `## [X.Y.Z] — YYYY-MM-DD`. Не оставлять пустых заголовков.
-4. **Пересобрать `Cargo.lock`**: `cd src-tauri && cargo check` (пересинхронизирует с новой версией пакета).
-5. **Коммит**: `git commit -m "release: vX.Y.Z"`.
-6. **Тег и пуш**:
+4. **Пересобрать `Cargo.lock`**: `cd src-tauri && cargo check` (пересинхронизирует с новой версией пакета). И `npm install --package-lock-only` для `package-lock.json`.
+5. **Closure-коммит на `dev`**: `git commit -m "chore: vX.Y.Z release closure"` (или `release: vX.Y.Z`).
+6. **Fast-forward → master → тег → пуш**:
    ```bash
+   git checkout master
+   git merge --ff-only dev
    git tag -a vX.Y.Z -m "vX.Y.Z"
-   git push origin master
-   git push origin vX.Y.Z
+   git push origin master vX.Y.Z
+   git checkout dev   # вернуться на dev для следующего цикла
    ```
+   Сокращённый вариант с alias'ами: `git release-ff && git tag -a vX.Y.Z -m "vX.Y.Z" && git push-all && git push origin vX.Y.Z`.
 7. GitHub Actions подхватит тег → собёрет → подпишет → опубликует Release.
 8. Проверить на GitHub: Release создан, артефакты на месте (`*-setup.exe`, `*-setup.exe.sig`, `latest.json`), body соответствует Changelog секции.
 9. (Опционально) на установленном приложении → About → "Проверить обновления" → убедиться что новая версия доступна → установить через in-app updater.
