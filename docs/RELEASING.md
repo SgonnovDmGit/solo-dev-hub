@@ -1,6 +1,6 @@
 # Releasing
 
-Процесс релиза GitHub Repo Manager (Solo Dev Hub) после 0.15.0 — через GitHub Actions pipeline. Локальная `npm run tauri build` больше не нужна для production-релизов.
+Процесс релиза Solo Dev Hub после 0.15.0 — через GitHub Actions pipeline. Локальная `npm run tauri build` больше не нужна для production-релизов.
 
 ## Обычный релиз
 
@@ -32,7 +32,7 @@
 1. Checkout, setup Node 20, install deps, setup Rust, cache.
 2. Извлечение release notes из `Changelog.md` скриптом `scripts/extract-changelog.mjs <version>`.
 3. `tauri-apps/tauri-action@v0` — компиляция, подпись (`TAURI_SIGNING_PRIVATE_KEY` + password), сборка NSIS installer'а, генерация `latest.json`, публикация Release с артефактами.
-4. Endpoint у installed apps настроен на `https://github.com/SgonnovDmGit/github-repo-manager/releases/latest/download/latest.json` — GitHub редиректит на актуальный релиз автоматически.
+4. Endpoint у installed apps настроен на `https://github.com/SgonnovDmGit/solo-dev-hub/releases/latest/download/latest.json` — GitHub редиректит на актуальный релиз автоматически. Репозиторий приватный до v1.0.0 public-flip'а — `latest.json` без auth не отдаётся, autoupdate фактически приостановлен на v0.25.x.
 
 ## GitHub Actions secrets (один раз настраиваются)
 
@@ -90,4 +90,4 @@ npm run tauri signer generate -- -w .tauri/signing-key.pem
 
 ## 0.14.0 → 0.15.0 (first time, one-off)
 
-0.14.0 и ранее не содержат updater-plugin. Переход с 0.14.0 на 0.15.0 — **ручной**: скачать `github-repo-manager_0.15.0_x64-setup.exe` с GitHub Releases и установить. С 0.15.0 дальнейшие обновления через in-app updater.
+0.14.0 и ранее не содержат updater-plugin. Переход с 0.14.0 на 0.15.0 — **ручной**: скачать `github-repo-manager_0.15.0_x64-setup.exe` с GitHub Releases и установить (исторический installer, имя файла на тот момент). С 0.15.0 дальнейшие обновления через in-app updater.

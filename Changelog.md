@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+### Changed
+- **T-000061 | Display-name rebrand "GitHub Repo Manager" → "Solo Dev Hub"**:
+  `productName` в `tauri.conf.json` + window title + Cargo description
+  + auto-generated MD footers + i18n строки `appDefaults.syncGlobalConfirm`
+  (ru+en) + About `githubUrl` + README заголовок + RELEASING.md / formats /
+  deploy_template_spec / release.yml releaseName. Технический identifier
+  (`com.user2.github-repo-manager`), Cargo `[package].name`, npm package
+  name, DB path и keyring service остаются стабильными до T-000063 (v1.0.0).
+- **Autoupdate endpoint** → `https://github.com/SgonnovDmGit/solo-dev-hub/releases/latest/download/latest.json`.
+  Репозиторий приватный до v1.0.0 public-flip'а — `latest.json` без auth не
+  отдаётся, autoupdate приостановлен на v0.25.x. Pubkey уже свежий
+  (сгенерирован в T-000059).
+
 ## [0.24.2] — 2026-05-07
 
 Diagnostics + ms reverse-lookup patch.

@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "github-repo-manager"
-version = "0.24.2"
+version = "0.25.0"
 dependencies = [
  "chrono",
  "dirs",

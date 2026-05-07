@@ -13,7 +13,7 @@
   } from '$lib/stores/updater';
 
   let version = $state('');
-  const githubUrl = 'https://github.com/SgonnovDmGit/github-repo-manager';
+  const githubUrl = 'https://github.com/SgonnovDmGit/solo-dev-hub';
   const boostyUrl = 'https://boosty.to/sgonnovdm/donate';
   const tonAddress = 'UQA-0I3SN2vw8F2ZzEoOTXT36-ToF0mu4Yp4_6pVmsR_dI0S';
   let tonCopied = $state(false);

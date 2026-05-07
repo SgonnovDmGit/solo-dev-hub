@@ -6,7 +6,7 @@
 
 ## Роль в проекте
 
-github-repo-manager должен уметь выдавать проекту «стартовый комплект» CI/CD: `dockerfile` + `.github/workflows/deploy.yml`, параметризованный под конкретный проект. Артефакт — точная копия рабочего деплоя `swan_support_test` (обкатан, задеплоен, https работает). Второй проект, получивший эти файлы через рендер, должен задеплоиться без ручных правок в сгенерированном коде.
+Solo Dev Hub должен уметь выдавать проекту «стартовый комплект» CI/CD: `dockerfile` + `.github/workflows/deploy.yml`, параметризованный под конкретный проект. Артефакт — точная копия рабочего деплоя `swan_support_test` (обкатан, задеплоен, https работает). Второй проект, получивший эти файлы через рендер, должен задеплоиться без ручных правок в сгенерированном коде.
 
 ## Что делает шаблон
 
@@ -49,7 +49,7 @@ github-repo-manager должен уметь выдавать проекту «с
 
 ## GitHub Secrets (обязательные для проекта, получающего шаблон)
 
-Должны быть заведены **до первого пуша**. github-repo-manager в UI формы может показать чеклист.
+Должны быть заведены **до первого пуша**. Solo Dev Hub в UI формы может показать чеклист.
 
 | Secret | Описание | Примечание |
 |---|---|---|
@@ -57,7 +57,7 @@ github-repo-manager должен уметь выдавать проекту «с
 | `APP_API_KEY` | Ключ аутентификации приложения к API | Кладётся в `.env` приложения |
 | `SSH_HOST` | Публичный адрес VPS | Домен или IP |
 | `SSH_USER` | Пользователь SSH | |
-| `SSH_KEY` | Приватный ключ SSH, **многострочный OpenSSH PEM** | Через `gh secret set SSH_KEY < keyfile` — веб-форма GHA также работает; github-repo-manager должен поддерживать ввод многострочного значения |
+| `SSH_KEY` | Приватный ключ SSH, **многострочный OpenSSH PEM** | Через `gh secret set SSH_KEY < keyfile` — веб-форма GHA также работает; Solo Dev Hub должен поддерживать ввод многострочного значения |
 | `SSH_PORT` | Порт SSH | Обычно `22` |
 | `CONTAINER_NAME_PROD` | Имя docker-контейнера на VPS | Используется в `--name` И как NPM `forward_host` — docker DNS резолвит имя внутри `goapp01_prod_proxy-network` |
 | `NPM_EMAIL` | Email пользователя NPM с правами Manage Proxy Hosts + Manage Certificates | **НЕ админ** |
@@ -100,9 +100,9 @@ function renderTemplate(tmpl: string, vars: Record<string, string>): string {
 - `dockerfile` — идентичен текущему `swan_support_test/dockerfile`, ноль плейсхолдеров, просто копия.
 - `.github/workflows/deploy.yml` — заполненный по манифесту.
 
-Перед записью — проверить, что оба файла либо отсутствуют, либо github-repo-manager показал пользователю diff и получил подтверждение на перезапись.
+Перед записью — проверить, что оба файла либо отсутствуют, либо Solo Dev Hub показал пользователю diff и получил подтверждение на перезапись.
 
-## UI в github-repo-manager
+## UI в Solo Dev Hub
 
 Новая вкладка «Deploy» на экране проекта (или расширение существующего). Поля:
 
@@ -115,7 +115,7 @@ function renderTemplate(tmpl: string, vars: Record<string, string>): string {
 - «Check secrets» — пройтись по списку обязательных Secrets (GH API `GET /repos/:owner/:repo/actions/secrets`), подсветить отсутствующие.
 - «Generate files» — вызвать рендер, показать diff с существующими файлами, по подтверждению записать в рабочую копию репо.
 
-## Верификация в github-repo-manager
+## Верификация в Solo Dev Hub
 
 1. Ренденринг-юнит-тест: `renderTemplate(fixture, {WORKFLOW_NAME:"X", IMAGE_TAG:"prod", COMPOSE_SERVICE:"y", DOMAIN:"z.tech"})` → точный ожидаемый текст.
 2. Ошибка на missing key: удалить `DOMAIN` из vars → throws `Missing manifest key: DOMAIN`.
@@ -132,6 +132,6 @@ function renderTemplate(tmpl: string, vars: Record<string, string>): string {
 
 ## Известные ограничения / грабли
 
-- **Первый пуш после настройки** — может упасть на `nginx` job из-за отсутствия LE-серта и ограничений схемы `POST /api/nginx/certificates` в некоторых версиях NPM. Фоллбэк: создать сертификат руками через UI один раз (форма → Let's Encrypt → домен + email), CI на следующем прогоне найдёт по домену и привяжет. UI в github-repo-manager может предупредить об этом на странице шаблона.
+- **Первый пуш после настройки** — может упасть на `nginx` job из-за отсутствия LE-серта и ограничений схемы `POST /api/nginx/certificates` в некоторых версиях NPM. Фоллбэк: создать сертификат руками через UI один раз (форма → Let's Encrypt → домен + email), CI на следующем прогоне найдёт по домену и привяжет. UI в Solo Dev Hub может предупредить об этом на странице шаблона.
 - **LE rate-limit**: 5 дубль-сертов на домен в неделю. Текущий ранний-выход в `nginx` job защищает, но если придётся много ретрайнуть на отладке — возможен `Too Many Requests`. Использовать LE staging-среду для отладки в таком случае.
-- **NPM user без прав** → API возвращает пустой список сертификатов → CI думает что cert'а нет → шлёт POST → дубликат. UI github-repo-manager должен подсказать выставить Full Access API-пользователю.
+- **NPM user без прав** → API возвращает пустой список сертификатов → CI думает что cert'а нет → шлёт POST → дубликат. UI Solo Dev Hub должен подсказать выставить Full Access API-пользователю.

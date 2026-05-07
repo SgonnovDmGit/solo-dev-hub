@@ -1,4 +1,4 @@
-# GitHub Repo Manager
+# Solo Dev Hub
 
 Personal Windows desktop application for managing GitHub repositories. Connects to a GitHub account, allows organizing repositories into projects with assigned roles, tracks bugs in Markdown files, syncs requirements between repos, and provides dashboard/statistics.
 
@@ -37,7 +37,7 @@ Personal Windows desktop application for managing GitHub repositories. Connects 
 ## Project Structure
 
 ```
-github-repo-manager/
+solo-dev-hub/
 ├── src-tauri/              # Rust backend
 │   ├── src/
 │   │   ├── lib.rs          # Tauri entry point, 70+ commands

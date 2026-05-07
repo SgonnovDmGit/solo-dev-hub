@@ -1,7 +1,7 @@
 [package]
 name = "github-repo-manager"
-version = "0.24.2"
-description = "GitHub Repo Manager — desktop app for managing GitHub projects"
+version = "0.25.0"
+description = "Solo Dev Hub — desktop app for managing GitHub projects"
 authors = ["you"]
 edition = "2021"
 
