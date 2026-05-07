@@ -74,17 +74,17 @@ git checkout dev && git rebase master   # подтягиваем хотфикс 
 `.github/workflows/release.yml`:
 1. Checkout, setup Node 20, install deps, setup Rust, cache.
 2. Извлечение release notes из `Changelog.md` скриптом `scripts/extract-changelog.mjs <version>`.
-3. `tauri-apps/tauri-action@v0` — компиляция, подпись (`TAURI_SIGNING_PRIVATE_KEY` + password), сборка NSIS installer'а, генерация `latest.json`, публикация Release с артефактами.
+3. `tauri-apps/tauri-action@v0` — компиляция, подпись (`TAURI_SIGNING_PRIVATE_KEY`, опционально + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` если ключ зашифрован — текущий ключ solo-dev-hub без пароля), сборка NSIS installer'а, генерация `latest.json`, публикация Release с артефактами.
 4. Endpoint у installed apps настроен на `https://github.com/SgonnovDmGit/solo-dev-hub/releases/latest/download/latest.json` — GitHub редиректит на актуальный релиз автоматически. Репозиторий приватный до v1.0.0 public-flip'а — `latest.json` без auth не отдаётся, autoupdate фактически приостановлен на v0.25.x.
 
 ## GitHub Actions secrets (один раз настраиваются)
 
 В Repo Settings → Secrets and variables → Actions:
 
-| Secret | Что содержит |
-|--------|--------------|
-| `TAURI_SIGNING_PRIVATE_KEY` | Содержимое `.tauri/signing-key.pem` (весь текст, включая `untrusted comment:` и base64 блок) |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Пароль, которым зашифрован приватник |
+| Secret | Что содержит | Required |
+|--------|--------------|----------|
+| `TAURI_SIGNING_PRIVATE_KEY` | Содержимое приватного ключа (весь текст, включая `untrusted comment:` и base64 блок) | да |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Пароль, которым зашифрован приватник | только если ключ был сгенерирован с паролем. Текущий ключ solo-dev-hub — без пароля, секрет не нужен |
 
 `GITHUB_TOKEN` автоматически подставляется Actions — отдельно не нужен.
 
