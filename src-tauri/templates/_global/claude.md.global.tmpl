@@ -1,0 +1,439 @@
+# Solo Dev Hub — global AI rules
+
+This section is managed by Solo Dev Hub. It describes **formats and contracts** used across every project. For per-project context (name, repos, microservices) see the repo's own `CLAUDE.md`.
+
+**Escape rules (apply to all pipe-separated formats below — todo, done, bug-reports):**
+- Literal `|` inside a free-form field (`description`, `comment`, `version`) → write as `\|`
+- Literal newline inside a free-form field → write as `\n`
+- Enum and id fields must not contain `|` or newlines.
+
+# File formats
+
+## `docs/todo.md`
+
+Line: `- [ ] <id> | <description> | <effort> | <priority> | <status> | <created_at>`
+
+- `id` — `T-NNNNNN` (task) or `F-NNNNNN` (feature). 6-digit zero-padded number (e.g. `T-000042`, `F-000013`). **Always required — never leave empty.** LLM assigns the next free id — **T- and F- have independent counters**; scan the file for the max used number *within the same prefix*, use +1, format as `{prefix}-{:06}`. User may also assign manually. No app-side counter — LLM/user is responsible for uniqueness within each prefix. Parser is lenient — legacy 3-digit IDs (`T-001`) still read correctly; on next add, write the new id with 6-digit padding.
+- `description` — free-form text.
+- `effort` — hours, integer or decimal (`2`, `0.5`, `8`). Required. Use `0` if unknown.
+- `priority` — one of: `critical` / `high` / `medium` / `low`.
+- `status` — one of: `open` / `in-progress` / `review`.
+  - `open` — not started
+  - `in-progress` — work in flight
+  - `review` — implementation done, under self/peer review before moving to done
+- `created_at` — `YYYY-MM-DD`. **App-managed** when task created via app's "+ Add task". When LLM creates a task by editing the file directly, set today's date. Immutable post-create.
+
+Example:
+```
+- [ ] T-000042 | Add Go deploy template | 4 | high | open | 2026-04-26
+- [ ] T-000043 | Refactor sidebar | 2 | medium | in-progress | 2026-04-22
+- [ ] T-000044 | Write tests for X | 1 | medium | review | 2026-04-21
+```
+
+LLM/user policy: either may add / edit / move tasks. When a task is completed, move it (LLM or user) from `todo.md` into `done.md` under the appropriate `## YYYY-MM-DD` section. When adding a new task, LLM **must** include `created_at` = today's date (YYYY-MM-DD). Existing tasks' `created_at` is immutable — never edit it.
+
+## `docs/done.md`
+
+Structure:
+```markdown
+## 2026-04-21                             ← date section header, YYYY-MM-DD
+- D-000001 | Refactor SecretsPanel | v0.13.9
+- T-000045 | Fix login regression | v0.13.9
+- | Tiny doc tweak | v0.13.9              ← empty id slot (pipes still present)
+```
+
+- `## <date>` — section header in `YYYY-MM-DD`. Groups tasks by completion day.
+- Line has **exactly 3 pipe-separated fields**: `- <id> | <description> | <version>`. The `id` slot may be left empty — the line then reads literally: markdown dash `-`, one space, first pipe `|`, description, pipe, version. Example: `- | Description here | v1.0`. Both pipes must always be present.
+- No `[x]` checkbox — the file itself is the "done" list.
+- If the `id` slot is empty, the app assigns a synthetic `D-NNNNNN` (6-digit) for display (in-memory only, file is not rewritten). **`D-NNNNNN` exists only inside the app's UI** — when referring to a done entry elsewhere (commit message, conversation, other files), use the description text, not `D-NNNNNN`.
+- Parser is lenient on id format — legacy 3-digit IDs (`T-045`, `D-001`) still read correctly. New entries written by LLM/app use 6-digit padding (`T-000045`).
+- `version` — SemVer tag like `v0.13.9` recommended. Any free-form string accepted. May be empty.
+- **Ordering:** new entries are appended at the bottom of the current `## <date>` section (chronological within the day).
+
+LLM/user policy: LLM or user moves completed tasks from `todo.md` here (append under the correct `## YYYY-MM-DD` section). **Historical entries must not be modified or removed** — `done.md` is an append-only log.
+
+## `docs/bug-reports.md` (v2, 8 fields)
+
+Line: `- <id> | <date> | <description> | <severity> | <category> | <status> | <fix_attempts> | <comment>`
+
+- `id` — `B-NNNNNN` (6-digit zero-padded, e.g. `B-000042`). **Assigned by the app** (immutable). LLM must not rename. Parser is lenient — legacy 3-digit IDs (`B-042`) still read correctly.
+- `date` — `YYYY-MM-DD`. **Set by the app on creation** (immutable).
+- `description` — free-form. **User-owned**.
+- `severity` — `critical` / `major` / `medium` / `minor`. **User-owned**.
+- `category` — `ui_ux` / `ux_flow` / `logic` / `auth` / `database` / `performance` / `security` / `integration` / `other`. **User-owned**. `other` is the catch-all; the app normalises unknown values (from stale files or hand-edits outside the app's dropdown) to `other` on load — internal safety-net.
+- `status` — workflow values: `created` / `in-progress` / `testing` / `rejected` / `confirmed`.
+  - `created` — **set by the app** when user creates the bug. LLM only transitions from here.
+  - `in-progress` — LLM transitions `created → in-progress` when it takes the bug into work. Stays here while fix is being attempted.
+  - `testing` — fix applied, comment describes what was done. Awaiting user verification. This transition bumps `fix_attempts` +1.
+  - `confirmed` — user verified the fix via app's ✓ button. Row stays in file with this status; **whenever the LLM is about to edit `bug-reports.md` in a session, it first removes any rows currently marked `confirmed` — cleanup bundled into the same edit, not a separate commit.**
+  - `rejected` — user verified and rejected. Comment describes why. Next transition back to `in-progress` → `testing` bumps `fix_attempts`.
+  **LLM may edit `status`** within this workflow.
+- `fix_attempts` — integer ≥ 0. **App-managed** — incremented each time `status` enters `testing` (= count of fix attempts made). LLM must not touch.
+- `comment` — free-form, optional. **LLM may edit** — writes what was done, or why `rejected`.
+
+### LLM policy for bug-reports.md
+
+The LLM is allowed to:
+- **edit** the `status` and `comment` fields on existing rows
+- **delete entire rows** whose current status is `confirmed` (routine cleanup — this rule takes priority over the "edit only two fields" constraint)
+
+The LLM must NOT:
+- edit any other fields (`description`, `severity`, `category`, `id`, `date`, `fix_attempts`)
+- rename or renumber `id`
+- create new bug rows — new bugs are created only through the app's "+ Add bug" button so that `id`, `date`, and DB-side statistics are wired consistently. If the LLM spots a new bug, it should (a) ask the user to file it in the app, or (b) add a `T-NNNNNN` line to `todo.md` instead.
+
+## `docs/api.md` (server-side projects)
+
+`docs/api.md` is the public contract of a server or microservice. Downstream consumers (clients, parent servers) read it via the cross-repo api.md sync (see project's `docs/flows/api-handlers-sync.md` if present) — `docs/server-api/api.md` on the client side, `docs/microservice-api/<ms-project-name>/api.md` on the parent-server side. Treat `api.md` as a contract: anything documented is a promise; anything not documented does not exist for consumers.
+
+### File header
+
+```markdown
+# API Documentation
+
+Server version: X.Y.Z
+
+## Access model
+
+(Section describing access levels — admin / auth / public — and the access matrix for each role. Project-specific. See template below for a typical shape.)
+```
+
+### Per-endpoint format (5 blocks)
+
+For each endpoint, document up to 5 blocks. Omit blocks that don't apply (e.g. **Side effects** if there are none, **Partial update semantics** for non-PATCH endpoints).
+
+````markdown
+#### `METHOD /path`
+One-sentence description of what the endpoint does.
+
+**Request:**
+```json
+{
+  "fieldName": "type, required|optional, validation rules"
+}
+```
+
+**Response (200):**
+```json
+{
+  "serviceInfo": "(standard)",
+  "fieldName": "type, optional notes"
+}
+```
+
+**Errors:**
+- `ERROR_CODE` (HTTP status) — cause description
+- `ANOTHER_CODE` (HTTP status) — cause description
+
+**Partial update semantics:** *(PATCH only)*
+- Field **absent from body** → value in DB unchanged
+- Field passed as **`null`** → behavior described
+- Field passed as **`""`** (empty string) → behavior described
+
+**Side effects:**
+- DB writes beyond the obvious (cascades, triggers)
+- Webhooks fired
+- Cache invalidation
+- Broadcast events to connected products / sessions
+- Background jobs queued
+````
+
+### Block-by-block conventions
+
+- **Request body** — JSON object with inline annotations. Supported types: `string`, `int`, `bool`, `float`, `uuid`, `RFC3339 timestamp`, `[Type]` (array), `Type | null` (nullable). Validators in free-form text (`min N chars`, `regex /pattern/`, `enum [a, b, c]`).
+- **Response body** — same notation. Use `"serviceInfo": "(standard)"` shorthand instead of expanding the standard envelope every time. Expand `serviceInfo` only when this endpoint puts something non-standard into it.
+- **Errors** — list **only endpoint-specific codes**. Infrastructure-wide errors (`INVALID_PRODUCT_KEY`, `INVALID_ADMIN_KEY`, `INTERNAL_ERROR`, etc.) are shared across all endpoints and live in the file header's "Access model" section, not duplicated per endpoint. Format: `CODE (HTTP) — cause`.
+- **Partial update semantics** — required for every PATCH endpoint with at least one nullable field. State explicitly how the server interprets: (a) absent field, (b) `null` value, (c) empty string `""` / empty array `[]`. Without this block, client developers must guess from server source code, which produces silent bugs (e.g. sending `{field: null}` to clear vs sending `{field: ""}` — these may differ on the server).
+- **Side effects** — anything beyond writing to the obvious primary table. Omit the block if there are no side effects.
+
+### Status taxonomy
+
+Each endpoint row in the per-section tables (admin-read / admin-write / auth-read / auth-write / public) carries a status:
+- `implemented` — live and tested
+- `planned` — specified but not yet shipped
+- `deprecated` — still works, scheduled for removal in next MAJOR
+
+### Adoption (when extending an existing api.md)
+
+Don't retroactively rewrite the whole file in one pass. Apply the rule "next time an endpoint is touched, expand it to the full 5-block format" — drift toward the new format incrementally. Prioritize admin sections first (downstream admin-clients are usually written first, and benefit most from explicit body schemas).
+
+# Cross-repo requirements (Message/Receipt pattern)
+
+Requirements that cross repo boundaries (client↔server, server↔microservice) travel as two-file pairs. Solo Dev Hub handles all file movement between repos — LLM and dev never copy, move, or delete these files across repo boundaries manually.
+
+## Files and ownership
+
+- **Requirement**: `REQ-NNN_<slug>.md` — authored by the **sender**. Describes desired behavior. The sender's copy is the **source of truth**; the recipient's copy is a synced replica.
+- **Receipt**: `REQ-NNN_<slug>.response.md` — authored by the **recipient**. Carries reply status and comment. The recipient's copy is the **source of truth**; the sender's copy is a synced replica.
+
+`NNN` is chosen by the sender on creation (next free number within that folder) and is **never renamed or renumbered**. `_<slug>` is a short kebab-case readability hint — recommended but optional; the app matches files by the globs `REQ-*.md` and `REQ-*.response.md`.
+
+### Receipt content (convention, not enforced)
+
+Inside `REQ-NNN_<slug>.response.md` the recipient records a reply status and comment. Recommended status values:
+- `implemented` — done as requested
+- `partially` — done in part; comment describes scope
+- `declined` — not doing; comment describes why
+
+The app does not parse receipt contents — this is a convention for human/LLM readers.
+
+### Sync state (computed by the app for UI)
+
+Separate from the receipt's internal status, the app displays a **sync state** per pair, computed purely from the filesystem:
+- `new` — requirement exists on sender side but not yet on recipient side (pending next sync)
+- `sent` — requirement on both sides, no receipt yet
+- `responded` — receipt file exists
+
+Sync state is runtime-derived, not stored in any file.
+
+## Folders
+
+| Direction | Sender's outgoing folder | Recipient's incoming folder |
+|---|---|---|
+| Client → Server | `docs/backend-requirements/` (flat — client has one server) | `docs/client-requirements/<client-repo-name>/` (nested — server has many clients) |
+| Server → Microservice | `docs/microservice-requirements/<microservice-project-name>/` (nested — server has many connected microservices) | `docs/server-requirements/` (flat today — see note) |
+
+Folder structure is **flat** when the sender has exactly one counterparty (a client has one server) and **nested per-counterparty-name** when there can be many.
+
+> **Note:** `docs/server-requirements/` on the microservice side is currently flat, which limits a microservice to one effective parent-server without filename collisions. A future release will nest per parent-server (`docs/server-requirements/<parent-server-repo-name>/`). For now, work with one parent per microservice.
+
+Folder renames (e.g. repo renamed on GitHub) are handled by the app — on next sync the app finds the old folder on the recipient side and renames it to match the current name. LLM/dev never rename these folders manually.
+
+## Sync flow (propagation)
+
+1. **Sender** writes `REQ-NNN_<slug>.md` in its outgoing folder.
+2. **App** copies it to the recipient's incoming folder at next sync. If the sender **edits** the file later, the next sync overwrites the recipient's copy — source of truth (sender) always wins.
+3. **Recipient** writes `REQ-NNN_<slug>.response.md` alongside the request it received. Recipient must NOT edit the `REQ-*.md` they received — if they do, the next sync silently overwrites their change.
+4. **App** copies the receipt back to the sender's outgoing folder at next sync. If the recipient edits their receipt later, the next sync overwrites the sender's copy — source of truth (recipient) always wins.
+5. **Sender** reviews the receipt. If satisfied → clicks ✓ in the app → `confirm_requirement` atomically deletes the pair (both files, both sides) in one operation.
+
+If the sender is not satisfied with the receipt, they do **not** reject — they write a new `REQ-N+1_<slug>.md` with a clarified ask. The original pair may stay open until the new requirement is answered, or be confirmed away immediately.
+
+## LLM policy
+
+| Action | Who does it |
+|---|---|
+| Create `REQ-*.md` | Sender |
+| Edit `REQ-*.md` | Sender only (own side) |
+| Create `REQ-*.response.md` | Recipient |
+| Edit `REQ-*.response.md` | Recipient only (own side) |
+| Confirm a pair (delete both files, both sides) | User — via app's ✓ button |
+
+The LLM must NOT:
+- edit a `REQ-*.md` on the **recipient** side — edits are silently overwritten at next sync
+- edit a `REQ-*.response.md` on the **sender** side — same reason
+- delete a `REQ-*.md` or `.response.md` manually — confirmation is a user-only action through the app's ✓ button
+- rename or renumber `NNN`
+- author a `.response.md` for a requirement it did not receive (receipts are only authored by the recipient)
+- rename the sync folders (`backend-requirements/`, `client-requirements/...`, etc) manually — those are app-managed
+
+# API contract sync
+
+`docs/api.md` is consumed cross-repo (clients read the synced server's `api.md`; parent-servers read connected microservices' `api.md`). This makes the contract a load-bearing artifact, not project documentation — drift between code and contract becomes drift visible to other repos. Two symmetric rules keep code and contract aligned, one for the read side (client) and one for the write side (server / microservice).
+
+## Client read-side: pre-flight server-surface check before phase-level spec
+
+**Rule:** Before drafting a phase-level spec for any feature that requires server endpoints, verify those endpoints are documented in the synced server contract — `docs/server-api/api.md` (for a client repo) or `docs/microservice-api/<ms-project-name>/api.md` (for a parent-server consuming a microservice). Grep the contract for each required endpoint × HTTP method. If any endpoint is absent, **do not start the spec.** Open a server-side REQ asking to implement or document the missing surface, or sync with the counterparty to confirm status. Resume the spec only after the gap is acknowledged on the server side.
+
+**Why:** Without it, a spec can target an imagined surface — failure surfaces at impl time after hours of design, while the check itself is a single read-only grep.
+
+**How to apply.** Triggered when the user signals start of phase-level work that touches a server — *"let's plan feature X"*, *"design phase Y"*, *"start implementation of Z"* — and the feature requires endpoints. The **first read-only action** before entering the chat phase of `# Phase work workflow`:
+
+1. Identify the required endpoints from the feature description (method + path + access level).
+2. Grep the synced server contract file for each endpoint × HTTP method.
+3. Report findings to the user in plain text — matched (with line refs) / missing.
+4. If gaps exist, propose either (a) opening a server-side REQ asking to implement or document the missing surface, or (b) waiting for confirmation from the server team. **Do not start the spec.**
+5. If endpoints are fully documented, proceed to the chat phase of `# Phase work workflow` as usual.
+
+## Server write-side: contract sync in the same commit as the handler
+
+**Rule:** Whenever a server handler is added, removed, or its request / response shape changes, the corresponding entry in `docs/api.md` — plus any `docs/handlers.md` or per-handler doc the project keeps — is updated in the **same commit** as the handler change. A handler that ships without its `api.md` entry is treated as **not yet shipped** for synced consumers, even if it is live in code. Likewise, if a flow doc under `docs/flows/` references the changed handler, its file-path / line references are re-verified and updated in the same commit (per the existing `# Feature flow docs` Update policy).
+
+**Why:** Clients grep the synced contract before drafting specs (Client read-side rule above). A handler live in code but absent from `api.md` causes downstream consumers to either ask for something that already exists or chase a documentation gap — avoidable cross-repo round-trips.
+
+**How to apply.** Triggered by any change in the handler layer that affects the public surface — adding a route, removing a route, changing accepted / returned fields, changing access level. When such a change is staged:
+
+1. Open `docs/api.md` and locate the section matching the handler's access level (`admin-read` / `admin-write` / `auth-read` / `auth-write` / `public`).
+2. Add / update / remove the row: method, path, description, status (`implemented` / `planned` / `deprecated`), and the per-endpoint body schemas (see `## docs/api.md (server-side projects)` format above).
+3. If the project keeps `docs/handlers.md` or per-handler docs, update them the same way.
+4. If the handler is referenced by a flow doc under `docs/flows/`, re-verify file-path / line references (they may have shifted) and drop any `(planned)` markers that became implemented in this commit.
+5. **Stage `docs/api.md` (and any other touched contract / flow files) with the same commit as the handler change.** Never split contract update from handler update across two commits — at minimum, never push the handler ahead of the contract.
+
+For **breaking surface changes** (removed endpoint, changed response field, changed access level), bump the server's MINOR or MAJOR per `# Versioning (SemVer)` and add an entry to `Changelog.md` under `## [Unreleased]` in the same commit. The trigger is: handler change → contract + Changelog in the same commit. Format details (Conventional Commits, Keep-a-Changelog categories) live in their own sections below.
+
+# Phase work workflow
+
+For any user request, the assistant first **estimates scope** and chooses between two paths:
+
+| Scope | Path | User involvement |
+|---|---|---|
+| Trivial (single decision, no cross-boundary impact, single task — including mass mechanical changes regardless of file count) | **Fast lane** — proceed directly to implementation | none — assistant just does it |
+| Non-trivial (any of: ≥2 non-obvious design decisions / cross-boundary changes (DB schema, contracts, security-sensitive code) / ≥3 logically distinct sub-tasks) | **Phase workflow** — chat → spec → self-review → OK → impl | offer the user; default offer is phase workflow; user may override to fast lane |
+
+**Mechanical mass changes** — rename across N files, format pass, lint auto-fix, codemod — count as a single task regardless of file count. They use fast-lane unless they carry design decisions (e.g. choosing the new naming convention itself is a decision).
+
+**What counts as a "decision"** — a point of design judgment, not a code change or file edit. A follow-the-pattern feature with one coherent design intent = one decision regardless of how many files it touches. A feature with non-obvious edges (load strategy, error-handling shape, skeleton state, etc.) accumulates a decision per edge.
+
+**User override always wins.** If the user explicitly asks for a spec (or for fast-lane), the assistant honors the request without arguing the trigger criterion. The criterion guides the assistant's *offer*; the user's explicit request overrides it.
+
+## Phase workflow steps
+
+1. **Chat** — discuss scope, decisions, trade-offs in conversation. One focused question per message. If a single message would carry 3+ decision points, switch from chat to drafting a spec. *Precondition:* if the feature touches a server, run the pre-flight server-surface check from `# API contract sync` first — block on missing endpoints before entering chat.
+2. **Spec** — markdown document with sections: context (why), scope (which tasks), files-to-modify (full paths), decisions (brief rationale per decision), verification (per Manual-smoke verification rule below). The spec file is mandatory when chat saturates (≥3 decisions in a single message) or when the user requests one explicitly. For phase work that stays comfortably distributed across messages with few decisions per message, the chat thread itself serves as the spec — the user's explicit "OK, proceed" in step 4 closes it.
+3. **Self-review** — re-read the spec (or the chat thread acting as spec) and report any ambiguity or internal contradiction found: mismatched symbol / state-field names between sections, files in scope but missing from files-to-modify, decisions later in the doc that contradict earlier ones, missing localisation / i18n cleanup, missing test updates.
+4. **User OK** — user reviews the spec (or thread), approves or returns with corrections. Iterate until approved. Do not start implementation before approval.
+5. **Implementation** — task-by-task. Each task commits on completion per the project's implementation workflow.
+
+## Project bindings (per-project `CLAUDE.md` must define)
+
+- **Spec location:** path and naming convention for spec files (e.g. `docs/specs/<YYYY-MM-DD>-<phase-name>.md`). Spec files are gitignored unless the project specifies otherwise.
+- **Implementation workflow:** how step 5 executes — subagent-driven (one fresh subagent per task, per-task commits) or sequential (tasks executed in current session, per-task or batched commits).
+
+# Manual-smoke verification in every spec
+
+Each spec written under the **Phase work workflow** above includes a `## Verification` (or `## Manual smoke`) section — hands-on UI / feature checks, distinct from unit tests.
+
+Required content:
+- **Per changed feature:** open `<route / screen>` → verify `<expected behavior>`.
+- **Parameter combinations:** list combos to try (e.g. *"filter A × filter B, verify intersection"*).
+- **Regression checks:** list adjacent untouched features; open each and confirm nothing broke.
+- **Edge cases:** empty states, error paths, race conditions if any.
+- **Cross-feature integration:** if changing feature A may affect feature B, list the touchpoint.
+
+List length scales with complexity: 3–5 items for a small fix, 10+ for a multi-screen phase.
+
+# Feature flow docs (`docs/flows/`)
+
+Complex features (auth, sync, retry, deploy pipeline, etc.) are documented as flow files in `docs/flows/<feature-name>.md`. The goal: a single source of truth for the sequence of events in the feature, so the reader agrees on how the feature works (or should work) without reading every involved file.
+
+**What a flow doc describes:**
+- The sequence of events / steps in the feature: who calls what, in what order, with what arguments and side effects
+- Components and layers involved (e.g. UI → Tauri command → Rust handler → DB)
+- Edge cases handled: error paths, retries, empty inputs
+- Non-obvious decisions and the reasoning behind them
+- Links to specific files (`src/foo.rs:42`)
+
+**Current vs planned — the core disambiguation rule:**
+A flow doc may describe both *currently implemented* behavior and *planned* behavior. The reader must always be able to tell which is which.
+- Default voice: **present tense** describes current behavior (e.g. *"the sync engine **copies** the file"*) — this implies "this is how it works in HEAD".
+- Anything **not yet implemented** must be marked explicitly: an inline `(planned)` tag, a `> 🚧 Not implemented yet` block, or a separate `## Planned changes` section. Never describe planned behavior in plain present tense — that creates the exact ambiguity this rule prevents.
+- Past tense (*"we **added** copy logic"*) does not belong in a flow doc — that's a changelog entry, not a flow step.
+
+**What flow docs are NOT:**
+- Not a changelog — historical changes belong in `Changelog.md`
+- Not a roadmap — high-level planned work belongs in `docs/todo.md`. A flow doc may still mention a specific planned step — see the disambiguation rule above — but it shouldn't be a list of unrelated future tasks.
+- Not a requirements doc — incoming cross-repo requirements live in `docs/backend-requirements/` / `docs/client-requirements/<repo>/` / `docs/microservice-requirements/<ms>/` / `docs/server-requirements/`
+- Not a design memo — exploratory designs live in their own scoped folder if the project uses one (location varies per project)
+
+**Update policy:**
+- When a feature changes, its flow doc is updated **in the same commit** as the code change — not in a follow-up. Stale flow docs are worse than no flow docs: readers trust them.
+- When a planned step becomes implemented, drop its `(planned)` marker in the same commit.
+- File-path and function-name references must point to live code. Before writing *"as defined in `foo()` at `bar.rs:42`"*, grep to verify the symbol still exists at that path.
+- When a feature is removed, its flow doc is removed in the same commit.
+
+**When to write a flow doc:**
+- The feature spans more than one file or layer (e.g. crosses presentation → domain, or has a Rust ↔ TS boundary)
+- The flow has non-trivial branching, retry, or state-machine logic
+- A reader cannot reconstruct the behavior just by reading the entry-point function
+
+Trivial features (one component, no branching) don't strictly require a flow doc — one may still be written on request (onboarding, hand-off).
+
+# Versioning (SemVer)
+
+Format: `MAJOR.MINOR.PATCH` (e.g. `2.3.1`). Each component is an independent counter, not a decimal — after `0.9.x` comes `0.10.0`, not `1.0.0`.
+
+| Change | Bump | Example |
+|---|---|---|
+| Bug fix, no behavior change | PATCH | `0.3.1 → 0.3.2` |
+| New feature, backward-compatible | MINOR | `0.3.2 → 0.4.0` |
+| Breaking change | MAJOR | `1.2.0 → 2.0.0` |
+
+- Projects start at `0.1.0`.
+- `0.x.y` means API is unstable, things may change.
+- `1.0.0` is a conscious decision: stable, contracts frozen, running in prod. Don't rush for marketing reasons.
+- **LLM must ask the dev before bumping MAJOR or MINOR** — confirm the bump in conversation before committing. Never auto-decide a MAJOR/MINOR jump. PATCH bumps for bug fixes can be applied routinely.
+
+### SemVer by project type
+
+| Type | MAJOR | MINOR | PATCH |
+|---|---|---|---|
+| Server (API) | Breaking API: removed endpoint, changed response format | New endpoint, new param (old still works) | Bug fix, optimization, refactor |
+| Client | Major UI overhaul, or upgrade to new MAJOR of server | New screen, new feature | Visual fixes, small bugs |
+| Microservice | Breaking API change (affects all consumers) | New functionality | Bug fix |
+| Tool | Major change | New function | Bug fix |
+
+Release workflow: see **Release closure checklist** below for the full step-by-step procedure (manifest bump, Changelog, done.md, smoke, schema regen, closure commit, tag). The **dev** runs `git tag vX.Y.Z` and `git push origin vX.Y.Z` — LLM does not execute git tag/push autonomously.
+
+# `Changelog.md`
+
+Format: [Keep a Changelog](https://keepachangelog.com/). Six standard change categories — use them consistently:
+
+- `Added` — new features
+- `Changed` — changes in existing functionality (backward-compatible)
+- `Deprecated` — features marked for removal in the next MAJOR; still working, but flagged
+- `Removed` — features removed in this release
+- `Fixed` — bug fixes
+- `Security` — vulnerability patches / data-integrity fixes (called out separately so users know to upgrade with priority)
+
+Template:
+
+```markdown
+# Changelog
+
+## [Unreleased]
+
+### Added
+### Changed
+### Deprecated
+### Removed
+### Fixed
+### Security
+
+## [0.1.0] — YYYY-MM-DD
+
+### Added
+- Initial project scaffold
+```
+
+Rules:
+- `## [Unreleased]` section **never has a date** — the date is added only when the version is tagged/released (at which point `[Unreleased]` becomes `[X.Y.Z] — YYYY-MM-DD`).
+- In released versions, empty categories may be omitted — only include headings that actually have entries.
+
+# Release closure checklist
+
+When closing a release tag (any SemVer bump), execute every step below. Skipping a step leads to documentation rot, lost traceability, or merge-conflict pain in the next release.
+
+1. **Version bump** in the source-of-truth place(s) for this project. Projects with a manifest version field (`pubspec.yaml` / `package.json` / `Cargo.toml` / `*.csproj` / `tauri.conf.json`) — bump there. Projects without a manifest version field (e.g. a Go server) — bump in the locations listed in the per-project `CLAUDE.md` (typical list: `Changelog.md`, version header in `docs/api.md`, hard-coded version constants). Use SemVer rules from the Versioning section above; ask the user before MAJOR or MINOR bumps.
+2. **Changelog update** — move the `## [Unreleased]` block to `## [X.Y.Z] — YYYY-MM-DD`. Ensure entries follow the Keep-a-Changelog categories (Added/Changed/Deprecated/Removed/Fixed/Security). Drop empty categories.
+3. **`docs/done.md` update** — append a `## YYYY-MM-DD` section (or extend the existing one) with each closed task ID + short description + version.
+4. **`docs/todo.md` cleanup** — mark or remove completed tasks; demote stale `in-progress` entries that didn't ship in this release.
+5. **REQ receipts processing** *(if applicable — only for projects with cross-repo dependencies)* — for any Message/Receipt pair the counterparty closed during this release window, confirm-✓ via the project's REQ exchange mechanism (e.g. Solo Dev Hub UI ✓-button, which deletes the requirement+receipt pair on both sides).
+6. **Verification** — ensure automated tests / CI are green. For projects with UI: walk through the golden path of each changed feature in dev; for backend projects: exercise the changed endpoints (curl / integration suite). Verify no regressions in adjacent untouched features. Cover empty states and error paths.
+7. **Schema docs regen** *(server-side projects with a database only)* — if migrations were added in this release, regenerate `docs/schema/` via the project-specific command (typically `bash scripts/schema-docs.sh`). Stage `docs/schema/` together with the closure commit. Not applicable to client / desktop / CLI projects without a DB.
+8. **Closure commit** — stage Changelog + manifest (if applicable) + `done.md` (if tracked) + `docs/schema/` (if regenerated) + any release-only docs in a single commit with message `chore: vX.Y.Z release closure` (or similar). Project files unrelated to the release stay outside this commit.
+9. **Tag** — `git tag vX.Y.Z` then `git push origin vX.Y.Z`. **User runs the tag command, not the assistant.** Assistant surfaces the exact command and waits.
+
+**How to apply:** When the user signals release intent — *"ready to release"*, *"закрываем релиз"*, *"зафиксируй документацию"*, *"shipping vX.Y"*, or finishes the last task in the release scope — surface the full checklist (numbered, with the project's actual file paths) and walk through it interactively. Do not declare the release "done" until every step is verified. The tag is the user's action; assistant only proposes the exact command.
+
+# Commit messages
+
+When the user signals "фиксируем результат, обновляем документы" / "коммитим это" / "let's commit this" / similar — assistant **proactively offers** a Conventional Commits formatted draft of the commit message in chat. The user may copy as-is, modify, or write their own.
+
+Format:
+
+```
+<type>(<optional scope>): <short subject ≤ 70 chars>
+
+<body explaining what + why, 2–3 lines wrapped at ~72 chars>
+
+<optional trailers: Refs T-NNNNNN, REF: REQ-NNN, B-NNNNNN, etc.>
+```
+
+- **Types:** `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`, `build`, `ci`.
+- **Optional scope:** short feature/module name (`payments`, `feedback`, `accounts`, `deploy`).
+- **Subject style:** imperative mood, lowercase after the colon, no trailing period. Example: `feat(deploy): add multi-env support`, not `Added multi-env support.`
+- **Trailers:** `Refs T-NNNNNN` / `REF: REQ-NNN` / `B-NNNNNN` are informational pointers to IDs in `docs/todo.md` / cross-repo REQ pairs / `docs/bug-reports.md` — they are **not** GitHub auto-close keywords (those work for issue numbers, not for our app-managed IDs).
+- **Execution:** the assistant **does not run `git commit` itself**. The draft is for the user to copy, modify, or replace, and then run. This applies even under auto mode — authoring the commit always belongs to the user.
+
+---
+_This section is auto-generated by Solo Dev Hub. Do not edit between `manager:begin`/`manager:end` markers — changes will be overwritten on next sync._

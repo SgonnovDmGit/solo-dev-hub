@@ -17,8 +17,6 @@ target/
 
 # AI and project management docs (local only)
 CLAUDE.md
-ToDo.md
-Done.md
 docs/todo.md
 docs/done.md
 
@@ -33,7 +31,7 @@ superpowers/
 docs/roadmap.md
 
 # --- solo-dev-hub:begin ---
-CLAUDE.*
+/CLAUDE.*
 .claude/
 docs/bug-reports.md
 docs/backend-requirements/
