@@ -20,6 +20,18 @@
   на `dev`, релиз = fast-forward в `master` + тег. Hotfix'ы прямо в
   `master`, потом `git rebase master` на `dev`. Документировано в
   `docs/RELEASING.md` секцией "Ветки" + suggested git aliases.
+- **CI lint**: убрана env-строка `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` из
+  `.github/workflows/release.yml` (текущий ключ solo-dev-hub без пароля).
+  Секрет помечен как опциональный в `docs/RELEASING.md`.
+
+### Added
+- **T-000062 | README RU+EN drafts (public-launch quality)** — text-only
+  pass: marketing-tone преамбула, Why / Features / Tech Stack /
+  Getting started / Development / Roadmap / Support / License,
+  ссылка на русскую версию `README.ru.md` сверху английской.
+  Скриншоты — отдельной сессией (placeholder'ы с captions расставлены
+  в обоих файлах).
+- `LICENSE` — MIT, ранее только в `package.json` без файла.
 
 ## [0.24.2] — 2026-05-07
 
