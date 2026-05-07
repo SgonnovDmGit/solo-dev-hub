@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>v0.22.0 — Stats redesign preview (final)</title>
+<style>
+  :root {
+    --bg: #1a1a1a;
+    --surface: #242424;
+    --surface-hover: #2e2e2e;
+    --text: #e8e8e8;
+    --text-muted: #888888;
+    --accent: #4a9eff;
+    --border: #333333;
+    --good: #22c55e;
+    --bad: #ef4444;
+  }
+  [data-theme="light"] {
+    --bg: #f5f5f5;
+    --surface: #ffffff;
+    --surface-hover: #f0f0f0;
+    --text: #1a1a1a;
+    --text-muted: #666666;
+    --accent: #2563eb;
+    --border: #d1d5db;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+    font-size: 13px;
+  }
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+  }
+  .toolbar button {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .toolbar button:hover { background: var(--surface-hover); }
+  .toolbar button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .toolbar .label { color: var(--text-muted); font-size: 11px; margin-right: 4px; }
+  .scope-title {
+    font-size: 18px;
+    font-weight: 600;
+    margin: 32px 0 4px;
+    color: var(--text);
+  }
+  .scope-sub {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 14px;
+  }
+  .lifetime-banner {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin: -4px 0 14px;
+    font-style: italic;
+  }
+  .stats-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    margin-bottom: 14px;
+  }
+  /* KPI row */
+  .kpi-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+  .kpi {
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 9px 10px;
+  }
+  [data-theme="light"] .kpi { background: rgba(0, 0, 0, 0.04); }
+  .kpi-label { font-size: 11px; font-weight: 600; margin-bottom: 3px; }
+  .kpi-hint { font-size: 10px; color: var(--text-muted); margin-bottom: 6px; min-height: 22px; line-height: 1.3; }
+  .kpi-value { font-size: 22px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .kpi-sub { font-size: 10px; color: var(--text-muted); margin-top: 4px; min-height: 12px; }
+  .kpi-sub .crit { color: var(--bad); font-weight: 600; }
+  /* Top hot list */
+  .hot-row {
+    display: grid;
+    grid-template-columns: 18px 1fr auto;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .hot-row:last-child { border-bottom: none; }
+  .hot-rank { color: var(--text-muted); font-size: 12px; font-weight: 600; }
+  .hot-name { font-weight: 500; font-size: 12px; }
+  .hot-meta { font-size: 11px; color: var(--text-muted); }
+  .hot-meta .crit { color: var(--bad); font-weight: 600; }
+  /* Category bars */
+  .cat-row {
+    display: grid;
+    grid-template-columns: 110px 1fr 80px;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .cat-label { font-size: 11px; color: var(--text); }
+  .cat-bar-wrap {
+    height: 12px;
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  [data-theme="light"] .cat-bar-wrap { background: rgba(0, 0, 0, 0.06); }
+  .cat-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--good), #4ade80);
+  }
+  .cat-bar.low { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+  .cat-bar.bad { background: linear-gradient(90deg, var(--bad), #f87171); }
+  .cat-num {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .section-title {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: var(--text);
+  }
+  .section-title .count {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 400;
+    margin-left: 6px;
+  }
+  /* Tab nav mock */
+  .tabs-nav {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+  }
+  .tab {
+    padding: 8px 14px;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    font-size: 12px;
+  }
+  .tab.active {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+    font-weight: 600;
+  }
+  /* Хронология placeholder block */
+  .timeline-placeholder {
+    background: var(--surface);
+    border: 1px dashed var(--accent);
+    border-radius: 6px;
+    padding: 24px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-style: italic;
+    margin-top: 14px;
+  }
+  .timeline-placeholder .title {
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 12px;
+    margin-bottom: 4px;
+    font-style: normal;
+  }
+</style>
+</head>
+<body data-theme="dark">
+
+<div class="toolbar">
+  <span class="label">Theme:</span>
+  <button id="dark" class="active" onclick="setTheme('dark', this)">Dark</button>
+  <button id="light" onclick="setTheme('light', this)">Light</button>
+  <span class="label" style="margin-left: 16px;">Scope:</span>
+  <button id="repo" class="active" onclick="setScope('repo', this)">Per-repo</button>
+  <button id="project" onclick="setScope('project', this)">Per-project</button>
+</div>
+
+<!-- ===== PER-REPO ===== -->
+<div id="scope-repo">
+  <div class="scope-title">RepoDetail → Таб «Статистика»</div>
+  <div class="scope-sub">Репо <code>swan_payment_test_app</code> · Project: Swan Payment</div>
+
+  <div class="tabs-nav">
+    <span class="tab">Баги</span>
+    <span class="tab">Задачи</span>
+    <span class="tab">Сделано</span>
+    <span class="tab">Changelog</span>
+    <span class="tab">Секреты</span>
+    <span class="tab active">Статистика</span>
+  </div>
+
+  <div class="lifetime-banner">Сводка с момента создания репо (2025-08-12 · 259 дней истории)</div>
+
+  <!-- KPI row -->
+  <div class="kpi-row">
+    <div class="kpi">
+      <div class="kpi-label">Активные баги</div>
+      <div class="kpi-hint">open + in-progress + testing</div>
+      <div class="kpi-value">8</div>
+      <div class="kpi-sub">из них <span class="crit">2 critical</span></div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Всего закрыто</div>
+      <div class="kpi-hint">confirmed bugs за всю историю</div>
+      <div class="kpi-value">47</div>
+      <div class="kpi-sub">за 259 дней</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Среднее попыток</div>
+      <div class="kpi-hint">avg fix_attempts на confirmed</div>
+      <div class="kpi-value">1.6</div>
+      <div class="kpi-sub">медиана: 1</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Fix rate</div>
+      <div class="kpi-hint">closed / created всего</div>
+      <div class="kpi-value">85%</div>
+      <div class="kpi-sub">47 закрыто / 55 создано</div>
+    </div>
+  </div>
+
+  <!-- Category bars -->
+  <div class="stats-card">
+    <div class="section-title">Эффективность по категориям <span class="count">(всё время · сорт. по % закрытия)</span></div>
+    <div class="cat-row">
+      <div class="cat-label">UX flow</div>
+      <div class="cat-bar-wrap"><div class="cat-bar" style="width: 92%"></div></div>
+      <div class="cat-num">92% (12/13)</div>
+    </div>
+    <div class="cat-row">
+      <div class="cat-label">Logic</div>
+      <div class="cat-bar-wrap"><div class="cat-bar" style="width: 87%"></div></div>
+      <div class="cat-num">87% (13/15)</div>
+    </div>
+    <div class="cat-row">
+      <div class="cat-label">UI / UX</div>
+      <div class="cat-bar-wrap"><div class="cat-bar" style="width: 75%"></div></div>
+      <div class="cat-num">75% (9/12)</div>
+    </div>
+    <div class="cat-row">
+      <div class="cat-label">Performance</div>
+      <div class="cat-bar-wrap"><div class="cat-bar low" style="width: 60%"></div></div>
+      <div class="cat-num">60% (3/5)</div>
+    </div>
+    <div class="cat-row">
+      <div class="cat-label">Other</div>
+      <div class="cat-bar-wrap"><div class="cat-bar bad" style="width: 40%"></div></div>
+      <div class="cat-num">40% (2/5)</div>
+    </div>
+  </div>
+
+  <!-- Хронология placeholder LAST (T-000056) -->
+  <div class="timeline-placeholder">
+    <div class="title">📅 Хронология (T-000056)</div>
+    Здесь будет 3-й блок — реализуется в той же v0.22.0 (отдельная задача).<br>
+    Pre-filtered Timeline-feed для этого репо: bug events, task events, sync, deploy, rename — последние N с pagination.
+  </div>
+</div>
+
+<!-- ===== PER-PROJECT ===== -->
+<div id="scope-project" style="display: none;">
+  <div class="scope-title">ProjectDetail → Таб «Статистика»</div>
+  <div class="scope-sub">Project <code>Swan Payment</code> · 3 репо</div>
+
+  <div class="tabs-nav">
+    <span class="tab">Репозитории</span>
+    <span class="tab">Микросервисы</span>
+    <span class="tab">Граф</span>
+    <span class="tab active">Статистика</span>
+  </div>
+
+  <div class="lifetime-banner">Сводка по проекту с момента старта (2025-06-04 · 328 дней истории · 3 репо)</div>
+
+  <!-- KPI row -->
+  <div class="kpi-row">
+    <div class="kpi">
+      <div class="kpi-label">Активные баги</div>
+      <div class="kpi-hint">все репо проекта</div>
+      <div class="kpi-value">23</div>
+      <div class="kpi-sub">из них <span class="crit">5 critical</span></div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Всего закрыто</div>
+      <div class="kpi-hint">confirmed по проекту</div>
+      <div class="kpi-value">142</div>
+      <div class="kpi-sub">за 328 дней</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Среднее попыток</div>
+      <div class="kpi-hint">avg по 3 репо</div>
+      <div class="kpi-value">1.9</div>
+      <div class="kpi-sub">медиана: 2</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Fix rate</div>
+      <div class="kpi-hint">closed / created всего</div>
+      <div class="kpi-value">81%</div>
+      <div class="kpi-sub">142 закр. / 175 созд.</div>
+    </div>
+  </div>
+
+  <!-- Top-hot repos within project -->
+  <div class="stats-card">
+    <div class="section-title">🔥 Топ-3 горячих репо в проекте <span class="count">(critical → major → активные)</span></div>
+    <div class="hot-row">
+      <div class="hot-rank">1.</div>
+      <div class="hot-name">swan_payment_test_app</div>
+      <div class="hot-meta"><span class="crit">3 critical</span> / 8 активных</div>
+    </div>
+    <div class="hot-row">
+      <div class="hot-rank">2.</div>
+      <div class="hot-name">swan_info_test_app</div>
+      <div class="hot-meta"><span class="crit">1 critical</span> / 5 активных</div>
+    </div>
+    <div class="hot-row">
+      <div class="hot-rank">3.</div>
+      <div class="hot-name">swan_test_flutter_app</div>
+      <div class="hot-meta">0 critical / 3 активных</div>
+    </div>
+  </div>
+
+  <!-- Category bars -->
+  <div class="stats-card">
+    <div class="section-title">Эффективность по категориям <span class="count">(агрегат проекта · всё время)</span></div>
+    <div class="cat-row">
+      <div class="cat-label">UX flow</div>
+      <div class="cat-bar-wrap"><div class="cat-bar" style="width: 88%"></div></div>
+      <div class="cat-num">88% (35/40)</div>
+    </div>
+    <div class="cat-row">
+      <div class="cat-label">Logic</div>
+      <div class="cat-bar-wrap"><div class="cat-bar" style="width: 82%"></div></div>
+      <div class="cat-num">82% (37/45)</div>
+    </div>
+    <div class="cat-row">
+      <div class="cat-label">UI / UX</div>
+      <div class="cat-bar-wrap"><div class="cat-bar" style="width: 76%"></div></div>
+      <div class="cat-num">76% (28/37)</div>
+    </div>
+    <div class="cat-row">
+      <div class="cat-label">Auth</div>
+      <div class="cat-bar-wrap"><div class="cat-bar" style="width: 71%"></div></div>
+      <div class="cat-num">71% (10/14)</div>
+    </div>
+    <div class="cat-row">
+      <div class="cat-label">Performance</div>
+      <div class="cat-bar-wrap"><div class="cat-bar low" style="width: 58%"></div></div>
+      <div class="cat-num">58% (14/24)</div>
+    </div>
+    <div class="cat-row">
+      <div class="cat-label">Other</div>
+      <div class="cat-bar-wrap"><div class="cat-bar bad" style="width: 47%"></div></div>
+      <div class="cat-num">47% (8/17)</div>
+    </div>
+  </div>
+
+  <!-- Хронология placeholder LAST (T-000056) -->
+  <div class="timeline-placeholder">
+    <div class="title">📅 Хронология (T-000056)</div>
+    Pre-filtered Timeline-feed для этого проекта: события всех репо проекта, последние N с pagination.
+  </div>
+</div>
+
+<script>
+  function setTheme(t, btn) {
+    document.body.setAttribute('data-theme', t);
+    document.querySelectorAll('.toolbar button').forEach(b => {
+      if (['dark','light'].includes(b.id)) b.classList.remove('active');
+    });
+    btn.classList.add('active');
+  }
+  function setScope(s, btn) {
+    document.getElementById('scope-repo').style.display = s === 'repo' ? 'block' : 'none';
+    document.getElementById('scope-project').style.display = s === 'project' ? 'block' : 'none';
+    document.querySelectorAll('.toolbar button').forEach(b => {
+      if (['repo','project'].includes(b.id)) b.classList.remove('active');
+    });
+    btn.classList.add('active');
+  }
+</script>
+</body>
+</html>

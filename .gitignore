@@ -1,0 +1,44 @@
+.DS_Store
+node_modules
+/build
+/.svelte-kit
+/package
+.env
+.env.*
+!.env.example
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Rust build artifacts
+target/
+
+# Database files
+*.db
+
+# AI and project management docs (local only)
+CLAUDE.md
+ToDo.md
+Done.md
+docs/todo.md
+docs/done.md
+
+# Tauri updater signing keys (NEVER commit private key)
+.tauri/
+*.pem
+tauri-updater-key*
+
+# Superpowers brainstorm companion (local mockups)
+.superpowers/
+superpowers/
+docs/roadmap.md
+
+# --- solo-dev-hub:begin ---
+CLAUDE.*
+.claude/
+docs/bug-reports.md
+docs/backend-requirements/
+docs/client-requirements/
+docs/microservice-requirements/
+docs/server-requirements/
+docs/superpowers/
+# --- solo-dev-hub:end ---

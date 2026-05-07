@@ -1,0 +1,24 @@
+# Bug reports
+
+## Bug workflow
+
+1. **User** creates a bug in the app → status `created`
+2. **Developer/LLM** takes it in progress → status `in-progress`
+3. **Developer/LLM** fixes it and writes a comment on what was done → status `testing` (this transition bumps `fix_attempts` +1)
+4. **User** verifies: ok → status `confirmed` (LLM removes the row on next cleanup pass) / not ok → status `rejected` + comment explaining why
+
+## Format (v2)
+
+`- <id> | <date> | <description> | <severity> | <category> | <status> | <fix_attempts> | <comment>`
+
+**LLM may edit only `status` and `comment`.** Other fields are user-owned (`description`, `severity`, `category`) or immutable (`id`, `date`) or app-managed (`fix_attempts`).
+
+**LLM must not create new bug rows.** New bugs are created only via the app's "+ Add bug" button so `id`, `date`, and DB stats are wired correctly. To flag a bug found while working, ask the user to file it, or add a `T-NNN` to `todo.md` instead.
+
+**Escape rules:** a literal `|` inside `description`/`comment` is written as `\|`. A literal newline is `\n`.
+
+<!-- Example:
+- B-001 | 2026-04-19 | Short bug description | medium | logic | created | 0 | optional comment
+-->
+
+## Open bugs

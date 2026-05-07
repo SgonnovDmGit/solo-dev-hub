@@ -1,0 +1,26 @@
+# ---- Flutter build (stable channel — more predictable than :latest) ----
+FROM ghcr.io/cirruslabs/flutter:stable AS builder
+
+WORKDIR /app
+
+# Cache dependencies
+COPY pubspec.yaml pubspec.lock* ./
+RUN flutter pub get
+
+# Copy source
+COPY . .
+
+# Flutter web is a static build — env vars cannot be injected at runtime by nginx.
+# Template supports two patterns; project picks based on pubspec/Dart code:
+#   1. --dart-define (compile-time constants, baked into the bundle) — uses these ARGs
+#   2. flutter_dotenv (runtime-read .env file from assets) — uses .env copied by COPY . .
+#      (deploy.yml generates the .env file in the build context before docker build runs)
+@@DOCKERFILE_ARGS@@
+
+RUN flutter build web --release @@DART_DEFINES@@
+
+# ---- Runtime image ----
+FROM nginx:alpine
+COPY --from=builder /app/build/web /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

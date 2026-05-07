@@ -1,0 +1,36 @@
+# ---- Build stage ----
+FROM golang:@@GO_VERSION@@-alpine AS builder
+
+# git may be required by `go mod download` for private deps
+RUN apk add --no-cache git
+
+# /src, not /app — the build directory name MUST differ from @@BINARY_NAME@@,
+# otherwise `go build -o /<binary>` sees a directory and writes the binary inside it
+# under the package name instead of as the intended filename.
+WORKDIR /src
+
+# Cache dependencies layer
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source and build static binary
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/@@BINARY_NAME@@ @@ENTRY_POINT@@
+
+# ---- Runtime stage ----
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /out/@@BINARY_NAME@@ ./
+
+# Uncomment if your project ships SQL migrations in /src/migrations
+# COPY --from=builder /src/migrations ./migrations
+
+EXPOSE @@APP_PORT@@
+
+CMD ["./@@BINARY_NAME@@"]
