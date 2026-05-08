@@ -26,11 +26,14 @@
 
 ### Added
 - **T-000062 | README RU+EN drafts (public-launch quality)** — text-only
-  pass: marketing-tone преамбула, Why / Features / Tech Stack /
-  Getting started / Development / Roadmap / Support / License,
-  ссылка на русскую версию `README.ru.md` сверху английской.
-  Скриншоты — отдельной сессией (placeholder'ы с captions расставлены
-  в обоих файлах).
+  pass: marketing-tone преамбула (3 абзаца: tagline / problem+AI-failure-
+  mode kicker / solution), AI-bug-closure with safety net как #1 фича
+  (4 гарантии: protected fields, auto-attempts counter, explicit user
+  confirm, full event log), Why / Features / Tech Stack / Getting started
+  / Development / Roadmap / Support / License, ссылка на русскую версию
+  `README.ru.md` сверху английской. RU-tagline — «личный пульт управления»
+  (EN — «cockpit»). Скриншоты вынесены в T-000073 (placeholder'ы с
+  captions расставлены в обоих файлах).
 - `LICENSE` — MIT, ранее только в `package.json` без файла.
 
 ## [0.24.2] — 2026-05-07

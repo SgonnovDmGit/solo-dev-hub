@@ -4,7 +4,9 @@
 
 **Solo developer's portfolio cockpit. Bugs, requirements, deploy — all in markdown.**
 
-Managing 10 GitHub repos as one person comes with friction GitHub itself doesn't solve: bugs scattered across per-repo Issues, no portfolio-wide overview, multi-repo features (client + server + microservice) demand mental coordination, deploy automation gets hand-rolled in every new project — and the moment you delegate a bug fix to an AI agent, "the agent said it's done, I forgot to verify" silently becomes the failure mode. Solo Dev Hub is a single-window desktop app that organizes your portfolio, locks every bug into a verifiable AI-agent workflow, tracks tasks in commit-able Markdown, syncs requirements between repos, and bundles deploy automation — all under one roof.
+Managing 10 GitHub repos as one person hits friction GitHub itself doesn't solve: bugs scattered across per-repo Issues, no portfolio-wide overview, multi-repo features (client + server + microservice) demand mental coordination, deploy automation gets hand-rolled in every new project. And the moment you delegate a bug fix to an AI agent, "the agent said it's done, I forgot to verify" silently becomes the failure mode.
+
+Solo Dev Hub is a single-window desktop app that organizes your portfolio, **locks every bug into a verifiable AI-agent workflow**, tracks tasks in commit-able Markdown, syncs requirements between repos, and bundles deploy automation — all under one roof.
 
 <!-- TODO screenshot: hero — main app window with sidebar (project tree expanded), Dashboard tab open, period filter set to Quarter, KPI tiles + top-3 hot projects + daily flow chart visible. Width ~1200px, dark theme. -->
 
