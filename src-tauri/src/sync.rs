@@ -1827,7 +1827,9 @@ mod tests {
         assert!(content.contains("# WebApp"));
         assert!(content.contains("My web application"));
         assert!(content.contains("📁 Standard"));
-        assert!(content.contains("owner/web-backend"));
+        // B-000001: display_name() returns last segment, not full owner/repo.
+        assert!(content.contains("web-backend"));
+        assert!(!content.contains("owner/web-backend"));
         assert!(content.contains("server"));
     }
 

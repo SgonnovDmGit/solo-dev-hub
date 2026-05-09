@@ -36,6 +36,31 @@
   captions расставлены в обоих файлах).
 - `LICENSE` — MIT, ранее только в `package.json` без файла.
 
+### Fixed
+- **B-000001 | SyncScreen показывал `owner/repo` вместо `repo`**: backend
+  `Repository::display_name()` возвращал полный `github_name`, а frontend
+  `getDisplayName()` уже отдавал last segment — асимметрия Rust↔TS пробивалась
+  через `RequirementInfo.source_repo / target_repo` (18 точек) в SyncScreen.
+  Переписан `display_name()` симметрично frontend'у (`gh.rsplit('/').next()`).
+  Все 18 точек RequirementInfo + sync-error-логи автоматически очистились.
+  `canonical_folder_name()` остаётся отдельно — он SoT для filesystem-папок
+  с другим fallback (`local-<id>`). +4 unit-теста.
+- **B-000002 | "Обновить документацию репозитория" теперь покрывает project.md
+  и CLAUDE.md**: команда `init_docs_for_repo` раньше трогала только
+  user-ownable skeletons (`todo.md`, `bug-reports.md`, `.gitignore`), а
+  app-owned файлы (`project.md`, `CLAUDE.md` секция) обновлялись только из
+  `sync_project`. Теперь идемпотентно регенерит обе категории — кнопка
+  зеркалит pre-phase из Sync для одного репо. Для orphan-репо без `project_id`
+  app-owned часть пропускается (rendering project-context не из чего).
+- **B-000002 (часть 2) | Silent skip в `sync_project` теперь в errors[]**:
+  если у репо нет `local_path` или папка отсутствует на диске, `sync_project`
+  раньше тихо пропускал репо (project.md/CLAUDE.md/.gitignore не писались, без
+  warning в toast). Теперь push'им explicit error — user видит причину
+  пропуска. Применено к обоим циклам (own repos + microservice server-repos).
+- Кнопка "📚 Инициализировать документацию" → "📚 Обновить документацию
+  репозитория" / "📚 Update repo docs". "Init" подразумевал one-time, тогда
+  как кнопка идемпотентна и теперь перезаписывает app-owned файлы каждый раз.
+
 ## [0.24.2] — 2026-05-07
 
 Diagnostics + ms reverse-lookup patch.

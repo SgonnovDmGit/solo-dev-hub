@@ -15,9 +15,21 @@
 | `docs/todo.md` | в `docs/` каждого репо | Skeleton задач (формат + пример) | Нет — только если файла нет (F-016, 0.11.0) |
 | `docs/bug-reports.md` | в `docs/` каждого репо | Skeleton баг-трекера (флоу статусов + пустой список) | Нет — только если файла нет (F-016, 0.11.0) |
 
-## Manual trigger: кнопка "📚 Инициализировать документацию" в RepoDetail
+## Manual trigger: кнопка "📚 Обновить документацию репозитория" в RepoDetail
 
-В дополнение к auto pre-phase при sync'е, user может запустить инициализацию скелетов для одного репо через команду `init_docs_for_repo(repo_id)` и кнопку в RepoDetail. **Scope команды**: `docs/todo.md`, `docs/bug-reports.md`, `.gitignore` — все user-ownable skeletons (copy-if-missing). `project.md` и `CLAUDE.md` НЕ трогаются — они app-owned и обрабатываются обычным sync pre-phase (полная перезапись).
+В дополнение к auto pre-phase при sync'е, user может запустить обновление документации одного репо через команду `init_docs_for_repo(repo_id)` и кнопку в RepoDetail. **Scope команды**: всё что приложение пишет в репо.
+
+| Файл | Поведение в `init_docs_for_repo` |
+|------|----------------------------------|
+| `docs/todo.md` | copy-if-missing (skeleton) |
+| `docs/bug-reports.md` | copy-if-missing (skeleton) |
+| `.gitignore` | section sync (block пересобирается) |
+| `docs/project.md` | full regen (только если репо привязан к проекту) |
+| `CLAUDE.md` | section sync между маркерами (только если репо привязан к проекту) |
+
+Для orphan-репо без `project_id` regen `project.md` / `CLAUDE.md` пропускается — project-context отрендерить не из чего. Скелеты (`todo.md` / `bug-reports.md` / `.gitignore`) пишутся независимо от project_id.
+
+Кнопка зеркалит pre-phase из `sync_project` для конкретного репо — после выполнения файлы в репо в том же состоянии как после Sync на проекте. Имя кнопки до v0.25.0 — "Инициализировать документацию"; переименована потому что семантика "init" подразумевала one-time, тогда как кнопка идемпотентна и в т.ч. перезаписывает app-owned файлы.
 
 ## Когда срабатывает
 

@@ -1065,17 +1065,31 @@ fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>, Str
         .map(|t| t.content)
         .unwrap_or_default();
 
-    let mut created = Vec::new();
+    let mut updated = Vec::new();
     if sync::copy_doc_skeleton_if_missing(&todo_template, base, "todo.md")? {
-        created.push("docs/todo.md".to_string());
+        updated.push("docs/todo.md".to_string());
     }
     if sync::copy_doc_skeleton_if_missing(&bug_reports_template, base, "bug-reports.md")? {
-        created.push("docs/bug-reports.md".to_string());
+        updated.push("docs/bug-reports.md".to_string());
     }
     if sync::sync_gitignore_section(&gitignore_template, base)? {
-        created.push(".gitignore (section)".to_string());
+        updated.push(".gitignore (section)".to_string());
     }
-    Ok(created)
+    // App-owned files (project.md + CLAUDE.md section) — always overwritten when
+    // the repo is attached to a project. Orphan repos (project_id=None) skip this
+    // since project-context wouldn't render meaningfully.
+    if let Some(pid) = repo.project_id {
+        sync::generate_project_md(&db, pid, base)?;
+        updated.push("docs/project.md".to_string());
+        sync::update_claude_md_section(
+            &db,
+            Some(pid),
+            repo.role.as_deref(),
+            &base.join("CLAUDE.md"),
+        )?;
+        updated.push("CLAUDE.md (section)".to_string());
+    }
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -1128,14 +1142,24 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
         .unwrap_or_default();
 
     for repo in &all_repos {
+        let label = repo.display_name();
         let Some(path) = repo.local_path.as_deref() else {
+            // B-000002: surface silently-skipped repos so user sees why project.md /
+            // CLAUDE.md / .gitignore weren't written for this repo.
+            errors.push(format!(
+                "Repo {}: no local_path set — project.md / CLAUDE.md / .gitignore skipped",
+                label
+            ));
             continue;
         };
         let base = Path::new(path);
-        if sync::ensure_root_exists(base).is_err() {
+        if let Err(e) = sync::ensure_root_exists(base) {
+            errors.push(format!(
+                "Repo {}: {} — project.md / CLAUDE.md / .gitignore skipped",
+                label, e
+            ));
             continue;
         }
-        let label = repo.display_name();
         if let Err(e) = sync::generate_project_md(&db, project_id, base) {
             errors.push(format!("project.md for {}: {}", label, e));
         }
@@ -1159,16 +1183,28 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
     }
     for ms_id in &microservice_ids {
         let Ok(ms_server) = db.server_repo_of_microservice(*ms_id) else {
+            errors.push(format!(
+                "Microservice project {}: no server-repo resolved — project.md skipped",
+                ms_id
+            ));
             continue;
         };
+        let label = ms_server.display_name();
         let Some(path) = ms_server.local_path.as_deref() else {
+            errors.push(format!(
+                "Microservice {}: no local_path set — project.md skipped",
+                label
+            ));
             continue;
         };
         let base = Path::new(path);
-        if sync::ensure_root_exists(base).is_err() {
+        if let Err(e) = sync::ensure_root_exists(base) {
+            errors.push(format!(
+                "Microservice {}: {} — project.md skipped",
+                label, e
+            ));
             continue;
         }
-        let label = ms_server.display_name();
         if let Err(e) = sync::generate_project_md(&db, *ms_id, base) {
             errors.push(format!("project.md for {}: {}", label, e));
         }

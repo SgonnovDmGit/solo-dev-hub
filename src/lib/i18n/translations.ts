@@ -768,9 +768,9 @@ const ru = {
   'repo.deployTarget': 'Шаблон деплоя',
   'repo.deployTargetNone': '— без шаблона —',
   'repo.deployButton': 'Deploy',
-  'repo.initDocsButton': '📚 Инициализировать документацию',
-  'toast.docsInitialized': 'Создано: {0}',
-  'toast.docsAlreadyExist': 'Все файлы уже существуют',
+  'repo.initDocsButton': '📚 Обновить документацию репозитория',
+  'toast.docsInitialized': 'Документация обновлена: {0}',
+  'toast.docsAlreadyExist': 'Все файлы уже актуальны',
 
   // F-012: project type / microservices as projects (15 keys)
   'project.typeLabel': 'Тип проекта',
@@ -1560,9 +1560,9 @@ const en: Record<TranslationKey, string> = {
   'repo.deployTarget': 'Deploy template',
   'repo.deployTargetNone': '— none —',
   'repo.deployButton': 'Deploy',
-  'repo.initDocsButton': '📚 Init docs',
-  'toast.docsInitialized': 'Created: {0}',
-  'toast.docsAlreadyExist': 'All files already exist',
+  'repo.initDocsButton': '📚 Update repo docs',
+  'toast.docsInitialized': 'Docs updated: {0}',
+  'toast.docsAlreadyExist': 'All files already up to date',
 
   // F-012: project type / microservices as projects (15 keys)
   'project.typeLabel': 'Project type',
