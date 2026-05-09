@@ -5,13 +5,23 @@
 ## [Unreleased]
 
 ### Changed
+- **T-000063 | Technical identifier rebrand**: Cargo `[package].name`
+  (`github-repo-manager` → `solo-dev-hub`) + `[lib].name`
+  (`github_repo_manager_lib` → `solo_dev_hub_lib`) + `main.rs` call site,
+  `tauri.conf.json` identifier (`com.user2.github-repo-manager` →
+  `com.solodevhub.app`), `package.json` name + regenerated `package-lock.json`.
+  DB path migration `%LOCALAPPDATA%\github-repo-manager\data.db` →
+  `%LOCALAPPDATA%\solo-dev-hub\data.db` через copy-once на первом старте
+  (idempotent, legacy остаётся как recovery breadcrumb). Keyring service
+  rename `github-repo-manager` → `solo-dev-hub` через `migrate_legacy_pat()`
+  (read legacy → write new → delete legacy, idempotent, best-effort).
+  Autoupdate-break: v0.24.x → v0.25.x проходит как fresh install (новый
+  identifier = новый Windows app entry); v0.25.x → v1.0.0 чисто.
 - **T-000061 | Display-name rebrand "GitHub Repo Manager" → "Solo Dev Hub"**:
   `productName` в `tauri.conf.json` + window title + Cargo description
   + auto-generated MD footers + i18n строки `appDefaults.syncGlobalConfirm`
   (ru+en) + About `githubUrl` + README заголовок + RELEASING.md / formats /
-  deploy_template_spec / release.yml releaseName. Технический identifier
-  (`com.user2.github-repo-manager`), Cargo `[package].name`, npm package
-  name, DB path и keyring service остаются стабильными до T-000063 (v1.0.0).
+  deploy_template_spec / release.yml releaseName.
 - **Autoupdate endpoint** → `https://github.com/SgonnovDmGit/solo-dev-hub/releases/latest/download/latest.json`.
   Репозиторий приватный до v1.0.0 public-flip'а — `latest.json` без auth не
   отдаётся, autoupdate приостановлен на v0.25.x. Pubkey уже свежий
@@ -23,8 +33,32 @@
 - **CI lint**: убрана env-строка `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` из
   `.github/workflows/release.yml` (текущий ключ solo-dev-hub без пароля).
   Секрет помечен как опциональный в `docs/RELEASING.md`.
+- **F-000037 | Deploy: CONTAINER_NAME из secret → placeholder** + UI rework.
+  Раньше CONTAINER_NAME лежал в GitHub Environment secrets — но это не
+  secret-данные, просто имя контейнера per-env. Перенесён в placeholder
+  (`extras` JSON в SQLite per-deploy_env). `${{ secrets.CONTAINER_NAME }}`
+  в deploy.yml.tmpl (3 места × 2 шаблона) → `@@CONTAINER_NAME@@`. После
+  следующего "Generate workflow files" значение запекается прямо в
+  `.github/workflows/deploy-{env}.yml` (visible в репо — но имя контейнера
+  и так публично из домена/labels, не raises rsks). Logical placeholder
+  reorder в meta.json: WORKFLOW → IMAGE_TAG → DOMAIN → DEPLOY_BRANCH →
+  NETWORK_NAME → CONTAINER_NAME → COMPOSE_PROJECT → COMPOSE_SERVICE →
+  (язык-specific). UI: copy-кнопка ↩ справа от Service Label (99%
+  случаев = container name). REQUIRED_KEYS gate (Generate-button) теперь
+  включает CONTAINER_NAME. Migration: legacy `CONTAINER_NAME` secret в
+  GitHub Environment остаётся orphaned (вреда нет), user заполняет
+  placeholder в DeployDetail. Stale `CONTAINER_NAME_PROD` references в
+  deploy_template_spec.md + flows/deploy-flow.md убраны.
 
 ### Added
+- **T-000075 | `CONTRIBUTING.md`** — pre-public-launch artifact: build
+  prerequisites (Node v18+, Rust, MSVC Build Tools, WebView2), getting
+  started, project layout, code style (Rust + TS/Svelte), commits
+  (Conventional Commits), tests, PR rules (target `dev`, не `master`),
+  AI-agent section (link to CLAUDE.md), releases (link to RELEASING.md).
+- **T-000076 | `.github/FUNDING.yml`** — `custom: [boosty.to/sgonnovdm/donate]`
+  для появления Sponsor-кнопки на repo header после public-flip'а. TON-кошелёк
+  остаётся в README + About (FUNDING.yml не поддерживает crypto).
 - **T-000062 | README RU+EN drafts (public-launch quality)** — text-only
   pass: marketing-tone преамбула (3 абзаца: tagline / problem+AI-failure-
   mode kicker / solution), AI-bug-closure with safety net как #1 фича
@@ -37,6 +71,69 @@
 - `LICENSE` — MIT, ранее только в `package.json` без файла.
 
 ### Fixed
+- **GitHub Environment auto-ensure on DeployDetail open** — линтер GH Actions
+  ругал `Value '<env-name>' is not valid` для workflow с `environment: <name>`,
+  если соответствующий объект Environment в `Settings → Environments` не
+  существовал. Несколько кейсов когда GH-side env отсутствовал: (1) legacy
+  envs от migration v20 (`deploy_manifests` → `deploy_environments`)
+  автогенерились с `name='prod'` в DB, но `createEnvironment` PUT не звался;
+  (2) если у env нет ни одного override-secret'а, неявная триггер-цепочка
+  через `createOrUpdateEnvironmentSecret` тоже не срабатывала, env оставался
+  только в DB. Фикс: `createEnvironment(owner, repo, env.name)` идемпотентно
+  вызывается в `DeployDetail.load()` (на mount) — covers все entry-paths
+  (open existing / clone / fresh create). PUT — no-op если уже существует.
+  Surface API-ошибок через warning-toast (с i18n key `deploy.envCreateFailed`)
+  чтобы PAT permission issues / fine-grained PAT без "Environments: write"
+  были диагностируемы.
+- **Deploy YAML build-args indent (10→12 пробелов)** — `render_build_args`
+  в [template_render.rs](src-tauri/src/template_render.rs) джойнил multi-secret
+  через `\n          ` (10 пробелов). В шаблоне `@@BUILD_ARGS@@` стоит на
+  12 пробелах под `build-args: |`. На >1 секрете второй и далее вылетали на
+  10 spaces — становились sibling'ами `build-args` вместо continuation, YAML
+  ломался: `APP_API_KEY: "${{ secrets.APP_API_KEY }}"` интерпретировался как
+  отдельный ключ соседнего map'а. Pre-fix комментарий в коде врал ("Indent =
+  10 spaces … matches template"). Фикс: `\n            ` (12 пробелов) +
+  regression-тест который рендерит реальный flutter_web template с 3
+  секретами и assert'ит column 12 на каждом. 296 cargo tests pass.
+- **B-000005 (critical) | Deploy-файлы не записывались в папку** —
+  TS↔Rust API mismatch в `write_deploy_files`. TS в
+  [DeployDetail.svelte:178](src/lib/components/DeployDetail.svelte#L178)
+  маппил `RenderedFile[]` через `(f) => ({rel_path: f.path, content: f.content})`,
+  переименовывая поле `path` в несуществующее `rel_path`. Rust struct
+  `RenderedFile` ожидает `path` без rename — serde fail на missing
+  field, команда возвращала Err, файлы не писались. Silent от прошлых
+  релизов (catch показывал toast, но возможно user не видел). Фикс:
+  передаём `toWrite` напрямую (уже корректный `RenderedFile[]`).
+  Параллельно пофикшен тип `writeDeployFiles` в
+  [tauri-commands.ts:452](src/lib/api/tauri-commands.ts#L452) — был
+  анонимный `{rel_path; content}[]` + `{written; skipped}` shape; `skipped`
+  тоже не существует (Rust возвращает `errors`). Теперь ссылается на
+  shared `RenderedFile` и `WriteResult` из types.ts — гарантирует
+  единый контракт между двумя сторонами.
+- **B-000004 | DeployScreen secrets refresh-кнопка** — добавлена ↻
+  "Обновить из GitHub" в [DeploySecretsTable.svelte](src/lib/components/DeploySecretsTable.svelte)
+  header-row, mirrors SecretsPanel pattern. Reuse i18n key
+  `secrets.refresh`.
+- **Deploy_secrets orphan-cleanup при изменении meta.json**:
+  `ensure_deploy_secrets_populated` теперь дополнительно DELETE rows
+  whose `secret_name` is in NEITHER current GitHub repo secrets NOR
+  `meta.json` required_secrets. Раньше row жил в `deploy_secrets`
+  навсегда — после F-000037-перевода CONTAINER_NAME из secret в
+  placeholder это оставляло orphan-строку в DeployDetail. Caller
+  должен звать только с successfully-fetched `repo_secret_names`
+  (empty-due-to-failure ложно бы прунил легитимные rows). +1 cargo
+  test → 295 total.
+- **B-000003 | Удалённые секреты репо не пропадают из UI до рестарта**:
+  GitHub `list secrets` endpoint имеет eventual consistency — refetch
+  сразу после DELETE может ещё несколько секунд возвращать удалённый
+  секрет, и старый код (`loadSecrets()` после delete) ре-показывал его.
+  Фикс в [SecretsPanel.svelte](src/lib/components/SecretsPanel.svelte):
+  (1) optimistic update — `existingSecrets` фильтруется локально сразу
+  по `succeeded` deletes; (2) filtered refetch — после refresh свежий
+  ответ от GitHub дополнительно фильтруется `deletedSet` (denylist),
+  чтобы stale-ответ не вернул удалённое; (3) кнопка ↻ "Обновить из
+  GitHub" в header'е "Текущие секреты" для manual reload в любых
+  staleness-сценариях.
 - **B-000001 | SyncScreen показывал `owner/repo` вместо `repo`**: backend
   `Repository::display_name()` возвращал полный `github_name`, а frontend
   `getDisplayName()` уже отдавал last segment — асимметрия Rust↔TS пробивалась

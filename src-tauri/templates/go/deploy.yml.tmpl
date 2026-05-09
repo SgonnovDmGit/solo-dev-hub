@@ -56,12 +56,12 @@ jobs:
           script: |
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
             docker pull ghcr.io/${{ env.REPO_LOWER }}:@@IMAGE_TAG@@
-            docker rm -f ${{ secrets.CONTAINER_NAME }} || true
+            docker rm -f @@CONTAINER_NAME@@ || true
             ENV_FILE="@@ENV_FILE_PATH@@"
             ENV_FILE_ARG=""
             if [ -n "$ENV_FILE" ]; then ENV_FILE_ARG="--env-file $ENV_FILE"; fi
             docker run -d \
-              --name ${{ secrets.CONTAINER_NAME }} \
+              --name @@CONTAINER_NAME@@ \
               --restart always \
               $ENV_FILE_ARG \
               @@RUNTIME_ENV_ARGS@@--network @@NETWORK_NAME@@ \
@@ -85,7 +85,7 @@ jobs:
             set -e
             NPM_URL=http://localhost:81
             DOMAIN=@@DOMAIN@@
-            FORWARD_HOST=${{ secrets.CONTAINER_NAME }}
+            FORWARD_HOST=@@CONTAINER_NAME@@
 
             # 1. Get NPM auth token
             TOKEN_RESP=$(curl -sS -w "\nHTTP_CODE:%{http_code}" -X POST "$NPM_URL/api/tokens" \

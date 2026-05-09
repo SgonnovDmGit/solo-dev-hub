@@ -36,20 +36,23 @@ pub fn render_template(tmpl: &str, vars: &HashMap<String, String>) -> Result<Str
 /// the pipe-delimited block layout in `deploy.yml.tmpl`:
 ///
 /// ```yaml
-///       build-args: |
-///         @@BUILD_ARGS@@
+///           build-args: |
+///             @@BUILD_ARGS@@
 /// ```
 ///
-/// Indent = 10 spaces (6 for `build-args:` parent + 4 for block content) — matches
-/// current hand-written template indentation for the first secret; subsequent secrets
-/// get same indent via leading-newline-join. Empty slice → empty string (template
-/// `build-args:` block handles empty gracefully).
+/// Indent = 12 spaces — matches the column where `@@BUILD_ARGS@@` sits in the
+/// template (10 for `build-args:` parent + 2 for YAML block-scalar content).
+/// First secret already has 12 spaces from the template; subsequent secrets get
+/// the same indent via leading-newline-join. Earlier (pre-fix) join used 10 spaces
+/// which broke YAML — second-and-later secrets landed at the parent map level,
+/// becoming siblings of `build-args` instead of continuation. Empty slice →
+/// empty string (template `build-args:` block handles empty gracefully).
 pub fn render_build_args(secret_names: &[String]) -> String {
     secret_names
         .iter()
         .map(|n| format!("{name}=${{{{ secrets.{name} }}}}", name = n))
         .collect::<Vec<_>>()
-        .join("\n          ")
+        .join("\n            ")
 }
 
 /// v0.18.0: render `docker run --env KEY="${{ secrets.KEY }}"` flags for runtime secrets.
@@ -159,6 +162,7 @@ mod tests {
             ("DEPLOY_BRANCH", "master"),
             ("ENV_NAME", "prod"),
             ("NETWORK_NAME", "swan_support_prod_proxy-network"),
+            ("CONTAINER_NAME", "swan-support-prod-frontend"),
             ("COMPOSE_PROJECT", "swan_support_prod"),
             ("BUILD_ARGS", build_args.as_str()),
         ]);
@@ -171,7 +175,9 @@ mod tests {
         assert!(rendered.contains("API_BASE_URL=${{ secrets.API_BASE_URL }}"));
         assert!(rendered.contains("APP_API_KEY=${{ secrets.APP_API_KEY }}"));
         assert!(!rendered.contains("CONTAINER_NAME_PROD"), "no hardcoded _PROD suffix");
-        assert!(rendered.contains("${{ secrets.CONTAINER_NAME }}"));
+        assert!(!rendered.contains("${{ secrets.CONTAINER_NAME }}"), "CONTAINER_NAME is now a placeholder, not a secret");
+        assert!(rendered.contains("--name swan-support-prod-frontend"));
+        assert!(rendered.contains("FORWARD_HOST=swan-support-prod-frontend"));
     }
 
     /// Smoke-regression: Go deploy.yml.tmpl renders end-to-end with SwanQu values.
@@ -190,6 +196,7 @@ mod tests {
             ("ENV_FILE_PATH", "/home/sda1991/swan_backend.env"),
             ("ENV_NAME", "prod"),
             ("NETWORK_NAME", "swan_prod_proxy-network"),
+            ("CONTAINER_NAME", "swan-backend-prod"),
             ("COMPOSE_PROJECT", "swan_prod"),
             ("RUNTIME_ENV_ARGS", ""),
         ]);
@@ -204,7 +211,9 @@ mod tests {
         assert!(rendered.contains("forward_port:8080"));
         assert!(rendered.contains(r#"ENV_FILE="/home/sda1991/swan_backend.env""#));
         assert!(!rendered.contains("CONTAINER_NAME_PROD"), "legacy hardcoded suffix must be gone");
-        assert!(rendered.contains("${{ secrets.CONTAINER_NAME }}"));
+        assert!(!rendered.contains("${{ secrets.CONTAINER_NAME }}"), "CONTAINER_NAME is now a placeholder, not a secret");
+        assert!(rendered.contains("--name swan-backend-prod"));
+        assert!(rendered.contains("FORWARD_HOST=swan-backend-prod"));
     }
 
     #[test]
@@ -221,6 +230,7 @@ mod tests {
             ("ENV_FILE_PATH", ""),
             ("ENV_NAME", "prod"),
             ("NETWORK_NAME", "app_prod_net"),
+            ("CONTAINER_NAME", "app-prod"),
             ("COMPOSE_PROJECT", "app_prod"),
             ("RUNTIME_ENV_ARGS", runtime.as_str()),
         ]);
@@ -244,6 +254,7 @@ mod tests {
             ("ENV_FILE_PATH", ""),
             ("ENV_NAME", "prod"),
             ("NETWORK_NAME", "app_prod_net"),
+            ("CONTAINER_NAME", "app-prod"),
             ("COMPOSE_PROJECT", "app_prod"),
             ("RUNTIME_ENV_ARGS", ""),
         ]);
@@ -254,12 +265,43 @@ mod tests {
 
     #[test]
     fn test_render_build_args_emits_one_per_secret_with_indent() {
+        // Indent must be 12 spaces — matches the column where `@@BUILD_ARGS@@` sits
+        // in deploy.yml.tmpl (under `build-args: |`). Pre-fix used 10 spaces which
+        // produced invalid YAML (second secret became sibling of build-args).
         let secrets = vec!["API_BASE_URL".to_string(), "APP_API_KEY".to_string()];
         let out = render_build_args(&secrets);
         assert_eq!(
             out,
-            "API_BASE_URL=${{ secrets.API_BASE_URL }}\n          APP_API_KEY=${{ secrets.APP_API_KEY }}",
+            "API_BASE_URL=${{ secrets.API_BASE_URL }}\n            APP_API_KEY=${{ secrets.APP_API_KEY }}",
         );
+    }
+
+    /// Regression: render real flutter_web template and verify the second-and-later
+    /// build-args lines align with the first one (column 12). Catches indent drift
+    /// in either the template or the joiner.
+    #[test]
+    fn test_build_args_indent_aligned_in_rendered_yaml() {
+        let tmpl = include_str!("../templates/flutter_web/deploy.yml.tmpl");
+        let build_args = render_build_args(&["A".to_string(), "B".to_string(), "C".to_string()]);
+        let v = vars(&[
+            ("WORKFLOW_NAME", "W"),
+            ("IMAGE_TAG", "prod"),
+            ("COMPOSE_SERVICE", "s"),
+            ("DOMAIN", "d"),
+            ("DEPLOY_BRANCH", "m"),
+            ("ENV_NAME", "prod"),
+            ("NETWORK_NAME", "n"),
+            ("CONTAINER_NAME", "c"),
+            ("COMPOSE_PROJECT", "p"),
+            ("BUILD_ARGS", build_args.as_str()),
+        ]);
+        let rendered = render_template(tmpl, &v).unwrap();
+        // Each secret line must start at exactly 12 spaces — same column as the first.
+        assert!(rendered.contains("            A=${{ secrets.A }}"), "first secret 12-space indent");
+        assert!(rendered.contains("            B=${{ secrets.B }}"), "second secret 12-space indent");
+        assert!(rendered.contains("            C=${{ secrets.C }}"), "third secret 12-space indent");
+        // Negative: 10-space prefix would mean wrong indent (sibling of build-args)
+        assert!(!rendered.contains("\n          B=${{ secrets.B }}"), "second secret must NOT be at 10 spaces");
     }
 
     #[test]

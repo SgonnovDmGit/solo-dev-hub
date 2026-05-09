@@ -58,9 +58,9 @@ jobs:
           script: |
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
             docker pull ghcr.io/${{ env.REPO_LOWER }}:@@IMAGE_TAG@@
-            docker rm -f ${{ secrets.CONTAINER_NAME }} || true
+            docker rm -f @@CONTAINER_NAME@@ || true
             docker run -d \
-              --name ${{ secrets.CONTAINER_NAME }} \
+              --name @@CONTAINER_NAME@@ \
               --restart always \
               --network @@NETWORK_NAME@@ \
               --label "com.docker.compose.project=@@COMPOSE_PROJECT@@" \
@@ -83,7 +83,7 @@ jobs:
             set -e
             NPM_URL=http://localhost:81
             DOMAIN=@@DOMAIN@@
-            FORWARD_HOST=${{ secrets.CONTAINER_NAME }}
+            FORWARD_HOST=@@CONTAINER_NAME@@
 
             # 1. Get NPM auth token
             TOKEN_RESP=$(curl -sS -w "\nHTTP_CODE:%{http_code}" -X POST "$NPM_URL/api/tokens" \

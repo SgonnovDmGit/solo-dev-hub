@@ -9,7 +9,7 @@
     renderDeployFilesForEnv,
     getTemplateFile, readRepoFiles, writeDeployFiles,
   } from '$lib/api/tauri-commands';
-  import { listBranches, splitRepoFullName, type BranchInfo } from '$lib/api/github';
+  import { listBranches, splitRepoFullName, createEnvironment, type BranchInfo } from '$lib/api/github';
   import type { DeployEnvironment, RenderedFile } from '$lib/types';
   import DeploySecretsTable from './DeploySecretsTable.svelte';
   import DiffDialog from './DiffDialog.svelte';
@@ -28,7 +28,14 @@
     type: string;
   }
 
+  // Core 5 — fields with dedicated DB columns in deploy_environments. Stays at 5
+  // (DB schema-tied). CONTAINER_NAME is a regular placeholder living in extras
+  // since v0.25.0 (was a GitHub secret before that).
   const CORE_KEYS = ['WORKFLOW_NAME', 'IMAGE_TAG', 'COMPOSE_SERVICE', 'DOMAIN', 'DEPLOY_BRANCH'];
+  // Required-non-empty for the "Generate" button to enable. Superset of CORE_KEYS
+  // — adds CONTAINER_NAME because empty value would render `docker run --name `
+  // (broken). Other placeholders may be optional (env-specific defaults).
+  const REQUIRED_KEYS = [...CORE_KEYS, 'CONTAINER_NAME'];
 
   let env = $state<DeployEnvironment | null>(null);
   let placeholders = $state<PlaceholderSpec[]>([]);
@@ -39,7 +46,7 @@
   let branches = $state<BranchInfo[]>([]);
 
   const repo = $derived(env ? ($allRepos.find((r) => r.id === env!.repository_id) ?? null) : null);
-  const coreComplete = $derived(CORE_KEYS.every((k) => (formValues[k] ?? '').trim() !== ''));
+  const coreComplete = $derived(REQUIRED_KEYS.every((k) => (formValues[k] ?? '').trim() !== ''));
 
   function extractLocalized(v: any, fallback: string): string {
     if (v == null) return fallback;
@@ -87,6 +94,29 @@
       next[spec.key] = env.extras[spec.key] ?? spec.default;
     }
     formValues = next;
+
+    // Ensure GitHub Environment exists for this deploy slot. Idempotent PUT —
+    // no-op when already exists, creates it when missing. Critical for the
+    // workflow's `environment: <name>` directive to validate (linter shows
+    // "Value '<name>' is not valid" when the GH-side object is absent). Covers
+    // both legacy gap (migration v20 created `name='prod'` in DB without GH
+    // counterpart) and the case where user never set any env-scoped overrides
+    // (no auto-trigger via createOrUpdateEnvironmentSecret yet). Surface API
+    // errors via toast so PAT permission issues are diagnosable.
+    if ($pat && repo.github_name && repo.github_name.includes('/')) {
+      try {
+        const { owner, repo: name } = splitRepoFullName(repo.github_name);
+        await createEnvironment($pat, owner, name, env.name);
+      } catch (e: any) {
+        const msg = String(e?.message ?? e);
+        addToast(
+          ($tStore('deploy.envCreateFailed' as any) || 'Could not create GitHub Environment "{0}": {1}')
+            .replace('{0}', env.name)
+            .replace('{1}', msg),
+          'warning',
+        );
+      }
+    }
 
     // Fetch branches for DEPLOY_BRANCH datalist
     if ($pat && repo.github_name && repo.github_name.includes('/')) {
@@ -138,14 +168,11 @@
     if (!coreComplete) return;
     generating = true;
     try {
+      // Note: GitHub Environment creation is handled in `load()` on mount —
+      // covers all entry paths (open existing env, just-cloned, just-created)
+      // without coupling it to the Generate flow. Generate just needs to render
+      // and write files.
       const rendered: RenderedFile[] = await renderDeployFilesForEnv(env.id);
-      // v0.18.0 scope cut: legacy deploy.yml detection → toast-warning only.
-      // Full DiffDialog-integrated delete flow deferred to v0.18.1 (requires
-      // DiffDialog `isDelete` semantics + delete_repo_file Tauri command).
-      const legacyProbe = await readRepoFiles(repo.local_path, ['.github/workflows/deploy.yml']);
-      if (legacyProbe[0] !== null) {
-        addToast($tStore('deploy.legacyDeployYmlWarning' as any) || 'Legacy .github/workflows/deploy.yml detected. After generating new deploy-{name}.yml files, remove it manually (git rm).', 'warning');
-      }
       const existing = await readRepoFiles(repo.local_path, rendered.map((r) => r.path));
       diffFiles = rendered.map((r, i) => ({
         path: r.path,
@@ -168,8 +195,7 @@
       return;
     }
     try {
-      const files = toWrite.map((f) => ({ rel_path: f.path, content: f.content }));
-      const result = await writeDeployFiles(env.id, env.repository_id, repo.local_path, files);
+      const result = await writeDeployFiles(env.id, env.repository_id, repo.local_path, toWrite);
       diffFiles = null;
       addToast(
         $tStore('toast.deployWritten' as any).replace('{0}', String(result.written.length)),
@@ -207,6 +233,18 @@
                 <option value={b.name}>{b.isDefault ? `${b.name} (default)` : ''}</option>
               {/each}
             </datalist>
+          {:else if spec.key === 'COMPOSE_SERVICE'}
+            <input id={inputId} type="text"
+                   value={formValues[spec.key] ?? ''}
+                   placeholder={spec.default}
+                   oninput={(e) => { formValues[spec.key] = (e.currentTarget as HTMLInputElement).value; scheduleSave(); }} />
+            <button type="button"
+                    class="ghost copy-btn"
+                    title={$tStore('deploy.copyFromContainerName' as any) || 'Copy from container name'}
+                    disabled={!(formValues.CONTAINER_NAME ?? '').trim()}
+                    onclick={() => { formValues.COMPOSE_SERVICE = (formValues.CONTAINER_NAME ?? '').trim(); scheduleSave(); }}>
+              ↩
+            </button>
           {:else}
             <input id={inputId} type="text"
                    value={formValues[spec.key] ?? ''}
@@ -259,6 +297,17 @@
     flex: 1;
     padding: 0.4rem;
     box-sizing: border-box;
+  }
+  .copy-btn {
+    flex-shrink: 0;
+    padding: 0.25rem 0.55rem;
+    font-size: 0.95em;
+    line-height: 1.2;
+    cursor: pointer;
+  }
+  .copy-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
   .generate-row {
     display: flex;

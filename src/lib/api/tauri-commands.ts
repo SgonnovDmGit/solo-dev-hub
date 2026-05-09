@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Project, Repository, FileBugNote, ReadBugsResult, BugView, MigrationReport, StatsSummary, SyncResult, RequirementInfo, RepoRename, TemplateFile, TemplateLanguage, RenderedFile, DashboardFilter, DashboardData, DeployEnvironment, DeploySecret, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, ActivityEvent, Task, SyncTasksReport, TimelineFilter, ProjectGraph } from '$lib/types';
+import type { Project, Repository, FileBugNote, ReadBugsResult, BugView, MigrationReport, StatsSummary, SyncResult, RequirementInfo, RepoRename, TemplateFile, TemplateLanguage, RenderedFile, WriteResult, DashboardFilter, DashboardData, DeployEnvironment, DeploySecret, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, ActivityEvent, Task, SyncTasksReport, TimelineFilter, ProjectGraph } from '$lib/types';
 
 // ── Project commands ──────────────────────────────────────────────────────────
 
@@ -449,8 +449,8 @@ export async function readRepoDone(repoId: number): Promise<ReadDoneResult> {
   return invoke<ReadDoneResult>('read_repo_done', { repoId });
 }
 
-export async function writeDeployFiles(deployEnvId: number, repoId: number, localPath: string, files: { rel_path: string; content: string }[]): Promise<{ written: string[]; skipped: string[] }> {
-  return invoke('write_deploy_files', { deployEnvId, repoId, localPath, files });
+export async function writeDeployFiles(deployEnvId: number, repoId: number, localPath: string, files: RenderedFile[]): Promise<WriteResult> {
+  return invoke<WriteResult>('write_deploy_files', { deployEnvId, repoId, localPath, files });
 }
 
 // ── v0.17.0 Dashboard ──────────────────────────────────────────────────────

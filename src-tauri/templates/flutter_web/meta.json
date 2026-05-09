@@ -4,11 +4,12 @@
   "placeholders": {
     "WORKFLOW_NAME": { "label": { "ru": "Имя workflow", "en": "Workflow name" }, "description": { "ru": "Имя workflow в GitHub Actions", "en": "GitHub Actions workflow name" }, "default": "", "type": "string" },
     "IMAGE_TAG": { "label": { "ru": "Docker tag", "en": "Docker tag" }, "description": { "ru": "Тег образа (prod/test/latest)", "en": "Image tag (prod/test/latest)" }, "default": "prod", "type": "string" },
-    "COMPOSE_SERVICE": { "label": { "ru": "Имя compose-сервиса", "en": "Compose service name" }, "description": { "ru": "Значение label com.docker.compose.service", "en": "Value for com.docker.compose.service label" }, "default": "", "type": "string" },
     "DOMAIN": { "label": { "ru": "Домен", "en": "Domain" }, "description": { "ru": "Публичный домен с A-записью на VPS", "en": "Public domain pointing to VPS" }, "default": "", "type": "string" },
     "DEPLOY_BRANCH": { "label": { "ru": "Ветка деплоя", "en": "Deploy branch" }, "description": { "ru": "Ветка, push в которую триггерит деплой", "en": "Branch that triggers deploy on push" }, "default": "master", "type": "string" },
     "NETWORK_NAME": { "label": { "ru": "Docker network", "en": "Docker network" }, "description": { "ru": "Имя docker-сети, к которой подключается контейнер. Разные env'ы могут использовать разные сети для изоляции.", "en": "Docker network name the container joins. Different envs may use different networks for isolation." }, "default": "", "type": "string" },
-    "COMPOSE_PROJECT": { "label": { "ru": "Compose project label", "en": "Compose project label" }, "description": { "ru": "Значение label com.docker.compose.project. Обычно {service}_{env}.", "en": "Value for com.docker.compose.project label. Typically {service}_{env}." }, "default": "", "type": "string" }
+    "CONTAINER_NAME": { "label": { "ru": "Имя контейнера", "en": "Container name" }, "description": { "ru": "Имя docker-контейнера на VPS (используется как `--name` и как NPM forward_host через docker DNS внутри proxy-network). Уникально на env.", "en": "Docker container name on VPS (used as `--name` and as NPM forward_host via docker DNS inside proxy-network). Unique per env." }, "default": "", "type": "string" },
+    "COMPOSE_PROJECT": { "label": { "ru": "Project label", "en": "Project label" }, "description": { "ru": "Значение label com.docker.compose.project. Обычно {service}_{env}.", "en": "Value for com.docker.compose.project label. Typically {service}_{env}." }, "default": "", "type": "string" },
+    "COMPOSE_SERVICE": { "label": { "ru": "Service label", "en": "Service label" }, "description": { "ru": "Значение label com.docker.compose.service. Обычно совпадает с именем контейнера — есть кнопка скопировать.", "en": "Value for com.docker.compose.service label. Typically matches the container name — copy button available." }, "default": "", "type": "string" }
   },
   "required_secrets": [
     { "name": "API_BASE_URL", "multiline": false, "description": "Публичный URL backend API", "role": "build", "scope": "environment" },
@@ -17,7 +18,6 @@
     { "name": "SSH_USER", "multiline": false, "description": "SSH пользователь", "role": "deploy", "scope": "environment" },
     { "name": "SSH_KEY", "multiline": true, "description": "Приватный SSH ключ (OpenSSH PEM)", "role": "deploy", "scope": "environment" },
     { "name": "SSH_PORT", "multiline": false, "description": "SSH порт (обычно 22)", "role": "deploy", "scope": "environment" },
-    { "name": "CONTAINER_NAME", "multiline": false, "description": "Имя docker-контейнера на VPS (forward_host в NPM). Уникально на env.", "role": "deploy", "scope": "environment" },
     { "name": "NPM_EMAIL", "multiline": false, "description": "Email API-пользователя NPM", "role": "deploy", "scope": "repo" },
     { "name": "NPM_PASSWORD", "multiline": false, "description": "Пароль API-пользователя NPM", "role": "deploy", "scope": "repo" }
   ],

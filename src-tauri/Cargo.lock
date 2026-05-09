@@ -1375,28 +1375,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "github-repo-manager"
-version = "0.25.0"
-dependencies = [
- "chrono",
- "dirs",
- "include_dir",
- "keyring",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tauri-plugin-process",
- "tauri-plugin-updater",
- "tempfile",
- "uuid",
-]
-
-[[package]]
 name = "glib"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3823,6 +3801,28 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "solo-dev-hub"
+version = "0.25.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "include_dir",
+ "keyring",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tauri-plugin-process",
+ "tauri-plugin-updater",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

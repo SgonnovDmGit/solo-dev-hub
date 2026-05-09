@@ -162,6 +162,13 @@
 </script>
 
 <div class="deploy-secrets-table">
+  <div class="header-row">
+    <button class="ghost mini refresh-btn"
+            onclick={load}
+            disabled={loading}
+            title={$tStore('secrets.refresh' as any) || 'Refresh from GitHub'}
+            type="button">{loading ? '⟳' : '↻'}</button>
+  </div>
   {#if loading}
     <p>{$tStore('common.loading' as any)}</p>
   {:else if githubUnavailable && dbSecrets.length === 0}
@@ -262,5 +269,23 @@
   .empty-hint {
     color: var(--text-muted);
     padding: 1rem;
+  }
+  .header-row {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 0.4rem;
+  }
+  .refresh-btn {
+    font-size: 14px;
+    padding: 0 6px;
+    color: var(--text-muted);
+    line-height: 1;
+  }
+  .refresh-btn:hover:not(:disabled) {
+    color: var(--accent);
+  }
+  .refresh-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 </style>

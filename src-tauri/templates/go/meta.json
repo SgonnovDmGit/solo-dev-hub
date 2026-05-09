@@ -14,12 +14,6 @@
       "default": "latest",
       "type": "string"
     },
-    "COMPOSE_SERVICE": {
-      "label": { "ru": "Имя compose-сервиса", "en": "Compose service name" },
-      "description": { "ru": "Значение label com.docker.compose.service", "en": "Value for com.docker.compose.service label" },
-      "default": "backend",
-      "type": "string"
-    },
     "DOMAIN": {
       "label": { "ru": "Домен", "en": "Domain" },
       "description": { "ru": "Публичный домен с A-записью на VPS", "en": "Public domain pointing to VPS" },
@@ -30,6 +24,30 @@
       "label": { "ru": "Ветка деплоя", "en": "Deploy branch" },
       "description": { "ru": "Ветка, push в которую триггерит деплой", "en": "Branch that triggers deploy on push" },
       "default": "main",
+      "type": "string"
+    },
+    "NETWORK_NAME": {
+      "label": { "ru": "Docker network", "en": "Docker network" },
+      "description": { "ru": "Имя docker-сети, к которой подключается контейнер (например goapp_prod_proxy-network). Разные env'ы могут использовать разные сети для изоляции.", "en": "Docker network name the container joins (e.g. goapp_prod_proxy-network). Different envs may use different networks for isolation." },
+      "default": "",
+      "type": "string"
+    },
+    "CONTAINER_NAME": {
+      "label": { "ru": "Имя контейнера", "en": "Container name" },
+      "description": { "ru": "Имя docker-контейнера на VPS (используется как `--name` и как NPM forward_host через docker DNS внутри proxy-network). Уникально на env.", "en": "Docker container name on VPS (used as `--name` and as NPM forward_host via docker DNS inside proxy-network). Unique per env." },
+      "default": "",
+      "type": "string"
+    },
+    "COMPOSE_PROJECT": {
+      "label": { "ru": "Project label", "en": "Project label" },
+      "description": { "ru": "Значение label com.docker.compose.project. Обычно {service}_{env} (например swan_prod, swan_test).", "en": "Value for com.docker.compose.project label. Typically {service}_{env} (e.g. swan_prod, swan_test)." },
+      "default": "",
+      "type": "string"
+    },
+    "COMPOSE_SERVICE": {
+      "label": { "ru": "Service label", "en": "Service label" },
+      "description": { "ru": "Значение label com.docker.compose.service. Обычно совпадает с именем контейнера — есть кнопка скопировать.", "en": "Value for com.docker.compose.service label. Typically matches the container name — copy button available." },
+      "default": "backend",
       "type": "string"
     },
     "GO_VERSION": {
@@ -66,18 +84,6 @@
       "description": { "ru": "Абсолютный путь к .env файлу на сервере (напр. /home/user/app.env). Передаётся как --env-file в docker run. Оставьте пустым — строка --env-file пропускается. Escape-hatch для bulk-переменных; для новых проектов предпочитайте runtime-секреты.", "en": "Absolute path to .env on the server (e.g. /home/user/app.env). Passed as --env-file to docker run. Leave empty — --env-file line is skipped. Escape-hatch for bulk vars; prefer runtime secrets for new projects." },
       "default": "",
       "type": "string"
-    },
-    "NETWORK_NAME": {
-      "label": { "ru": "Docker network", "en": "Docker network" },
-      "description": { "ru": "Имя docker-сети, к которой подключается контейнер (например goapp_prod_proxy-network). Разные env'ы могут использовать разные сети для изоляции.", "en": "Docker network name the container joins (e.g. goapp_prod_proxy-network). Different envs may use different networks for isolation." },
-      "default": "",
-      "type": "string"
-    },
-    "COMPOSE_PROJECT": {
-      "label": { "ru": "Compose project label", "en": "Compose project label" },
-      "description": { "ru": "Значение label com.docker.compose.project. Обычно {service}_{env} (например swan_prod, swan_test).", "en": "Value for com.docker.compose.project label. Typically {service}_{env} (e.g. swan_prod, swan_test)." },
-      "default": "",
-      "type": "string"
     }
   },
   "required_secrets": [
@@ -85,7 +91,6 @@
     { "name": "SSH_USER", "multiline": false, "description": "SSH пользователь", "role": "deploy", "scope": "environment" },
     { "name": "SSH_KEY", "multiline": true, "description": "Приватный SSH ключ (OpenSSH PEM)", "role": "deploy", "scope": "environment" },
     { "name": "SSH_PORT", "multiline": false, "description": "SSH порт (обычно 22)", "role": "deploy", "scope": "environment" },
-    { "name": "CONTAINER_NAME", "multiline": false, "description": "Имя docker-контейнера на VPS (используется как forward_host в NPM). Уникально на env.", "role": "deploy", "scope": "environment" },
     { "name": "NPM_EMAIL", "multiline": false, "description": "Email API-пользователя Nginx Proxy Manager", "role": "deploy", "scope": "repo" },
     { "name": "NPM_PASSWORD", "multiline": false, "description": "Пароль API-пользователя NPM", "role": "deploy", "scope": "repo" }
   ],

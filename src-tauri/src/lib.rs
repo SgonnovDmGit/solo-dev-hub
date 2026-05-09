@@ -21,11 +21,30 @@ use std::path::{Path, PathBuf};
 use tauri::State;
 
 fn get_db_path() -> PathBuf {
-    let app_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("github-repo-manager");
-    std::fs::create_dir_all(&app_dir).ok();
-    app_dir.join("data.db")
+    let local = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    let new_dir = local.join("solo-dev-hub");
+    let new_db = new_dir.join("data.db");
+
+    // T-000063: one-time copy-once migration from the legacy app dir.
+    // We copy (not move) so that if the new build crashes mid-migration the
+    // legacy SQLite stays intact as a recovery breadcrumb. The user can
+    // delete the legacy folder manually once they're satisfied the rebrand
+    // build works. Idempotent: only fires when new doesn't exist yet.
+    if !new_db.exists() {
+        let legacy_db = local.join("github-repo-manager").join("data.db");
+        if legacy_db.exists() {
+            std::fs::create_dir_all(&new_dir).ok();
+            if let Err(e) = std::fs::copy(&legacy_db, &new_db) {
+                eprintln!(
+                    "warn: failed to migrate legacy DB {:?} → {:?}: {}",
+                    legacy_db, new_db, e
+                );
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&new_dir).ok();
+    new_db
 }
 
 // ── Project commands ──────────────────────────────────────────────────────────
@@ -2642,6 +2661,10 @@ fn read_timeline(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db = AppDb::new(get_db_path()).expect("Failed to initialize database");
+
+    // T-000063: copy legacy PAT from old keyring service to new one. Idempotent;
+    // only fires when new service has no entry yet.
+    keyring_store::migrate_legacy_pat();
 
     // Seed bundled templates (e.g. flutter_web) if language is missing in DB.
     if let Err(e) = template_seeder::seed_bundled_templates(&db) {

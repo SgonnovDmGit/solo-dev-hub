@@ -110,6 +110,7 @@
     showDeleteConfirm = false;
     pushing = true;
     const names = [...selectedSecrets];
+    const succeeded: string[] = [];
     let failures = 0;
     const repoIdForCleanup = $allRepos.find(r => r.github_name === repoFullName)?.id;
     let envIdsForCleanup: number[] = [];
@@ -119,10 +120,11 @@
         envIdsForCleanup = envs.map(e => e.id);
       } catch {}
     }
+    const { owner, repo } = splitRepoFullName(repoFullName);
     for (const name of names) {
       try {
-        const { owner, repo } = splitRepoFullName(repoFullName);
         await deleteRepoSecret($pat, owner, repo, name);
+        succeeded.push(name);
         // v0.18.0: also remove from all deploy_secrets rows (DB-level cleanup)
         for (const envId of envIdsForCleanup) {
           try { await deleteDeploySecret(envId, name); } catch {}
@@ -135,13 +137,27 @@
         failures++;
       }
     }
+    // B-000003: GitHub `list secrets` endpoint has eventual consistency — a
+    // refetch immediately after DELETE may still return the deleted entries
+    // for several seconds. Keep a denylist of just-deleted names and filter
+    // them out of any refetch result so the UI stays consistent without
+    // depending on GH propagation.
+    const deletedSet = new Set(succeeded);
+    existingSecrets = existingSecrets.filter((s) => !deletedSet.has(s.name));
+    selectedSecrets = new Set();
+    secretValues = {};
+    try {
+      const fresh = await listRepoSecrets($pat, owner, repo);
+      existingSecrets = fresh.filter((s) => !deletedSet.has(s.name));
+    } catch {
+      // Optimistic local state already applied; reconcile happens on next refresh.
+    }
     pushing = false;
     if (failures === 0) {
       addToast($tStore('secrets.deletedCount' as any).replace('{0}', String(names.length)), 'success');
     } else {
       addToast($tStore('secrets.pushPartialFail' as any).replace('{0}', String(failures)).replace('{1}', String(names.length)), 'error');
     }
-    await loadSecrets();
   }
 
   async function handleUpdateSelected() {
@@ -346,16 +362,24 @@
       <!-- Existing secrets list (repo mode only) -->
       {#if mode === 'repo'}
         <div class="existing-secrets">
-          <div class="sub-label">{$tStore('secrets.existingSecrets' as any)}</div>
+          <div class="sub-label-row">
+            <span class="sub-label">{$tStore('secrets.existingSecrets' as any)}</span>
+            {#if !loading && existingSecrets.length > 0}
+              <button class="ghost mini" onclick={selectAllSecrets} type="button">{$tStore('secrets.selectAll' as any)}</button>
+              <button class="ghost mini" onclick={deselectAllSecrets} type="button">{$tStore('secrets.deselectAll' as any)}</button>
+            {/if}
+            <span class="spacer"></span>
+            <button class="ghost mini refresh-btn"
+                    onclick={loadSecrets}
+                    disabled={loading}
+                    title={$tStore('secrets.refresh' as any) || 'Refresh from GitHub'}
+                    type="button">{loading ? '⟳' : '↻'}</button>
+          </div>
           {#if loading}
             <div class="loading-text">...</div>
           {:else if existingSecrets.length === 0}
             <div class="no-secrets">{$tStore('secrets.noSecrets' as any)}</div>
           {:else}
-            <div class="secret-list-header">
-              <button class="ghost mini" onclick={selectAllSecrets} type="button">{$tStore('secrets.selectAll' as any)}</button>
-              <button class="ghost mini" onclick={deselectAllSecrets} type="button">{$tStore('secrets.deselectAll' as any)}</button>
-            </div>
             <div class="secret-list">
               {#each existingSecrets as secret (secret.name)}
                 <div class="secret-row">
@@ -534,6 +558,43 @@
     margin-bottom: 6px;
   }
 
+  .sub-label-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+
+  .sub-label-row .sub-label {
+    margin-bottom: 0;
+  }
+
+  .sub-label-row .spacer {
+    flex: 1;
+  }
+
+  .sub-label-row .mini {
+    font-size: 11px;
+    color: var(--accent);
+    padding: 0 4px;
+  }
+
+  .refresh-btn {
+    font-size: 14px;
+    padding: 0 6px;
+    color: var(--text-muted);
+    line-height: 1;
+  }
+
+  .refresh-btn:hover:not(:disabled) {
+    color: var(--accent);
+  }
+
+  .refresh-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   .loading-text {
     font-size: 12px;
     color: var(--text-muted);
@@ -543,18 +604,6 @@
     font-size: 12px;
     color: var(--text-muted);
     font-style: italic;
-  }
-
-  .secret-list-header {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 4px;
-  }
-
-  .secret-list-header .mini {
-    font-size: 11px;
-    color: var(--accent);
-    padding: 0;
   }
 
   .secret-list {

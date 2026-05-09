@@ -3315,6 +3315,19 @@ impl AppDb {
                 ],
             )?;
         }
+
+        // Prune orphans: rows whose secret_name is in NEITHER current GitHub repo
+        // secrets NOR meta.json required_secrets. Happens after a template
+        // updates (e.g. CONTAINER_NAME removed in v0.25.0) or after the user
+        // deletes a repo-level secret in GitHub. Caller must only invoke this
+        // function with a fresh `repo_secret_names` from a successful list call
+        // — empty-due-to-failure would falsely prune legitimate rows.
+        for orphan in existing.iter().filter(|n| !all_names.contains(n.as_str())) {
+            conn.execute(
+                "DELETE FROM deploy_secrets WHERE deploy_env_id = ?1 AND secret_name = ?2",
+                rusqlite::params![deploy_env_id, orphan],
+            )?;
+        }
         Ok(())
     }
 
@@ -6111,6 +6124,40 @@ mod tests {
         // NPM_EMAIL: in meta with scope=repo → override_enabled=false
         assert!(!by_name["NPM_EMAIL"].override_enabled);
         assert_eq!(by_name["NPM_EMAIL"].role, Some("deploy".to_string()));
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn test_ensure_deploy_secrets_populated_prunes_orphans() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = AppDb::new(tmp.path().join("test.db")).unwrap();
+        let (_p, r) = seed_repo_for_deploy_tests(&db);
+        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
+            repository_id: r, name: "prod".to_string(),
+            workflow_name: "W".to_string(), image_tag: "l".to_string(),
+            compose_service: "s".to_string(), domain: "d".to_string(),
+            deploy_branch: "m".to_string(), extras: Default::default(),
+        }).unwrap();
+
+        // First seed: CONTAINER_NAME was in old meta.json hints (legacy state).
+        let old_hints = vec![
+            MetaSecretHint { name: "SSH_HOST".to_string(), role: "deploy".to_string(), scope: "environment".to_string() },
+            MetaSecretHint { name: "CONTAINER_NAME".to_string(), role: "deploy".to_string(), scope: "environment".to_string() },
+        ];
+        db.ensure_deploy_secrets_populated(env.id, &["SSH_HOST".to_string()], &old_hints).unwrap();
+        assert_eq!(db.list_deploy_secrets(env.id).unwrap().len(), 2);
+
+        // Second seed: meta.json updated — CONTAINER_NAME removed (e.g. v0.25.0
+        // where it became a placeholder, not a secret). Repo secrets still
+        // include SSH_HOST. Orphan CONTAINER_NAME row must be pruned.
+        let new_hints = vec![
+            MetaSecretHint { name: "SSH_HOST".to_string(), role: "deploy".to_string(), scope: "environment".to_string() },
+        ];
+        db.ensure_deploy_secrets_populated(env.id, &["SSH_HOST".to_string()], &new_hints).unwrap();
+
+        let secrets = db.list_deploy_secrets(env.id).unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].secret_name, "SSH_HOST");
         std::mem::forget(tmp);
     }
 

@@ -1,5 +1,5 @@
 [package]
-name = "github-repo-manager"
+name = "solo-dev-hub"
 version = "0.25.0"
 description = "Solo Dev Hub — desktop app for managing GitHub projects"
 authors = ["you"]
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "github_repo_manager_lib"
+name = "solo_dev_hub_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

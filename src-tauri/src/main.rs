@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    github_repo_manager_lib::run()
+    solo_dev_hub_lib::run()
 }
