@@ -472,8 +472,30 @@ pub fn generate_project_md(db: &AppDb, project_id: i64, repo_root: &Path) -> Res
     if parents.is_empty() {
         md.push_str("_No parent projects._\n\n");
     } else {
+        // F-000040: include each parent server-repo's local path so MS-LLM
+        // can write proactive announcements directly into that filesystem.
+        // server_repo_of_microservice() is generic over project_id and
+        // returns the server-role repo of any project (despite its name).
         for p in &parents {
-            md.push_str(&format!("- {}\n", p.name));
+            match db.server_repo_of_microservice(p.id) {
+                Ok(srv) => {
+                    let srv_label = srv.display_name();
+                    let path_label = match srv.local_path.as_deref() {
+                        Some(path) => format!("path: {}", path),
+                        None => "no local path configured".to_string(),
+                    };
+                    md.push_str(&format!(
+                        "- **{}** — server repo: {} ({})\n",
+                        p.name, srv_label, path_label
+                    ));
+                }
+                Err(_) => {
+                    md.push_str(&format!(
+                        "- **{}** — ⚠ server repo not resolvable\n",
+                        p.name
+                    ));
+                }
+            }
         }
         md.push('\n');
     }
@@ -1849,6 +1871,72 @@ mod tests {
         assert!(content.contains("# AuthMS"));
         assert!(content.contains("⚙ Microservice"));
         assert!(content.contains("Parent"), "parent project listed");
+    }
+
+    /// F-000040: Parent projects section must include parent server-repo's
+    /// local path so MS-LLM can write announcements directly into that filesystem.
+    #[test]
+    fn test_generate_project_md_microservice_parent_includes_server_path() {
+        let db = make_test_db();
+        let parent = db.create_project("WebApp", None, "standard").unwrap();
+        let parent_srv = db
+            .upsert_repository("owner/web-app-backend", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(parent_srv.id, Some(parent.id), Some("server"))
+            .unwrap();
+        db.set_repo_local_path(parent_srv.id, Some("/home/dev/web-app-backend"))
+            .unwrap();
+
+        let ms = db.create_project("Storage", None, "microservice").unwrap();
+        let ms_repo = db
+            .upsert_repository("owner/storage-backend", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(ms_repo.id, Some(ms.id), Some("server"))
+            .unwrap();
+        db.connect_microservice(parent.id, ms.id).unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        generate_project_md(&db, ms.id, tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
+        // MS-LLM consumes path from this line to write announcements to parent
+        assert!(
+            content.contains("- **WebApp** — server repo: web-app-backend (path: /home/dev/web-app-backend)"),
+            "parent rendering should include canonical server-repo name + local path; got:\n{}",
+            content
+        );
+    }
+
+    /// F-000040: Parent server repo without local_path renders graceful placeholder
+    /// (announcement-write is impossible in that state, but project.md still renders).
+    #[test]
+    fn test_generate_project_md_microservice_parent_without_server_path() {
+        let db = make_test_db();
+        let parent = db.create_project("WebApp", None, "standard").unwrap();
+        let parent_srv = db
+            .upsert_repository("owner/web-app-backend", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(parent_srv.id, Some(parent.id), Some("server"))
+            .unwrap();
+        // intentionally no set_repo_local_path
+
+        let ms = db.create_project("Storage", None, "microservice").unwrap();
+        let ms_repo = db
+            .upsert_repository("owner/storage-backend", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(ms_repo.id, Some(ms.id), Some("server"))
+            .unwrap();
+        db.connect_microservice(parent.id, ms.id).unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        generate_project_md(&db, ms.id, tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
+        assert!(
+            content.contains("- **WebApp** — server repo: web-app-backend (no local path configured)"),
+            "should signal missing path explicitly; got:\n{}",
+            content
+        );
     }
 
     #[test]

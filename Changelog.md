@@ -4,6 +4,37 @@
 
 ## [Unreleased]
 
+### Added
+- **F-000040 | Cross-repo announcements (proactive push)** — новая секция
+  в global CLAUDE.md template для unsolicited информации, не помещающейся
+  в REQ/receipt pattern. 2 направления: server→client (sender пишет
+  напрямую в `<client-path>/docs/server-announcements/<sender-canonical>/ANNOUNCE-NNN_<slug>.md`)
+  и microservice→parent-server (зеркально, в `docs/microservice-announcements/<ms-project>/`).
+  Recipient читает + удаляет = implicit ack (audit trail в git history
+  recipient'а). No app-side sync, no receipts, no confirm-✓. Sender
+  получает recipient'ский local path из собственного `docs/project.md`:
+  `## Repositories` Path column (для clients) или `## Parent projects`
+  (для parent servers, теперь с path после расширения `generate_project_md`).
+  Если path отсутствует ("no local path configured") — announcement не
+  деливерится, surface в own todo. Explicit carve-out из правила
+  "LLM never copies across repo boundaries" — для announcements это
+  разрешено, для REQ — нет. Use cases: server self-initiated change
+  affecting client (e.g. new admin endpoint requires client integration);
+  side-effect change affecting other clients; post-internal-review
+  rework affecting client; MS-side change affecting parent. **NOT** для
+  "client asked → server did → integration notes" — то идёт в REQ
+  receipt `## Comment:`.
+
+### Changed
+- **`docs/project.md` Parent projects section** теперь включает локальный
+  path parent server-репо: `- **<parent-name>** — server repo: <name>
+  (path: <local-path>)` или `(no local path configured)`. Источник —
+  `db.server_repo_of_microservice(parent_id)` + `.local_path`. Нужно для
+  F-000040 announcement push'а MS→server: MS-LLM получает целевой
+  filesystem path из своего project.md без cross-repo sync infrastructure.
+  +2 unit-теста (`test_generate_project_md_microservice_parent_includes_server_path`,
+  `test_generate_project_md_microservice_parent_without_server_path`) → 298 total.
+
 ## [0.25.0] — 2026-05-12
 
 ### Added
