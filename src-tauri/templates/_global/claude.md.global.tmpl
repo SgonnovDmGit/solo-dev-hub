@@ -168,16 +168,37 @@ Requirements that cross repo boundaries (client↔server, server↔microservice)
 
 `NNN` is chosen by the sender on creation (next free number within that folder) and is **never renamed or renumbered**. `_<slug>` is a short kebab-case readability hint — recommended but optional; the app matches files by the globs `REQ-*.md` and `REQ-*.response.md`.
 
-### Receipt content (convention, not enforced)
+## Receipt format
 
-Inside `REQ-NNN_<slug>.response.md` the recipient records a reply status and comment. Recommended status values:
-- `implemented` — done as requested
-- `partially` — done in part; comment describes scope
-- `declined` — not doing; comment describes why
+A receipt file `REQ-NNN_<slug>.response.md` **must** begin with a `## Status:` heading carrying one of the values below, plus a `## Comment:` block per the per-status rules.
 
-The app does not parse receipt contents — this is a convention for human/LLM readers.
+| Status | Meaning | `## Comment:` |
+|---|---|---|
+| `implemented` | Done as requested | Optional — used to add notes or caveats |
+| `partially` | Done in part; scope reduced | **Required** — describe what was done vs what was left out |
+| `declined` | Will not be done | **Required** — describe why; suggest alternatives if applicable |
+| `clarification-needed` | Cannot complete because the REQ is ambiguous or incomplete | **Required** — list specific, concrete questions |
 
-### Sync state (computed by the app for UI)
+### Empty receipts forbidden
+
+A receipt file with no `## Status:` line is invalid. If you cannot determine which status applies — that means the scope is unclear; write `clarification-needed` with specific questions. Never leave the file blank, never write `todo` or placeholder text.
+
+### `clarification-needed` workflow
+
+When the recipient writes `clarification-needed`:
+
+1. The **sender**, in the next session, reads the receipt and updates the **original** `REQ-NNN_<slug>.md` inline with the clarifications — **not** a new `REQ-N+1`.
+2. The next sync propagates the updated REQ to the recipient.
+3. The **recipient** re-evaluates scope and **overwrites** its own receipt with the appropriate final status (`implemented` / `partially` / `declined`). If the REQ is still ambiguous, the receipt is overwritten with refined `clarification-needed` questions.
+4. The loop continues until the sender writes a complete REQ.
+
+Receipt files are **mutable on the recipient side** — the recipient may overwrite its own receipt as work progresses or as clarifications arrive. The sender never edits the recipient's receipt.
+
+### Note on enforcement
+
+The app does not parse receipt contents today — these rules are conventions for human and LLM readers. A future release will surface `Status:` in the sync UI and auto-confirm `implemented` receipts; following this format now means existing receipts will already be in the right shape when that ships.
+
+## Sync state (computed by the app for UI)
 
 Separate from the receipt's internal status, the app displays a **sync state** per pair, computed purely from the filesystem:
 - `new` — requirement exists on sender side but not yet on recipient side (pending next sync)
@@ -207,7 +228,9 @@ Folder renames (e.g. repo renamed on GitHub) are handled by the app — on next 
 4. **App** copies the receipt back to the sender's outgoing folder at next sync. If the recipient edits their receipt later, the next sync overwrites the sender's copy — source of truth (recipient) always wins.
 5. **Sender** reviews the receipt. If satisfied → clicks ✓ in the app → `confirm_requirement` atomically deletes the pair (both files, both sides) in one operation.
 
-If the sender is not satisfied with the receipt, they do **not** reject — they write a new `REQ-N+1_<slug>.md` with a clarified ask. The original pair may stay open until the new requirement is answered, or be confirmed away immediately.
+If the sender is not satisfied with a **final** receipt (`implemented` / `partially` / `declined`), they do **not** reject — they write a new `REQ-N+1_<slug>.md` with a clarified ask. The original pair may stay open until the new requirement is answered, or be confirmed away immediately.
+
+If the receipt is `clarification-needed`, a different path applies: the sender updates the **original** REQ inline with the clarifications rather than writing `REQ-N+1`. See `## Receipt format` above for the full clarification-needed loop.
 
 ## LLM policy
 
@@ -226,6 +249,60 @@ The LLM must NOT:
 - rename or renumber `NNN`
 - author a `.response.md` for a requirement it did not receive (receipts are only authored by the recipient)
 - rename the sync folders (`backend-requirements/`, `client-requirements/...`, etc) manually — those are app-managed
+- infer audience or other semantic properties from the `Forwarded-from:` header value — that header is metadata for server-side chain-tracing only (see `## Forwarding` below)
+
+## Forwarding (triangular flow: client → server → microservice)
+
+When a client REQ requires work that lies in a connected microservice, the simple two-party REQ pattern is not enough — the server cannot answer "not my responsibility" because the client has no contract with the microservice. The rules below cover the triangular flow.
+
+### Server-side responsibility
+
+When the server-side LLM receives a client REQ:
+
+1. **Classify scope.** Use the project's own `docs/project.md` (sections `## Repositories` and `## Connected microservices`) plus the current handler surface to decide whether the REQ is:
+   - **server-only** — handle as in the standard two-party flow;
+   - **MS-only** — entirely a connected microservice's responsibility;
+   - **mixed** — partly server, partly one or more connected microservices.
+
+   **"Not my responsibility" is never a valid receipt.** If the REQ touches MS work, forward it — do not refuse.
+
+2. **For MS-only and mixed scope, create downstream REQs.** Write `REQ-MMM_<slug>.md` in `docs/microservice-requirements/<microservice-project-name>/`, with the request **reformulated in server↔MS contract terms**. Do not pass through "the client wants X" verbatim — the microservice has no contract with clients, so its REQ must be addressed in terms of what the server needs from the MS. If the client REQ requires work from multiple microservices, create one downstream REQ in each respective folder.
+
+3. **Wait for the full chain to complete before writing the client receipt.** No interim receipts. The client receipt is written **exactly once** — after every downstream MS-REQ has a receipt **and** the server's own portion (if the scope was mixed) is done — and consolidates the outcome (`implemented` / `partially` / `declined`, with a comment that breaks down per microservice if more than one was involved).
+
+4. **Resuming an in-flight forward across sessions.** A forwarded chain often spans multiple sessions. At session start, scan for in-flight chains: for each `docs/client-requirements/<client>/REQ-NNN.md` without a server-side `.response.md`, grep `docs/microservice-requirements/*/REQ-*.md` for a `Forwarded-from: <client-repo>/REQ-NNN` header.
+   - **Match found, downstream has `.response.md`** — write the consolidated client receipt now.
+   - **Match found, no `.response.md`** — the chain is in flight; wait.
+   - **No match** — forwards have not been created yet; classify scope per #1 and act.
+
+### Linkage header
+
+When the server creates a downstream REQ for a microservice, it adds a header immediately after the H1 title:
+
+```markdown
+# REQ-002: Avatar blob storage
+
+**Forwarded-from:** web-app-client/REQ-001
+
+## Description
+...
+```
+
+The header uses the **last-segment / canonical** form of the client repo name (e.g. `web-app-client/REQ-001`, not `SgonnovDmGit/web-app-client/REQ-001`) — matching the folder names in the sync structure. If a single client REQ is forwarded to multiple microservices, the header is written in **each** downstream REQ with the same value (one client REQ identifier, multiple MS REQ files).
+
+**Why the header exists.** It enables the server-side LLM to recover in-flight chains across sessions (see Server-side responsibility #4). Without it, the link between a client REQ and its downstream MS REQs is not discoverable from the filesystem alone.
+
+**The client receipt contains nothing about microservices** — no `Forwarded-to` header, no MS names, no implementation strategy. Symmetric to the MS-side responsibility below: as the MS does not know about the client, the client does not know about the MS. The server's implementation decomposition stays opaque to clients.
+
+### MS-side responsibility
+
+When the microservice-side LLM receives an incoming downstream REQ in `docs/server-requirements/`:
+
+1. **Ignore client identity entirely.** If a client name leaks into the REQ — through the `Forwarded-from:` header or through body text — do not save it in your DB structures, code, or comments. The `Forwarded-from:` header is metadata for **server-side** chain-tracing only; it is not actionable for the microservice. Treat the REQ body as the single source of truth for your scope.
+
+   The one legitimate client-related distinction for a microservice is **admin-vs-user-facing**, when it affects RBAC or access scopes. The server passes this **explicitly in the REQ body** (in the description, free-form), **not via inferences from the client name**. If the body is silent on audience and audience matters for your implementation, write a `clarification-needed` receipt asking explicitly.
+
+2. **Receipts go in your own `docs/server-requirements/` folder only.** Never write to a client repo, never create a `docs/client-requirements/` folder — there is no MS↔client channel. If a REQ body says "the client is waiting" — that does NOT mean "go write to the client"; it means the server will respond to the client after your receipt arrives. Your work ends at the receipt to the server.
 
 # API contract sync
 

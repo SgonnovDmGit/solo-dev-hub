@@ -4,6 +4,47 @@
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-05-12
+
+### Added
+- **T-000078 | Triangular REQ-flow rules в global CLAUDE.md template** —
+  расширение секции `# Cross-repo requirements` для случая client → server
+  → microservice. Две новые H2 секции: `## Receipt format` (4 hard-enforced
+  status values: `implemented` / `partially` / `declined` / `clarification-needed`
+  + workflow перезаписи receipt'а при clarification-loop) и `## Forwarding
+  (triangular flow)` (Server-side responsibility — classify/forward/wait/
+  resume; Linkage header `Forwarded-from: <client>/REQ-NNN` для chain-tracing;
+  MS-side responsibility — игнор client identity, audience-via-body). LLM
+  policy расширен правилом про игнор `Forwarded-from:` header'а как server-
+  side metadata. Sync flow — disambiguation: final receipt + unhappy sender
+  пишет REQ-N+1; `clarification-needed` receipt → sender обновляет
+  оригинальный REQ inline. Старый H3 `### Receipt content (convention, not
+  enforced)` удалён — clash'ил с hard-enforce Rule 4. `### Sync state`
+  промоутнут из H3 в H2 (потерял parent). Behavioral validation через
+  5 fresh subagent-сценариев на pre-impl drafts (all PASS, coverage: 4/4
+  rules, 4/4 status values, 4 edge cases — multi-MS, clarification-loop,
+  audience leak, resuming across sessions). Flow doc
+  `docs/flows/microservice-server-sync.md` дополнен секцией Triangular flow
+  (lifecycle + Solo Dev Hub vs LLM responsibility таблица).
+- **T-000075 | `CONTRIBUTING.md`** — pre-public-launch artifact: build
+  prerequisites (Node v18+, Rust, MSVC Build Tools, WebView2), getting
+  started, project layout, code style (Rust + TS/Svelte), commits
+  (Conventional Commits), tests, PR rules (target `dev`, не `master`),
+  AI-agent section (link to CLAUDE.md), releases (link to RELEASING.md).
+- **T-000076 | `.github/FUNDING.yml`** — `custom: [boosty.to/sgonnovdm/donate]`
+  для появления Sponsor-кнопки на repo header после public-flip'а. TON-кошелёк
+  остаётся в README + About (FUNDING.yml не поддерживает crypto).
+- **T-000062 | README RU+EN drafts (public-launch quality)** — text-only
+  pass: marketing-tone преамбула (3 абзаца: tagline / problem+AI-failure-
+  mode kicker / solution), AI-bug-closure with safety net как #1 фича
+  (4 гарантии: protected fields, auto-attempts counter, explicit user
+  confirm, full event log), Why / Features / Tech Stack / Getting started
+  / Development / Roadmap / Support / License, ссылка на русскую версию
+  `README.ru.md` сверху английской. RU-tagline — «личный пульт управления»
+  (EN — «cockpit»). Скриншоты вынесены в T-000073 (placeholder'ы с
+  captions расставлены в обоих файлах).
+- `LICENSE` — MIT, ранее только в `package.json` без файла.
+
 ### Changed
 - **T-000063 | Technical identifier rebrand**: Cargo `[package].name`
   (`github-repo-manager` → `solo-dev-hub`) + `[lib].name`
@@ -49,26 +90,6 @@
   GitHub Environment остаётся orphaned (вреда нет), user заполняет
   placeholder в DeployDetail. Stale `CONTAINER_NAME_PROD` references в
   deploy_template_spec.md + flows/deploy-flow.md убраны.
-
-### Added
-- **T-000075 | `CONTRIBUTING.md`** — pre-public-launch artifact: build
-  prerequisites (Node v18+, Rust, MSVC Build Tools, WebView2), getting
-  started, project layout, code style (Rust + TS/Svelte), commits
-  (Conventional Commits), tests, PR rules (target `dev`, не `master`),
-  AI-agent section (link to CLAUDE.md), releases (link to RELEASING.md).
-- **T-000076 | `.github/FUNDING.yml`** — `custom: [boosty.to/sgonnovdm/donate]`
-  для появления Sponsor-кнопки на repo header после public-flip'а. TON-кошелёк
-  остаётся в README + About (FUNDING.yml не поддерживает crypto).
-- **T-000062 | README RU+EN drafts (public-launch quality)** — text-only
-  pass: marketing-tone преамбула (3 абзаца: tagline / problem+AI-failure-
-  mode kicker / solution), AI-bug-closure with safety net как #1 фича
-  (4 гарантии: protected fields, auto-attempts counter, explicit user
-  confirm, full event log), Why / Features / Tech Stack / Getting started
-  / Development / Roadmap / Support / License, ссылка на русскую версию
-  `README.ru.md` сверху английской. RU-tagline — «личный пульт управления»
-  (EN — «cockpit»). Скриншоты вынесены в T-000073 (placeholder'ы с
-  captions расставлены в обоих файлах).
-- `LICENSE` — MIT, ранее только в `package.json` без файла.
 
 ### Fixed
 - **GitHub Environment auto-ensure on DeployDetail open** — линтер GH Actions
