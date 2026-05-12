@@ -69,11 +69,18 @@
     }));
   }
 
+  // C3 review-fix: split into env-fetch (runs once on mount) and the
+  // repo-dependent GitHub-Environments + branches fetch (runs via $effect
+  // when both env and repo are resolved). Previously the entire load()
+  // early-returned when `repo` was null at mount time — `$allRepos` is
+  // loaded in parallel in +page.svelte and may not be resolved yet, so the
+  // GH-side createEnvironment and branches fetch were silently skipped
+  // and never retriggered, leaving DeployDetail stuck on "Loading…".
   async function load() {
     env = await getDeployEnvironment(deployEnvId);
-    if (!env || !repo) return;
+    if (!env) return;
 
-    if (repo.deploy_target) {
+    if (repo?.deploy_target) {
       const metaFile = await getTemplateFile(repo.deploy_target, 'meta.json');
       if (metaFile) {
         const meta = JSON.parse(metaFile.content);
@@ -95,37 +102,40 @@
     }
     formValues = next;
 
+  }
+
+  // Idempotent GitHub-side bootstrap that depends on `repo` being resolved.
+  // Tracks both `env` and `repo` reactively so a late-arriving `$allRepos`
+  // doesn't leave the deploy detail stuck without an Environment object.
+  let ghBootstrapped = $state(false);
+  $effect(() => {
+    if (!env || !repo || ghBootstrapped) return;
+    if (!$pat || !repo.github_name || !repo.github_name.includes('/')) return;
+    ghBootstrapped = true;
+    void bootstrapGitHubSide(env, repo.github_name);
+  });
+
+  async function bootstrapGitHubSide(envSnapshot: DeployEnvironment, ghName: string) {
+    const { owner, repo: name } = splitRepoFullName(ghName);
     // Ensure GitHub Environment exists for this deploy slot. Idempotent PUT —
     // no-op when already exists, creates it when missing. Critical for the
-    // workflow's `environment: <name>` directive to validate (linter shows
-    // "Value '<name>' is not valid" when the GH-side object is absent). Covers
-    // both legacy gap (migration v20 created `name='prod'` in DB without GH
-    // counterpart) and the case where user never set any env-scoped overrides
-    // (no auto-trigger via createOrUpdateEnvironmentSecret yet). Surface API
-    // errors via toast so PAT permission issues are diagnosable.
-    if ($pat && repo.github_name && repo.github_name.includes('/')) {
-      try {
-        const { owner, repo: name } = splitRepoFullName(repo.github_name);
-        await createEnvironment($pat, owner, name, env.name);
-      } catch (e: any) {
-        const msg = String(e?.message ?? e);
-        addToast(
-          ($tStore('deploy.envCreateFailed' as any) || 'Could not create GitHub Environment "{0}": {1}')
-            .replace('{0}', env.name)
-            .replace('{1}', msg),
-          'warning',
-        );
-      }
+    // workflow's `environment: <name>` directive to validate.
+    try {
+      await createEnvironment($pat!, owner, name, envSnapshot.name);
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      addToast(
+        ($tStore('deploy.envCreateFailed' as any) || 'Could not create GitHub Environment "{0}": {1}')
+          .replace('{0}', envSnapshot.name)
+          .replace('{1}', msg),
+        'warning',
+      );
     }
-
-    // Fetch branches for DEPLOY_BRANCH datalist
-    if ($pat && repo.github_name && repo.github_name.includes('/')) {
-      try {
-        const { owner, repo: name } = splitRepoFullName(repo.github_name);
-        branches = await listBranches($pat, owner, name);
-      } catch {
-        // Offline or no access — datalist stays empty, free-text still works
-      }
+    // Fetch branches for DEPLOY_BRANCH datalist.
+    try {
+      branches = await listBranches($pat!, owner, name);
+    } catch {
+      // Offline or no access — datalist stays empty, free-text still works.
     }
   }
 

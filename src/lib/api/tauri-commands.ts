@@ -340,8 +340,13 @@ export async function listProjectRequirements(projectId: number): Promise<Requir
   return invoke<RequirementInfo[]>('list_project_requirements', { projectId });
 }
 
-export async function confirmRequirement(projectId: number, filename: string, sourceRepoId: number): Promise<void> {
-  return invoke<void>('confirm_requirement', { projectId, filename, sourceRepoId });
+export async function confirmRequirement(
+  projectId: number,
+  filename: string,
+  sourceRepoId: number,
+  targetRepoId: number,
+): Promise<void> {
+  return invoke<void>('confirm_requirement', { projectId, filename, sourceRepoId, targetRepoId });
 }
 
 // ── Rename log (F-033) ────────────────────────────────────────────────────────

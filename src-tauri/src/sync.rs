@@ -749,11 +749,14 @@ pub fn parse_numeric_id(display_id: &str) -> Option<i64> {
 ///   in-progress → testing         (fix ready, bumps fix_attempts)
 ///   rejected → in-progress        (restart work after rejection)
 ///   rejected → testing            (quick retry after rejection, bumps fix_attempts)
-///   testing → confirmed           (UI-only path via ✓ button, not reachable via LLM MD edit)
-///   testing → rejected            (UI-only path via ✗ button)
-/// Anything else (e.g. `created → confirmed`, `confirmed → anything`,
-/// `testing → created`) is a contract violation — ignored with a warning.
-/// All transitions ending in `testing` bump `fix_attempts +1` — see reconcile logic.
+/// `testing → confirmed` and `testing → rejected` are UI-only paths via
+/// ✓/✗ buttons and the dedicated `resolve_bug` / `reject_bug` commands —
+/// NOT reachable via LLM MD edit. Allowing them here would let an LLM
+/// bypass the user-verification gate by writing `status: confirmed` in
+/// bug-reports.md. Anything else (e.g. `created → confirmed`, `confirmed
+/// → anything`, `testing → created`) is a contract violation — ignored
+/// with a warning. All transitions ending in `testing` bump `fix_attempts
+/// +1` — see reconcile logic.
 pub fn valid_transition(from: &str, to: &str) -> bool {
     matches!(
         (from, to),
@@ -762,8 +765,6 @@ pub fn valid_transition(from: &str, to: &str) -> bool {
             | ("in-progress", "testing")
             | ("rejected", "in-progress")
             | ("rejected", "testing")
-            | ("testing", "confirmed")
-            | ("testing", "rejected")
     )
 }
 
@@ -998,22 +999,16 @@ pub fn reconcile_bugs_for_repo(db: &AppDb, repo_id: i64) -> Result<(), String> {
                 } else {
                     None
                 };
-                let new_confirmed_at = if note.status == "confirmed" {
-                    Some(now.as_str())
-                } else {
-                    None
-                };
                 let event_type = match (db_bug.status.as_str(), note.status.as_str()) {
                     ("created", "in-progress") => "taken",
                     ("created", "testing") => "entered_testing",
                     ("in-progress", "testing") => "entered_testing",
                     ("rejected", "in-progress") => "reopened",
                     ("rejected", "testing") => "entered_testing",
-                    ("testing", "confirmed") => "confirmed",
-                    ("testing", "rejected") => "rejected",
                     _ => "taken", // fallback — valid_transition filters invalids, unreachable in practice
                 };
-                db.update_bug_status(db_bug.id, &note.status, new_attempts, new_confirmed_at)
+                // confirmed_at is set only via UI (resolve_bug), never via LLM MD edit.
+                db.update_bug_status(db_bug.id, &note.status, new_attempts, None)
                     .map_err(|e| e.to_string())?;
                 db.insert_bug_event(
                     db_bug.id,
@@ -2266,8 +2261,12 @@ mod tests {
         assert!(valid_transition("in-progress", "testing"));
         assert!(valid_transition("rejected", "in-progress"));
         assert!(valid_transition("rejected", "testing"));         // retry after rejection
-        assert!(valid_transition("testing", "confirmed"));        // (UI-only path)
-        assert!(valid_transition("testing", "rejected"));         // (UI-only path)
+
+        // UI-only paths via ✓/✗ buttons (resolve_bug / reject_bug commands).
+        // NOT reachable via LLM MD edit — otherwise LLM could bypass the
+        // user-verification gate by writing `status: confirmed`.
+        assert!(!valid_transition("testing", "confirmed"));
+        assert!(!valid_transition("testing", "rejected"));
 
         // Invalid: skipping the `testing` verification step is never allowed.
         assert!(!valid_transition("created", "confirmed"));
@@ -2411,7 +2410,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_status_transition_to_confirmed_sets_confirmed_at() {
+    fn test_reconcile_rejects_testing_to_confirmed_from_md() {
+        // Guard: LLM must not be able to confirm a bug via MD edit — that
+        // path is reserved for the UI ✓ button (resolve_bug command). If
+        // the LLM writes `status: confirmed` in bug-reports.md, reconcile
+        // ignores the transition and regen restores the testing status.
         let (db, tmp, rid) = setup_repo_with_dir();
         write_bug_reports_md(
             tmp.path(),
@@ -2419,7 +2422,7 @@ mod tests {
         );
         migrate_bugs_for_repo(&db, rid).unwrap();
 
-        // LLM moves testing → confirmed.
+        // LLM attempts testing → confirmed — should be ignored.
         write_bug_reports_md(
             tmp.path(),
             &["- B-000001 | 2026-03-01 | bug | minor | other | confirmed | 1 |"],
@@ -2427,15 +2430,8 @@ mod tests {
         reconcile_bugs_for_repo(&db, rid).unwrap();
 
         let b = db.get_bug_by_display_id(rid, "B-000001").unwrap().unwrap();
-        assert_eq!(b.status, "confirmed");
-        assert!(b.confirmed_at.is_some());
-        assert!(b.archived_from_md_at.is_none(),
-                "fresh confirm must not be archived yet — LLM hasn't acknowledged");
-
-        // v0.21.1: MD keeps confirmed row visible (LLM-acknowledgement workflow).
-        // Row drops only after LLM removes it from MD on a subsequent edit.
-        let md = read_bug_reports_md(tmp.path());
-        assert!(md.contains("B-000001"), "confirmed row still in MD until LLM acknowledges");
+        assert_eq!(b.status, "testing", "LLM cannot bypass user-verification gate");
+        assert!(b.confirmed_at.is_none(), "confirmed_at set only via UI resolve_bug");
     }
 
     #[test]

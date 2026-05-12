@@ -64,10 +64,17 @@
 
   async function handleConfirm(req: RequirementInfo) {
     if (!projectId) return;
-    const repoId = findRepoId(req.source_repo);
-    if (repoId === null) return;
+    const sourceRepoId = findRepoId(req.source_repo);
+    const targetRepoId = findRepoId(req.target_repo);
+    if (sourceRepoId === null || targetRepoId === null) {
+      addToast(`Cannot resolve repo for ${req.filename}: ${req.source_repo} → ${req.target_repo}`, 'error');
+      return;
+    }
     try {
-      await confirmRequirement(projectId, req.filename, repoId);
+      // C1 review-fix: pass both source AND target IDs. Earlier the backend
+      // iterated all connected microservices and deleted from any whose
+      // filename matched — collided NNNs across MSes erased sibling pairs.
+      await confirmRequirement(projectId, req.filename, sourceRepoId, targetRepoId);
       addToast(`${req.filename}: confirmed`, 'success');
       // B-000016: localize update — backend deleted the file pair, this RequirementInfo no longer
       // exists. Filtering keeps surrounding DOM stable so scroll position is preserved.
