@@ -105,8 +105,6 @@ const ru = {
   'sidebar.unassignedBadge': 'Нераспределённые ({count})',
 
   // repo detail
-  'repoDetail.backToRepos': '← Назад к Дашборду',
-  'repoDetail.backToReposTooltip': 'Назад к списку репозиториев',
   'repoDetail.notFound': 'Репозиторий не найден',
   'repoDetail.notFoundHint': 'Выберите репозиторий на боковой панели или вернитесь к списку.',
   'repoDetail.openOnGitHub': 'Открыть на GitHub',
@@ -419,7 +417,6 @@ const ru = {
   'empty.noBugsHint': 'Нажмите «+ Добавить ошибку», чтобы начать отслеживание.',
 
   // project detail
-  'project.backToRepos': '← Назад',
   'project.editName': 'Нажмите для редактирования',
   'project.description': 'Описание',
   'project.descriptionPlaceholder': 'Добавьте описание проекта...',
@@ -769,7 +766,7 @@ const ru = {
   'toast.targetChanged': 'Шаблон изменён',
   'repo.deployTarget': 'Шаблон деплоя',
   'repo.deployTargetNone': '— без шаблона —',
-  'repo.initDocsButton': '📚 Обновить документацию репозитория',
+  'repo.initDocsButton': 'Обновить документацию репозитория',
   'toast.docsInitialized': 'Документация обновлена: {0}',
   'toast.docsAlreadyExist': 'Все файлы уже актуальны',
 
@@ -898,8 +895,6 @@ const en: Record<TranslationKey, string> = {
   'sidebar.unassignedBadge': 'Unassigned ({count})',
 
   // repo detail
-  'repoDetail.backToRepos': '← Back to Dashboard',
-  'repoDetail.backToReposTooltip': 'Back to repository list',
   'repoDetail.notFound': 'Repository not found',
   'repoDetail.notFoundHint': 'Select a repository from the sidebar or go back to the list.',
   'repoDetail.openOnGitHub': 'Open on GitHub',
@@ -1212,7 +1207,6 @@ const en: Record<TranslationKey, string> = {
   'empty.noBugsHint': 'Click + Add Bug to start tracking issues for this repository.',
 
   // project detail
-  'project.backToRepos': '← Back',
   'project.editName': 'Click to edit',
   'project.description': 'Description',
   'project.descriptionPlaceholder': 'Add project description...',
@@ -1562,7 +1556,7 @@ const en: Record<TranslationKey, string> = {
   'toast.targetChanged': 'Template changed',
   'repo.deployTarget': 'Deploy template',
   'repo.deployTargetNone': '— none —',
-  'repo.initDocsButton': '📚 Update repo docs',
+  'repo.initDocsButton': 'Update repo docs',
   'toast.docsInitialized': 'Docs updated: {0}',
   'toast.docsAlreadyExist': 'All files already up to date',
 

@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.26.1] — 2026-05-12
+
 ### Added
 - **F-000040 | Cross-repo announcements (proactive push)** — новая секция
   в global CLAUDE.md template для unsolicited информации, не помещающейся
@@ -69,6 +71,53 @@
   § Triangular flow для REQ-based флоу.
 
 ### Changed
+- **T-000088 | RepoDetail header — 2-ряд chip layout** —
+  шапка переписана после iterative design review с ui-ux-pro-max
+  скиллом (вариант C). Заменяет первоначальный 5-ряд layout на
+  компактный 2-ряд chip-based: (1) `[lang] last-pushed · 📁 path
+  [папка]` с правой стороны `[📚 Обновить документацию]`; (2) editable
+  chips `[Проект: ▼] [Роль: ▼] [Шаблон деплоя: ▼]` с правой стороны
+  `🗑 Удалить`. Удалено: back-button «Назад к Дашборду» (Dashboard
+  доступен через top-bar + sidebar, кнопка была redundant + mislabel —
+  всегда вела в Dashboard, не back), header-top cluster с
+  role-badge/project-tag (значения дублировались с chips ниже),
+  описание `repo.description` (низкий signal, шумит шапку), derived
+  `roleLabel`/`roleIcon`/`projectName` (больше не используются),
+  импорт `ROLE_ICONS`. Editable controls стилизованы как pill chips
+  (radius 14px, surface bg, hover'ом accent border) — native `<select>`
+  inside transparent-styled. Delete button — ghost (transparent
+  border в покое, danger-border на hover'е, без слова «репозиторий» —
+  контекст из шапки). New CSS: `.chip`, `.chip-label`, `.chip-select`,
+  `.row-action`, `.meta-dot`. Removed CSS: `.header-top`,
+  `.header-right`, `.back-btn`, `.repo-desc`, `.settings-row`,
+  `.actions-row`, `.meta-pair`, `.meta-label`, `.role-badge`,
+  `.project-tag`, `.inline-select`. HTML-preview итераций в
+  `docs/superpowers/plans/2026-05-12-repo-detail-header-variants.html`.
+  Параллельно тот же подход применён к **ProjectDetail** — удалена
+  back-кнопка «← Назад» (вела в Dashboard hardcoded; redundant с
+  top-bar + sidebar) включая non-found state, удалён `header-top-row`
+  div, функция `goBack()`, CSS `.header-top-row` / `.back-btn`.
+  Чистка мёртвых i18n keys: `repoDetail.backToRepos`,
+  `repoDetail.backToReposTooltip`, `project.backToRepos` (ru + en).
+  Adaptive narrow-window behaviour: chips получили `white-space:
+  nowrap` + `flex-shrink: 0` (label «Шаблон деплоя:» больше не
+  wrap'ится на 2 строки в узком окне). Action-кнопки сворачиваются
+  в icon-only через container query `@container repo-header
+  (max-width: 760px)` — `.sticky-header` объявлен named
+  size-container, ниже порога `.row-action .btn-label` скрывается,
+  остаётся только icon + tooltip. Текст «Обновить документацию»
+  и «Удалить» обёрнут в `<span class="btn-icon">` + `<span
+  class="btn-label">`. Emoji `📚` убран из i18n value
+  `repo.initDocsButton` (теперь в template как icon-span).
+- **Dark theme contrast в native `<select>` dropdown'ах** — добавлен
+  `color-scheme: dark` на `:root` / `[data-theme="dark"]` и
+  `color-scheme: light` на `[data-theme="light"]` в `app.css`. Это
+  стандартная подсказка браузеру использовать тёмное native UI для
+  scrollbars, dropdown'ов, datepicker'ов. Раньше native `<option>`
+  popup рендерился WebView2 в OS-default white-bg → серый текст
+  становился нечитаемым. Дополнительный fallback `option { background:
+  var(--bg); color: var(--text); }` на случай платформ не уважающих
+  color-scheme.
 - **T-000080 / T-000079 | Deploy переехал из отдельного экрана в таб
   RepoDetail** — раньше `Deploy` открывался отдельным screen-route'ом
   через кнопку 🚀 в шапке RepoDetail (`currentScreen.set({name:

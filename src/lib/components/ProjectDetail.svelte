@@ -257,10 +257,6 @@
     showDeleteConfirm = false;
   }
 
-  function goBack() {
-    currentScreen.set({ name: 'dashboard' });
-  }
-
   function openSync() {
     currentScreen.set({ name: 'sync' });
   }
@@ -289,14 +285,9 @@
   {#if !project}
     <div class="not-found">
       <p>{$tStore('project.notFound')}</p>
-      <button onclick={goBack}>{$tStore('project.backToRepos')}</button>
     </div>
   {:else}
     <div class="header">
-      <div class="header-top-row">
-        <button class="ghost back-btn" onclick={goBack}>{$tStore('project.backToRepos')}</button>
-      </div>
-
       <div class="title-row">
         {#if editingName}
           <input
@@ -594,12 +585,6 @@
     flex-shrink: 0;
   }
 
-  .header-top-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
   .sync-nav-btn {
     font-size: 12px;
     padding: 4px 12px;
@@ -614,17 +599,6 @@
   .sync-nav-btn:hover {
     background-color: var(--accent);
     color: white;
-  }
-
-  .back-btn {
-    align-self: flex-start;
-    font-size: 12px;
-    padding: 3px 8px;
-    color: var(--text-muted);
-  }
-
-  .back-btn:hover {
-    color: var(--accent);
   }
 
   .title-row {

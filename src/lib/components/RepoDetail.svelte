@@ -8,7 +8,7 @@
   import type { RepoRename } from '$lib/types';
   import { deleteRepoOnGitHub, splitRepoFullName } from '$lib/api/github';
   import { addToast } from '$lib/stores/ui';
-  import { getRoleLabel, getDisplayName, ROLE_ICONS, type Role } from '$lib/types';
+  import { getRoleLabel, getDisplayName, type Role } from '$lib/types';
   import type { StatsSummary as StatsSummaryData } from '$lib/types';
   import { tStore, locale } from '$lib/i18n';
   import { pat } from '$lib/stores/settings';
@@ -28,13 +28,6 @@
   const roles = roleKeys.map((key) => [key, getRoleLabel(key)] as [Role, string]);
 
   const repo = $derived($allRepos.find((r) => r.id === $selectedRepoId) ?? null);
-  const projectName = $derived(
-    repo?.project_id
-      ? ($projects.find((p) => p.id === repo.project_id)?.name ?? $tStore('repoDetail.unknown'))
-      : $tStore('repoDetail.unassigned')
-  );
-  const roleLabel = $derived(repo?.role ? getRoleLabel(repo.role as Role) : null);
-  const roleIcon = $derived(repo?.role ? ROLE_ICONS[repo.role as Role] ?? '' : '');
 
   // T-050 v0.21.0: inline-edit display name for local-only repos + rename history list
   const isLocalOnly = $derived(repo ? repo.github_name === null : false);
@@ -247,27 +240,10 @@
 
 <div class="repo-detail">
   {#if !repo}
-    <div class="back-row">
-      <button class="back-btn" onclick={() => currentScreen.set({ name: 'dashboard' })} type="button">
-        {$tStore('repoDetail.backToRepos')}
-      </button>
-    </div>
     <EmptyState icon="📂" title={$tStore('repoDetail.notFound')} hint={$tStore('repoDetail.notFoundHint')} />
   {:else}
-    <!-- Sticky header -->
+    <!-- Sticky header (C-variant: 2-row compact, no back-btn, no top-right badges) -->
     <div class="sticky-header">
-      <div class="header-top">
-        <button class="back-btn" onclick={() => currentScreen.set({ name: 'dashboard' })} type="button">
-          {$tStore('repoDetail.backToRepos')}
-        </button>
-        <div class="header-right">
-          {#if roleLabel}
-            <span class="role-badge">{roleIcon} {roleLabel}</span>
-          {/if}
-          <span class="project-tag">{projectName}</span>
-        </div>
-      </div>
-
       <h2 class="repo-name">
         {#if editingName && isLocalOnly}
           <input
@@ -299,60 +275,59 @@
         </div>
       {/if}
 
-      {#if repo.description}
-        <p class="repo-desc">{repo.description}</p>
-      {/if}
-
+      <!-- Row 1: lang + last-pushed + path + folder-btn, action прижата вправо -->
       <div class="meta-row">
         {#if repo.language}
           <span class="lang-badge">{repo.language}</span>
         {/if}
         <span class="meta-text">{$tStore('repoDetail.labelLastPushed')}: {formatDate(repo.last_pushed_at)}</span>
-
-        <span class="meta-sep">|</span>
-
-        <select class="inline-select" value={repo.role ?? 'other'} onchange={handleRoleChange} title={$tStore('repoDetail.setRole')}>
-          {#each roles as [key, label] (key)}
-            <option value={key}>{label}</option>
-          {/each}
-        </select>
-
-        <select class="inline-select" value={repo.project_id ?? ''} onchange={handleProjectChange} title={$tStore('repoDetail.assignToProject')}>
-          <option value="">{$tStore('repoDetail.unassigned')}</option>
-          {#each $projects as project (project.id)}
-            <option value={project.id}>{project.name}</option>
-          {/each}
-        </select>
-
-        <span class="meta-sep">|</span>
-
+        <span class="meta-dot">·</span>
         {#if repo.local_path}
           <span class="local-path ok">📁 {repo.local_path}</span>
         {:else}
           <span class="local-path warn">⚠ {$tStore('repo.localPathNotFound' as any)}</span>
         {/if}
         <button class="ghost mini" onclick={handleSetLocalPath} type="button">{$tStore('repo.localPathSet' as any)}</button>
-
-        <span class="meta-sep">|</span>
-
-        <select
-          class="inline-select"
-          value={repo.deploy_target ?? ''}
-          onchange={handleDeployTargetChange}
-          title={$tStore('repo.deployTarget' as any)}
-        >
-          <option value="">{$tStore('repo.deployTargetNone' as any)}</option>
-          {#each deployTargetOptions as lang (lang)}
-            <option value={lang}>{lang}</option>
-          {/each}
-        </select>
-
-        <button class="init-docs-btn" onclick={handleInitDocs} type="button">
-          {$tStore('repo.initDocsButton' as any)}
+        <button class="init-docs-btn row-action" onclick={handleInitDocs} type="button" title={$tStore('repo.initDocsButton' as any)}>
+          <span class="btn-icon">📚</span>
+          <span class="btn-label">{$tStore('repo.initDocsButton' as any)}</span>
         </button>
+      </div>
 
-        <button class="delete-repo-btn" onclick={openDeleteDialog} type="button" disabled={deleting}>
-          {$tStore('repo.deleteButton' as any)}
+      <!-- Row 2: editable chips (Project / Role / Шаблон), Delete прижат вправо -->
+      <div class="chips-row">
+        <div class="chip">
+          <span class="chip-label">{$tStore('repoDetail.labelProject' as any)}:</span>
+          <select class="chip-select" value={repo.project_id ?? ''} onchange={handleProjectChange} title={$tStore('repoDetail.assignToProject')}>
+            <option value="">{$tStore('repoDetail.unassigned')}</option>
+            {#each $projects as project (project.id)}
+              <option value={project.id}>{project.name}</option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="chip">
+          <span class="chip-label">{$tStore('repoDetail.labelRole' as any)}:</span>
+          <select class="chip-select" value={repo.role ?? 'other'} onchange={handleRoleChange} title={$tStore('repoDetail.setRole')}>
+            {#each roles as [key, label] (key)}
+              <option value={key}>{label}</option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="chip">
+          <span class="chip-label">{$tStore('repo.deployTarget' as any)}:</span>
+          <select class="chip-select" value={repo.deploy_target ?? ''} onchange={handleDeployTargetChange}>
+            <option value="">{$tStore('repo.deployTargetNone' as any)}</option>
+            {#each deployTargetOptions as lang (lang)}
+              <option value={lang}>{lang}</option>
+            {/each}
+          </select>
+        </div>
+
+        <button class="delete-repo-btn row-action" onclick={openDeleteDialog} type="button" disabled={deleting} title={$tStore('repo.deleteButton' as any)}>
+          <span class="btn-icon">🗑</span>
+          <span class="btn-label">{$tStore('repo.deleteButton' as any)}</span>
         </button>
       </div>
     </div>
@@ -543,34 +518,10 @@
   .sticky-header {
     flex-shrink: 0;
     padding: 12px 24px;
+    container-type: inline-size;
+    container-name: repo-header;
     border-bottom: 1px solid var(--border);
     background-color: var(--bg);
-  }
-
-  .header-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 4px;
-  }
-
-  .header-right {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-  }
-
-  .back-btn {
-    background: none;
-    border: none;
-    padding: 0;
-    color: var(--text-muted);
-    font-size: 12px;
-    cursor: pointer;
-  }
-
-  .back-btn:hover {
-    color: var(--accent);
   }
 
   .repo-name {
@@ -627,27 +578,22 @@
     font-size: 11px;
   }
 
-  .repo-desc {
-    font-size: 12px;
-    color: var(--text-muted);
-    margin: 0 0 8px 0;
-    line-height: 1.4;
-  }
-
   .meta-row {
     display: flex;
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
     font-size: 12px;
+    margin-top: 4px;
   }
 
   .meta-text {
     color: var(--text-muted);
   }
 
-  .meta-sep {
-    color: var(--border);
+  .meta-dot {
+    color: var(--text-muted);
+    opacity: 0.5;
   }
 
   .lang-badge {
@@ -659,34 +605,60 @@
     color: var(--text-muted);
   }
 
-  .role-badge {
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 12px;
-    background-color: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text-muted);
-    white-space: nowrap;
+  .chips-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    padding-top: 6px;
   }
 
-  .project-tag {
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 12px;
-    background-color: rgba(59, 130, 246, 0.1);
-    border: 1px solid rgba(59, 130, 246, 0.2);
-    color: #60a5fa;
-    white-space: nowrap;
-  }
-
-  .inline-select {
-    font-size: 11px;
-    padding: 1px 4px;
-    height: 22px;
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 10px;
     background: var(--surface);
     border: 1px solid var(--border);
+    border-radius: 14px;
+    transition: border-color 150ms, background 150ms;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .chip:hover { border-color: var(--accent); background: var(--surface-hover); }
+  .chip-label {
+    color: var(--text-muted);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .chip-select {
+    background: transparent;
     color: var(--text);
-    border-radius: 3px;
+    border: 0;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    padding: 2px 0;
+    font-family: inherit;
+    outline: none;
+  }
+
+  .row-action {
+    margin-left: auto;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .btn-icon { line-height: 1; }
+  .btn-label { white-space: nowrap; }
+
+  /* Adaptive collapse: hide button labels when header gets narrow.
+     Threshold tuned so icons appear before the row would wrap. */
+  @container repo-header (max-width: 760px) {
+    .row-action .btn-label { display: none; }
+    .row-action { padding: 4px 8px; }
   }
 
   .local-path {
@@ -745,36 +717,31 @@
   }
 
   .init-docs-btn {
-    font-size: 12px;
-    padding: 4px 10px;
+    font-size: 11px;
+    padding: 2px 10px;
     border-radius: 4px;
     border: 1px solid var(--border);
     background: transparent;
     color: var(--text);
     cursor: pointer;
-  }
-  .init-docs-btn:hover { background: var(--surface); }
-
-  .delete-repo-btn {
-    margin-left: auto;
-    font-size: 10px;
-    padding: 1px 7px;
-    height: 22px;
-    color: var(--danger, #ef4444);
-    background: transparent;
-    border: 1px solid var(--danger, #ef4444);
-    border-radius: 3px;
-    cursor: pointer;
-    opacity: 0.7;
     white-space: nowrap;
   }
+  .init-docs-btn:hover { background: var(--surface); border-color: var(--accent); }
 
-  .delete-repo-btn:hover:not(:disabled) {
-    background: var(--danger, #ef4444);
-    color: white;
-    opacity: 1;
+  .delete-repo-btn {
+    font-size: 11px;
+    padding: 2px 8px;
+    color: var(--danger, #ef4444);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: border-color 150ms;
   }
-
+  .delete-repo-btn:hover:not(:disabled) {
+    border-color: var(--danger, #ef4444);
+  }
   .delete-repo-btn:disabled {
     opacity: 0.3;
     cursor: not-allowed;
