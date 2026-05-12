@@ -1110,6 +1110,12 @@ fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>, Str
             &base.join("CLAUDE.md"),
         )?;
         updated.push("CLAUDE.md (section)".to_string());
+    } else {
+        // M6 review-fix: surface that the repo is orphan and the app-owned
+        // files were intentionally skipped. Without this entry the success
+        // toast lists what was actually written, leaving the user wondering
+        // why project.md / CLAUDE.md weren't updated.
+        updated.push("(project.md + CLAUDE.md skipped — repo has no project assigned)".to_string());
     }
     Ok(updated)
 }
@@ -1307,8 +1313,12 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                                     &r.old_canonical,
                                     &r.new_canonical,
                                 ) {
-                                    Ok(true) => migrated += 1,
-                                    Ok(false) => {}
+                                    Ok(sync::RenameOutcome::Renamed) => migrated += 1,
+                                    Ok(sync::RenameOutcome::NoOp) => {}
+                                    Ok(sync::RenameOutcome::Collision) => errors.push(format!(
+                                        "Rename collision on server side: both {}/ and {}/ exist under client-requirements — manual intervention needed",
+                                        r.old_canonical, r.new_canonical
+                                    )),
                                     Err(e) => errors.push(format!(
                                         "Rename replay {} → {} on server: {}",
                                         r.old_canonical, r.new_canonical, e
@@ -1372,9 +1382,14 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                                 errors.push(format!("Copy api.md -> {}: {}", client.display_name(), e))
                             }
                         }
-                    } else {
-                        errors.push(format!("api.md not found at: {}", srv_api.display()));
                     }
+                    // M5 review-fix: `api.md` absent → silent skip, symmetric
+                    // with `handlers.md`. Freshly scaffolded servers that haven't
+                    // yet written their contract were generating an error toast
+                    // on every sync. Once the server writes api.md the next sync
+                    // picks it up normally; the "missing api.md" condition is
+                    // reported in the client's pre-flight check (see global
+                    // CLAUDE.md `# API contract sync`), not via sync errors.
 
                     // Copy server's docs/handlers.md to client's docs/server-api/handlers.md
                     // (optional — silent skip if missing)
@@ -1473,8 +1488,12 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                                 &r.old_canonical,
                                 &r.new_canonical,
                             ) {
-                                Ok(true) => migrated += 1,
-                                Ok(false) => {}
+                                Ok(sync::RenameOutcome::Renamed) => migrated += 1,
+                                Ok(sync::RenameOutcome::NoOp) => {}
+                                Ok(sync::RenameOutcome::Collision) => errors.push(format!(
+                                    "Rename collision on server side: both {}/ and {}/ exist under microservice-requirements — manual intervention needed",
+                                    r.old_canonical, r.new_canonical
+                                )),
                                 Err(e) => errors.push(format!(
                                     "Rename replay {} → {} on server: {}",
                                     r.old_canonical, r.new_canonical, e
@@ -1497,8 +1516,12 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                                 &r.old_canonical,
                                 &r.new_canonical,
                             ) {
-                                Ok(true) => migrated += 1,
-                                Ok(false) => {}
+                                Ok(sync::RenameOutcome::Renamed) => migrated += 1,
+                                Ok(sync::RenameOutcome::NoOp) => {}
+                                Ok(sync::RenameOutcome::Collision) => errors.push(format!(
+                                    "Rename collision on microservice side: both {}/ and {}/ exist under server-requirements — manual intervention needed",
+                                    r.old_canonical, r.new_canonical
+                                )),
                                 Err(e) => errors.push(format!(
                                     "Rename replay {} → {} on microservice: {}",
                                     r.old_canonical, r.new_canonical, e

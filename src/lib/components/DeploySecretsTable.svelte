@@ -20,8 +20,11 @@
     deployEnvId: number;
     envName: string;
     repoId: number;
+    /** Notifies parent that workflow files are stale (role changes affect
+     *  which YAML section the secret renders into). M9 review-fix. */
+    onRoleChange?: () => void;
   }
-  let { deployEnvId, envName, repoId }: Props = $props();
+  let { deployEnvId, envName, repoId, onRoleChange }: Props = $props();
 
   let dbSecrets = $state<DeploySecret[]>([]);
   let repoSecretsFromGitHub = $state<RepoSecret[]>([]);
@@ -89,11 +92,13 @@
   }
 
   async function changeRole(s: DeploySecret, role: DeploySecretRole) {
+    if (s.role === role) return;
     await upsertDeploySecret(deployEnvId, s.secret_name, role, s.included, s.override_enabled);
     // Optimistic update — no full re-render
     dbSecrets = dbSecrets.map(x =>
       x.secret_name === s.secret_name ? { ...x, role } : x
     );
+    onRoleChange?.();
   }
 
   async function cycleRole(s: DeploySecret) {

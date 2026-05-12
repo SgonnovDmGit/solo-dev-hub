@@ -42,11 +42,28 @@
   let formValues = $state<Record<string, string>>({});
   let saving = $state(false);
   let generating = $state(false);
+  // M9 review-fix: secret role changes (build/deploy/runtime) flip which
+  // YAML section the secret renders into; without a regenerate the
+  // workflow files on disk fall out of sync with the user's intent.
+  // Cleared when handleGenerate completes successfully.
+  let workflowStale = $state(false);
   let diffFiles = $state<Array<{ path: string; content: string; existingContent: string | null; shouldWrite: boolean }> | null>(null);
   let branches = $state<BranchInfo[]>([]);
 
   const repo = $derived(env ? ($allRepos.find((r) => r.id === env!.repository_id) ?? null) : null);
   const coreComplete = $derived(REQUIRED_KEYS.every((k) => (formValues[k] ?? '').trim() !== ''));
+
+  // M10 review-fix: placeholder values are substituted into generated YAML
+  // via `@@VAR@@` without context-aware escaping. Values containing chars
+  // that break YAML in unquoted scalar positions (`:`, `#`, leading `>`,
+  // `|`, etc.) silently corrupt the rendered workflow. Flag suspicious
+  // values so the user knows before clicking Generate.
+  const YAML_UNSAFE_RE = /[:#"'`\\\n\r]|^[\s>|*&!\[\]{}?\-=<]/;
+  const yamlWarnings = $derived(
+    Object.entries(formValues)
+      .filter(([_, v]) => YAML_UNSAFE_RE.test((v ?? '').trim()))
+      .map(([k]) => k)
+  );
 
   function extractLocalized(v: any, fallback: string): string {
     if (v == null) return fallback;
@@ -207,6 +224,7 @@
     try {
       const result = await writeDeployFiles(env.id, env.repository_id, repo.local_path, toWrite);
       diffFiles = null;
+      workflowStale = false;
       addToast(
         $tStore('toast.deployWritten' as any).replace('{0}', String(result.written.length)),
         'success',
@@ -267,12 +285,31 @@
 
     <section>
       <h4>{$tStore('deploy.secretsSection' as any) || 'Secrets'}</h4>
-      <DeploySecretsTable deployEnvId={env.id} envName={env.name} repoId={repo.id} />
+      <DeploySecretsTable
+        deployEnvId={env.id}
+        envName={env.name}
+        repoId={repo.id}
+        onRoleChange={() => { workflowStale = true; }}
+      />
     </section>
 
+    {#if yamlWarnings.length > 0}
+      <section class="yaml-warn">
+        ⚠ {$tStore('deploy.yamlUnsafeWarning' as any) || 'Values may break YAML — review before generating'}: {yamlWarnings.join(', ')}
+      </section>
+    {/if}
+
     <section class="generate-row">
-      <button class="primary" disabled={generating || !coreComplete} onclick={handleGenerate}>
-        {$tStore('deploy.generateWorkflowFiles' as any) || 'Generate workflow files'}
+      <button
+        class="primary"
+        class:stale={workflowStale}
+        disabled={generating || !coreComplete}
+        onclick={handleGenerate}
+        title={workflowStale ? ($tStore('deploy.regenerateNeeded' as any) || 'Workflow files are stale — regenerate to apply role changes') : ''}
+      >
+        {workflowStale
+          ? ($tStore('deploy.regenerateWorkflowFiles' as any) || 'Regenerate workflow files')
+          : ($tStore('deploy.generateWorkflowFiles' as any) || 'Generate workflow files')}
       </button>
     </section>
   </div>
@@ -322,5 +359,24 @@
   .generate-row {
     display: flex;
     justify-content: flex-end;
+  }
+  .yaml-warn {
+    background: rgba(234, 179, 8, 0.1);
+    border: 1px solid rgba(234, 179, 8, 0.35);
+    border-radius: 4px;
+    padding: 0.5rem 0.75rem;
+    color: var(--text);
+    font-size: 0.85rem;
+  }
+  /* M9 review-fix: amber-tinted button when workflow files are stale due
+     to role changes. Stays disabled if !coreComplete (semantic priority:
+     "fix the form first"); enables once form is complete to draw the
+     user toward regenerate. */
+  button.primary.stale {
+    background-color: rgb(234, 179, 8);
+    border-color: rgb(234, 179, 8);
+  }
+  button.primary.stale:hover:not(:disabled) {
+    background-color: rgb(202, 138, 4);
   }
 </style>

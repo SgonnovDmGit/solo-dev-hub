@@ -78,13 +78,24 @@ export async function checkForUpdate(silent = false): Promise<void> {
       updaterStatus.set({ kind: 'upToDate' });
     }
   } catch (err) {
+    const category = categorizeError(err);
     if (silent) {
-      updaterStatus.set({ kind: 'idle' });
-      console.warn('Silent update check failed:', err);
-      return;
+      // M11 review-fix: silent-mode previously reset everything to `idle`
+      // and swallowed all error categories — fine for `notFound` (expected
+      // on private repo pre-public-flip), but `network` / `signature` /
+      // `unknown` are real problems that the About card should be able to
+      // surface when the user opens it. Keep `notFound` quiet, escalate
+      // the others into the normal error state.
+      if (category === 'notFound') {
+        updaterStatus.set({ kind: 'idle' });
+        console.warn('Silent update check: not found (expected on private repo)', err);
+        return;
+      }
+      console.warn('Silent update check surfaced unexpected error:', err);
+    } else {
+      console.warn('Update check failed:', err);
     }
-    console.warn('Update check failed:', err);
-    updaterStatus.set({ kind: 'error', category: categorizeError(err), message: String(err) });
+    updaterStatus.set({ kind: 'error', category, message: String(err) });
   }
 }
 

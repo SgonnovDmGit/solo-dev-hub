@@ -226,8 +226,12 @@
     </div>
   </div>
 
-  <!-- Row 3: Comment (only when fix_attempts > 0) -->
-  {#if bug.fix_attempts > 0}
+  <!-- Row 3: Comment. Shown whenever a comment exists OR at least one fix
+       attempt happened. M2 review-fix: an LLM/user can set comment on a
+       bug still in `created`/`in-progress`; the previous `fix_attempts > 0`
+       gate hid the comment until the first testing transition, which made
+       the comment appear out of nowhere later. -->
+  {#if bug.fix_attempts > 0 || (bug.comment ?? '').trim().length > 0}
     <div class="row-3">
       {#if editingComment}
         <textarea

@@ -138,18 +138,32 @@ pub fn migrate_file(source: &Path, target: &Path) -> Result<(), String> {
 /// Callers pass the **parent** directory (e.g. `srv/docs/client-requirements/`)
 /// and the `old`/`new` canonical folder names. No DB state is updated — idempotency
 /// comes from fs checks, not from a persistent "applied" flag.
-pub fn replay_rename_in_dir(parent: &Path, old: &str, new: &str) -> Result<bool, String> {
+/// M7 review-fix: distinguishable outcomes so callers can surface
+/// "collision" as a warning instead of swallowing it as no-op. Previously
+/// the function returned `Ok(false)` for both "nothing to do" and "new dir
+/// already exists alongside old" — the latter is a manual-intervention
+/// signal, the former is normal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenameOutcome {
+    /// Successfully renamed `old` → `new`.
+    Renamed,
+    /// No rename needed (old missing, identical names, or empty inputs).
+    NoOp,
+    /// Both `old` and `new` directories exist — ambiguous state, left as-is.
+    Collision,
+}
+
+pub fn replay_rename_in_dir(parent: &Path, old: &str, new: &str) -> Result<RenameOutcome, String> {
     if old == new || old.is_empty() || new.is_empty() {
-        return Ok(false);
+        return Ok(RenameOutcome::NoOp);
     }
     let old_dir = parent.join(old);
     let new_dir = parent.join(new);
     if !old_dir.exists() {
-        return Ok(false);
+        return Ok(RenameOutcome::NoOp);
     }
     if new_dir.exists() {
-        // Caller may choose to log this (collision = manual intervention needed).
-        return Ok(false);
+        return Ok(RenameOutcome::Collision);
     }
     fs::rename(&old_dir, &new_dir).map_err(|e| {
         format!(
@@ -159,7 +173,7 @@ pub fn replay_rename_in_dir(parent: &Path, old: &str, new: &str) -> Result<bool,
             e
         )
     })?;
-    Ok(true)
+    Ok(RenameOutcome::Renamed)
 }
 
 /// F-033 Stage 1f Case B: one-time migration of a subfolder under a parent dir,
@@ -1489,7 +1503,7 @@ mod tests {
         // new exists but no old
         fs::create_dir_all(parent.join("new-name")).unwrap();
         let result = replay_rename_in_dir(parent, "old-name", "new-name").unwrap();
-        assert!(!result, "no-op when old_dir missing");
+        assert_eq!(result, RenameOutcome::NoOp, "no-op when old_dir missing");
         assert!(parent.join("new-name").exists());
     }
 
@@ -1501,21 +1515,21 @@ mod tests {
         fs::write(parent.join("old-name/REQ-001.md"), "x").unwrap();
 
         let result = replay_rename_in_dir(parent, "old-name", "new-name").unwrap();
-        assert!(result, "actual rename happened");
+        assert_eq!(result, RenameOutcome::Renamed);
         assert!(!parent.join("old-name").exists());
         assert!(parent.join("new-name").exists());
         assert!(parent.join("new-name/REQ-001.md").exists());
     }
 
     #[test]
-    fn test_replay_rename_noop_when_new_exists() {
+    fn test_replay_rename_collision_when_both_exist() {
         let tmp = TempDir::new().unwrap();
         let parent = tmp.path();
         fs::create_dir_all(parent.join("old-name")).unwrap();
         fs::create_dir_all(parent.join("new-name")).unwrap();
 
         let result = replay_rename_in_dir(parent, "old-name", "new-name").unwrap();
-        assert!(!result, "collision → no-op");
+        assert_eq!(result, RenameOutcome::Collision, "both dirs present → collision");
         assert!(parent.join("old-name").exists(), "old preserved");
         assert!(parent.join("new-name").exists(), "new preserved");
     }
@@ -1525,7 +1539,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("same")).unwrap();
         let result = replay_rename_in_dir(tmp.path(), "same", "same").unwrap();
-        assert!(!result);
+        assert_eq!(result, RenameOutcome::NoOp);
     }
 
     // ── F-033 Stage 1f Case B: migrate_subfolder_rename ──────────────────────

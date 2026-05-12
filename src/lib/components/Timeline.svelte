@@ -66,13 +66,16 @@
   }
 
   onMount(() => {
-    // v0.22.0 (T-000056): consume transient repo-filter from RecentActivityFeed deep-link
+    // v0.22.0 (T-000056): consume transient repo-filter from RecentActivityFeed
+    // deep-link. The $effect below will pick up the assignment and fire
+    // loadFirstPage once — no explicit call needed (M3 review-fix: previous
+    // versions called loadFirstPage here AND let the effect fire, causing
+    // a duplicate fetch on every deep-link mount).
     const initRepoIds = get(timelineInitialRepoIds);
     if (initRepoIds && initRepoIds.length > 0) {
       selectedRepos = initRepoIds;
       timelineInitialRepoIds.set(null);  // one-shot: clear after consume
     }
-    loadFirstPage();
   });
 
   let filterChangeTimer: ReturnType<typeof setTimeout> | null = null;

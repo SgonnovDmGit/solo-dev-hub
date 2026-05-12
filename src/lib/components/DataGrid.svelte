@@ -178,7 +178,23 @@
     if (p === 'medium') return 'rgb(234, 179, 8)';
     return 'var(--text-muted)';
   }
+
+  // M4 review-fix: close the column filter dropdown on outside-click and Esc.
+  // Without this it stayed open after the user clicked anywhere else in the
+  // grid, breaking the "open one filter at a time" expectation. Mirrors the
+  // pattern used in InputContextMenu (B-000007).
+  function handleDocumentClick(e: MouseEvent) {
+    if (openFilterKey === null) return;
+    const target = e.target as Element | null;
+    if (target && target.closest('.filter-dropdown')) return;
+    openFilterKey = null;
+  }
+  function handleKeydown(e: KeyboardEvent) {
+    if (openFilterKey !== null && e.key === 'Escape') openFilterKey = null;
+  }
 </script>
+
+<svelte:window onclick={handleDocumentClick} onkeydown={handleKeydown} />
 
 <div class="grid">
   <div class="toolbar">
