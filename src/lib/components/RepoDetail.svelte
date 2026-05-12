@@ -22,6 +22,7 @@
   import DoneTab from './DoneTab.svelte';
   import { syncTasksForRepo } from '$lib/api/tauri-commands';
   import RepoChangelogTab from './RepoChangelogTab.svelte';
+  import DeployScreen from './DeployScreen.svelte';
 
   const roleKeys: Role[] = ['server', 'admin_client', 'client', 'test_client', 'landing', 'tool', 'other'];
   const roles = roleKeys.map((key) => [key, getRoleLabel(key)] as [Role, string]);
@@ -152,8 +153,8 @@
   // B-003: deploy target state
   let deployTargetOptions = $state<string[]>([]);
 
-  // F-021: tabs in RepoDetail.
-  type Tab = 'bugs' | 'tasks' | 'done' | 'changelog' | 'secrets' | 'stats';
+  // F-021: tabs in RepoDetail. T-000080: Deploy moved from separate screen to tab.
+  type Tab = 'bugs' | 'tasks' | 'done' | 'changelog' | 'deploy' | 'secrets' | 'stats';
   let activeTab = $state<Tab>('bugs');
 
   $effect(() => {
@@ -173,10 +174,6 @@
     const val = (e.target as HTMLSelectElement).value;
     await setDeployTarget(repo.id, val === '' ? null : val);
     await loadAllRepos();
-  }
-
-  function openDeploy() {
-    currentScreen.set({ name: 'deploy' });
   }
 
   async function handleInitDocs() {
@@ -350,12 +347,6 @@
           {/each}
         </select>
 
-        {#if repo.deploy_target && repo.github_name}
-          <button class="deploy-btn" onclick={openDeploy} type="button">
-            🚀 {$tStore('repo.deployButton' as any)}
-          </button>
-        {/if}
-
         <button class="init-docs-btn" onclick={handleInitDocs} type="button">
           {$tStore('repo.initDocsButton' as any)}
         </button>
@@ -392,6 +383,12 @@
         onclick={() => (activeTab = 'changelog')}
         type="button"
       >{$tStore('repo.tabChangelog' as any)}</button>
+      <button
+        class="tab-btn"
+        class:active={activeTab === 'deploy'}
+        onclick={() => (activeTab = 'deploy')}
+        type="button"
+      >{$tStore('repo.tabDeploy' as any)}</button>
       <button
         class="tab-btn"
         class:active={activeTab === 'secrets'}
@@ -443,6 +440,14 @@
       {:else}
         <div class="bugs-blocked">
           <p>{$tStore('repo.bugsBlocked' as any)}</p>
+        </div>
+      {/if}
+    {:else if activeTab === 'deploy'}
+      {#if repo.github_name && repo.deploy_target}
+        <DeployScreen />
+      {:else}
+        <div class="bugs-blocked">
+          <p>{$tStore('repo.deployBlocked' as any)}</p>
         </div>
       {/if}
     {:else if activeTab === 'stats'}
@@ -749,23 +754,6 @@
     cursor: pointer;
   }
   .init-docs-btn:hover { background: var(--surface); }
-
-  .deploy-btn {
-    font-size: 10px;
-    padding: 1px 7px;
-    height: 22px;
-    color: var(--accent);
-    background: transparent;
-    border: 1px solid var(--accent);
-    border-radius: 3px;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-
-  .deploy-btn:hover {
-    background: var(--accent);
-    color: white;
-  }
 
   .delete-repo-btn {
     margin-left: auto;

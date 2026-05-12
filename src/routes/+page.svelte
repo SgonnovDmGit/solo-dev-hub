@@ -21,7 +21,6 @@
   import SyncScreen from '$lib/components/SyncScreen.svelte';
   import TemplatesScreen from '$lib/components/TemplatesScreen.svelte';
   import AppDefaultsScreen from '$lib/components/AppDefaultsScreen.svelte';
-  import DeployScreen from '$lib/components/DeployScreen.svelte';
   import About from '$lib/components/About.svelte';
   import Timeline from '$lib/components/Timeline.svelte';
   import GlobalClaudeEditor from '$lib/components/GlobalClaudeEditor.svelte';
@@ -253,8 +252,6 @@
         <TemplatesScreen />
       {:else if $currentScreen.name === 'app_defaults'}
         <AppDefaultsScreen />
-      {:else if $currentScreen.name === 'deploy'}
-        <DeployScreen />
       {:else if $currentScreen.name === 'about'}
         <About />
       {:else if $currentScreen.name === 'timeline'}

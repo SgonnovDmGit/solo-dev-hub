@@ -34,6 +34,58 @@
   filesystem path из своего project.md без cross-repo sync infrastructure.
   +2 unit-теста (`test_generate_project_md_microservice_parent_includes_server_path`,
   `test_generate_project_md_microservice_parent_without_server_path`) → 298 total.
+- **T-000086 | F-000040 template clarifications** — два уточнения в
+  `# Cross-repo announcements` секции global CLAUDE.md template после
+  pilot-проверки subagent'ом, выявившей места требующие интерпретации.
+  (1) **NNN counter behavior** — explicit правило для непустой folder:
+  использовать `max(existing NNN) + 1`; NNN — monotonic counter, не
+  slot allocator. Закрывает кейс когда часть entries ранее acknowledged
+  и удалена — новые номера всё равно идут после максимального
+  использованного, не переиспользуют свободные слоты. (2) **Threshold:
+  actionable impact required** — новый `### Threshold` подраздел после
+  основной таблицы "When to use". Strict criterion: announcement
+  оправдана только если recipient должен принять действие (изменить
+  код / конфиг / поведение). Чистое существование sender-side изменения
+  (e.g. новый admin-only endpoint) — недостаточно; pure surface
+  additions идут через `docs/api.md` sync. Positive criterion (helper
+  для unsure-sender'ов): если recipient должен изменить код/конфиг/
+  поведение чтобы продолжать работать — пиши announcement; если может
+  работать дальше и подобрать изменение через api.md позже — не пиши.
+  Rationale: чрезмерные announcements обесценивают канал.
+- **T-000085 | docs/flows/cross-repo-announcements.md** — новый flow
+  doc для F-000040 announcement channel, mirror'ом структуры
+  `microservice-server-sync.md`. Содержание: модель (one-way push, 2
+  направления, no app-side sync), таблица "Когда использовать vs REQ
+  receipt" + threshold/positive criterion summary, lifecycle (server→client
+  пример с rate-limit header), microservice→parent server flow (с
+  упоминанием project.md path lookup и v0.26.0 расширения), сценарии
+  "когда уместен" (sender-initiated / side-effect / post-review-rework
+  / deprecation) vs "когда НЕ уместен" (admin-only surface / silent fix
+  / reactive case / reverse REQ / undefined impact), таблица "Где
+  Solo Dev Hub помогает / не помогает" (app участвует только в
+  generate_project_md), carve-out из no-cross-repo-writes rule с
+  обоснованием через асимметрию flow, cross-reference на нормативные
+  H1/H2/H3 в global CLAUDE.md template'е и на `microservice-server-sync.md`
+  § Triangular flow для REQ-based флоу.
+
+### Changed
+- **T-000080 / T-000079 | Deploy переехал из отдельного экрана в таб
+  RepoDetail** — раньше `Deploy` открывался отдельным screen-route'ом
+  через кнопку 🚀 в шапке RepoDetail (`currentScreen.set({name:
+  'deploy'})`). Архитектурно это master-detail внутри одного репо
+  (список deploy-инстансов → drill-down per-env), поэтому логичнее
+  жить рядом с Bugs/Tasks/Done/Changelog/Secrets/Stats. Tab вставлен
+  между Changelog и Secrets. Symmetry с другими табами: state локальный
+  (`$state<Tab>`), drill-down (выбранный env) — внутри DeployScreen, не
+  в ui-store, при tab-switch сбрасывается. Закрывает T-000079 (контекст
+  репо очевиден из tabs-nav + RepoDetail header). Изменения: drop
+  `'deploy'` из `ScreenName` union в ui-store, drop route в
+  `+page.svelte`, drop back-button + H2 header в `DeployScreen.svelte`,
+  drop `openDeploy()` + 🚀 кнопку + `.deploy-btn` стили в RepoDetail,
+  drop dead i18n keys (`deploy.back`, `deploy.deploymentsTitle`,
+  `repo.deployButton`), новые i18n keys (`repo.tabDeploy`,
+  `repo.deployBlocked`) × ru/en. Empty-state если репо без
+  `github_name` или `deploy_target` (с инструкцией указать в шапке).
 
 ## [0.25.0] — 2026-05-12
 

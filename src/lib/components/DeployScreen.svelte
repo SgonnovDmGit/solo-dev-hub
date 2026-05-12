@@ -1,9 +1,8 @@
 <script lang="ts">
-  import { selectedRepoId, currentScreen, addToast } from '$lib/stores/ui';
+  import { selectedRepoId, addToast } from '$lib/stores/ui';
   import { allRepos } from '$lib/stores/repos';
   import { pat } from '$lib/stores/settings';
   import { tStore } from '$lib/i18n';
-  import { getDisplayName } from '$lib/types';
   import type { DeployEnvironment } from '$lib/types';
   import {
     listDeployEnvironments, createDeployEnvironment, cloneDeployEnvironment,
@@ -129,10 +128,6 @@
     }
   }
 
-  function back() {
-    currentScreen.set({ name: 'repo-detail' });
-  }
-
   $effect(() => {
     if (repo && viewMode === 'list') {
       loadEnvironments();
@@ -149,13 +144,6 @@
       onBack={backToList}
     />
   {:else}
-    <div class="header">
-      <button class="ghost back-btn" onclick={back} type="button">
-        {$tStore('deploy.back' as any)}
-      </button>
-      <h2>{($tStore('deploy.deploymentsTitle' as any) || 'Deployments: {0}').replace('{0}', getDisplayName(repo))}</h2>
-    </div>
-
     {#if loading}
       <p class="loading">{$tStore('common.loading' as any)}</p>
     {:else if environments.length === 0 && !showNewForm}

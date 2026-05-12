@@ -319,6 +319,14 @@ Announcements are a one-way push channel for **unsolicited** information that do
 
 In short: REQ → receipt is reactive ("you asked, here's the answer"). Announcement is proactive ("you didn't ask, but you need to know this"). They share no machinery — announcements have no recipient response, no app-side sync, no confirmation pair.
 
+### Threshold: actionable impact required
+
+An announcement is appropriate **only when the recipient would need to take action** — change code, configuration, or behavior, or acknowledge a deprecation timeline. The mere existence of a related sender-side change (e.g. a new admin-only endpoint, an internal refactor that does not affect the wire format) is **not** enough. For pure surface additions that the recipient may or may not adopt, use the standard `docs/api.md` contract sync — the recipient discovers them through the synced contract on its own schedule.
+
+**Positive criterion (helper if you're unsure):** if the recipient would need to change code, config, or behavior to keep working correctly — write an announcement. If the recipient can continue working unchanged and pick up the change later through `docs/api.md`, do not.
+
+Why the threshold matters: excessive announcements train recipients to ignore the channel, which devalues the urgent ones.
+
 ## Directions
 
 Two directions exist symmetrically:
@@ -338,7 +346,10 @@ Reverse directions (client → server, server → MS) do not exist as announceme
 
    If the path is missing (rendered as `no local path configured`) or the repo entry is marked `⚠ server repo not resolvable`, **do not write the announcement** — it is not deliverable. Surface the gap to the user (own session log, or a `T-NNNNNN` in `docs/todo.md`).
 
-2. **Pick the next free `NNN`** in the recipient's announcement folder. If the folder does not exist, create it and use `001`. Number is per-(sender × recipient) pair, not global.
+2. **Pick the next free `NNN`** in the recipient's announcement folder.
+   - If the folder does not exist, create it and use `001`.
+   - If the folder exists and contains at least one `ANNOUNCE-*.md`, use `max(existing NNN) + 1`. Do **not** reuse numbers from previously deleted (acknowledged) entries — `NNN` is a monotonic counter, not a slot allocator. This keeps git history of the recipient repo readable: numbers always grow, even after acknowledgements remove files.
+   - Number is per-(sender × recipient) pair, not global.
 
    **Subfolder naming** — use **last-segment / canonical** form (e.g. `web-app-backend`, not `SgonnovDmGit/web-app-backend`), matching the existing convention for `client-requirements/<client-repo>/` and `microservice-requirements/<ms-project>/`. The sender identifies its own canonical name from its `docs/project.md` `## Repositories` row whose `Path` matches the current working directory.
 
