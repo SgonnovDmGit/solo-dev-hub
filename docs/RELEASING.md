@@ -131,6 +131,3 @@ npm run tauri signer generate -- -w .tauri/signing-key.pem
    - **npm ci fail** — обновить `package-lock.json` и закоммитить.
 3. Удалить failed Release (если был создан) и tag (`git push --delete origin vX.Y.Z` + `git tag -d vX.Y.Z`), исправить проблему, перетегнуть.
 
-## 0.14.0 → 0.15.0 (first time, one-off)
-
-0.14.0 и ранее не содержат updater-plugin. Переход с 0.14.0 на 0.15.0 — **ручной**: скачать `github-repo-manager_0.15.0_x64-setup.exe` с GitHub Releases и установить (исторический installer, имя файла на тот момент). С 0.15.0 дальнейшие обновления через in-app updater.
