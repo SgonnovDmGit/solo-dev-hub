@@ -1,6 +1,7 @@
 <script lang="ts" generics="T extends Record<string, any>">
   import { onMount } from 'svelte';
   import { getSetting, setSetting } from '$lib/api/tauri-commands';
+  import { tStore } from '$lib/i18n';
 
   interface ColumnDef<T> {
     key: keyof T & string;
@@ -201,7 +202,7 @@
     <input
       type="search"
       class="search"
-      placeholder="🔍 Поиск..."
+      placeholder={$tStore('grid.searchPlaceholder' as any)}
       bind:value={searchText}
     />
   </div>

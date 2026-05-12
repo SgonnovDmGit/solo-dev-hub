@@ -3,6 +3,12 @@
   import { tStore } from '$lib/i18n';
   import TemplateEditor from './TemplateEditor.svelte';
 
+  // P9 review-fix: stable reference so TemplateEditor's $effect tracking
+  // `excludeFiles` doesn't re-fire on every parent render (theme toggle,
+  // i18n change). Inline array literal `{['x']}` allocates a new array
+  // every render — same content, different identity.
+  const excludeFiles = ['claude.md.global.tmpl'];
+
   function back() {
     currentScreen.set({ name: 'settings' });
   }
@@ -17,7 +23,7 @@
   </div>
 
   <div class="body">
-    <TemplateEditor languageKey="_global" excludeFiles={['claude.md.global.tmpl']} />
+    <TemplateEditor languageKey="_global" {excludeFiles} />
   </div>
 </div>
 

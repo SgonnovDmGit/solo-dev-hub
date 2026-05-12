@@ -6,6 +6,7 @@ const ru = {
   'common.loading': 'Загрузка...',
   'common.selectAll': 'Все',
   'common.clearAll': 'Сбросить',
+  'grid.searchPlaceholder': '🔍 Поиск...',
   // app
   'app.title': 'Solo Dev Hub',
   'app.settings': 'Настройки',
@@ -799,6 +800,7 @@ const en: Record<TranslationKey, string> = {
   'common.loading': 'Loading...',
   'common.selectAll': 'All',
   'common.clearAll': 'Clear',
+  'grid.searchPlaceholder': '🔍 Search...',
   // app
   'app.title': 'Solo Dev Hub',
   'app.settings': 'Settings',

@@ -5,7 +5,6 @@
   import { tStore } from '$lib/i18n';
   import { syncProject, listProjectRequirements, confirmRequirement } from '$lib/api/tauri-commands';
   import { getDisplayName, type RequirementInfo } from '$lib/types';
-  import { onMount } from 'svelte';
 
   let requirements = $state<RequirementInfo[]>([]);
   let syncing = $state(false);
@@ -25,8 +24,12 @@
     }
   }
 
-  onMount(() => {
-    loadRequirements();
+  // P8 review-fix: reactive on projectId so navigating to SyncScreen for a
+  // different project (without unmount) reloads its requirements instead
+  // of showing stale data from the previous project. Mirrors the pattern
+  // used in TasksTab and RepoChangelogTab.
+  $effect(() => {
+    if (projectId) loadRequirements();
   });
 
   async function handleSync() {

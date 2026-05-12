@@ -103,7 +103,7 @@ export async function toggleShowConfirmed(): Promise<void> {
 
 export async function addBug(
   description: string = '',
-  severity: string = 'minor',
+  severity: string = 'medium',
   category: string = 'other',
 ): Promise<void> {
   if (currentRepoId === null) return;

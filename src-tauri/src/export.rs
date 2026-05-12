@@ -539,14 +539,29 @@ pub fn parse_done_entries_in_period(
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(date_str) = trimmed.strip_prefix("## ") {
-            let date = date_str.trim();
-            if date.len() == 10
-                && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
-            {
-                current_date = Some(date.to_string());
-            } else {
-                current_date = None;
-            }
+            // P5 review-fix: match parse_done_tasks's date tolerance — accept
+            // legacy `## День 29.03.2026` headers via `is_date_like` (which
+            // recognises ISO + DD.MM.YYYY + DD/MM/YYYY). Normalise everything
+            // to YYYY-MM-DD for the range comparison so the Dashboard chart
+            // doesn't silently drop tasks from old projects.
+            current_date = date_str
+                .split_whitespace()
+                .find(|w| is_date_like(w))
+                .map(|d| {
+                    let d = d.trim();
+                    let b = d.as_bytes();
+                    if b[4] == b'-' {
+                        d.to_string()
+                    } else {
+                        // DD.MM.YYYY or DD/MM/YYYY → YYYY-MM-DD
+                        format!(
+                            "{}-{}-{}",
+                            &d[6..10],
+                            &d[3..5],
+                            &d[0..2]
+                        )
+                    }
+                });
         } else if trimmed.starts_with("- ") {
             if let Some(d) = &current_date {
                 if d.as_str() >= start && d.as_str() <= end {

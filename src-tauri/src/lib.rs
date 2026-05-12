@@ -921,6 +921,10 @@ fn read_dashboard(db: State<AppDb>, filter: DashboardFilter) -> Result<Dashboard
         .map_err(|e| e.to_string())?;
 
     Ok(DashboardData {
+        // active_bugs is a point-in-time count, not a period flow — delta
+        // vs prev_value would be misleading (e.g. "10 active" today vs
+        // "8 active" three months ago says nothing about throughput).
+        // The critical-count sub-line carries the only meaningful overlay.
         active_bugs: KpiCard {
             value: Some(active as f64),
             prev_value: None,
@@ -1264,10 +1268,14 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
         .map(|p| p.project_type)
         .unwrap_or_else(|| "standard".to_string());
     if project_type == "standard" {
+        // P6 review-fix: "No clients" is only relevant once the server is
+        // in place. Server-only build-out phase (server first, clients
+        // later) shouldn't generate a warning toast on every sync — that
+        // trains the user to ignore them. The "No server" case stays a
+        // warning because the server is the core of the standard flow.
         if server.is_none() {
             errors.push("No server found in project".to_string());
-        }
-        if clients.is_empty() {
+        } else if clients.is_empty() {
             errors.push("No clients found in project".to_string());
         }
     }

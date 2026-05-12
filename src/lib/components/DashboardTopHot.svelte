@@ -24,6 +24,7 @@
               {:else}
                 {p.critical} crit /
               {/if}
+              {p.major} maj /
               {p.active} act
             </div>
           </div>
