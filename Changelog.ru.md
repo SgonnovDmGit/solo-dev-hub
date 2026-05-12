@@ -4,7 +4,25 @@
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-05-12
+
 ### Changed
+- **T-000081 | Project CLAUDE.md full refactor** — раздел «Ключевые решения»
+  с inline-историей v0.16→v0.25 сжат в компактную «Эволюцию» с
+  одностроками per-version (детали и так в Changelog). Stale-link cleanup:
+  product display name «GitHub Repo Manager» → «Solo Dev Hub», autoupdate
+  endpoint URL обновлён на `solo-dev-hub` repo, устаревшие `docs/doc1_global_rules.md`
+  / `doc2` / `doc3` ссылки заменены актуальными путями (`docs/flows/`,
+  `docs/formats/`, global template). Test count re-baselined на 298.
+  Components-таблица консолидирована (Dashboard sub-components сгруппированы
+  в одну строку). Aligned с section taxonomy глобального шаблона.
+- **T-000089 | Changelog EN + RU split** — переименовали `Changelog.md`
+  (русский) в `Changelog.ru.md`, создан английский primary `Changelog.md`
+  для public-аудитории. Pre-v0.16 версии в EN сжаты до одностроков
+  (исторический контекст полностью сохранён в RU-mirror'е). EN — основной
+  changelog; RU поддерживается параллельно. Аналогично паттерну
+  `README.md` (EN) + `README.ru.md` (RU). `docs/RELEASING.md` обновлён —
+  release closure теперь требует обновления обоих файлов.
 - **T-000090 | Template: explicit reverse-direction disclaimer для REQ** —
   усиление `# Cross-repo requirements` секции global CLAUDE.md template
   после обнаружения misuse в живой сессии (server-LLM написал «REQ для
@@ -20,6 +38,19 @@
   заполняются Solo Dev Hub'ом из sender-outgoing, не вручную; REQ там
   не пропагируется и будет принят за incoming-request». Server→client
   и MS→server инициативные сообщения = announcement, не REQ.
+
+### Added
+- **T-000084 | GitHub repo description + topics** — pre-public-launch
+  SEO/discovery подготовка. Применено через GitHub web UI 2026-05-12
+  (Settings → About). Description: «Solo developer's portfolio cockpit.
+  Bugs, requirements, deploy — all in markdown.» (matches README hero,
+  80 chars, в пределах GitHub 350-char limit). Topics (12): `tauri`,
+  `svelte`, `sveltekit`, `rust`, `project-management`, `github`,
+  `solo-developer`, `indie-dev`, `bug-tracker`, `deploy-automation`,
+  `developer-tools`, `desktop-app`. Последние два добавлены по
+  замечанию second-agent для broader discoverability. Топики работают
+  и на приватном репо; станут визуально-доступными после public flip
+  (T-000064 в v1.0.0).
 
 ## [0.26.1] — 2026-05-12
 
