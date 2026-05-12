@@ -20,6 +20,11 @@ export const showConfirmed = writable<boolean>(false);
 export const confirmedCount = writable<number>(0);
 
 let currentRepoId: number | null = null;
+// H1 review-fix: tracked alongside currentRepoId so refreshBugs can skip
+// reconcile for remote-only repos (no local_path → bugs_migrated_at IS
+// NULL → reconcile errors with "not migrated yet"). Earlier refreshBugs
+// called reconcile unconditionally → error toast on every bug-tab remount.
+let currentRepoHasLocalPath = false;
 
 /**
  * v0.16.0 load flow — DB-centric. Triggered on bug-tab open or repo switch.
@@ -34,6 +39,7 @@ let currentRepoId: number | null = null;
  */
 export async function loadBugsForRepo(repoId: number, hasLocalPath: boolean): Promise<void> {
   currentRepoId = repoId;
+  currentRepoHasLocalPath = hasLocalPath;
   try {
     if (hasLocalPath) {
       const report = await ensureBugsMigrated(repoId);
@@ -65,7 +71,11 @@ export async function loadBugsForRepo(repoId: number, hasLocalPath: boolean): Pr
 export async function refreshBugs(): Promise<void> {
   if (currentRepoId === null) return;
   try {
-    await reconcileBugsForRepo(currentRepoId);
+    // Skip reconcile for remote-only repos — bugs_migrated_at IS NULL there,
+    // reconcile would error and surface a toast on every bug-tab remount.
+    if (currentRepoHasLocalPath) {
+      await reconcileBugsForRepo(currentRepoId);
+    }
     const include = get(showConfirmed);
     bugs.set(await readBugsFromDb(currentRepoId, include));
     confirmedCount.set(await countConfirmedBugs(currentRepoId));

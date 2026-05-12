@@ -2624,12 +2624,15 @@ fn write_deploy_files(
     }
 
     // v0.20.0: record deploy event after successful file write.
+    // H8 review-fix: report `written.len()` (actually written) rather than
+    // `files.len()` (input total). Path-rejects + fs::write failures used
+    // to be silently counted into the metric.
     let _ = db.insert_deploy_event(
         Some(deploy_env_id),
         repo_id,
         "render",
         &chrono::Utc::now().to_rfc3339(),
-        Some(&format!(r#"{{"file_count":{}}}"#, files.len())),
+        Some(&serde_json::json!({ "file_count": written.len() }).to_string()),
     );
 
     Ok(WriteResult { written, errors })

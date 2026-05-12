@@ -21,10 +21,17 @@ pub fn get_pat() -> Result<Option<String>, String> {
 pub fn delete_pat() -> Result<(), String> {
     let entry = Entry::new(SERVICE_NAME, PAT_KEY).map_err(|e| e.to_string())?;
     match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(e) => return Err(e.to_string()),
     }
+    // H7 review-fix: also wipe the legacy entry. Otherwise
+    // `migrate_legacy_pat()` would resurrect the deleted token on the next
+    // cold start (it copies legacy → new whenever new is missing). The user
+    // would see the token reappear after restart with no obvious cause.
+    if let Ok(legacy) = Entry::new(LEGACY_SERVICE_NAME, PAT_KEY) {
+        let _ = legacy.delete_credential();
+    }
+    Ok(())
 }
 
 // T-000063: one-time PAT migration from the legacy keyring service to the new one.

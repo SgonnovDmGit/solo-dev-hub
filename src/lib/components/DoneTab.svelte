@@ -21,10 +21,15 @@
   let tasks = $state<Task[]>([]);
   let loading = $state(true);
 
+  // The "Date" column reflects when the task was marked done. `updated_at`
+  // is set by `update_task_source` when source flips todo → done; for
+  // historical done entries imported from done.md it falls back to the
+  // entry's date header. `created_at` would be wrong here — that's task-
+  // creation date (often months before completion).
   const columns: ColumnDef<Task>[] = $derived([
     { key: 'task_id', label: $tStore('done.col.id' as any), sortable: true, render: 'monospace', flex: 0.6 },
     { key: 'description', label: $tStore('done.col.description' as any), sortable: false, filter: 'text', flex: 4, wrap: true },
-    { key: 'created_at', label: $tStore('done.col.date' as any), sortable: true, render: 'date', flex: 1 },
+    { key: 'updated_at', label: $tStore('done.col.date' as any), sortable: true, render: 'date', flex: 1 },
     { key: 'version', label: $tStore('done.col.version' as any), sortable: true, filter: 'text', flex: 1 },
   ]);
 
@@ -66,7 +71,7 @@
       <DataGrid
         {columns}
         rows={tasks}
-        defaultSort={{ key: 'created_at', direction: 'desc' }}
+        defaultSort={{ key: 'updated_at', direction: 'desc' }}
         persistKey={`done_grid_state_${repoId}`}
         emptyMessage={$tStore('done.empty' as any)}
       />

@@ -48,7 +48,10 @@
     server: ['logic', 'database', 'performance', 'security', 'integration', 'other'],
     tool: ['ui_ux', 'ux_flow', 'logic', 'database', 'performance', 'other'],
   };
-  const defaultCategories = ['ui_ux', 'ux_flow', 'logic', 'backend', 'network', 'database', 'security', 'performance', 'integration', 'other'];
+  // 9 categories per DB CHECK constraint (`bugs.category`). Legacy v1 values
+  // `backend` / `network` were removed in v0.13.12 from the enum but lingered
+  // in this default array — picking them produced raw CHECK errors on save.
+  const defaultCategories = ['ui_ux', 'ux_flow', 'logic', 'auth', 'database', 'security', 'performance', 'integration', 'other'];
 
   const categories = $derived(categoriesByRole[repoRole] ?? defaultCategories);
 

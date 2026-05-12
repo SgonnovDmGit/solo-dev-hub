@@ -1120,14 +1120,22 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
         (Vec::new(), String::new())
     };
 
-    // Read and parse done.md
-    let done_tasks = if done_path.exists() {
+    // Read and parse done.md. `done_mtime` is used as the fallback date for
+    // historical done entries whose `## YYYY-MM-DD` section header is
+    // missing — `todo_mtime` was wrong here because the entry came from
+    // done.md, not todo.md (review H5).
+    let (done_tasks, done_mtime) = if done_path.exists() {
         let content = std::fs::read_to_string(&done_path)
             .map_err(|e| format!("read done.md: {}", e))?;
+        let mtime = std::fs::metadata(&done_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
         let (tasks, _warnings) = export::parse_done_tasks(&content);
-        tasks
+        (tasks, mtime)
     } else {
-        Vec::new()
+        (Vec::new(), String::new())
     };
 
     // Load existing DB rows keyed by task_id string
@@ -1258,11 +1266,13 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
             ).map_err(|e| e.to_string())?;
             events_emitted += 1;
         } else {
-            // Brand new done entry (historical task, never seen before in DB)
-            let fallback_date = if todo_mtime.is_empty() {
+            // Brand new done entry (historical task, never seen before in DB).
+            // Use done.md mtime as the fallback — the entry originated there,
+            // not in todo.md (which may have been touched much later).
+            let fallback_date = if done_mtime.is_empty() {
                 chrono::Utc::now().format("%Y-%m-%d").to_string()
             } else {
-                todo_mtime.clone()
+                done_mtime.clone()
             };
             let row = db.insert_task(
                 repo_id,
@@ -1301,6 +1311,22 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
     let db_todos_now = db.list_tasks_by_repo(repo_id, "todo").map_err(|e| e.to_string())?;
     for t in &db_todos_now {
         if !md_todo_ids.contains(t.task_id.as_str()) {
+            db.delete_task(t.id).map_err(|e| e.to_string())?;
+        }
+    }
+
+    // H6 review-fix: resolve split-state where the same task_id exists in
+    // both `todo` and `done` source for the same repo. The UNIQUE constraint
+    // is `(repository_id, task_id, source)` (not `task_id` alone), so this
+    // state is reachable after a crash mid-transition or a manual MD edit
+    // listing the same id in both files. Done is the more recent intent —
+    // drop the todo duplicate. Without this the user would see the task
+    // simultaneously in both Tasks and Done tabs.
+    let db_todos_now = db.list_tasks_by_repo(repo_id, "todo").map_err(|e| e.to_string())?;
+    let db_dones_now = db.list_tasks_by_repo(repo_id, "done").map_err(|e| e.to_string())?;
+    let done_ids: HashSet<&str> = db_dones_now.iter().map(|t| t.task_id.as_str()).collect();
+    for t in &db_todos_now {
+        if done_ids.contains(t.task_id.as_str()) {
             db.delete_task(t.id).map_err(|e| e.to_string())?;
         }
     }
@@ -2927,6 +2953,44 @@ mod tests {
         assert!(ids.contains("F-000035"));
         assert!(!ids.contains("T-034"), "old 3-digit row must be gone");
         assert!(!ids.contains("F-NNN"), "placeholder row must be gone");
+        std::mem::forget(tmp);
+    }
+
+    /// H6 review-fix: split-state where the same task_id ended up in both
+    /// `todo` and `done` source (e.g. after a crash mid-transition or a
+    /// manual MD edit listing it in both files) is resolved by dropping the
+    /// `todo` duplicate. The user would otherwise see the task in both tabs.
+    #[test]
+    fn test_sync_tasks_resolves_todo_done_split_state() {
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_path.join("docs")).unwrap();
+        // Initial state: task in todo only.
+        std::fs::write(
+            repo_path.join("docs/todo.md"),
+            "- [ ] T-000042 | Test task | 1 | high | open\n",
+        ).unwrap();
+        std::fs::write(repo_path.join("docs/done.md"), "").unwrap();
+        let repo = db.insert_local_repository(repo_path.to_str().unwrap(), "r1", None, None).unwrap();
+        crate::sync::sync_tasks_for_repo(&db, repo.id).unwrap();
+
+        // Simulate split-state: task_id present in both DB sources. Direct
+        // INSERT bypasses normal update_task_source to mimic the post-crash
+        // pathological state.
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_task(repo.id, "T-000042", "T", "Test task done", None, None, None,
+                       None, "done", &now).unwrap();
+        assert_eq!(db.list_tasks_by_repo(repo.id, "todo").unwrap().len(), 1);
+        assert_eq!(db.list_tasks_by_repo(repo.id, "done").unwrap().len(), 1);
+
+        // Next sync should drop the todo duplicate.
+        crate::sync::sync_tasks_for_repo(&db, repo.id).unwrap();
+
+        assert_eq!(db.list_tasks_by_repo(repo.id, "todo").unwrap().len(), 0,
+                   "todo duplicate must be removed when done row exists");
+        assert_eq!(db.list_tasks_by_repo(repo.id, "done").unwrap().len(), 1,
+                   "done row must survive");
         std::mem::forget(tmp);
     }
 

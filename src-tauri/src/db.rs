@@ -3607,15 +3607,42 @@ impl AppDb {
         offset: u32,
         limit: u32,
     ) -> SqlResult<Vec<crate::models::ActivityEvent>> {
-        let kinds_filter = filter.event_kinds.as_ref().filter(|v| !v.is_empty());
-        let project_ids_set: Option<std::collections::HashSet<i64>> = filter.project_ids.as_ref()
-            .filter(|v| !v.is_empty())
-            .map(|v| v.iter().copied().collect());
-        let repo_ids_set: Option<std::collections::HashSet<i64>> = filter.repo_ids.as_ref()
-            .filter(|v| !v.is_empty())
-            .map(|v| v.iter().copied().collect());
+        // H3 review-fix: push kind/repo/project filters into SQL `WHERE`
+        // before LIMIT/OFFSET. Previously these filters ran in Rust after
+        // fetching `limit` rows — when most rows got filtered out the
+        // caller saw `r.length < PAGE_SIZE` and assumed "no more events"
+        // even though plenty matched on later pages. `search` stays in
+        // Rust (substring match is cheap and the SQL form would be ugly
+        // across kinds).
+        // Build the dynamic WHERE additions from validated filters. Both
+        // i64 IDs (numeric) and the event-kind enum are safe to inline.
+        const VALID_KINDS: &[&str] = &[
+            "bug_event", "task_event", "sync_event", "deploy_event", "repo_rename",
+        ];
+        let mut where_extra = String::new();
+        if let Some(ref kinds) = filter.event_kinds {
+            let filtered: Vec<&str> = kinds.iter()
+                .filter_map(|k| VALID_KINDS.iter().find(|v| **v == k.as_str()).copied())
+                .collect();
+            if !filtered.is_empty() {
+                let list = filtered.iter().map(|k| format!("'{}'", k)).collect::<Vec<_>>().join(", ");
+                where_extra.push_str(&format!(" AND kind IN ({})", list));
+            }
+        }
+        if let Some(ref repos) = filter.repo_ids {
+            if !repos.is_empty() {
+                let list = repos.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ");
+                where_extra.push_str(&format!(" AND repo_id IN ({})", list));
+            }
+        }
+        if let Some(ref projs) = filter.project_ids {
+            if !projs.is_empty() {
+                let list = projs.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+                where_extra.push_str(&format!(" AND project_id IN ({})", list));
+            }
+        }
 
-        let sql = r#"
+        let sql_body = r#"
             SELECT * FROM (
               SELECT
                 'bug_event' AS kind,
@@ -3704,12 +3731,14 @@ impl AppDb {
               LEFT JOIN deploy_environments e ON e.id = de.deploy_env_id
             )
             WHERE date(ts) BETWEEN ?1 AND ?2
-            ORDER BY ts DESC
-            LIMIT ?3 OFFSET ?4
         "#;
+        let sql = format!(
+            "{}{} ORDER BY ts DESC LIMIT ?3 OFFSET ?4",
+            sql_body, where_extra
+        );
 
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![&filter.start_date, &filter.end_date, limit, offset], |row| {
             Ok((
                 row.get::<_, String>(0)?,            // kind
@@ -3731,23 +3760,10 @@ impl AppDb {
 
         let mut out: Vec<crate::models::ActivityEvent> = Vec::new();
         for row in rows {
-            let (kind, event_type, ts, repo_id, repo_name, bug_id, task_id, old_c, new_c, sync_t, deploy_a, deploy_e, change_c, project_id) = row?;
+            let (kind, event_type, ts, repo_id, repo_name, bug_id, task_id, old_c, new_c, sync_t, deploy_a, deploy_e, change_c, _project_id) = row?;
 
-            if let Some(ref kinds) = kinds_filter {
-                if !kinds.contains(&kind) { continue; }
-            }
-            if let Some(ref repos) = repo_ids_set {
-                match repo_id {
-                    Some(rid) if repos.contains(&rid) => {},
-                    _ => continue,
-                }
-            }
-            if let Some(ref projs) = project_ids_set {
-                match project_id {
-                    Some(pid) if projs.contains(&pid) => {},
-                    _ => continue,
-                }
-            }
+            // kind / repo_ids / project_ids are now filtered in SQL (above) —
+            // only `search` (substring match) stays in Rust.
             if let Some(ref s) = filter.search {
                 if !s.is_empty() {
                     let q = s.to_lowercase();
