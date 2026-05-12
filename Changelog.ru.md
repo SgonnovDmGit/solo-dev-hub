@@ -4,6 +4,55 @@
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-05-12
+
+Второй проход code-review после v0.27.1 — 32 находки в 4 доменах (bug/stats/dashboard, tasks/timeline/datagrid, cross-repo sync, deploy/secrets/settings). Закрыты 4 батчами: 3 critical + 8 high + 11 medium + 9 polish + 2 deferred (P7 microservice-api rename-replay требует новой схемы, P10 COMPOSE_SERVICE copy UX — дизайн-вопрос). Без новых фич, без migration'ов.
+
+### Fixed (critical)
+- **C1 | `confirm_requirement` удалял не ту microservice-пару при collision NNN** — ветка server→MS итерировала всех connected microservices и удаляла из первого где filename match'ил, без disambiguation по target. Каждая MS-папка ведёт свой NNN-счётчик, два MS могут независимо иметь `REQ-001.md` — клик ✓ на одной строке стирал sibling-пару. Tauri-команда теперь принимает `target_repo_id`, frontend SyncScreen.handleConfirm резолвит и source и target через `getDisplayName`. Включает M8: source role не `client*`/`server` (e.g. `tool`/`landing`) теперь возвращает explicit error вместо silent no-op'а.
+- **C2 | `valid_transition` пропускал LLM `testing → confirmed`** — функция whitelist'ила transition хотя комментарии настаивали что path UI-only. LLM пишущий `status: confirmed` в `bug-reports.md` обходил user-verification gate. Удалены `testing → confirmed` и `testing → rejected` из whitelist'а; `confirmed_at` теперь устанавливается только через UI `resolve_bug`. Тест переименован в `test_reconcile_rejects_testing_to_confirmed_from_md` asserting новый guard.
+- **C3 | `DeployDetail.load()` early-exit'ил когда `repo` не reactive** — `repo` это `$derived` от `$allRepos`, загружающийся параллельно и может быть not-yet-ready на mount'е. Предыдущий `if (!env || !repo) return` silently скипал GitHub Environment auto-ensure и branches fetch без retrigger'а. Split на env-fetch на mount + `$effect`-driven GitHub-side bootstrap firing один раз когда оба resolved.
+
+### Fixed (high)
+- **H1** `refreshBugs` теперь skip'ит reconcile для remote-only репо (no `local_path` → `bugs_migrated_at IS NULL` → error toast на каждый bug-tab remount). Store трекает `currentRepoHasLocalPath` рядом с `currentRepoId`.
+- **H2** Удалены legacy `backend` / `network` из `BugItem.defaultCategories` (не в 9-value DB CHECK enum с v0.13.12 — выбор давал raw SQLite error toast). Добавлен `auth` взамен.
+- **H3** Timeline `kind` / `repo_ids` / `project_ids` filters push'нуты в SQL `WHERE` clause до `LIMIT/OFFSET`. Раньше Rust фильтровал после fetch'а — когда большинство rows filtered out, frontend видел `r.length < PAGE_SIZE` и stop'ил pagination с matching events на дальнейших страницах. `search` substring остаётся в Rust.
+- **H4** DoneTab date column + default sort с `created_at` (task-creation, часто months before completion) на `updated_at` (set'ится `update_task_source` на todo→done transition).
+- **H5** Historical done.md entries с empty `dt.date` (no section header context) теперь fallback'ятся на `done.md` mtime вместо `todo.md` mtime — entry родился в done.md, не todo.md.
+- **H6** `sync_tasks_for_repo` теперь resolve'ит split-state когда тот же `task_id` существует в обоих `todo` и `done` sources (post-crash или manual MD edit). `done` wins т.к. отражает later intent. +1 unit test.
+- **H7** `delete_pat` также wipe'ит legacy keyring entry (`github-repo-manager`). Без этого `migrate_legacy_pat` resurrect'ил deleted token на next cold start.
+- **H8** `write_deploy_files` Timeline event записывает `written.len()` вместо `files.len()` — path-rejects + write failures больше не inflate metric. Event details migrate'нуты на `serde_json::json!` для consistency.
+
+### Fixed (medium UX)
+- **M2** BugItem comment row visible когда comment непустой, не только `fix_attempts > 0`. Раньше comment set в `created`/`in-progress` был invisible до first testing transition.
+- **M3** Timeline убран double `loadFirstPage` на deep-link mount — `$effect` уже fire'ит на initial mount.
+- **M4** DataGrid filter dropdown закрывается на outside-click + Esc через `svelte:window` listeners.
+- **M5** Server's `docs/api.md` отсутствующий при client sync больше не push'ится в `errors` — silent skip, симметрично с `handlers.md`.
+- **M6** `init_docs_for_repo` surface'ит `"(project.md + CLAUDE.md skipped — repo has no project assigned)"` в result list для orphan репо.
+- **M7** `replay_rename_in_dir` возвращает `RenameOutcome { Renamed, NoOp, Collision }` enum вместо ambiguous `bool`. Callers surface collisions как explicit warnings.
+- **M9** DeployDetail Generate button отражает workflow-stale state после secret role changes (build/deploy/runtime cycle). Amber tint + «Перегенерировать workflow-файлы» label + tooltip. `DeploySecretsTable` принимает `onRoleChange` callback prop.
+- **M10** DeployDetail surface'ит YAML-unsafe-value warning перед Generate button когда placeholder values содержат chars ломающие YAML в unquoted scalars (`:`, `#`, quotes, backticks, newlines, leading flow-indicator).
+- **M11** Updater silent-mode preserve'ит error category для `network` / `signature` / `unknown` — только `notFound` (expected на приватном репо до public-flip) остаётся тихим, чтобы About card мог surface real errors на next user-initiated check.
+
+### Fixed (polish)
+- **P1** `addBug` store default severity 'minor' → 'medium' aligned с UI call site.
+- **P2** Comment на `active_bugs` KpiCard объясняющий intentional absence compare-period delta (point-in-time metric).
+- **P3** `DashboardTopHot` meta line показывает `major` count рядом с `critical` и `active` — backend sort weighs critical → major → active.
+- **P4** DataGrid search placeholder migrate'нут на i18n key `grid.searchPlaceholder` (ru + en).
+- **P5** `parse_done_entries_in_period` принимает legacy `DD.MM.YYYY` / `DD/MM/YYYY` date headers (matching `parse_done_tasks` tolerance). Normalize'ит в `YYYY-MM-DD` для range comparison.
+- **P6** «No clients found» warning suppressed когда server тоже отсутствует — server-only build-out phase это legitimate state, без warning spam'а.
+- **P8** `SyncScreen.loadRequirements` migrate'нут с `onMount` на `$effect(projectId)` — reload'ится на project change без unmount.
+- **P9** `AppDefaultsScreen.excludeFiles` moved в module-level const чтобы `TemplateEditor.$effect` не re-fire'ил на каждый parent render.
+
+### Deferred
+- **M1** Dashboard KPI5 vs `StatsSummary` avg attempts drift — теоретический, только после `migrate_bugs_for_repo` без backfill `entered_testing` events. Требует structural rework. → v0.29.0.
+- **P7** `microservice-api/<project-name>/` rename-replay — требует `project_renames` таблицы (`repo_renames` repo-scoped only). → v0.29.0.
+- **P10** COMPOSE_SERVICE copy-from-CONTAINER_NAME direction — design call, лучше tooltip; future Deploy UX pass.
+
+### Tests
+- 303 cargo passing (+1 от H6 split-state test, net после C2 test rename)
+- svelte-check 444 / 0 errors / 0 warnings
+
 ## [0.27.1] — 2026-05-12
 
 Patch-релиз: code-review фиксы — 2 критичных бага + 5 important issues + 1 cleanup. Никаких новых фич, schema без изменений.

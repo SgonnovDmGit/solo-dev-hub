@@ -4,6 +4,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-05-12
+
+Second code-review pass after v0.27.1 — 32 findings across 4 domains (bug/stats/dashboard, tasks/timeline/datagrid, cross-repo sync, deploy/secrets/settings). All addressed across 4 batches: 3 critical + 8 high + 11 medium + 9 polish + 2 deferred (P7 microservice-api rename-replay needs new schema, P10 COMPOSE_SERVICE copy UX is a design call). No new features, no schema migrations.
+
+### Fixed (critical)
+- **C1 | `confirm_requirement` deletes wrong microservice pair when NNN collides** — the server→MS branch iterated all connected microservices and deleted from the first whose filename matched, with no target disambiguation. Each MS's REQ folder has its own NNN counter, so two MSes can independently carry `REQ-001.md` — clicking ✓ on one row erased the sibling. Tauri command now takes `target_repo_id`, frontend `SyncScreen.handleConfirm` resolves both source and target via `getDisplayName`. Includes M8 fix: source role other than `client*`/`server` (e.g. `tool`/`landing`) now returns an explicit error instead of silently no-op'ing through the MS iteration path.
+- **C2 | `valid_transition` allowed LLM `testing → confirmed`** — the function whitelisted the transition while comments insisted it was UI-only. An LLM writing `status: confirmed` in `bug-reports.md` bypassed the user-verification gate. Removed `testing → confirmed` and `testing → rejected` from the whitelist; `confirmed_at` is now set exclusively via the UI `resolve_bug` command. Test renamed to `test_reconcile_rejects_testing_to_confirmed_from_md` asserting the new guard.
+- **C3 | `DeployDetail.load()` early-exited when `repo` not yet reactive** — `repo` is `$derived` from `$allRepos`, which loads in parallel and may not be ready at mount. The previous `if (!env || !repo) return` silently skipped the GitHub Environment auto-ensure and branches fetch with no retrigger. Split into env-fetch on mount + `$effect`-driven GitHub-side bootstrap that fires once when both are resolved.
+
+### Fixed (high)
+- **H1** `refreshBugs` now skips reconcile for remote-only repos (no `local_path` → `bugs_migrated_at IS NULL` → error toast on every bug-tab remount). Store tracks `currentRepoHasLocalPath` alongside `currentRepoId`.
+- **H2** Removed legacy `backend` / `network` from `BugItem.defaultCategories` (not in the 9-value DB CHECK enum since v0.13.12 — picking them produced raw SQLite error toasts). Added `auth` instead.
+- **H3** Timeline `kind` / `repo_ids` / `project_ids` filters pushed into the SQL `WHERE` clause before `LIMIT/OFFSET`. Previously Rust filtered after fetch — when most rows got filtered out the frontend saw `r.length < PAGE_SIZE` and stopped paginating with matching events still on later pages. `search` substring stays in Rust.
+- **H4** DoneTab date column + default sort changed from `created_at` (task-creation date, often months before completion) to `updated_at` (set by `update_task_source` on todo→done transition).
+- **H5** Historical done.md entries with empty `dt.date` (no section header context) now fallback to `done.md` mtime instead of `todo.md` mtime — the entry originated in done.md, not todo.md.
+- **H6** `sync_tasks_for_repo` now resolves split-state where the same `task_id` exists in both `todo` and `done` sources (post-crash or manual MD edit listing in both files) by dropping the `todo` duplicate. `done` wins because it reflects later intent. +1 unit test.
+- **H7** `delete_pat` also wipes the legacy keyring entry (`github-repo-manager`). Without this, `migrate_legacy_pat` resurrected the deleted token on the next cold start.
+- **H8** `write_deploy_files` Timeline event records `written.len()` rather than `files.len()` — path-rejects and write failures no longer inflate the metric. Migrated event details emission to `serde_json::json!` for consistency with H4 batch from v0.27.1.
+
+### Fixed (medium UX)
+- **M2** BugItem comment row now visible whenever a comment exists, not only when `fix_attempts > 0`. Previously a comment set in `created` / `in-progress` state was invisible until the first testing transition.
+- **M3** Timeline removed double `loadFirstPage` on deep-link mount — the `$effect` already fires on initial mount.
+- **M4** DataGrid filter dropdown closes on outside-click + Esc via `svelte:window` listeners.
+- **M5** Server's `docs/api.md` absent during client sync is no longer pushed to `errors` — silent skip, symmetric with `handlers.md`.
+- **M6** `init_docs_for_repo` surfaces `"(project.md + CLAUDE.md skipped — repo has no project assigned)"` in the result list for orphan repos so the user sees what was intentionally omitted.
+- **M7** `replay_rename_in_dir` returns `RenameOutcome { Renamed, NoOp, Collision }` enum instead of ambiguous `bool`. Callers now surface collisions as explicit warnings.
+- **M9** DeployDetail Generate button reflects workflow-stale state after secret role changes (build/deploy/runtime cycle). Amber tint + "Regenerate workflow files" label + tooltip. `DeploySecretsTable` takes `onRoleChange` callback prop.
+- **M10** DeployDetail surfaces a YAML-unsafe-value warning before the Generate button when placeholder values contain chars that break YAML in unquoted scalars (`:`, `#`, quotes, backticks, newlines, leading flow-indicator).
+- **M11** Updater silent-mode preserves error category for `network` / `signature` / `unknown` — only `notFound` (expected on private repo pre-public-flip) stays quiet so the About card can surface real errors on next user-initiated check.
+
+### Fixed (polish)
+- **P1** `addBug` store default severity aligned 'minor' → 'medium' to match the UI call site.
+- **P2** Comment on `active_bugs` KpiCard explaining intentional absence of compare-period delta (point-in-time metric).
+- **P3** `DashboardTopHot` meta line shows `major` count alongside `critical` and `active` — backend sort weighs critical → major → active.
+- **P4** DataGrid search placeholder migrated to i18n key `grid.searchPlaceholder` (ru + en).
+- **P5** `parse_done_entries_in_period` accepts legacy `DD.MM.YYYY` / `DD/MM/YYYY` date headers (matching `parse_done_tasks` tolerance). Normalizes to `YYYY-MM-DD` for range comparison.
+- **P6** "No clients found" warning suppressed when server is also missing — server-only build-out phase is a legitimate state, no warning spam.
+- **P8** `SyncScreen.loadRequirements` migrated from `onMount` to `$effect(projectId)` — reloads on project change without unmount.
+- **P9** `AppDefaultsScreen.excludeFiles` moved to a module-level const so `TemplateEditor.$effect` doesn't re-fire on every parent render.
+
+### Deferred
+- **M1** (Dashboard KPI5 vs `StatsSummary` avg attempts drift) — theoretical, only after `migrate_bugs_for_repo` imports without backfilling `entered_testing` events. Requires structural rework to unify data sources. → v0.29.0.
+- **P7** (`microservice-api/<project-name>/` rename-replay) — needs a new `project_renames` table (`repo_renames` is repo-scoped only). → v0.29.0.
+- **P10** (COMPOSE_SERVICE copy-from-CONTAINER_NAME direction) — design call (CONTAINER_NAME often = COMPOSE_SERVICE + env suffix); a better tooltip is the right fix, future Deploy UX pass.
+
+### Tests
+- 303 cargo passing (+1 from H6 split-state test, net after C2 test rename)
+- svelte-check 444 / 0 errors / 0 warnings
+
 ## [0.27.1] — 2026-05-12
 
 Patch release: code review fixes — 2 critical bugs + 5 important issues + 1 cleanup. No new features, no schema changes.
