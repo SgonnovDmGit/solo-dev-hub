@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+### Changed
+- **T-000090 | Template: explicit reverse-direction disclaimer для REQ** —
+  усиление `# Cross-repo requirements` секции global CLAUDE.md template
+  после обнаружения misuse в живой сессии (server-LLM написал «REQ для
+  админки» и положил его в `docs/client-requirements/<client>/` инверсно
+  — фактически это был announcement). Изменения: (1) в `## Folders`
+  после flat/nested explainer'а добавлено explicit «Reverse directions
+  (server → client, microservice → parent server) do not exist as REQ —
+  sender-initiated changes flow through announcements». Симметрично уже
+  существующему disclaimer'у в `## Directions` announcement-секции.
+  (2) В `## LLM policy > LLM must NOT:` добавлен новый bullet —
+  «author REQ-*.md в собственной recipient-folder (server's
+  client-requirements/, MS's server-requirements/) — те folders'ы
+  заполняются Solo Dev Hub'ом из sender-outgoing, не вручную; REQ там
+  не пропагируется и будет принят за incoming-request». Server→client
+  и MS→server инициативные сообщения = announcement, не REQ.
+
 ## [0.26.1] — 2026-05-12
 
 ### Added

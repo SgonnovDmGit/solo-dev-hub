@@ -216,6 +216,8 @@ Sync state is runtime-derived, not stored in any file.
 
 Folder structure is **flat** when the sender has exactly one counterparty (a client has one server) and **nested per-counterparty-name** when there can be many.
 
+**Reverse directions** (server → client, microservice → parent server) **do not exist as REQ** — sender-initiated changes affecting the recipient flow through announcements (see `# Cross-repo announcements`). If you are a server with something to tell a client (e.g. "I shipped new endpoints, here is a smoke checklist"), do not write a REQ in the client's `docs/client-requirements/` folder — that path is for **incoming** REQs the client authored, and inverse use will confuse the next sync. Use an announcement instead.
+
 > **Note:** `docs/server-requirements/` on the microservice side is currently flat, which limits a microservice to one effective parent-server without filename collisions. A future release will nest per parent-server (`docs/server-requirements/<parent-server-repo-name>/`). For now, work with one parent per microservice.
 
 Folder renames (e.g. repo renamed on GitHub) are handled by the app — on next sync the app finds the old folder on the recipient side and renames it to match the current name. LLM/dev never rename these folders manually.
@@ -243,6 +245,7 @@ If the receipt is `clarification-needed`, a different path applies: the sender u
 | Confirm a pair (delete both files, both sides) | User — via app's ✓ button |
 
 The LLM must NOT:
+- author a `REQ-*.md` in its **own recipient folder** (server's `docs/client-requirements/<client>/`, microservice's `docs/server-requirements/`) — those folders are populated **by Solo Dev Hub** from the sender's outgoing folder. A REQ written there will not propagate anywhere and will be mistaken for an incoming request the LLM should answer. Server-initiated communication to a client / microservice-initiated communication to its parent goes through **announcements** (`# Cross-repo announcements`), not REQ
 - edit a `REQ-*.md` on the **recipient** side — edits are silently overwritten at next sync
 - edit a `REQ-*.response.md` on the **sender** side — same reason
 - delete a `REQ-*.md` or `.response.md` manually — confirmation is a user-only action through the app's ✓ button
