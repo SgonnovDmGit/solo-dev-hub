@@ -26,18 +26,6 @@ export interface Repository {
   deploy_target: string | null;
 }
 
-export interface DeployManifest {
-  repository_id: number;
-  workflow_name: string;
-  image_tag: string;
-  compose_service: string;
-  domain: string;
-  deploy_branch: string;
-  updated_at: string;
-  /** Non-core placeholder values (ENV_FILE_PATH, ENTRY_POINT, GO_VERSION, …). */
-  extras: Record<string, string>;
-}
-
 export interface RenderedFile {
   path: string;
   content: string;

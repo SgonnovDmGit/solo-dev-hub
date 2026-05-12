@@ -173,7 +173,7 @@
       // without coupling it to the Generate flow. Generate just needs to render
       // and write files.
       const rendered: RenderedFile[] = await renderDeployFilesForEnv(env.id);
-      const existing = await readRepoFiles(repo.local_path, rendered.map((r) => r.path));
+      const existing = await readRepoFiles(repo.id, rendered.map((r) => r.path));
       diffFiles = rendered.map((r, i) => ({
         path: r.path,
         content: r.content,

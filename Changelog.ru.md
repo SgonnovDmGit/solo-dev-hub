@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-05-12
+
+Patch-релиз: code-review фиксы — 2 критичных бага + 5 important issues + 1 cleanup. Никаких новых фич, schema без изменений.
+
+### Fixed
+- **Critical | ✓ Confirm-кнопка в SyncScreen молча no-op'ит для всех GitHub-backed репо** (регрессия с v0.25.0). После фикса B-000001 `Repository::display_name()` стал возвращать last segment `github_name` (`web-app-client`, не `owner/web-app-client`), но `findRepoId` в [SyncScreen.svelte:57](src/lib/components/SyncScreen.svelte#L57) всё ещё матчил против полного `r.github_name`. Итог: каждый клик ✓ на GitHub-репо возвращал `null` и выходил молча — backend никогда не вызывался. Фикс: заменить сравнение на `getDisplayName(r) === name` чтобы TS-сторона зеркалила Rust-семантику. Local-only репо случайно работали через description fallback.
+- **Critical | Path traversal в `write_deploy_files`** — `meta.json` `file_targets` join'ился к repo root без проверки на `..`-escape или абсолютные пути. User-edited template через TemplatesScreen мог писать за пределами репо. Новый helper [sync::is_safe_subpath](src-tauri/src/sync.rs) отклоняет абсолютные пути, drive letters, `..`, root-component пути. Применён в [write_deploy_files](src-tauri/src/lib.rs#L2553) (write loop) и в [read_repo_files](src-tauri/src/lib.rs#L2532) (симметричный read-side). +4 unit-теста (`test_is_safe_subpath_accepts_normal` / `_rejects_parent_dir` / `_rejects_absolute` / `_rejects_windows_absolute`) → 302 total.
+- **`NaiveDate::succ_opt().unwrap()` panic risk** в Dashboard daily flow loops — заменено на `match ... break` в [lib.rs:1021](src-tauri/src/lib.rs#L1021) и [db.rs:2951](src-tauri/src/db.rs#L2951). Malformed или far-future date filter (`9999-12-31`) в итоге переполнял бы и панил IPC thread.
+- **JSON injection в event details column** — `record_deploy_secret_event` и `record_secret_event` интерполировали `secret_name` / `action` напрямую в raw JSON через `format!`. Заменено на `serde_json::json!({...}).to_string()` — кавычки и спецсимволы в input больше не corrupt'ят сохранённый JSON.
+- **`SyncResult.errors` false positives для non-standard проектов** — `sync_project` безусловно push'ил «No server found» / «No clients found» даже для microservice-проектов (которые intentionally без сервера/клиентов). Теперь scope'нуто на `project_type == "standard"`. UI warning-toast'ы перестают firing'ить на каждый sync microservice проекта.
+- **`migrate_flat_to_nested` partial-copy rollback** (sync.rs Case C, multi-parent same-content ветка) — если `fs::copy` падал mid-loop после успешных более ранних копий, код early-return'ил оставляя ghost files в некоторых parent subfolder'ах. Теперь rollback'ает successful копии и emit'ит warning, оставляя flat source intact для retry на следующем sync.
+- **`read_repo_files` принимал raw `local_path` от frontend** — рефакторнуто на `repo_id` с lookup'ом из DB (mirror'ит shape `read_repo_file`). Закрывает wider-than-necessary read surface; frontend caller в [DeployDetail.svelte:176](src/lib/components/DeployDetail.svelte#L176) обновлён передавать `repo.id`.
+
+### Removed
+- Dead TypeScript interface `DeployManifest` в [types.ts](src/lib/types.ts) — Rust-эквивалент был заменён на `DeployEnvironment` в v0.18.0. Импортов больше не было.
+
 ## [0.27.0] — 2026-05-12
 
 ### Changed

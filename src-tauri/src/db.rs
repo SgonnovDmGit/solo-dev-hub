@@ -2948,7 +2948,10 @@ impl AppDb {
                 done: None,
                 is_future: d > today,
             });
-            d = d.succ_opt().unwrap();
+            match d.succ_opt() {
+                Some(next) => d = next,
+                None => break,
+            }
         }
         Ok(out)
     }

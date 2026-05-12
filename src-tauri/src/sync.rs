@@ -24,6 +24,20 @@ pub fn ensure_root_exists(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Reject paths that would escape the repo root: absolute paths, paths
+/// containing `..`, or paths with drive letters / root components. Used to
+/// guard `write_deploy_files` against malicious `file_targets` in meta.json.
+/// Accepts forward and backward separators uniformly via `Path::components()`.
+pub fn is_safe_subpath(rel: &str) -> bool {
+    use std::path::Component;
+    let p = Path::new(rel);
+    if p.is_absolute() {
+        return false;
+    }
+    p.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 /// Remove `.git` folder inside `repo_root` if it exists. No-op if missing.
 /// Used by B-003 delete-repo flow; leaves other files in the folder untouched.
 pub fn remove_git_dir(repo_root: &Path) -> Result<(), String> {
@@ -286,15 +300,41 @@ where
                 migrated += 1;
             }
             _ => {
-                // Multi-parent same-content: duplicate into each matching parent's subfolder.
+                // Multi-parent same-content: duplicate into each matching parent's
+                // subfolder. If any copy fails mid-loop, roll back the successful
+                // ones and leave the flat source intact — preserves "all or nothing"
+                // for the parent set so the next sync pass can retry cleanly without
+                // ghost partial copies in some parents.
+                let mut created: Vec<std::path::PathBuf> = Vec::new();
+                let mut copy_error: Option<String> = None;
                 for parent_canonical in &matches {
                     let dst = flat_root.join(parent_canonical).join(&fname);
                     if let Some(dst_dir) = dst.parent() {
-                        fs::create_dir_all(dst_dir).map_err(|e| e.to_string())?;
+                        if let Err(e) = fs::create_dir_all(dst_dir) {
+                            copy_error = Some(e.to_string());
+                            break;
+                        }
                     }
-                    fs::copy(&flat, &dst).map_err(|e| {
-                        format!("Case C: copy {} -> {}: {}", flat.display(), dst.display(), e)
-                    })?;
+                    if let Err(e) = fs::copy(&flat, &dst) {
+                        copy_error = Some(format!(
+                            "Case C: copy {} -> {}: {}",
+                            flat.display(),
+                            dst.display(),
+                            e
+                        ));
+                        break;
+                    }
+                    created.push(dst);
+                }
+                if let Some(err) = copy_error {
+                    for dst in &created {
+                        let _ = fs::remove_file(dst);
+                    }
+                    warnings.push(format!(
+                        "Case C: {} partial-copy failed, rolled back ({}); left in flat root for retry",
+                        fname, err
+                    ));
+                    continue;
                 }
                 fs::remove_file(&flat).map_err(|e| {
                     format!("Case C: remove flat source {}: {}", flat.display(), e)
@@ -1286,6 +1326,35 @@ mod tests {
     fn test_ensure_root_exists_ok() {
         let tmp = TempDir::new().unwrap();
         assert!(ensure_root_exists(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn test_is_safe_subpath_accepts_normal() {
+        assert!(is_safe_subpath("Dockerfile"));
+        assert!(is_safe_subpath(".github/workflows/deploy.yml"));
+        assert!(is_safe_subpath("subdir/file.txt"));
+        assert!(is_safe_subpath("./Dockerfile"));
+    }
+
+    #[test]
+    fn test_is_safe_subpath_rejects_parent_dir() {
+        assert!(!is_safe_subpath("../escape.yml"));
+        assert!(!is_safe_subpath("ok/../../escape.yml"));
+        assert!(!is_safe_subpath(".github/../../../etc/passwd"));
+    }
+
+    #[test]
+    fn test_is_safe_subpath_rejects_absolute() {
+        assert!(!is_safe_subpath("/etc/passwd"));
+        assert!(!is_safe_subpath("/tmp/x.yml"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_is_safe_subpath_rejects_windows_absolute() {
+        assert!(!is_safe_subpath("C:\\Windows\\system32\\foo"));
+        assert!(!is_safe_subpath("C:/x.yml"));
+        assert!(!is_safe_subpath("\\server\\share\\x"));
     }
 
     #[test]

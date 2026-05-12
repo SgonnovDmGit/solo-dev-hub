@@ -383,8 +383,8 @@ export async function setDeployTarget(id: number, target: string | null): Promis
 }
 
 
-export async function readRepoFiles(localPath: string, relPaths: string[]): Promise<(string | null)[]> {
-  return invoke<(string | null)[]>('read_repo_files', { localPath, relPaths });
+export async function readRepoFiles(repoId: number, relPaths: string[]): Promise<(string | null)[]> {
+  return invoke<(string | null)[]>('read_repo_files', { repoId, relPaths });
 }
 
 export async function readRepoFile(repoId: number, relPath: string): Promise<string | null> {

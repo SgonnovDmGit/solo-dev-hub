@@ -4,7 +4,7 @@
   import { allRepos } from '$lib/stores/repos';
   import { tStore } from '$lib/i18n';
   import { syncProject, listProjectRequirements, confirmRequirement } from '$lib/api/tauri-commands';
-  import type { RequirementInfo } from '$lib/types';
+  import { getDisplayName, type RequirementInfo } from '$lib/types';
   import { onMount } from 'svelte';
 
   let requirements = $state<RequirementInfo[]>([]);
@@ -54,7 +54,11 @@
   }
 
   function findRepoId(name: string): number | null {
-    const repo = $allRepos.find(r => r.github_name === name);
+    // `name` here is RequirementInfo.source_repo, which Rust populates from
+    // Repository::display_name() — the last segment of github_name (e.g.
+    // "web-app-client", not "owner/web-app-client"). Matching against
+    // r.github_name directly would fail for every GitHub-backed repo.
+    const repo = $allRepos.find(r => getDisplayName(r) === name);
     return repo ? repo.id : null;
   }
 

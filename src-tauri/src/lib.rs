@@ -1018,7 +1018,10 @@ fn tasks_daily_flow(
             done: Some(*per_day.get(&key).unwrap_or(&0)),
             is_future: d > today,
         });
-        d = d.succ_opt().unwrap();
+        match d.succ_opt() {
+            Some(next) => d = next,
+            None => break,
+        }
     }
     Ok(out)
 }
@@ -1246,11 +1249,21 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
         }
     }
 
-    if server.is_none() {
-        errors.push("No server found in project".to_string());
-    }
-    if clients.is_empty() {
-        errors.push("No clients found in project".to_string());
+    // Server/client checks only matter for `standard` project type. A
+    // `microservice` project intentionally has neither — surfacing those as
+    // errors produces false-positive warning toasts on every sync.
+    let project_type = db
+        .get_project(project_id)
+        .ok()
+        .map(|p| p.project_type)
+        .unwrap_or_else(|| "standard".to_string());
+    if project_type == "standard" {
+        if server.is_none() {
+            errors.push("No server found in project".to_string());
+        }
+        if clients.is_empty() {
+            errors.push("No clients found in project".to_string());
+        }
     }
 
     if let Some(srv) = server {
@@ -2517,12 +2530,24 @@ fn parse_done_entries_in_period_cmd(
 
 #[tauri::command]
 fn read_repo_files(
-    local_path: String,
+    db: State<AppDb>,
+    repo_id: i64,
     rel_paths: Vec<String>,
 ) -> Result<Vec<Option<String>>, String> {
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let Some(local_path) = repo.local_path else {
+        return Ok(rel_paths.iter().map(|_| None).collect());
+    };
     let root = std::path::Path::new(&local_path);
     let mut result: Vec<Option<String>> = Vec::with_capacity(rel_paths.len());
     for rel in &rel_paths {
+        // Reject `..`-escapes and absolute paths — symmetric with the
+        // write_deploy_files guard so the read side respects the same
+        // repo-root boundary the write side enforces.
+        if !sync::is_safe_subpath(rel) {
+            result.push(None);
+            continue;
+        }
         let p = root.join(rel);
         if p.exists() {
             match std::fs::read_to_string(&p) {
@@ -2551,6 +2576,17 @@ fn write_deploy_files(
     let mut written: Vec<String> = Vec::new();
     let mut errors: Vec<WriteError> = Vec::new();
     for f in &files {
+        // Path traversal guard: reject `..`, absolute paths, drive letters.
+        // `f.path` ultimately comes from meta.json `file_targets`, which a user
+        // can edit via TemplatesScreen; without this check a malicious template
+        // could write outside the repo root.
+        if !sync::is_safe_subpath(&f.path) {
+            errors.push(WriteError {
+                path: f.path.clone(),
+                error: format!("unsafe path rejected: {}", f.path),
+            });
+            continue;
+        }
         let target = root.join(&f.path);
         if let Some(parent) = target.parent() {
             if parent != root {
@@ -2621,12 +2657,13 @@ fn record_deploy_secret_event(
     action: String,
     secret_name: String,
 ) -> Result<(), String> {
+    let details = serde_json::json!({ "name": secret_name }).to_string();
     db.insert_deploy_event(
         Some(deploy_env_id),
         repo_id,
         action.as_str(),
         &chrono::Utc::now().to_rfc3339(),
-        Some(&format!(r#"{{"name":"{}"}}"#, secret_name)),
+        Some(&details),
     ).map_err(|e| e.to_string())
 }
 
@@ -2637,12 +2674,13 @@ fn record_secret_event(
     action: String,
     secret_name: String,
 ) -> Result<(), String> {
+    let details = serde_json::json!({ "action": action, "name": secret_name }).to_string();
     db.insert_sync_event(
         Some(repo_id),
         "secret",
         &chrono::Utc::now().to_rfc3339(),
         1,
-        Some(&format!(r#"{{"action":"{}","name":"{}"}}"#, action, secret_name)),
+        Some(&details),
     ).map_err(|e| e.to_string())
 }
 

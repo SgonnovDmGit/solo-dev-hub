@@ -4,6 +4,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-05-12
+
+Patch release: code review fixes — 2 critical bugs + 5 important issues + 1 cleanup. No new features, no schema changes.
+
+### Fixed
+- **Critical | ✓ Confirm button in SyncScreen silently no-ops for all GitHub-backed repos** (regression since v0.25.0). After B-000001 fix `Repository::display_name()` was changed to return the last segment of `github_name` (`web-app-client`, not `owner/web-app-client`), but `findRepoId` in [SyncScreen.svelte:57](src/lib/components/SyncScreen.svelte#L57) was still matching against the full `r.github_name`. Result: every confirm click on a GitHub repo returned `null` and exited silently — backend was never called. Fix: replace the comparison with `getDisplayName(r) === name` so the TS side mirrors Rust's semantics. Local-only repos accidentally worked through the description fallback.
+- **Critical | Path traversal in `write_deploy_files`** — `meta.json` `file_targets` was joined onto repo root without validating against `..`-escapes or absolute paths. A user-edited template via TemplatesScreen could write outside the repo root. New helper [sync::is_safe_subpath](src-tauri/src/sync.rs) rejects absolute paths, drive letters, `..`, and root-component paths. Applied as a guard in [write_deploy_files](src-tauri/src/lib.rs#L2553) (rendering loop) and in [read_repo_files](src-tauri/src/lib.rs#L2532) (symmetric read-side). +4 unit tests (`test_is_safe_subpath_accepts_normal` / `_rejects_parent_dir` / `_rejects_absolute` / `_rejects_windows_absolute`) → 302 total.
+- **`NaiveDate::succ_opt().unwrap()` panic risk** on Dashboard daily flow loops — replaced with `match ... break` in [lib.rs:1021](src-tauri/src/lib.rs#L1021) and [db.rs:2951](src-tauri/src/db.rs#L2951). A malformed or far-future date filter (`9999-12-31`) would have eventually overflowed and panicked the IPC thread.
+- **JSON injection in event details column** — `record_deploy_secret_event` and `record_secret_event` interpolated `secret_name` / `action` directly into a raw JSON string via `format!`. Replaced with `serde_json::json!({...}).to_string()` so quotes and special chars in input no longer corrupt the stored JSON.
+- **`SyncResult.errors` false positives for non-standard projects** — `sync_project` unconditionally pushed "No server found" / "No clients found" even when the project was a microservice (intentionally has neither). Now scoped to `project_type == "standard"`. UI warning toasts on every sync of a microservice project stop firing.
+- **`migrate_flat_to_nested` partial-copy rollback** (sync.rs Case C, multi-parent same-content branch) — if `fs::copy` failed mid-loop after earlier copies succeeded, the code early-returned leaving ghost files in some parent subfolders. Now rolls back successful copies and emits a warning, leaving the flat source intact for retry on the next sync.
+- **`read_repo_files` accepted raw `local_path` from frontend** — refactored to take `repo_id` and look up the local path from DB (mirrors `read_repo_file`'s shape). Closes a wider-than-necessary read surface; the frontend caller in [DeployDetail.svelte:176](src/lib/components/DeployDetail.svelte#L176) updated to pass `repo.id`.
+
+### Removed
+- Dead TypeScript interface `DeployManifest` in [types.ts](src/lib/types.ts) — corresponding Rust type was replaced with `DeployEnvironment` in v0.18.0. Nothing imported it anymore.
+
 ## [0.27.0] — 2026-05-12
 
 ### Changed
