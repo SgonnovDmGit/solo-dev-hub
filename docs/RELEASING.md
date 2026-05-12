@@ -49,7 +49,7 @@ git checkout dev && git rebase master   # подтягиваем хотфикс 
    - `package.json` (`"version": "..."`)
    - `src-tauri/Cargo.toml` (`version = "..."`)
    - `src-tauri/tauri.conf.json` (`"version": "..."`)
-3. **Обновить `Changelog.md`** — переместить накопленное из `## [Unreleased]` в новую секцию `## [X.Y.Z] — YYYY-MM-DD`. Не оставлять пустых заголовков.
+3. **Обновить `Changelog.md` (EN primary) + `Changelog.ru.md`** — переместить накопленное из `## [Unreleased]` в новую секцию `## [X.Y.Z] — YYYY-MM-DD` в **обоих** файлах. `Changelog.md` — основной (читается release-pipeline'ом и публичной аудиторией); `Changelog.ru.md` — русский mirror. Не оставлять пустых заголовков.
 4. **Пересобрать `Cargo.lock`**: `cd src-tauri && cargo check` (пересинхронизирует с новой версией пакета). И `npm install --package-lock-only` для `package-lock.json`.
 5. **Closure-коммит на `dev`**: `git commit -m "chore: vX.Y.Z release closure"` (или `release: vX.Y.Z`).
 6. **Fast-forward → master → тег → пуш**:
