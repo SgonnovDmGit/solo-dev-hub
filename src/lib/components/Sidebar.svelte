@@ -192,6 +192,14 @@
       newProjectDesc = '';
       newProjectType = 'standard';
       showNewProjectForm = false;
+      // B-000007: focus the new project so the header ▲/▼ buttons are
+      // immediately actionable on it. Without this, any stale selection
+      // (selectedRepoId from a previous click on a repo) keeps targeting
+      // the old item, and the user perceives "reorder doesn't work" on
+      // the newly-added project.
+      selectedRepoId.set(null);
+      selectedProjectId.set(created.id);
+      currentScreen.set({ name: 'project' });
     }
     isCreating = false;
   }

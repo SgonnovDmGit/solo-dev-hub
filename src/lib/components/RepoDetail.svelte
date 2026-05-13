@@ -419,7 +419,14 @@
       {/if}
     {:else if activeTab === 'deploy'}
       {#if repo.github_name && repo.deploy_target}
-        <DeployScreen />
+        {#key repo.id}
+          <!-- B-000006: DeployScreen drill-down state (viewMode='detail',
+               selectedDeployEnvId) lives in component-local state. Without a
+               `key` on repo.id the component is reused on repo switch, so a
+               drill-down opened on Repo A keeps rendering Repo A's env after
+               the user clicks Repo B in the sidebar. Keying forces remount. -->
+          <DeployScreen />
+        {/key}
       {:else}
         <div class="bugs-blocked">
           <p>{$tStore('repo.deployBlocked' as any)}</p>
