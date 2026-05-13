@@ -192,20 +192,22 @@
           <input type="checkbox" checked={s.override_enabled} disabled={!s.included} onchange={() => toggleOverride(s)} />
           {$tStore('deploy.overrideCheckbox' as any) || 'Override'}
         </label>
-        <input type="password"
-               class="value-input"
-               bind:value={values[s.secret_name]}
-               disabled={!s.included || !s.override_enabled}
-               placeholder={!s.included
-                 ? ($tStore('deploy.notIncluded' as any) || 'not included')
-                 : !s.override_enabled
-                   ? (repoSecretMeta(s.secret_name)
-                       ? ($tStore('deploy.inheritedFromRepo' as any) || '(from repo, updated {0})').replace('{0}', repoSecretMeta(s.secret_name)!.updated_at.slice(0, 10))
-                       : ($tStore('deploy.notSetInRepo' as any) || 'Not set in repo'))
-                   : (envSecretMeta(s.secret_name)
-                       ? ($tStore('deploy.overrideSavedHint' as any) || 'saved {0}').replace('{0}', envSecretMeta(s.secret_name)!.updated_at.slice(0, 10))
-                       : ($tStore('deploy.enterOverrideValue' as any) || 'Enter value'))}
-               onblur={() => saveValue(s)} />
+        <textarea class="value-input"
+                  rows="1"
+                  spellcheck="false"
+                  autocomplete="off"
+                  bind:value={values[s.secret_name]}
+                  disabled={!s.included || !s.override_enabled}
+                  placeholder={!s.included
+                    ? ($tStore('deploy.notIncluded' as any) || 'not included')
+                    : !s.override_enabled
+                      ? (repoSecretMeta(s.secret_name)
+                          ? ($tStore('deploy.inheritedFromRepo' as any) || '(from repo, updated {0})').replace('{0}', repoSecretMeta(s.secret_name)!.updated_at.slice(0, 10))
+                          : ($tStore('deploy.notSetInRepo' as any) || 'Not set in repo'))
+                      : (envSecretMeta(s.secret_name)
+                          ? ($tStore('deploy.overrideSavedHint' as any) || 'saved {0}').replace('{0}', envSecretMeta(s.secret_name)!.updated_at.slice(0, 10))
+                          : ($tStore('deploy.enterOverrideValue' as any) || 'Enter value'))}
+                  onblur={() => saveValue(s)}></textarea>
         <label class="include-toggle">
           <input type="checkbox" checked={s.included} onchange={() => toggleIncluded(s)} />
           {$tStore('deploy.includeCheckbox' as any) || 'Include'}
@@ -266,6 +268,16 @@
     box-sizing: border-box;
     font-family: var(--font-mono, monospace);
     font-size: 0.85em;
+    resize: vertical;
+    min-height: calc(0.85em * 1.5 + 0.7rem);
+    white-space: pre;
+    overflow: auto;
+    /* Mask like password — textarea accepts multi-line paste, user sees dots.
+       Mirrors SecretsPanel.svelte `.secret-value-input` pattern. */
+    -webkit-text-security: disc;
+  }
+  .value-input:focus {
+    min-height: 80px;
   }
   .value-input:disabled {
     opacity: 0.6;

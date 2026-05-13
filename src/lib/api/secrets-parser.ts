@@ -104,9 +104,11 @@ export function parseEnvText(text: string): ParseResult {
       continue;
     }
 
-    // Single-line KEY=value
-    const value = afterEq.trim();
+    // Single-line KEY=value (dotenv-compatible: strips quotes, decodes escapes
+    // in double-quoted values, strips inline `# comment` after value).
     if (!validateName(name, i + 1, errors)) { i++; continue; }
+    const value = parseSingleLineValue(afterEq, i + 1, errors);
+    if (value === null) { i++; continue; }
     if (value === '') {
       errors.push(`Line ${i + 1}: empty value for '${name}'`);
       i++;
@@ -118,4 +120,71 @@ export function parseEnvText(text: string): ParseResult {
   }
 
   return { secrets, errors };
+}
+
+/// v0.30.0: dotenv-style single-line value parser.
+/// Returns the parsed value, or `null` if parsing failed (errors pushed).
+///
+/// - `KEY=bar` → "bar"
+/// - `KEY="bar baz"` → "bar baz" (surrounding quotes stripped)
+/// - `KEY="line1\nline2"` → "line1\nline2" (escape decoded inside double-quotes)
+/// - `KEY='no\nescape'` → "no\\nescape" (single quotes: literal, no escape decode)
+/// - `KEY=22 # comment` → "22" (inline comment, must be preceded by whitespace)
+/// - `KEY="value" # comment` → "value" (inline comment after closing quote)
+/// - `KEY=v1.0#abc` → "v1.0#abc" (no whitespace before #, kept as literal)
+/// - `KEY="url#frag"` → "url#frag" (inside quotes, kept as literal)
+function parseSingleLineValue(
+  input: string,
+  lineNo: number,
+  errors: string[]
+): string | null {
+  const s = input.trimStart();
+  if (s === '') return '';
+
+  const first = s[0];
+
+  if (first === '"' || first === "'") {
+    const quote = first;
+    const decodeEscapes = quote === '"';
+    let value = '';
+    let i = 1;
+    while (i < s.length) {
+      const c = s[i];
+      if (c === quote) {
+        // Closing quote — rest of line must be whitespace and/or a comment.
+        const rest = s.substring(i + 1).trimStart();
+        if (rest !== '' && !rest.startsWith('#')) {
+          errors.push(`Line ${lineNo}: unexpected content after closing quote`);
+          return null;
+        }
+        return value;
+      }
+      if (decodeEscapes && c === '\\' && i + 1 < s.length) {
+        const next = s[i + 1];
+        switch (next) {
+          case 'n': value += '\n'; i += 2; continue;
+          case 'r': value += '\r'; i += 2; continue;
+          case 't': value += '\t'; i += 2; continue;
+          case '\\': value += '\\'; i += 2; continue;
+          case '"': value += '"'; i += 2; continue;
+          default: value += c; i += 1; continue;
+        }
+      }
+      value += c;
+      i += 1;
+    }
+    errors.push(`Line ${lineNo}: unclosed quote`);
+    return null;
+  }
+
+  // Unquoted value — strip inline `# comment` (must be preceded by whitespace).
+  // `value#tag` stays intact (no space before #), `value  # tag` becomes `value`.
+  let endIdx = s.length;
+  for (let i = 1; i < s.length; i++) {
+    if (s[i] === '#' && (s[i - 1] === ' ' || s[i - 1] === '\t')) {
+      endIdx = i;
+      break;
+    }
+  }
+  return s.substring(0, endIdx).trimEnd();
 }
