@@ -3391,7 +3391,13 @@ impl AppDb {
     /// v0.18.0: seed deploy_secrets rows for a newly-opened deploy env.
     /// Union of `repo_secret_names` (what user actually has in GitHub Secrets) and
     /// `meta_hints` (what template declares). For each name that has no DB row yet:
-    ///   - role  = meta_hints.role if present, else "deploy"
+    ///   - role  = meta_hints.role if present, else "runtime"
+    ///     (v0.29.2: changed from "deploy" → "runtime". Rationale: meta_hints
+    ///     already covers deploy-infrastructure secrets (SSH_*, NPM_*) and any
+    ///     build-time needs (Flutter API_BASE_URL etc) explicitly. Whatever the
+    ///     user adds outside hints is almost always app config — DB creds, API
+    ///     keys, etc — which belongs in runtime env-vars. Existing rows are
+    ///     untouched; users can manually cycle via the role chip in DeployTable.)
     ///   - override_enabled = (meta_hints.scope == "environment")
     ///   - included = true
     /// Existing rows are untouched (idempotent).
@@ -3425,7 +3431,7 @@ impl AppDb {
             }
             let (role, override_enabled) = match hints_by_name.get(name) {
                 Some(h) => (h.role.as_str(), h.scope == "environment"),
-                None => ("deploy", false),
+                None => ("runtime", false),
             };
             conn.execute(
                 "INSERT INTO deploy_secrets (deploy_env_id, secret_name, role, included, override_enabled)
@@ -6421,6 +6427,39 @@ mod tests {
         // NPM_EMAIL: in meta with scope=repo → override_enabled=false
         assert!(!by_name["NPM_EMAIL"].override_enabled);
         assert_eq!(by_name["NPM_EMAIL"].role, Some("deploy".to_string()));
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn test_ensure_deploy_secrets_populated_defaults_unknown_to_runtime() {
+        // v0.29.2: secrets that exist in the repo but have NO hint in meta.json
+        // default to role="runtime" (was "deploy" pre-v0.29.2). Rationale: meta
+        // hints already cover deploy-infra secrets (SSH/NPM) and explicit build
+        // (Flutter API_BASE_URL); whatever the user pushes outside that is
+        // almost always app config → runtime env-vars in the running container.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = AppDb::new(tmp.path().join("test.db")).unwrap();
+        let (_p, r) = seed_repo_for_deploy_tests(&db);
+        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
+            repository_id: r, name: "prod".to_string(),
+            workflow_name: "W".to_string(), image_tag: "l".to_string(),
+            compose_service: "s".to_string(), domain: "d".to_string(),
+            deploy_branch: "m".to_string(), extras: Default::default(),
+        }).unwrap();
+
+        // No hints at all — secrets are user-provided application config.
+        let repo_secret_names = vec!["DB_HOST".to_string(), "MASTER_KEY".to_string()];
+        let meta_hints: Vec<MetaSecretHint> = vec![];
+
+        db.ensure_deploy_secrets_populated(env.id, &repo_secret_names, &meta_hints).unwrap();
+
+        let secrets = db.list_deploy_secrets(env.id).unwrap();
+        let by_name: std::collections::HashMap<_, _> = secrets.iter()
+            .map(|s| (s.secret_name.clone(), s.clone())).collect();
+        assert_eq!(by_name["DB_HOST"].role, Some("runtime".to_string()));
+        assert_eq!(by_name["MASTER_KEY"].role, Some("runtime".to_string()));
+        assert!(by_name["DB_HOST"].included);
+        assert!(!by_name["DB_HOST"].override_enabled, "scope defaults to repo (override off)");
         std::mem::forget(tmp);
     }
 

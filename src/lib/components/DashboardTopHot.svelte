@@ -20,12 +20,12 @@
             <div class="tophot-name">{p.name}</div>
             <div class="tophot-meta">
               {#if p.critical > 0}
-                <span class="crit">{p.critical} crit</span> /
+                <span class="crit">{p.critical} {$tStore('dashboard.topHotCritShort' as any)}</span> /
               {:else}
-                {p.critical} crit /
+                {p.critical} {$tStore('dashboard.topHotCritShort' as any)} /
               {/if}
-              {p.major} maj /
-              {p.active} act
+              {p.major} {$tStore('dashboard.topHotMajShort' as any)} /
+              {p.active} {$tStore('dashboard.topHotActShort' as any)}
             </div>
           </div>
         </div>

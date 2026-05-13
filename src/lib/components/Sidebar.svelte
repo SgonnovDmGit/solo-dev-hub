@@ -168,6 +168,12 @@
   }
 
   function openProject(projectId: number) {
+    // B-000012: clear the stale repo selection — otherwise `reorderTarget`
+    // (which prefers selectedRepoId over selectedProjectId) keeps targeting
+    // the previously-clicked repo, even though the user has shifted focus to
+    // a different project. Same root as B-000007 for handleCreateProject;
+    // this is the openProject branch the first fix missed.
+    selectedRepoId.set(null);
     selectedProjectId.set(projectId);
     currentScreen.set({ name: 'project' });
   }
@@ -279,6 +285,8 @@
   }
 
   function clickProjectInCollapsed(projectId: number) {
+    // B-000012: see openProject — same stale-selectedRepoId cleanup.
+    selectedRepoId.set(null);
     selectedProjectId.set(projectId);
     currentScreen.set({ name: 'project' });
     // One-shot force-expand the clicked project (other projects keep their state per spec)
