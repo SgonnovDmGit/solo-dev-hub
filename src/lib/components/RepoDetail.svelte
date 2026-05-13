@@ -419,14 +419,20 @@
       {/if}
     {:else if activeTab === 'deploy'}
       {#if repo.github_name && repo.deploy_target}
-        {#key repo.id}
-          <!-- B-000006: DeployScreen drill-down state (viewMode='detail',
-               selectedDeployEnvId) lives in component-local state. Without a
-               `key` on repo.id the component is reused on repo switch, so a
-               drill-down opened on Repo A keeps rendering Repo A's env after
-               the user clicks Repo B in the sidebar. Keying forces remount. -->
-          <DeployScreen />
-        {/key}
+        <div class="deploy-wrapper">
+          {#key repo.id}
+            <!-- B-000006: DeployScreen drill-down state (viewMode='detail',
+                 selectedDeployEnvId) lives in component-local state. Without a
+                 `key` on repo.id the component is reused on repo switch, so a
+                 drill-down opened on Repo A keeps rendering Repo A's env after
+                 the user clicks Repo B in the sidebar. Keying forces remount.
+                 B-000008: parent `.repo-detail` is overflow:hidden, so the
+                 Deploy tab needs its own scroll container (mirrors the
+                 `.secrets-wrapper` / `.stats-section` pattern). Without this
+                 wrapper, many secrets/envs are clipped below the viewport. -->
+            <DeployScreen />
+          {/key}
+        </div>
       {:else}
         <div class="bugs-blocked">
           <p>{$tStore('repo.deployBlocked' as any)}</p>
@@ -700,6 +706,16 @@
     min-height: 0;
     overflow-y: auto;
     padding: 0 24px;
+  }
+
+  /* B-000008: same overflow-scroll pattern as .secrets-wrapper / .stats-section.
+     DeployDetail with many secrets needs its own scroll container — parent
+     .repo-detail is overflow:hidden, so without this the bottom of the list
+     is clipped below the viewport and the user can't scroll to see it. */
+  .deploy-wrapper {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
   }
 
   .stats-section {
