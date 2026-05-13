@@ -4,6 +4,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [0.29.2] — 2026-05-14
+
+Hotfix collected from the multi-deploy Go dogfood session. Six bug-fixes and one template-rule clarification across the sidebar, deploy screen, dashboard, and Go template.
+
+### Fixed
+- **B-000006** DeployScreen drill-down state (env detail) survived repo navigation — switching to another repo in the sidebar kept rendering the first repo's env. Wrapped `<DeployScreen />` in `{#key repo.id}` so the component remounts on repo change and the drill-down resets.
+- **B-000007** Reorder ▲/▼ buttons targeted a stale selection right after creating a new project. `handleCreateProject` now clears `selectedRepoId`, focuses the new project, and opens its screen — the reorder buttons become immediately actionable on the just-added project.
+- **B-000008** Deploy tab content was clipped below the viewport when the env list or secrets table grew long. `RepoDetail` deploy tab was missing the scroll-container wrapper that Secrets and Stats tabs already had; added `.deploy-wrapper` mirroring that pattern.
+- **B-000009** Secret value entry: typing-and-tabbing in DeployTable's per-secret input ran `await load()` after every save, full-reloading the list and stealing focus from the next textarea. Replaced with optimistic local update. SecretsPanel per-existing-secret edit moved to the same per-row autosave pattern so both screens share one mechanic.
+- **B-000010** Generated workflow had empty `build-args:` and `docker run -e` lines even after marking secrets for inclusion. Root cause: `ensure_deploy_secrets_populated` defaulted unknown secrets to `role="deploy"` (which neither build nor runtime filters pick up). Changed default to `runtime` since meta hints already cover deploy infrastructure (SSH/NPM) and explicit build (Flutter API_BASE_URL); whatever the user adds outside hints is overwhelmingly app config. Also moved the `"-alpine"` suffix out of the Go Dockerfile template into the `GO_VERSION` value (default `"alpine"` = latest stable Go on alpine via Docker Hub auto-track); the prior `golang:@@GO_VERSION@@-alpine` template was brittle on empty values, `"latest"`, and double-suffix from user-entered full tags. Empty-required validation: meta.json now accepts `"optional": true` per placeholder; DeployDetail highlights empty required fields with a red border and blocks Generate. Go template: `migrations` COPY uncommented by default (Go web servers typically embed them), `@@BUILD_ARGS@@` / `@@DOCKERFILE_ARGS@@` placeholders wired through `docker/build-push-action` and Dockerfile builder stage.
+- **B-000011** Top-3 hot projects meta line ("0 crit / 0 maj / 2 act") was hardcoded English. Moved to i18n keys (`крит` / `важн` / `актив` in Russian).
+- **B-000012** Same stale-selection root as B-000007 but via `openProject` and `clickProjectInCollapsed` — clicking on a sibling project after moving a repo kept ▲/▼ targeting the moved repo. Both functions now clear `selectedRepoId` before setting `selectedProjectId`.
+
+### Changed
+- **Template wording** for the confirmed-bug cleanup rule in the global CLAUDE.md template — cleanup now fires on the user signal ("посмотри баги", "I added bugs", etc.) instead of "next time the LLM edits bug-reports.md for any unrelated reason". Confirmed rows no longer linger across sessions.
+
+### Tests
+- 314 cargo (was 311) — +1 each for default-role-runtime, GO_VERSION bare-alpine, GO_VERSION 1.26-alpine regression rename.
+- 50 vitest, svelte-check clean.
+
 ## [0.29.1] — 2026-05-13
 
 Patch release. Secrets input UX fixes across all three entry points so SSH-key-style multi-line values, inline `# comments`, and quoted values work consistently in the bulk `.env` paste, the per-repo-secret edit box, and the per-deploy-secret override box.

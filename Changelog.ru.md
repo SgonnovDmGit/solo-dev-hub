@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+## [0.29.2] — 2026-05-14
+
+Hotfix-патч из multi-deploy Go dogfood-сессии. Шесть багфиксов и одно уточнение template-правила в sidebar, deploy-экране, dashboard'е и Go-шаблоне.
+
+### Fixed
+- **B-000006** DeployScreen drill-down state (открытый env detail) переживал смену репо — переключение на другой репо в sidebar'е продолжало рендерить env первого репо. `<DeployScreen />` обёрнут в `{#key repo.id}` — компонент пере-монтируется при смене репо, drill-down сбрасывается.
+- **B-000007** Reorder ▲/▼ кнопки таргетили stale-selection сразу после создания нового проекта. `handleCreateProject` теперь очищает `selectedRepoId`, выставляет фокус на новый проект и открывает его экран — ▲/▼ становятся сразу actionable на только что добавленном проекте.
+- **B-000008** Deploy-таб обрезал контент за viewport'ом при длинном списке env'ов или секретов. У Deploy-таба в `RepoDetail` отсутствовал scroll-контейнер (в Secrets/Stats табах он был); добавлен `.deploy-wrapper` mirror'ом этого паттерна.
+- **B-000009** Ввод значения секрета: typing-then-tab в DeployTable per-secret инпуте запускал `await load()` после каждого сохранения — full-reload листа крал фокус у следующей textarea. Заменено на optimistic local update. SecretsPanel per-existing-secret edit переведён на тот же per-row autosave паттерн — два экрана теперь имеют одну механику.
+- **B-000010** Сгенерированный workflow имел пустые `build-args:` и `docker run -e` lines даже после включения секретов. Корень: `ensure_deploy_secrets_populated` дефолтил unknown секреты в `role="deploy"` (ни build, ни runtime фильтр их не берёт). Поменян дефолт на `runtime` — meta hints уже покрывают деплой-инфра (SSH/NPM) и explicit build (Flutter API_BASE_URL); вне хинтов почти всегда app config. Также вынес `"-alpine"` суффикс из Go Dockerfile template в значение `GO_VERSION` placeholder'а (дефолт `"alpine"` = последний stable Go в alpine через Docker Hub auto-track); прежний `golang:@@GO_VERSION@@-alpine` ломался на пустом значении, `"latest"`, и double-suffix при вводе полного тега. Empty-required валидация: meta.json теперь принимает `"optional": true` per placeholder; DeployDetail подсвечивает пустые required поля красной рамкой и блокирует Generate. Go template: `migrations` COPY раскомментирован по умолчанию (Go веб-серверы обычно их embed'ят), `@@BUILD_ARGS@@` / `@@DOCKERFILE_ARGS@@` placeholder'ы прокинуты через `docker/build-push-action` и Dockerfile builder stage.
+- **B-000011** Top-3 hot projects мета-строка ("0 crit / 0 maj / 2 act") был hardcoded английский. Переведён в i18n ключи (`крит` / `важн` / `актив`).
+- **B-000012** Тот же stale-selection корень что B-000007 но через `openProject` и `clickProjectInCollapsed` — клик на соседний проект после reorder'а репо удерживал ▲/▼ на repo'шке. Обе функции теперь очищают `selectedRepoId` перед `selectedProjectId`.
+
+### Changed
+- **Уточнение в template'е** правила cleanup'а confirmed-багов в global CLAUDE.md — cleanup теперь срабатывает на user-signal ("посмотри баги", "I added bugs" и т.д.), а не "когда LLM в следующий раз правит bug-reports.md по любой причине". Confirmed-строки больше не висят между сессиями.
+
+### Tests
+- 314 cargo (было 311) — +1 каждый для default-role-runtime, GO_VERSION bare-alpine, GO_VERSION 1.26-alpine regression rename.
+- 50 vitest, svelte-check clean.
+
 ## [0.29.1] — 2026-05-13
 
 Patch-релиз. Фиксы UX ввода секретов во всех 3 entry-point'ах, чтобы multi-line значения (типичный SSH-key), inline `# comments` и значения в кавычках работали единообразно в bulk `.env` paste, в per-secret боксе репо-секретов и в per-deploy-secret override-боксе.
