@@ -2121,6 +2121,11 @@ impl AppDb {
     /// `confirmed_at` is set to `now` if `row.status=='confirmed'`, else None.
     /// MD file write happens outside this transaction, on success — see
     /// `sync::migrate_bugs_for_repo` for the surrounding flow.
+    ///
+    /// T-000091: also synthesizes `bug_events` rows per imported bug
+    /// (`created` + N×`entered_testing` + optional `confirmed`) so that
+    /// Dashboard KPI5 (reads bug_events) stays aligned with StatsSummary
+    /// (reads bugs.fix_attempts). Mirrors `backfill_bug_events_for_existing`.
     pub fn migrate_bugs_transactional(
         &self,
         repo_id: i64,
@@ -2170,9 +2175,57 @@ impl AppDb {
                     archived_from_md_at,
                 ],
             )?;
+            let bug_id = tx.last_insert_rowid();
             imported += 1;
             if row.status == "confirmed" {
                 confirmed_archived += 1;
+            }
+
+            // T-000091: synthesize bug_events for the imported bug so that
+            // Dashboard KPI5 (reads bug_events.entered_testing count) stays
+            // aligned with stats_summary.avg_attempts (reads bugs.fix_attempts).
+            // Same logic as `backfill_bug_events_for_existing`, scoped to the
+            // single row we just inserted.
+            let mut synth_attempts = row.fix_attempts as i64;
+            if row.status == "confirmed" && synth_attempts < 1 {
+                synth_attempts = 1;
+            }
+
+            tx.execute(
+                "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status)
+                 VALUES (?1, 'created', ?2, NULL, 'created')",
+                rusqlite::params![bug_id, created_at],
+            )?;
+
+            if synth_attempts > 0 {
+                let end_ts = confirmed_at.unwrap_or(now);
+                let start_dt = chrono::DateTime::parse_from_rfc3339(&created_at)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                let end_dt = chrono::DateTime::parse_from_rfc3339(end_ts)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                let span = (end_dt - start_dt).num_seconds().max(1);
+
+                for i in 0..synth_attempts {
+                    let t = start_dt
+                        + chrono::Duration::seconds(((i + 1) * span) / (synth_attempts + 1));
+                    tx.execute(
+                        "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status)
+                         VALUES (?1, 'entered_testing', ?2, 'in-progress', 'testing')",
+                        rusqlite::params![bug_id, t.to_rfc3339()],
+                    )?;
+                }
+            }
+
+            if row.status == "confirmed" {
+                if let Some(cat) = confirmed_at {
+                    tx.execute(
+                        "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status)
+                         VALUES (?1, 'confirmed', ?2, 'testing', 'confirmed')",
+                        rusqlite::params![bug_id, cat],
+                    )?;
+                }
             }
         }
 
@@ -5247,6 +5300,129 @@ mod tests {
         assert_eq!(typ, "entered_testing");
         assert_eq!(from_s.as_deref(), Some("in-progress"));
         assert_eq!(to_s.as_deref(), Some("testing"));
+    }
+
+    #[test]
+    fn test_migrate_bugs_transactional_synthesizes_events() {
+        // T-000091: migrate_bugs_for_repo imports fix_attempts from MD without
+        // creating bug_events. Subsequent reads from `bug_events.entered_testing`
+        // (Dashboard KPI5) would diverge from `bugs.fix_attempts` (StatsSummary).
+        // Fix: synthesize per-row events inside the transaction.
+        let db = make_db();
+        let rid = make_repo(&db);
+        let rows = vec![
+            (
+                1i64,
+                FileBugNote {
+                    id: "B-000001".to_string(),
+                    date: "2026-05-01".to_string(),
+                    description: "active bug, 2 attempts".to_string(),
+                    severity: "major".to_string(),
+                    category: "logic".to_string(),
+                    status: "testing".to_string(),
+                    fix_attempts: 2,
+                    comment: Some("retried twice".to_string()),
+                },
+            ),
+            (
+                2i64,
+                FileBugNote {
+                    id: "B-000002".to_string(),
+                    date: "2026-05-02".to_string(),
+                    description: "confirmed, 3 attempts".to_string(),
+                    severity: "minor".to_string(),
+                    category: "ui_ux".to_string(),
+                    status: "confirmed".to_string(),
+                    fix_attempts: 3,
+                    comment: None,
+                },
+            ),
+            (
+                3i64,
+                FileBugNote {
+                    id: "B-000003".to_string(),
+                    date: "2026-05-03".to_string(),
+                    description: "legacy confirmed, attempts=0".to_string(),
+                    severity: "minor".to_string(),
+                    category: "other".to_string(),
+                    status: "confirmed".to_string(),
+                    fix_attempts: 0,
+                    comment: None,
+                },
+            ),
+            (
+                4i64,
+                FileBugNote {
+                    id: "B-000004".to_string(),
+                    date: "2026-05-04".to_string(),
+                    description: "fresh, 0 attempts".to_string(),
+                    severity: "minor".to_string(),
+                    category: "other".to_string(),
+                    status: "created".to_string(),
+                    fix_attempts: 0,
+                    comment: None,
+                },
+            ),
+        ];
+        let report = db
+            .migrate_bugs_transactional(rid, &rows, "2026-05-13T10:00:00Z")
+            .unwrap();
+        assert_eq!(report.imported, 4);
+        assert_eq!(report.confirmed_archived, 2);
+
+        let conn = db.conn.lock().unwrap();
+
+        // Bug-1 (testing, 2 attempts): created + 2× entered_testing = 3 events.
+        let n1: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bug_events WHERE bug_id = (SELECT id FROM bugs WHERE display_id = 'B-000001')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n1, 3, "bug 1: created + 2 entered_testing");
+        let t1: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bug_events WHERE event_type='entered_testing' AND bug_id=(SELECT id FROM bugs WHERE display_id='B-000001')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(t1, 2);
+
+        // Bug-2 (confirmed, 3 attempts): created + 3× entered_testing + confirmed = 5 events.
+        let n2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bug_events WHERE bug_id = (SELECT id FROM bugs WHERE display_id = 'B-000002')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n2, 5, "bug 2: created + 3 entered_testing + confirmed");
+
+        // Bug-3 (legacy: confirmed with fix_attempts=0): backfill forces 1 synthetic.
+        // Result: created + 1 entered_testing + confirmed = 3.
+        let n3: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bug_events WHERE bug_id = (SELECT id FROM bugs WHERE display_id = 'B-000003')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n3, 3,
+            "legacy confirmed/0-attempts gets 1 synthetic entered_testing"
+        );
+
+        // Bug-4 (created, 0 attempts): only 'created' event.
+        let n4: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bug_events WHERE bug_id = (SELECT id FROM bugs WHERE display_id = 'B-000004')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n4, 1, "fresh created bug: only 'created' event");
     }
 
     #[test]
