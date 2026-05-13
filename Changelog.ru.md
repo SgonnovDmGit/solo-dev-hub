@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [0.29.1] — 2026-05-13
+
+Patch-релиз. Фиксы UX ввода секретов во всех 3 entry-point'ах, чтобы multi-line значения (типичный SSH-key), inline `# comments` и значения в кавычках работали единообразно в bulk `.env` paste, в per-secret боксе репо-секретов и в per-deploy-secret override-боксе.
+
+### Added
+- `secrets-parser` теперь принимает dotenv-style single-line values: окружающие `"..."` / `'...'` кавычки strip'ятся, `\n \r \t \\ \"` escape-последовательности декодируются внутри double-quoted значений (single-quotes остаются literal'ом), inline `# comment` после значения отбрасывается если предшествует whitespace. Triple-quote `"""..."""` форма блока без изменений. SSH-ключ теперь можно ввести в одну строку через `\n`-escape'ы.
+
+### Fixed
+- DeploySecretsTable per-env override-value бокс был `<input type="password">` и не принимал multi-line paste вообще — SSH_KEY override был невозможен без создания пустого secret'а в репо-стороне и редактирования его там. Заменён на `<textarea>` с `-webkit-text-security: disc` маскированием, mirror'ом SecretsPanel per-secret-box. Два бокса теперь visually consistent.
+
+### Tests
+- +11 vitest case'ов в `secrets-parser.test.ts`: inline comments, quote stripping, escape decoding, single-vs-double-quote semantics, unclosed-quote errors, SSH-key one-row round-trip. 50 vitest total, svelte-check clean, 311 cargo без изменений.
+
 ## [0.29.0] — 2026-05-13
 
 Pre-screenshot polish-бандл перед public launch. Два deferred-пункта прошлого ревью (P7, KPI/StatsSummary drift) закрыты; multi-deploy Go isolation покрыт интеграционными тестами.

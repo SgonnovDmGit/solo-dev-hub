@@ -4,6 +4,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [0.29.1] — 2026-05-13
+
+Patch release. Secrets input UX fixes across all three entry points so SSH-key-style multi-line values, inline `# comments`, and quoted values work consistently in the bulk `.env` paste, the per-repo-secret edit box, and the per-deploy-secret override box.
+
+### Added
+- `secrets-parser` now accepts dotenv-style single-line values: surrounding `"..."` / `'...'` quotes are stripped, `\n \r \t \\ \"` escape sequences are decoded inside double-quoted values (single quotes stay literal), and inline `# comment` after a value is dropped when preceded by whitespace. Triple-quote `"""..."""` block form unchanged. SSH keys can now be entered as a one-row value via `\n` escapes.
+
+### Fixed
+- DeploySecretsTable per-env override-value box was an `<input type="password">` and could not accept multi-line paste at all — making SSH_KEY override impossible without first creating an empty secret elsewhere and editing it in the repo-side box. Swapped to a `<textarea>` with `-webkit-text-security: disc` masking, matching the SecretsPanel per-secret-box pattern. The two boxes are now visually consistent.
+
+### Tests
+- +11 vitest cases in `secrets-parser.test.ts` covering inline comments, quote stripping, escape decoding, single-vs-double-quote semantics, unclosed-quote errors, and an SSH-key one-row round-trip. 50 vitest total, svelte-check clean, 311 cargo unchanged.
+
 ## [0.29.0] — 2026-05-13
 
 Pre-screenshot polish bundle for the public launch. Two deferred review items (P7, KPI/StatsSummary drift) closed; multi-deploy Go isolation pinned by integration tests.
