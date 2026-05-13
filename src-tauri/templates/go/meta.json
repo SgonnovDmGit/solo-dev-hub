@@ -52,8 +52,8 @@
     },
     "GO_VERSION": {
       "label": { "ru": "Версия Go", "en": "Go version" },
-      "description": { "ru": "Базовый образ golang:<version>-alpine. `latest` или конкретная версия (напр. 1.23).", "en": "Base image golang:<version>-alpine. Use `latest` or pin (e.g. 1.23)." },
-      "default": "latest",
+      "description": { "ru": "Базовый образ golang:<version>-alpine. Пин на конкретную minor (напр. 1.26). `latest` НЕ работает: тега `golang:latest-alpine` в Docker Hub не существует.", "en": "Base image golang:<version>-alpine. Pin to a specific minor (e.g. 1.26). `latest` does NOT work: there is no `golang:latest-alpine` tag in Docker Hub." },
+      "default": "1.26",
       "type": "string",
       "auto_detect": {
         "source": "file",
@@ -83,7 +83,8 @@
       "label": { "ru": "Путь к .env на VPS", "en": "Path to .env on VPS" },
       "description": { "ru": "Абсолютный путь к .env файлу на сервере (напр. /home/user/app.env). Передаётся как --env-file в docker run. Оставьте пустым — строка --env-file пропускается. Escape-hatch для bulk-переменных; для новых проектов предпочитайте runtime-секреты.", "en": "Absolute path to .env on the server (e.g. /home/user/app.env). Passed as --env-file to docker run. Leave empty — --env-file line is skipped. Escape-hatch for bulk vars; prefer runtime secrets for new projects." },
       "default": "",
-      "type": "string"
+      "type": "string",
+      "optional": true
     }
   },
   "required_secrets": [

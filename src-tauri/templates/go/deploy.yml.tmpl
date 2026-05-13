@@ -35,6 +35,8 @@ jobs:
           tags: |
             ghcr.io/${{ env.REPO_LOWER }}:@@IMAGE_TAG@@
             ghcr.io/${{ env.REPO_LOWER }}:${{ github.sha }}
+          build-args: |
+            @@BUILD_ARGS@@
 
   deploy:
     needs: build-and-push

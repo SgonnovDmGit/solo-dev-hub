@@ -199,6 +199,7 @@ mod tests {
             ("CONTAINER_NAME", "swan-backend-prod"),
             ("COMPOSE_PROJECT", "swan_prod"),
             ("RUNTIME_ENV_ARGS", ""),
+            ("BUILD_ARGS", ""),
         ]);
         let rendered = render_template(tmpl, &v).expect("Go deploy.yml must render cleanly");
         assert!(rendered.contains("name: Deploy Go Backend"));
@@ -233,6 +234,7 @@ mod tests {
             ("CONTAINER_NAME", "app-prod"),
             ("COMPOSE_PROJECT", "app_prod"),
             ("RUNTIME_ENV_ARGS", runtime.as_str()),
+            ("BUILD_ARGS", ""),
         ]);
         let rendered = render_template(tmpl, &v).expect("must render");
         assert!(rendered.contains("--env DATABASE_URL=\"${{ secrets.DATABASE_URL }}\""));
@@ -257,6 +259,7 @@ mod tests {
             ("CONTAINER_NAME", "app-prod"),
             ("COMPOSE_PROJECT", "app_prod"),
             ("RUNTIME_ENV_ARGS", ""),
+            ("BUILD_ARGS", ""),
         ]);
         let rendered = render_template(tmpl, &v).expect("must render with empty ENV_FILE_PATH");
         assert!(rendered.contains(r#"ENV_FILE="""#));
@@ -384,6 +387,7 @@ mod tests {
             ("BINARY_NAME", "swan-server"),
             ("ENTRY_POINT", "./cmd/api/"),
             ("APP_PORT", "8080"),
+            ("DOCKERFILE_ARGS", ""),
         ]);
         let rendered = render_template(tmpl, &v).expect("Go dockerfile must render cleanly");
         assert!(rendered.contains("FROM golang:1.26-alpine AS builder"));
@@ -391,9 +395,33 @@ mod tests {
         assert!(rendered.contains("COPY --from=builder /out/swan-server ./"));
         assert!(rendered.contains("EXPOSE 8080"));
         assert!(rendered.contains(r#"CMD ["./swan-server"]"#));
+        // B-000010c: migrations COPY is now uncommented by default (Go web
+        // servers typically embed migrations). User can comment it manually
+        // if the project doesn't ship a /src/migrations folder.
+        assert!(rendered.contains("COPY --from=builder /src/migrations ./migrations"));
+        assert!(!rendered.contains("# COPY --from=builder /src/migrations"),
+                "migrations COPY must NOT be commented out by default");
         // Regression: guard against the WORKDIR/-o collision that produced
         // `exec: "./app": stat ./app: no such file or directory` when BINARY_NAME defaulted to "app".
         assert!(!rendered.contains("WORKDIR /app\n\n# git"),
                 "builder WORKDIR must NOT be /app (collides with default BINARY_NAME=app)");
+    }
+
+    #[test]
+    fn test_go_dockerfile_renders_dockerfile_args_block() {
+        // B-000010d: DOCKERFILE_ARGS block declares ARG NAME for each build-role
+        // secret in the UNION across envs. Empty when no build-role secrets.
+        let tmpl = include_str!("../templates/go/dockerfile.tmpl");
+        let args_block = render_dockerfile_args(&["API_KEY".to_string(), "BUILD_TOKEN".to_string()]);
+        let v = vars(&[
+            ("GO_VERSION", "1.26"),
+            ("BINARY_NAME", "app"),
+            ("ENTRY_POINT", "./cmd/api/"),
+            ("APP_PORT", "8080"),
+            ("DOCKERFILE_ARGS", args_block.as_str()),
+        ]);
+        let rendered = render_template(tmpl, &v).expect("Go dockerfile must render with ARGs");
+        assert!(rendered.contains("ARG API_KEY"));
+        assert!(rendered.contains("ARG BUILD_TOKEN"));
     }
 }

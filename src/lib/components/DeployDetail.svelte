@@ -26,16 +26,17 @@
     description: string;
     default: string;
     type: string;
+    // B-000010a: `optional: true` in meta.json marks a placeholder where empty
+    // value is intentional (e.g. ENV_FILE_PATH — the template's bash conditional
+    // handles empty correctly). Without this flag, an empty value is treated as
+    // a required-but-unset field and blocks Generate.
+    optional: boolean;
   }
 
   // Core 5 — fields with dedicated DB columns in deploy_environments. Stays at 5
   // (DB schema-tied). CONTAINER_NAME is a regular placeholder living in extras
   // since v0.25.0 (was a GitHub secret before that).
   const CORE_KEYS = ['WORKFLOW_NAME', 'IMAGE_TAG', 'COMPOSE_SERVICE', 'DOMAIN', 'DEPLOY_BRANCH'];
-  // Required-non-empty for the "Generate" button to enable. Superset of CORE_KEYS
-  // — adds CONTAINER_NAME because empty value would render `docker run --name `
-  // (broken). Other placeholders may be optional (env-specific defaults).
-  const REQUIRED_KEYS = [...CORE_KEYS, 'CONTAINER_NAME'];
 
   let env = $state<DeployEnvironment | null>(null);
   let placeholders = $state<PlaceholderSpec[]>([]);
@@ -51,7 +52,16 @@
   let branches = $state<BranchInfo[]>([]);
 
   const repo = $derived(env ? ($allRepos.find((r) => r.id === env!.repository_id) ?? null) : null);
-  const coreComplete = $derived(REQUIRED_KEYS.every((k) => (formValues[k] ?? '').trim() !== ''));
+
+  // B-000010a: a placeholder is "required" unless meta.json marks it `optional`.
+  // List of currently-empty required placeholders blocks Generate.
+  const requiredKeys = $derived(
+    placeholders.filter((p) => !p.optional).map((p) => p.key),
+  );
+  const missingRequired = $derived(
+    requiredKeys.filter((k) => (formValues[k] ?? '').trim() === ''),
+  );
+  const coreComplete = $derived(missingRequired.length === 0);
 
   // M10 review-fix: placeholder values are substituted into generated YAML
   // via `@@VAR@@` without context-aware escaping. Values containing chars
@@ -83,6 +93,7 @@
       description: extractLocalized(spec?.description, ''),
       default: typeof spec?.default === 'string' ? spec.default : '',
       type: typeof spec?.type === 'string' ? spec.type : 'string',
+      optional: spec?.optional === true,
     }));
   }
 
@@ -249,7 +260,8 @@
     <section>
       {#each placeholders as spec (spec.key)}
         {@const inputId = `placeholder-${env.id}-${spec.key}`}
-        <div class="field" title={spec.description}>
+        {@const isMissing = !spec.optional && (formValues[spec.key] ?? '').trim() === ''}
+        <div class="field" class:missing-required={isMissing} title={spec.description}>
           <label for={inputId}>{spec.label}:</label>
           {#if spec.key === 'DEPLOY_BRANCH' && branches.length > 0}
             <input id={inputId} type="text"
@@ -293,6 +305,12 @@
       />
     </section>
 
+    {#if missingRequired.length > 0}
+      <section class="missing-warn">
+        ⚠ {$tStore('deploy.missingRequired' as any) || 'Required fields are empty — fill them before generating'}: {missingRequired.join(', ')}
+      </section>
+    {/if}
+
     {#if yamlWarnings.length > 0}
       <section class="yaml-warn">
         ⚠ {$tStore('deploy.yamlUnsafeWarning' as any) || 'Values may break YAML — review before generating'}: {yamlWarnings.join(', ')}
@@ -305,7 +323,11 @@
         class:stale={workflowStale}
         disabled={generating || !coreComplete}
         onclick={handleGenerate}
-        title={workflowStale ? ($tStore('deploy.regenerateNeeded' as any) || 'Workflow files are stale — regenerate to apply role changes') : ''}
+        title={!coreComplete
+          ? (($tStore('deploy.missingRequired' as any) || 'Required fields are empty') + ': ' + missingRequired.join(', '))
+          : workflowStale
+            ? ($tStore('deploy.regenerateNeeded' as any) || 'Workflow files are stale — regenerate to apply role changes')
+            : ''}
       >
         {workflowStale
           ? ($tStore('deploy.regenerateWorkflowFiles' as any) || 'Regenerate workflow files')
@@ -345,6 +367,13 @@
     padding: 0.4rem;
     box-sizing: border-box;
   }
+  /* B-000010a: visual marker for empty required placeholders. Red border on
+     the input so the user can spot the missing field without scanning the
+     full form against the summary list at the bottom. */
+  .field.missing-required input {
+    border-color: rgb(220, 38, 38);
+    box-shadow: 0 0 0 1px rgba(220, 38, 38, 0.25);
+  }
   .copy-btn {
     flex-shrink: 0;
     padding: 0.25rem 0.55rem;
@@ -363,6 +392,16 @@
   .yaml-warn {
     background: rgba(234, 179, 8, 0.1);
     border: 1px solid rgba(234, 179, 8, 0.35);
+    border-radius: 4px;
+    padding: 0.5rem 0.75rem;
+    color: var(--text);
+    font-size: 0.85rem;
+  }
+  /* B-000010a: red-tinted warning matching .yaml-warn's structure but with
+     "blocker" semantics (Generate is disabled while this is shown). */
+  .missing-warn {
+    background: rgba(220, 38, 38, 0.1);
+    border: 1px solid rgba(220, 38, 38, 0.35);
     border-radius: 4px;
     padding: 0.5rem 0.75rem;
     color: var(--text);
