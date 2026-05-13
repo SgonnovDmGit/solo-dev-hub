@@ -3032,6 +3032,139 @@ mod render_deploy_tests {
     }
 
     #[test]
+    fn test_multi_env_go_isolation_per_env_values_baked_in() {
+        // v0.29.0 multi-deploy smoke: same Go repo, two envs, each rendered
+        // workflow file must contain its own env-specific values and NOT leak
+        // values from the other env.
+        let (db, repo_id, prod_id) = setup();
+        let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
+            repository_id: repo_id,
+            name: "test".to_string(),
+            workflow_name: "Deploy test".to_string(),
+            image_tag: "test".to_string(),
+            compose_service: "backend".to_string(),
+            domain: "test.x.com".to_string(),
+            deploy_branch: "dev".to_string(),
+            extras: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("APP_PORT".to_string(), "8080".to_string());
+                m.insert("GO_VERSION".to_string(), "1.23".to_string());
+                m.insert("BINARY_NAME".to_string(), "app".to_string());
+                m.insert("ENTRY_POINT".to_string(), "./cmd/api/".to_string());
+                m.insert("ENV_FILE_PATH".to_string(), "".to_string());
+                m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
+                m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
+                m
+            },
+        }).unwrap();
+
+        let prod_files = render_files_for_deploy_env(&db, prod_id).unwrap();
+        let test_files = render_files_for_deploy_env(&db, test_env.id).unwrap();
+
+        let prod_yml = &prod_files.iter().find(|f| f.path.ends_with("deploy-prod.yml")).unwrap().content;
+        let test_yml = &test_files.iter().find(|f| f.path.ends_with("deploy-test.yml")).unwrap().content;
+
+        // Prod-specific values present in prod, absent from test.
+        assert!(prod_yml.contains("environment: prod"));
+        assert!(prod_yml.contains("--network app_prod_net"));
+        assert!(prod_yml.contains("com.docker.compose.project=app_prod"));
+        assert!(prod_yml.contains("branches: [ master ]"));
+        assert!(prod_yml.contains("DOMAIN=x.com"));
+        assert!(!prod_yml.contains("app_test_net"), "prod must not leak test network");
+        assert!(!prod_yml.contains("test.x.com"), "prod must not leak test domain");
+
+        // Test-specific values present in test, absent from prod.
+        assert!(test_yml.contains("environment: test"));
+        assert!(test_yml.contains("--network app_test_net"));
+        assert!(test_yml.contains("com.docker.compose.project=app_test"));
+        assert!(test_yml.contains("branches: [ dev ]"));
+        assert!(test_yml.contains("DOMAIN=test.x.com"));
+        assert!(!test_yml.contains("app_prod_net"), "test must not leak prod network");
+        assert!(!test_yml.contains("DOMAIN=x.com\n"), "test must not leak prod domain");
+    }
+
+    #[test]
+    fn test_multi_env_go_runtime_secrets_per_env_isolation() {
+        // Each env's runtime secrets must appear only in that env's deploy.yml.
+        let (db, repo_id, prod_id) = setup();
+        let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
+            repository_id: repo_id,
+            name: "test".to_string(),
+            workflow_name: "Deploy test".to_string(),
+            image_tag: "test".to_string(),
+            compose_service: "backend".to_string(),
+            domain: "test.x.com".to_string(),
+            deploy_branch: "dev".to_string(),
+            extras: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("APP_PORT".to_string(), "8080".to_string());
+                m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
+                m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
+                m.insert("ENV_FILE_PATH".to_string(), "".to_string());
+                m
+            },
+        }).unwrap();
+
+        // Per-env runtime secrets: prod gets DATABASE_URL_PROD, test gets DATABASE_URL_TEST.
+        db.upsert_deploy_secret(prod_id, "DATABASE_URL_PROD", Some("runtime"), true, true).unwrap();
+        db.upsert_deploy_secret(test_env.id, "DATABASE_URL_TEST", Some("runtime"), true, true).unwrap();
+
+        let prod_files = render_files_for_deploy_env(&db, prod_id).unwrap();
+        let test_files = render_files_for_deploy_env(&db, test_env.id).unwrap();
+
+        let prod_yml = &prod_files.iter().find(|f| f.path.ends_with("deploy-prod.yml")).unwrap().content;
+        let test_yml = &test_files.iter().find(|f| f.path.ends_with("deploy-test.yml")).unwrap().content;
+
+        assert!(prod_yml.contains("DATABASE_URL_PROD"), "prod must reference its own runtime secret");
+        assert!(!prod_yml.contains("DATABASE_URL_TEST"), "prod must not leak test runtime secret");
+        assert!(test_yml.contains("DATABASE_URL_TEST"), "test must reference its own runtime secret");
+        assert!(!test_yml.contains("DATABASE_URL_PROD"), "test must not leak prod runtime secret");
+    }
+
+    #[test]
+    fn test_multi_env_go_shared_dockerfile_identical_across_envs() {
+        // Go's Dockerfile uses only repo-wide placeholders (GO_VERSION,
+        // BINARY_NAME, ENTRY_POINT, APP_PORT) and NOT env-specific
+        // DOCKERFILE_ARGS (that's a Flutter-specific concept — Go binaries are
+        // statically linked, secrets are runtime-injected via docker --env).
+        // So when those repo-wide values match, the rendered Dockerfile must
+        // be byte-identical regardless of which env triggers the render.
+        let (db, repo_id, prod_id) = setup();
+        let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
+            repository_id: repo_id,
+            name: "test".to_string(),
+            workflow_name: "Deploy test".to_string(),
+            image_tag: "test".to_string(),
+            compose_service: "backend".to_string(),
+            domain: "test.x.com".to_string(),
+            deploy_branch: "dev".to_string(),
+            extras: {
+                let mut m = std::collections::HashMap::new();
+                // Repo-wide values match prod's setup() values exactly.
+                m.insert("APP_PORT".to_string(), "8080".to_string());
+                m.insert("GO_VERSION".to_string(), "1.23".to_string());
+                m.insert("BINARY_NAME".to_string(), "app".to_string());
+                m.insert("ENTRY_POINT".to_string(), "./cmd/api/".to_string());
+                m.insert("ENV_FILE_PATH".to_string(), "".to_string());
+                // Env-specific values differ from prod.
+                m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
+                m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
+                m
+            },
+        }).unwrap();
+
+        let prod_files = render_files_for_deploy_env(&db, prod_id).unwrap();
+        let test_files = render_files_for_deploy_env(&db, test_env.id).unwrap();
+
+        let prod_dockerfile = &prod_files.iter().find(|f| f.path == "Dockerfile").unwrap().content;
+        let test_dockerfile = &test_files.iter().find(|f| f.path == "Dockerfile").unwrap().content;
+        assert_eq!(
+            prod_dockerfile, test_dockerfile,
+            "Go Dockerfile is repo-wide; identical extras must render identical Dockerfile"
+        );
+    }
+
+    #[test]
     fn test_validate_env_name_accepts_valid() {
         assert!(super::validate_env_name("prod").is_ok());
         assert!(super::validate_env_name("test-1").is_ok());
