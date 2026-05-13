@@ -1,5 +1,5 @@
 use crate::models::*;
-use rusqlite::{Connection, Result as SqlResult, Row};
+use rusqlite::{Connection, OptionalExtension, Result as SqlResult, Row};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -557,6 +557,26 @@ impl AppDb {
             )?;
         }
 
+        if version < 24 {
+            // T-000092 (v0.29.0): project-rename log. Symmetric to `repo_renames`
+            // (v16) but scoped to a project rather than a repository. Used to
+            // replay `microservice-api/<X>/` folder renames on parent server side
+            // when a microservice project is renamed — the folder there is keyed
+            // by project name (`ms_project.name`), not by repo canonical name,
+            // so `repo_renames` alone doesn't cover it.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS project_renames (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    old_name TEXT NOT NULL,
+                    new_name TEXT NOT NULL,
+                    renamed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_project_renames_project ON project_renames(project_id);
+                 PRAGMA user_version = 24;",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -624,10 +644,28 @@ impl AppDb {
         description: Option<&str>,
     ) -> SqlResult<Project> {
         let conn = self.conn.lock().unwrap();
+        // T-000092: detect name change → log to project_renames so sync-preamble
+        // can rename `microservice-api/<old>/` to `<new>/` on parent server side.
+        // Only logs when name actually differs (no-op for description-only edits).
+        let old_name: Option<String> = conn
+            .query_row(
+                "SELECT name FROM projects WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
         conn.execute(
             "UPDATE projects SET name = ?1, description = ?2 WHERE id = ?3",
             rusqlite::params![name, description, id],
         )?;
+        if let Some(prev) = old_name {
+            if prev != name && !prev.is_empty() && !name.is_empty() {
+                conn.execute(
+                    "INSERT INTO project_renames (project_id, old_name, new_name) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id, prev, name],
+                )?;
+            }
+        }
         conn.query_row(
             "SELECT id, name, description, created_at, project_type FROM projects WHERE id = ?1",
             rusqlite::params![id],
@@ -1794,6 +1832,33 @@ impl AppDb {
                 repository_id: row.get(1)?,
                 old_canonical: row.get(2)?,
                 new_canonical: row.get(3)?,
+                renamed_at: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    // ── Project-rename log (T-000092) ──────────────────────────────────────────
+
+    pub fn list_renames_for_project(
+        &self,
+        project_id: i64,
+    ) -> SqlResult<Vec<crate::models::ProjectRename>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, old_name, new_name, renamed_at
+             FROM project_renames WHERE project_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![project_id], |row| {
+            Ok(crate::models::ProjectRename {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                old_name: row.get(2)?,
+                new_name: row.get(3)?,
                 renamed_at: row.get(4)?,
             })
         })?;
@@ -3896,7 +3961,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
     }
 
 
@@ -4190,6 +4255,43 @@ mod tests {
             .unwrap();
         assert_eq!(updated.name, "New Name");
         assert_eq!(updated.description.as_deref(), Some("new desc"));
+    }
+
+    #[test]
+    fn test_update_project_logs_rename() {
+        // T-000092: name change → entry in project_renames.
+        let db = make_db();
+        let p = db.create_project("Old MS", None, "microservice").unwrap();
+        db.update_project(p.id, "New MS", None).unwrap();
+        let renames = db.list_renames_for_project(p.id).unwrap();
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames[0].old_name, "Old MS");
+        assert_eq!(renames[0].new_name, "New MS");
+    }
+
+    #[test]
+    fn test_update_project_description_only_no_rename_log() {
+        // T-000092: description-only edit must NOT create a project_renames row.
+        let db = make_db();
+        let p = db.create_project("Stable MS", None, "microservice").unwrap();
+        db.update_project(p.id, "Stable MS", Some("new desc")).unwrap();
+        let renames = db.list_renames_for_project(p.id).unwrap();
+        assert!(renames.is_empty());
+    }
+
+    #[test]
+    fn test_update_project_multi_rename_chain() {
+        // T-000092: two consecutive renames → two entries in chain order.
+        let db = make_db();
+        let p = db.create_project("V1", None, "microservice").unwrap();
+        db.update_project(p.id, "V2", None).unwrap();
+        db.update_project(p.id, "V3", None).unwrap();
+        let renames = db.list_renames_for_project(p.id).unwrap();
+        assert_eq!(renames.len(), 2);
+        assert_eq!(renames[0].old_name, "V1");
+        assert_eq!(renames[0].new_name, "V2");
+        assert_eq!(renames[1].old_name, "V2");
+        assert_eq!(renames[1].new_name, "V3");
     }
 
     #[test]
@@ -5972,9 +6074,9 @@ mod tests {
         ).unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v23 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v24 also applied on fresh DB)
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
 
         drop(conn);
         let _ = repo;
@@ -6581,7 +6683,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
     }
 
     #[test]
@@ -6627,6 +6729,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 0, "bug_stats must not exist as a table either");
+    }
+
+    #[test]
+    fn test_db_migration_v24_creates_project_renames() {
+        // T-000092: project-rename log. Mirrors `repo_renames` (v16) for
+        // microservice-api/<project-name>/ replay on parent server side.
+        let db = make_db();
+        let conn = db.conn.lock().unwrap();
+        let exists: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='project_renames'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "project_renames table must be created by v24");
+        let idx: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_project_renames_project'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "idx_project_renames_project must be created by v24");
     }
 
     #[test]

@@ -20,6 +20,17 @@
 
 **Источник истины для `<ms-project-name>`** — `projects.name` (не github_name). Тот же паттерн, что для REQ-*.md в 0.8.0.
 
+## Rename-replay (T-000092, v0.29.0)
+
+Когда microservice-проект переименован в приложении (`update_project` → `projects.name`), parent-сервер'у нужно переименовать у себя папку `docs/microservice-api/<old>/` → `<new>/`, иначе на следующем sync'е API/handlers скопируются в новую папку, а старая останется как мусор.
+
+Механика симметрична `repo_renames` (v16):
+
+- `update_project` сравнивает старое и новое имя, при отличии пишет строку в `project_renames` (id, project_id, old_name, new_name, renamed_at).
+- На каждом sync'е, в цикле по микросервисам проекта, вызывается `db.list_renames_for_project(ms_project_id)` и для каждой записи — `sync::replay_rename_in_dir(<srv>/docs/microservice-api/, old, new)`.
+- Идемпотентно по fs: replay = no-op, если `old/` уже нет (переименована раньше). Если и `old/`, и `new/` существуют одновременно — `Collision`, ошибка в `SyncResult.errors`, ручное вмешательство.
+- Папка `microservice-requirements/<ms_canonical>/` rename'ится по `repo_renames` для server-репо микросервиса (это отдельная сущность с github_name → canonical_folder_name).
+
 ## Автомиграция клиента (одноразовая)
 
 До 0.9.0 `api.md` на клиенте лежал в `docs/api.md`. В 0.9.0 target переехал в `docs/server-api/api.md`. При первом sync после обновления:

@@ -399,6 +399,19 @@ pub struct RepoRename {
     pub renamed_at: String,
 }
 
+/// T-000092: project-rename log. Symmetric to `RepoRename` but scoped to a
+/// project rather than a repository. Used to replay `microservice-api/<X>/`
+/// folder renames on parent server side when a microservice project is
+/// renamed (the folder is keyed by project name, not repo canonical name).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProjectRename {
+    pub id: i64,
+    pub project_id: i64,
+    pub old_name: String,
+    pub new_name: String,
+    pub renamed_at: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TemplateFile {
     pub language_key: String,

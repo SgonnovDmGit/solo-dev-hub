@@ -1515,6 +1515,38 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                     )),
                 }
 
+                // T-000092: replay ms-PROJECT renames on parent side
+                // (microservice-api/<ms-project-name>/). repo_renames doesn't
+                // cover project renames because the folder is keyed by project
+                // name, not repo canonical name.
+                let ms_api_parent = srv_base.join("docs").join("microservice-api");
+                match db.list_renames_for_project(*ms_project_id) {
+                    Ok(renames) => {
+                        for r in renames {
+                            match sync::replay_rename_in_dir(
+                                &ms_api_parent,
+                                &r.old_name,
+                                &r.new_name,
+                            ) {
+                                Ok(sync::RenameOutcome::Renamed) => migrated += 1,
+                                Ok(sync::RenameOutcome::NoOp) => {}
+                                Ok(sync::RenameOutcome::Collision) => errors.push(format!(
+                                    "Rename collision on parent side: both {}/ and {}/ exist under microservice-api — manual intervention needed",
+                                    r.old_name, r.new_name
+                                )),
+                                Err(e) => errors.push(format!(
+                                    "Project rename replay {} → {} on parent: {}",
+                                    r.old_name, r.new_name, e
+                                )),
+                            }
+                        }
+                    }
+                    Err(e) => errors.push(format!(
+                        "List renames for ms-project {}: {}",
+                        ms_project_id, e
+                    )),
+                }
+
                 // F-033 Stage 1e: replay server renames on ms side (server-requirements/).
                 match db.list_renames_for_repo(srv.id) {
                     Ok(renames) => {
