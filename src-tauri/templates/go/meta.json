@@ -51,9 +51,9 @@
       "type": "string"
     },
     "GO_VERSION": {
-      "label": { "ru": "Версия Go", "en": "Go version" },
-      "description": { "ru": "Базовый образ golang:<version>-alpine. Пин на конкретную minor (напр. 1.26). `latest` НЕ работает: тега `golang:latest-alpine` в Docker Hub не существует.", "en": "Base image golang:<version>-alpine. Pin to a specific minor (e.g. 1.26). `latest` does NOT work: there is no `golang:latest-alpine` tag in Docker Hub." },
-      "default": "1.26",
+      "label": { "ru": "Go образ (Docker tag)", "en": "Go image (Docker tag)" },
+      "description": { "ru": "Полный Docker Hub тег для базового образа `golang:<тег>`. Примеры: `alpine` (рекомендуется — последний стабильный Go, ~250 MB), `1.26-alpine` (пин на minor), `1.26.0-alpine` (точная patch-версия), `1.26` (Debian, ~800 MB), `bookworm` (Debian, последний). Избегайте просто `latest` — не всегда совпадает с актуальным релизом.", "en": "Full Docker Hub tag for the base image `golang:<tag>`. Examples: `alpine` (recommended — latest stable Go, ~250 MB), `1.26-alpine` (pin to minor), `1.26.0-alpine` (exact patch), `1.26` (Debian, ~800 MB), `bookworm` (Debian, latest). Avoid bare `latest` — not always aligned with current release." },
+      "default": "alpine",
       "type": "string",
       "auto_detect": {
         "source": "file",

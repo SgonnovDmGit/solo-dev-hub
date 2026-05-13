@@ -381,9 +381,13 @@ mod tests {
     /// Smoke-regression: Go dockerfile.tmpl renders with SwanQu values.
     #[test]
     fn test_regression_go_swanqu_server_dockerfile() {
+        // v0.29.2: GO_VERSION now holds the FULL Docker Hub tag (incl. variant
+        // suffix), not just the version number. Template no longer hardcodes
+        // `-alpine`. Default is `alpine` (latest stable Go on alpine); users
+        // can pin to `1.26-alpine`, `1.26.0-alpine`, `bookworm`, etc.
         let tmpl = include_str!("../templates/go/dockerfile.tmpl");
         let v = vars(&[
-            ("GO_VERSION", "1.26"),
+            ("GO_VERSION", "1.26-alpine"),
             ("BINARY_NAME", "swan-server"),
             ("ENTRY_POINT", "./cmd/api/"),
             ("APP_PORT", "8080"),
@@ -405,6 +409,25 @@ mod tests {
         // `exec: "./app": stat ./app: no such file or directory` when BINARY_NAME defaulted to "app".
         assert!(!rendered.contains("WORKDIR /app\n\n# git"),
                 "builder WORKDIR must NOT be /app (collides with default BINARY_NAME=app)");
+    }
+
+    #[test]
+    fn test_go_dockerfile_renders_bare_alpine_default() {
+        // v0.29.2: default GO_VERSION is `alpine` — Docker Hub auto-tracks
+        // latest stable Go on alpine. Template must produce `golang:alpine`
+        // without any mangled prefix/suffix.
+        let tmpl = include_str!("../templates/go/dockerfile.tmpl");
+        let v = vars(&[
+            ("GO_VERSION", "alpine"),
+            ("BINARY_NAME", "app"),
+            ("ENTRY_POINT", "./cmd/api/"),
+            ("APP_PORT", "8080"),
+            ("DOCKERFILE_ARGS", ""),
+        ]);
+        let rendered = render_template(tmpl, &v).expect("must render with bare 'alpine' tag");
+        assert!(rendered.contains("FROM golang:alpine AS builder"));
+        assert!(!rendered.contains("golang:alpine-alpine"), "no double-suffix");
+        assert!(!rendered.contains("golang:-alpine"), "no leading-dash mangling");
     }
 
     #[test]

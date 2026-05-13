@@ -1,5 +1,5 @@
 # ---- Build stage ----
-FROM golang:@@GO_VERSION@@-alpine AS builder
+FROM golang:@@GO_VERSION@@ AS builder
 
 # git may be required by `go mod download` for private deps
 RUN apk add --no-cache git
