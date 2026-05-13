@@ -150,7 +150,22 @@
       await recordDeploySecretEvent(deployEnvId, repoId, 'env_secret_set', s.secret_name).catch((e) => console.warn(e));
       addToast(($tStore('deploy.secretSaved' as any) || 'Secret "{0}" saved').replace('{0}', s.secret_name), 'success');
       values[s.secret_name] = '';
-      await load(); // needs to pick up updated_at from GitHub
+      // B-000009: optimistic update of envSecretsFromGitHub instead of `await load()`.
+      // A full reload replaces dbSecrets/envSecretsFromGitHub arrays → keyed each
+      // block re-renders → focus is lost from the next textarea the user tabs to.
+      // We know the push succeeded; mark the env secret as just-updated locally.
+      const nowIso = new Date().toISOString();
+      const existing = envSecretsFromGitHub.find((e) => e.name === s.secret_name);
+      if (existing) {
+        envSecretsFromGitHub = envSecretsFromGitHub.map((e) =>
+          e.name === s.secret_name ? { ...e, updated_at: nowIso } : e
+        );
+      } else {
+        envSecretsFromGitHub = [
+          ...envSecretsFromGitHub,
+          { name: s.secret_name, created_at: nowIso, updated_at: nowIso },
+        ];
+      }
     } catch (err) {
       addToast(String(err), 'error');
     }
