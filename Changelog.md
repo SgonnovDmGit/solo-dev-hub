@@ -4,6 +4,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-05-13
+
+Pre-screenshot polish bundle for the public launch. Two deferred review items (P7, KPI/StatsSummary drift) closed; multi-deploy Go isolation pinned by integration tests.
+
+### Added
+- **T-000092** `project_renames` table (migration v24) — symmetric to `repo_renames` but scoped to a project. `update_project` logs name changes; sync-preamble replays them as `microservice-api/<old>/ → <new>/` folder renames on parent server side. `repo_renames` did not cover this because the folder is keyed by project name (`projects.name`), not by repo canonical name. Idempotent via fs checks; collision (both `old/` and `new/` exist) surfaces as a manual-intervention warning. Flow doc `docs/flows/api-handlers-sync.md` updated with the rename-replay section.
+- Multi-env Go integration coverage — three new tests in `render_deploy_tests` verifying same-repo prod+test renders produce env-isolated `deploy-{name}.yml` (network, branch, domain, container, runtime secrets) and an env-agnostic shared `Dockerfile` when repo-wide placeholders (`GO_VERSION`, `BINARY_NAME`, `ENTRY_POINT`, `APP_PORT`) match.
+
+### Fixed
+- **T-000091** Dashboard KPI5 `avg attempts` (reads `bug_events.entered_testing` count) drifted from per-repo / per-project `StatsSummary` (reads `bugs.fix_attempts`) after running `migrate_bugs_for_repo` on a freshly added repo with existing MD content. Cause: `migrate_bugs_transactional` inserted bugs with `fix_attempts > 0` but did not create synthetic `bug_events`, and `backfill_bug_events_for_existing` had a global one-shot guard that skipped subsequent migrations. Fix: synthesize `created` + N×`entered_testing` + optional `confirmed` events inside the migration transaction, mirroring the backfill logic. Invariant `COUNT(entered_testing) == bugs.fix_attempts` now holds at all entry points.
+
+### Tests
+- 311 cargo tests (was 308): +1 for T-000091 migration→events synthesis, +3 for T-000092 project_renames, +3 for multi-env Go isolation, +1 for v24 schema migration.
+
 ## [0.28.0] — 2026-05-12
 
 Second code-review pass after v0.27.1 — 32 findings across 4 domains (bug/stats/dashboard, tasks/timeline/datagrid, cross-repo sync, deploy/secrets/settings). All addressed across 4 batches: 3 critical + 8 high + 11 medium + 9 polish + 2 deferred (P7 microservice-api rename-replay needs new schema, P10 COMPOSE_SERVICE copy UX is a design call). No new features, no schema migrations.

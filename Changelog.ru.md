@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-05-13
+
+Pre-screenshot polish-бандл перед public launch. Два deferred-пункта прошлого ревью (P7, KPI/StatsSummary drift) закрыты; multi-deploy Go isolation покрыт интеграционными тестами.
+
+### Added
+- **T-000092** Таблица `project_renames` (migration v24) — симметрична `repo_renames`, но scoped'ом на проект, не на репо. `update_project` логирует смену имени; sync-preamble proигрывает её как `microservice-api/<old>/ → <new>/` на parent-сервер'е. `repo_renames` это не покрывал: папка keyed by `projects.name`, не canonical repo name. Идемпотентно по fs; collision (и `old/`, и `new/` существуют одновременно) surface'ится как ручное вмешательство. Flow-doc `docs/flows/api-handlers-sync.md` дополнен секцией rename-replay.
+- Multi-env Go integration coverage — три новых теста в `render_deploy_tests`: same-repo prod+test рендерят env-isolated `deploy-{name}.yml` (network, branch, domain, container, runtime secrets), общий `Dockerfile` env-agnostic при совпадающих repo-wide placeholders (`GO_VERSION`, `BINARY_NAME`, `ENTRY_POINT`, `APP_PORT`).
+
+### Fixed
+- **T-000091** Dashboard KPI5 `avg attempts` (читает `bug_events.entered_testing`) расходился с per-repo / per-project `StatsSummary` (читает `bugs.fix_attempts`) после `migrate_bugs_for_repo` на свежедобавленном репо с готовым MD-контентом. Причина: `migrate_bugs_transactional` вставлял bug'и с `fix_attempts > 0`, но не создавал synthetic `bug_events`, а `backfill_bug_events_for_existing` имел глобальный one-shot guard и скипал последующие миграции. Фикс: синтезировать `created` + N×`entered_testing` + optional `confirmed` события внутри транзакции миграции, mirror'я backfill-логику. Инвариант `COUNT(entered_testing) == bugs.fix_attempts` теперь держится на всех entry-point'ах.
+
+### Tests
+- 311 cargo-тестов (было 308): +1 для T-000091 migration→events synthesis, +3 для T-000092 project_renames, +3 для multi-env Go isolation, +1 для v24 schema migration.
+
 ## [0.28.0] — 2026-05-12
 
 Второй проход code-review после v0.27.1 — 32 находки в 4 доменах (bug/stats/dashboard, tasks/timeline/datagrid, cross-repo sync, deploy/secrets/settings). Закрыты 4 батчами: 3 critical + 8 high + 11 medium + 9 polish + 2 deferred (P7 microservice-api rename-replay требует новой схемы, P10 COMPOSE_SERVICE copy UX — дизайн-вопрос). Без новых фич, без migration'ов.
