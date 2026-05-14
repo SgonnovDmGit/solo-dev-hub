@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+## [0.30.1] — 2026-05-14
+
+Второй проход механического рефакторинга поверх v0.30.0. Ещё три split'а — `export.rs` по доменам парсеров, `sync/claude_md.rs` разбит на три концерна, `i18n/translations.ts` разнесён по префиксам ключей. Pure лексический move, поведение не менялось. Тестовые наборы без изменений (314 cargo, 50 vitest, svelte-check clean — file count 454 → 489 из-за новых `i18n/strings/`).
+
+### Changed
+- **T-000104** `src-tauri/src/export.rs` (1123 строки) разнесён в `src-tauri/src/export/`: `mod.rs` (barrel) + `util.rs` (shared pipe-парсер, escape/unescape) + `bugs.rs` (v2 8-field generate/parse) + `bugs_legacy.rs` (pre-v2 import: `parse_header`, `parse_bug_entry`, `parse_markdown_legacy`) + `todo_done.rs` (F-021 todo/done парсеры). Commit `4ca36e0`.
+- **T-000105** `src-tauri/src/sync/claude_md.rs` (872 строки, три концерна) расщеплён: `claude_md.rs` (448 строк — только CLAUDE.md section), `project_md.rs` (238, новый — `generate_project_md` для cross-repo announcement Path lookup'ов), `gitignore.rs` (221, новый — `sync_gitignore_section`). Commit `0684235`.
+- **T-000106** `src/lib/i18n/translations.ts` (1594 строки, ~727 ключей × ru/en flat objects) разнесён по префиксу ключа в `src/lib/i18n/strings/<domain>.ts` (35 файлов, по одному per top-level prefix). Каждый file экспортит `ru` + `en` срез своего домена. Корневой `translations.ts` (теперь 116 строк) merge'ит через spread. `TranslationKey` type-narrowing сохранён через `as const`. Commit `336ec38`.
+
+### Tests
+- 314 cargo (без изменений), 50 vitest (без изменений), svelte-check 0/0/0 на 489 файлах (было 454 — +35 `i18n/strings/*.ts`).
+
 ## [0.30.0] — 2026-05-14
 
 Pre-v1.0.0 механический refactor-bundle. Шесть задач (T-000093/094/095/096/097/102) разнесли четыре самых больших Rust-модуля и TypeScript `types.ts` по доменам. Чистый лексический move + extraction — поведение не менялось. Все тестовые наборы остаются зелёными (314 cargo, 50 vitest, svelte-check clean).
