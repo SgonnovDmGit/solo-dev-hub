@@ -789,6 +789,7 @@ mod tests {
 
     // ── B-007 merge local-only ↔ GitHub sync ──────────────────────────────────
 
+    #[allow(dead_code)]
     fn make_repo(db: &AppDb) -> i64 {
         let r = db
             .upsert_repository("owner/x", None, None, None, None, None)
