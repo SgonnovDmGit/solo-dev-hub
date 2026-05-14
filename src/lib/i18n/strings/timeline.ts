@@ -22,6 +22,15 @@ export const ru = {
   'timeline.event.sync.project_sync': 'синхронизация проекта',
   'timeline.event.sync.tasks': 'синхронизация задач',
   'timeline.event.sync.secret': 'секрет обновлён',
+  'timeline.event.sync.requirements': 'синхронизация требований',
+  // T-000103 Task 6: v25 deploy-config migration warning. Three variants:
+  //  • migration  — single-conflict line:  "1 коллизия при миграции deploy-конфига — для {firstKey} оставлено значение из env {keptEnv}"
+  //  • migrationMany — N>1 conflicts:    "{count} коллизий при миграции deploy-конфига (для {firstKey} оставлено значение из env {keptEnv})"
+  //  • migrationNoDetail — fallback when details JSON missing / unparseable: "миграция deploy-конфига применена"
+  // Placeholders: {count}, {firstKey}, {keptEnv}. Rendered in TS via .replace().
+  'timeline.event.sync.migration': '1 коллизия при миграции deploy-конфига — для {firstKey} оставлено значение из env {keptEnv}',
+  'timeline.event.sync.migrationMany': '{count} коллизий при миграции deploy-конфига (для {firstKey} оставлено значение из env {keptEnv})',
+  'timeline.event.sync.migrationNoDetail': 'миграция deploy-конфига применена',
   'timeline.event.deploy.render': 'deploy.yml записан',
   'timeline.event.deploy.env_secret_set': 'env-секрет установлен',
   'timeline.event.deploy.env_secret_delete': 'env-секрет удалён',
@@ -56,6 +65,11 @@ export const en: Record<keyof typeof ru, string> = {
   'timeline.event.sync.project_sync': 'project synced',
   'timeline.event.sync.tasks': 'tasks synced',
   'timeline.event.sync.secret': 'secret updated',
+  'timeline.event.sync.requirements': 'requirements synced',
+  // T-000103 Task 6: see RU comment above.
+  'timeline.event.sync.migration': '1 deploy-config migration conflict — kept {firstKey} value from env {keptEnv}',
+  'timeline.event.sync.migrationMany': '{count} deploy-config migration conflicts (kept {firstKey} value from env {keptEnv})',
+  'timeline.event.sync.migrationNoDetail': 'deploy-config migration applied',
   'timeline.event.deploy.render': 'deploy.yml written',
   'timeline.event.deploy.env_secret_set': 'env secret set',
   'timeline.event.deploy.env_secret_delete': 'env secret deleted',

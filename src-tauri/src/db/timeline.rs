@@ -47,6 +47,10 @@ impl AppDb {
             }
         }
 
+        // T-000103 Task 6: every UNION leg now projects a 14th `details` column
+        // so sync_event rows can carry their `details` JSON to the frontend
+        // (currently only `sync_type='migration'` populates this; other legs
+        // emit NULL).
         let sql_body = r#"
             SELECT * FROM (
               SELECT
@@ -64,6 +68,7 @@ impl AppDb {
                 NULL AS old_canonical, NULL AS new_canonical,
                 NULL AS sync_type, NULL AS deploy_action, NULL AS deploy_env_name,
                 NULL AS change_count,
+                NULL AS details,
                 r.project_id AS project_id
               FROM bug_events be
               JOIN bugs b ON b.id = be.bug_id
@@ -81,6 +86,7 @@ impl AppDb {
                 NULL, NULL,
                 rr.old_canonical, rr.new_canonical,
                 NULL, NULL, NULL, NULL,
+                NULL,
                 r.project_id
               FROM repo_renames rr
               LEFT JOIN repositories r ON r.id = rr.repository_id
@@ -97,6 +103,7 @@ impl AppDb {
                 NULL, t.task_id,
                 NULL, NULL,
                 NULL, NULL, NULL, NULL,
+                NULL,
                 r.project_id
               FROM task_events te
               JOIN tasks t ON t.id = te.task_id
@@ -114,6 +121,7 @@ impl AppDb {
                 NULL, NULL,
                 NULL, NULL,
                 se.sync_type, NULL, NULL, se.change_count,
+                se.details,
                 r.project_id
               FROM sync_events se
               LEFT JOIN repositories r ON r.id = se.repository_id
@@ -130,6 +138,7 @@ impl AppDb {
                 NULL, NULL,
                 NULL, NULL,
                 NULL, de.action, e.name, NULL,
+                NULL,
                 r.project_id
               FROM deploy_events de
               LEFT JOIN repositories r ON r.id = de.repository_id
@@ -159,13 +168,14 @@ impl AppDb {
                 row.get::<_, Option<String>>(10)?,   // deploy_action
                 row.get::<_, Option<String>>(11)?,   // deploy_env_name
                 row.get::<_, Option<i64>>(12)?,      // change_count
-                row.get::<_, Option<i64>>(13)?,      // project_id
+                row.get::<_, Option<String>>(13)?,   // details (T-000103 Task 6)
+                row.get::<_, Option<i64>>(14)?,      // project_id
             ))
         })?;
 
         let mut out: Vec<crate::models::ActivityEvent> = Vec::new();
         for row in rows {
-            let (kind, event_type, ts, repo_id, repo_name, bug_id, task_id, old_c, new_c, sync_t, deploy_a, deploy_e, change_c, _project_id) = row?;
+            let (kind, event_type, ts, repo_id, repo_name, bug_id, task_id, old_c, new_c, sync_t, deploy_a, deploy_e, change_c, details_v, _project_id) = row?;
 
             // kind / repo_ids / project_ids are now filtered in SQL (above) —
             // only `search` (substring match) stays in Rust.
@@ -192,6 +202,7 @@ impl AppDb {
                 deploy_action: deploy_a,
                 deploy_env_name: deploy_e,
                 change_count: change_c,
+                details: details_v,
             });
         }
         Ok(out)

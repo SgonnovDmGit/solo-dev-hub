@@ -70,4 +70,12 @@ export interface ActivityEvent {
   deploy_action: string | null;
   deploy_env_name: string | null;
   change_count: number | null;
+  /**
+   * v0.31.0 (T-000103 Task 6): structured JSON payload for sync_events.
+   * Currently used by `sync_type='migration'` to surface v25 deploy-config
+   * placeholder conflict info. Shape (for migration events):
+   *   {"conflicts":[{"key":"GO_VERSION","kept_env":"prod","kept_value":"...","discarded":[{"env":"...","value":"..."}]}]}
+   * `null` for non-sync events, and for older sync_events with NULL details.
+   */
+  details: string | null;
 }

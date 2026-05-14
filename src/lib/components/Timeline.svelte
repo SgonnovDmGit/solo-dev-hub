@@ -123,6 +123,11 @@
   }
 
   function eventLabel(ev: ActivityEvent): string {
+    // T-000103 Task 6: special-case sync_type='migration' — render conflict
+    // summary parsed from `details` JSON when present.
+    if (ev.kind === 'sync_event' && ev.sync_type === 'migration') {
+      return renderMigrationLabel(ev);
+    }
     const family = ev.kind === 'repo_rename' ? 'repo_rename'
       : ev.kind === 'sync_event' ? 'sync'
       : ev.kind === 'deploy_event' ? 'deploy'
@@ -131,6 +136,38 @@
     const key = `timeline.event.${family}.${ev.event_type}`;
     const label = $tStore(key as any);
     return label && label !== key ? label : ev.event_type;
+  }
+
+  /** T-000103 Task 6: parse `details` JSON for migration events and render
+   * a friendly conflict-summary using the first conflict's key + kept env.
+   * Falls back to a generic label if details missing / unparseable.
+   * Shape:
+   *   {"conflicts":[{"key":"GO_VERSION","kept_env":"prod","kept_value":"…","discarded":[…]}]}
+   */
+  function renderMigrationLabel(ev: ActivityEvent): string {
+    if (!ev.details) {
+      return $tStore('timeline.event.sync.migrationNoDetail' as any);
+    }
+    try {
+      const parsed = JSON.parse(ev.details);
+      const conflicts = Array.isArray(parsed?.conflicts) ? parsed.conflicts : [];
+      if (conflicts.length === 0) {
+        return $tStore('timeline.event.sync.migrationNoDetail' as any);
+      }
+      const first = conflicts[0] ?? {};
+      const firstKey = String(first.key ?? '?');
+      const keptEnv = String(first.kept_env ?? '?');
+      const key = conflicts.length === 1
+        ? 'timeline.event.sync.migration'
+        : 'timeline.event.sync.migrationMany';
+      const tmpl = $tStore(key as any);
+      return tmpl
+        .replace('{count}', String(conflicts.length))
+        .replace('{firstKey}', firstKey)
+        .replace('{keptEnv}', keptEnv);
+    } catch {
+      return $tStore('timeline.event.sync.migrationNoDetail' as any);
+    }
   }
 
   function timeOfDay(iso: string): string {
