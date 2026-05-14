@@ -47,7 +47,7 @@ Tasks may be grouped under `## vX.Y.Z — <short description>` section headers f
 - [ ] T-000064 | Public flip | 3 | high | open | 2026-04-26
 ```
 
-Parser treats `## ...` lines as comments — purely a human-readability aid, no behavioral effect on the task list. Tasks under any header (or no header) are read identically. Use when it helps your planning; skip for small/single-version projects.
+Plain markdown readers treat `## ...` lines as comments — tasks under any header (or no header) read identically as a flat list. Some tools may use these headers as release-grouping signals: Solo Dev Hub, for example, parses `## vX.Y.Z` (must start with `v` followed by a digit) and surfaces the inherited version as a sortable column in the Tasks view; non-version headers like `## Format` or `## Backlog` are ignored. Headers stay optional — use when they help planning, skip for small/single-version projects.
 
 ## `docs/done.md`
 
