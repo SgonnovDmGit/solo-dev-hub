@@ -3,6 +3,7 @@
   import { syncTasksForRepo, readDoneFromDb } from '$lib/api/tauri-commands';
   import type { Task } from '$lib/types';
   import DataGrid from './DataGrid.svelte';
+  import { compareSemVer } from '$lib/utils/semver';
 
   interface ColumnDef<T> {
     key: keyof T & string;
@@ -13,6 +14,7 @@
     render?: 'default' | 'monospace' | 'priority-color' | 'date';
     flex?: number;
     wrap?: boolean;
+    sortCompare?: (a: any, b: any) => number;
   }
 
   interface Props { repoId: number; }
@@ -30,7 +32,8 @@
     { key: 'task_id', label: $tStore('done.col.id' as any), sortable: true, render: 'monospace', flex: 0.6 },
     { key: 'description', label: $tStore('done.col.description' as any), sortable: false, filter: 'text', flex: 4, wrap: true },
     { key: 'updated_at', label: $tStore('done.col.date' as any), sortable: true, render: 'date', flex: 1 },
-    { key: 'version', label: $tStore('done.col.version' as any), sortable: true, filter: 'text', flex: 1 },
+    // T-000109: SemVer-aware sort — v0.10.0 sorts after v0.9.0 (not before).
+    { key: 'version', label: $tStore('done.col.version' as any), sortable: true, filter: 'text', flex: 1, sortCompare: compareSemVer },
   ]);
 
   async function load() {

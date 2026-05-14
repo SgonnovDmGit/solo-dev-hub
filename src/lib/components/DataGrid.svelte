@@ -19,6 +19,11 @@
     // B-000005: when set, cell renders the mapped label (e.g. localized) but
     // the underlying value is unchanged for filter/search matching.
     labelMap?: Record<string, string>;
+    // T-000109: when set, sort uses this comparator instead of localeCompare /
+    // sortWeight. Higher-precedence than `sortWeight` (mutually exclusive in
+    // practice — set one or the other per column). Used for SemVer-aware
+    // version column ordering (v0.10.0 > v0.9.0).
+    sortCompare?: (a: any, b: any) => number;
   }
 
   interface Props {
@@ -134,8 +139,12 @@
       // together at the end, then break ties alphabetically.
       const col = columns.find((c) => c.key === key);
       const weights = col?.sortWeight;
+      const customCompare = col?.sortCompare;
       r = [...r].sort((a, b) => {
         const av = a[key], bv = b[key];
+        // T-000109: custom comparator wins. Use it for SemVer-aware version
+        // ordering. The comparator itself decides how to treat null/empty.
+        if (customCompare) return customCompare(av, bv) * dir;
         if (av == null && bv == null) return 0;
         if (av == null) return 1;
         if (bv == null) return -1;
