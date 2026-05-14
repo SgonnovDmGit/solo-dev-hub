@@ -2167,6 +2167,26 @@ fn set_deploy_target(
         .map_err(|e| e.to_string())
 }
 
+// T-000103 Task 1: repo-wide deploy config (placeholder values shared across
+// envs — e.g. GO_VERSION baked into the single Dockerfile).
+#[tauri::command]
+fn get_repo_deploy_config(
+    db: State<AppDb>,
+    repo_id: i64,
+) -> Result<HashMap<String, String>, String> {
+    db.get_repo_deploy_config(repo_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_repo_deploy_config(
+    db: State<AppDb>,
+    repo_id: i64,
+    config: HashMap<String, String>,
+) -> Result<(), String> {
+    db.set_repo_deploy_config(repo_id, &config)
+        .map_err(|e| e.to_string())
+}
+
 // ── Deploy render (v0.18.0, multi-env) ────────────────────────────────────────
 
 /// v0.18.0: render workflow/Dockerfile files for a single deploy_env.
@@ -2807,6 +2827,8 @@ pub fn run() {
             reset_template_file,
             // Deploy (0.7.0 / v0.18.0 multi-env)
             set_deploy_target,
+            get_repo_deploy_config,
+            set_repo_deploy_config,
             render_deploy_files_for_env,
             list_deploy_environments,
             get_deploy_environment,
