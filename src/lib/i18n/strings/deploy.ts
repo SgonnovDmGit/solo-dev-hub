@@ -73,6 +73,9 @@ export const ru = {
   // T-000103 Task 4: shared (repo-wide) image config section above the env list.
   'deploy.sharedImageConfig': 'Общие настройки образа',
   'deploy.sharedImageConfigSubtitle': 'Применяется в Dockerfile; общие для всех env\'ов',
+  // T-000103 Task 5: empty-required warning for repo-scope placeholders.
+  // {0} is the comma-separated list of missing keys (e.g. "GO_VERSION, BINARY_NAME").
+  'deploy.missingRequiredRepoScope': 'Не заполнены общие настройки образа — задайте их в разделе «Общие настройки образа» выше: {0}',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -150,4 +153,7 @@ export const en: Record<keyof typeof ru, string> = {
   // T-000103 Task 4: shared (repo-wide) image config section above the env list.
   'deploy.sharedImageConfig': 'Shared image config',
   'deploy.sharedImageConfigSubtitle': 'Applied to Dockerfile; same across all envs',
+  // T-000103 Task 5: empty-required warning for repo-scope placeholders.
+  // {0} is the comma-separated list of missing keys (e.g. "GO_VERSION, BINARY_NAME").
+  'deploy.missingRequiredRepoScope': 'Shared image config is empty — set it in the "Shared image config" section above: {0}',
 };
