@@ -79,8 +79,15 @@ pub struct ActivityEvent {
     pub task_display_id: Option<String>,     // "T-NNN" / "F-NNN" for task_event; None otherwise
     pub old_canonical: Option<String>,       // rename only
     pub new_canonical: Option<String>,       // rename only
-    pub sync_type: Option<String>,           // sync_event only: project_sync/tasks/secret/requirements
+    pub sync_type: Option<String>,           // sync_event only: project_sync/tasks/secret/requirements/migration
     pub deploy_action: Option<String>,       // deploy_event only: render/env_secret_set/env_secret_delete
     pub deploy_env_name: Option<String>,     // deploy_event only: environment name
     pub change_count: Option<i64>,           // sync_event only
+    /// v0.31.0 (T-000103 Task 6): structured JSON payload for sync_events.
+    /// Currently used by `sync_type='migration'` to surface v25 placeholder
+    /// conflict info on the activity-feed render branch:
+    ///   {"conflicts":[{"key":"GO_VERSION","kept_env":"prod","kept_value":"1.26-alpine","discarded":[{"env":"test","value":"alpine"}]}]}
+    /// Other sync_type values may add structured payload here later.
+    /// `None` for non-sync events and for older sync_events with NULL details.
+    pub details: Option<String>,
 }

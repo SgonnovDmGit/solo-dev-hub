@@ -64,13 +64,44 @@ pub struct UpdateDeployEnvironmentArgs {
     pub extras: HashMap<String, String>,
 }
 
-/// v0.18.0: meta.json v4 hint shape — role + scope per required_secret.
+/// v0.18.0+ meta.json hint shape — role + scope per required_secret.
 /// Passed from lib.rs (which parses meta.json) into db.rs ensure_deploy_secrets_populated.
+///
+/// v0.31.0 (T-000103 Task 2 — schema v5): secret scope vocabulary was renamed
+/// `"repo" → "deploy_repo"` to disambiguate from placeholder scope `"repo"`
+/// (which marks a placeholder as repo-wide rather than per-env). The two fields
+/// now use distinct value spaces:
+///   - `MetaPlaceholder.scope` ∈ {`"repo"`, `"environment"`}  (default `"environment"`)
+///   - `MetaSecretHint.scope`  ∈ {`"deploy_repo"`, `"environment"`}
+/// Parsers must `Err` on any other value for either field — see
+/// `parse_meta_secret_hint` / `parse_meta_placeholders` in `template_meta`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaSecretHint {
     pub name: String,
     pub role: String,     // "build" | "deploy" | "runtime"
-    pub scope: String,    // "repo" | "environment"
+    pub scope: String,    // "deploy_repo" | "environment"
+}
+
+/// v0.31.0 (T-000103 Task 2 — schema v5): meta.json `placeholders.<KEY>` shape.
+/// Only fields the Rust side currently consumes are modeled — `label`,
+/// `description`, `default`, `type`, `auto_detect` live in the JSON but the
+/// frontend reads them straight from the raw JSON value.
+///
+/// `scope` marks a placeholder as either repo-wide (`"repo"`) — i.e. rendered
+/// into a single repo-wide file like `Dockerfile` and stored on
+/// `repositories.deploy_repo_config` — or per-env (`"environment"`, default)
+/// — stored in `deploy_environments.extras`.
+///
+/// Unknown scope values must be rejected at template-load time
+/// (strict mode, no silent fallback). See `parse_meta_placeholder`.
+///
+/// Consumed by Task 3's schema-aware render merger in `template_render`
+/// (`build_placeholder_vars`) and by the frontend via Task 4/5's UI work.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetaPlaceholder {
+    /// "repo" | "environment". Absent → treat as "environment".
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

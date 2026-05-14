@@ -3,6 +3,7 @@ mod export;
 mod keyring_store;
 mod models;
 mod sync;
+mod template_meta;
 mod template_render;
 mod template_seeder;
 
@@ -2167,6 +2168,26 @@ fn set_deploy_target(
         .map_err(|e| e.to_string())
 }
 
+// T-000103 Task 1: repo-wide deploy config (placeholder values shared across
+// envs — e.g. GO_VERSION baked into the single Dockerfile).
+#[tauri::command]
+fn get_repo_deploy_config(
+    db: State<AppDb>,
+    repo_id: i64,
+) -> Result<HashMap<String, String>, String> {
+    db.get_repo_deploy_config(repo_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_repo_deploy_config(
+    db: State<AppDb>,
+    repo_id: i64,
+    config: HashMap<String, String>,
+) -> Result<(), String> {
+    db.set_repo_deploy_config(repo_id, &config)
+        .map_err(|e| e.to_string())
+}
+
 // ── Deploy render (v0.18.0, multi-env) ────────────────────────────────────────
 
 /// v0.18.0: render workflow/Dockerfile files for a single deploy_env.
@@ -2200,6 +2221,15 @@ pub fn render_files_for_deploy_env(
     let file_targets = meta.get("file_targets").and_then(|v| v.as_object())
         .ok_or_else(|| "meta.json missing 'file_targets'".to_string())?;
 
+    // T-000103 Task 3: parse meta.placeholders strict (also gives us each
+    // placeholder's `scope` for the schema-aware merger below).
+    let meta_placeholders = template_meta::parse_meta_placeholders(&target, &meta)?;
+
+    // T-000103 Task 3: fetch repo-wide deploy config (placeholder values for
+    // repo-scope keys like GO_VERSION that render a single repo-wide
+    // Dockerfile). Empty map on first render before user fills anything in.
+    let repo_config = db.get_repo_deploy_config(env.repository_id).map_err(|e| e.to_string())?;
+
     // Gather build/runtime secrets for THIS env
     let secrets = db.list_deploy_secrets(deploy_env_id).map_err(|e| e.to_string())?;
     let build_for_this_env: Vec<String> = secrets.iter()
@@ -2222,7 +2252,21 @@ pub fn render_files_for_deploy_env(
     }
     let union_build_vec: Vec<String> = union_build.into_iter().collect();
 
-    // Build placeholder map
+    // Build placeholder map. Order matters:
+    //  1. Seed with each placeholder's `default` from meta.json.
+    //  2. Overlay scope-driven values via build_placeholder_vars — sources
+    //     `scope: "repo"` keys from `repo_config` and `scope: "environment"`
+    //     (the default) from `env.extras`. Orphan keys in either source are
+    //     filtered out by the merger.
+    //  3. Override the typed columns from `deploy_environments` (core 5 +
+    //     ENV_NAME) — these are not in `env.extras` but are listed in
+    //     `meta.placeholders` with `scope: "environment"`; the merger emits
+    //     nothing for them in step 2, so the explicit override below fills
+    //     them from the typed columns.
+    //  4. Insert v0.18.0-specific synthetic vars (BUILD_ARGS etc.) — these
+    //     are NOT in meta.placeholders, they're rendered separately by the
+    //     helper fns and substituted into placeholders that appear in the
+    //     templates verbatim.
     let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if let Some(phs) = meta.get("placeholders").and_then(|v| v.as_object()) {
         for (k, spec) in phs {
@@ -2231,23 +2275,25 @@ pub fn render_files_for_deploy_env(
             }
         }
     }
-    // Core 5 from deploy_env
+    // Schema-aware merge: pick each declared placeholder's value from the
+    // correct source based on its scope. Orphan keys in either source are
+    // ignored.
+    for (k, v) in template_render::build_placeholder_vars(&meta_placeholders, &repo_config, &env.extras) {
+        vars.insert(k, v);
+    }
+    // Core 5 from deploy_env typed columns (overrides defaults — these
+    // values live on the typed columns, not in `extras`).
     vars.insert("WORKFLOW_NAME".to_string(), env.workflow_name.clone());
     vars.insert("IMAGE_TAG".to_string(), env.image_tag.clone());
     vars.insert("COMPOSE_SERVICE".to_string(), env.compose_service.clone());
     vars.insert("DOMAIN".to_string(), env.domain.clone());
     vars.insert("DEPLOY_BRANCH".to_string(), env.deploy_branch.clone());
-    // Extras (override defaults when present)
-    for (k, v) in &env.extras {
-        if !v.is_empty() {
-            vars.insert(k.clone(), v.clone());
-        }
-    }
-    // v0.18.0-specific
+    // v0.18.0-specific synthetic placeholders (not declared in meta.placeholders)
     vars.insert("ENV_NAME".to_string(), env.name.clone());
     vars.insert("BUILD_ARGS".to_string(), template_render::render_build_args(&build_for_this_env));
     vars.insert("RUNTIME_ENV_ARGS".to_string(), template_render::render_runtime_env_args(&runtime_for_this_env));
     vars.insert("DOCKERFILE_ARGS".to_string(), template_render::render_dockerfile_args(&union_build_vec));
+    vars.insert("DOCKERFILE_ENVS".to_string(), template_render::render_dockerfile_envs(&union_build_vec));
     vars.insert("DART_DEFINES".to_string(), template_render::render_dart_defines(&union_build_vec));
 
     // Render each file from the template dir whose file_name is listed in file_targets
@@ -2401,22 +2447,16 @@ fn validate_env_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse `required_secrets` for a given template (`target` = `language_key`)
+/// from the `templates` SQLite table. v0.31.0+ uses the strict parser in
+/// `template_meta` — custom templates with the obsolete `"scope": "repo"`
+/// secret value fail to load with a UI-friendly error.
 fn parse_meta_secret_hints(db: &AppDb, target: &str) -> Result<Vec<MetaSecretHint>, String> {
     let meta_file = db.get_template_file(target, "meta.json").map_err(|e| e.to_string())?;
     let Some(mf) = meta_file else { return Ok(Vec::new()); };
     let meta: serde_json::Value = serde_json::from_str(&mf.content)
         .map_err(|e| format!("Invalid meta.json: {}", e))?;
-    let Some(arr) = meta.get("required_secrets").and_then(|v| v.as_array()) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for item in arr {
-        let Some(name) = item.get("name").and_then(|v| v.as_str()) else { continue };
-        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("deploy").to_string();
-        let scope = item.get("scope").and_then(|v| v.as_str()).unwrap_or("repo").to_string();
-        out.push(MetaSecretHint { name: name.to_string(), role, scope });
-    }
-    Ok(out)
+    template_meta::parse_meta_secret_hints(target, &meta)
 }
 
 /// Read a single file from a repo by its database id + relative path.
@@ -2807,6 +2847,8 @@ pub fn run() {
             reset_template_file,
             // Deploy (0.7.0 / v0.18.0 multi-env)
             set_deploy_target,
+            get_repo_deploy_config,
+            set_repo_deploy_config,
             render_deploy_files_for_env,
             list_deploy_environments,
             get_deploy_environment,
@@ -2851,6 +2893,19 @@ mod render_deploy_tests {
         let project = db.create_project("p", None, "tool").unwrap();
         let repo = db.insert_local_repository("/tmp/r", "r", Some(project.id), None).unwrap();
         db.set_deploy_target(repo.id, Some("go")).unwrap();
+        // T-000103 Task 3: repo-scope placeholders (GO_VERSION, BINARY_NAME,
+        // ENTRY_POINT, APP_PORT) now live in `repositories.deploy_repo_config`,
+        // not per-env `extras`. They bake into the single repo-wide Dockerfile.
+        let repo_config: std::collections::HashMap<String, String> = [
+            ("GO_VERSION", "1.23"),
+            ("BINARY_NAME", "app"),
+            ("ENTRY_POINT", "./cmd/api/"),
+            ("APP_PORT", "8080"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        db.set_repo_deploy_config(repo.id, &repo_config).unwrap();
         let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
             repository_id: repo.id,
             name: "prod".to_string(),
@@ -2860,11 +2915,8 @@ mod render_deploy_tests {
             domain: "x.com".to_string(),
             deploy_branch: "master".to_string(),
             extras: {
+                // Env-scope placeholders only — repo-scope ones moved to repo_config above.
                 let mut m = std::collections::HashMap::new();
-                m.insert("APP_PORT".to_string(), "8080".to_string());
-                m.insert("GO_VERSION".to_string(), "1.23".to_string());
-                m.insert("BINARY_NAME".to_string(), "app".to_string());
-                m.insert("ENTRY_POINT".to_string(), "./cmd/api/".to_string());
                 m.insert("ENV_FILE_PATH".to_string(), "".to_string());
                 m.insert("NETWORK_NAME".to_string(), "app_prod_net".to_string());
                 m.insert("COMPOSE_PROJECT".to_string(), "app_prod".to_string());
@@ -2892,6 +2944,9 @@ mod render_deploy_tests {
     #[test]
     fn test_render_multiple_envs_produces_separate_workflow_files() {
         let (db, repo_id, prod_id) = setup();
+        // T-000103 Task 3: repo-scope keys live in deploy_repo_config (seeded
+        // by setup() for both envs of this repo). Only env-scope keys go in
+        // each env's `extras`.
         let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
             repository_id: repo_id,
             name: "test".to_string(),
@@ -2902,10 +2957,6 @@ mod render_deploy_tests {
             deploy_branch: "dev".to_string(),
             extras: {
                 let mut m = std::collections::HashMap::new();
-                m.insert("APP_PORT".to_string(), "8080".to_string());
-                m.insert("GO_VERSION".to_string(), "1.23".to_string());
-                m.insert("BINARY_NAME".to_string(), "app".to_string());
-                m.insert("ENTRY_POINT".to_string(), "./cmd/api/".to_string());
                 m.insert("ENV_FILE_PATH".to_string(), "".to_string());
                 m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
                 m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
@@ -2925,6 +2976,8 @@ mod render_deploy_tests {
         // v0.29.0 multi-deploy smoke: same Go repo, two envs, each rendered
         // workflow file must contain its own env-specific values and NOT leak
         // values from the other env.
+        // T-000103 Task 3: repo-scope keys live in deploy_repo_config (seeded
+        // by setup()). Only env-scope keys go in `extras`.
         let (db, repo_id, prod_id) = setup();
         let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
             repository_id: repo_id,
@@ -2936,10 +2989,6 @@ mod render_deploy_tests {
             deploy_branch: "dev".to_string(),
             extras: {
                 let mut m = std::collections::HashMap::new();
-                m.insert("APP_PORT".to_string(), "8080".to_string());
-                m.insert("GO_VERSION".to_string(), "1.23".to_string());
-                m.insert("BINARY_NAME".to_string(), "app".to_string());
-                m.insert("ENTRY_POINT".to_string(), "./cmd/api/".to_string());
                 m.insert("ENV_FILE_PATH".to_string(), "".to_string());
                 m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
                 m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
@@ -2975,6 +3024,7 @@ mod render_deploy_tests {
     #[test]
     fn test_multi_env_go_runtime_secrets_per_env_isolation() {
         // Each env's runtime secrets must appear only in that env's deploy.yml.
+        // T-000103 Task 3: APP_PORT lives in deploy_repo_config (seeded by setup()).
         let (db, repo_id, prod_id) = setup();
         let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
             repository_id: repo_id,
@@ -2986,7 +3036,6 @@ mod render_deploy_tests {
             deploy_branch: "dev".to_string(),
             extras: {
                 let mut m = std::collections::HashMap::new();
-                m.insert("APP_PORT".to_string(), "8080".to_string());
                 m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
                 m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
                 m.insert("ENV_FILE_PATH".to_string(), "".to_string());
@@ -3018,6 +3067,10 @@ mod render_deploy_tests {
         // statically linked, secrets are runtime-injected via docker --env).
         // So when those repo-wide values match, the rendered Dockerfile must
         // be byte-identical regardless of which env triggers the render.
+        // T-000103 Task 3: repo-wide values now live in `deploy_repo_config`
+        // (seeded once by setup() — shared by ALL envs of the repo by design,
+        // so identical-rendered-Dockerfile becomes a structural guarantee, not
+        // a coincidence-of-matching-extras).
         let (db, repo_id, prod_id) = setup();
         let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
             repository_id: repo_id,
@@ -3029,13 +3082,8 @@ mod render_deploy_tests {
             deploy_branch: "dev".to_string(),
             extras: {
                 let mut m = std::collections::HashMap::new();
-                // Repo-wide values match prod's setup() values exactly.
-                m.insert("APP_PORT".to_string(), "8080".to_string());
-                m.insert("GO_VERSION".to_string(), "1.23".to_string());
-                m.insert("BINARY_NAME".to_string(), "app".to_string());
-                m.insert("ENTRY_POINT".to_string(), "./cmd/api/".to_string());
                 m.insert("ENV_FILE_PATH".to_string(), "".to_string());
-                // Env-specific values differ from prod.
+                // Env-specific values differ from prod — must NOT affect Dockerfile.
                 m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
                 m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
                 m

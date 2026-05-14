@@ -2,6 +2,7 @@
 // Moved from db.rs.
 
 use super::*;
+use std::collections::HashMap;
 use std::path::Path;
 
 impl AppDb {
@@ -609,6 +610,40 @@ impl AppDb {
         Ok(out)
     }
 
+    // ── T-000103: repo-wide deploy config (placeholder values for repo-scope
+    // keys like GO_VERSION that render a single Dockerfile per repo). ──────────
+
+    /// Read `repositories.deploy_repo_config` JSON for a repo and parse into
+    /// a HashMap. On parse error or missing row → empty map (don't crash).
+    pub fn get_repo_deploy_config(&self, repo_id: i64) -> SqlResult<HashMap<String, String>> {
+        let conn = self.conn.lock().unwrap();
+        let json_str: String = match conn.query_row(
+            "SELECT deploy_repo_config FROM repositories WHERE id = ?1",
+            rusqlite::params![repo_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(s) => s,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(HashMap::new()),
+            Err(e) => return Err(e),
+        };
+        Ok(serde_json::from_str(&json_str).unwrap_or_default())
+    }
+
+    /// Serialize `config` to JSON and write to `repositories.deploy_repo_config`.
+    pub fn set_repo_deploy_config(
+        &self,
+        repo_id: i64,
+        config: &HashMap<String, String>,
+    ) -> SqlResult<()> {
+        let json = serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE repositories SET deploy_repo_config = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2",
+            rusqlite::params![json, repo_id],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1287,5 +1322,48 @@ mod tests {
             .unwrap();
         assert_eq!(repo.project_id, Some(proj.id));
         assert_eq!(repo.role, Some("server".to_string()));
+    }
+
+    // ── T-000103 Task 1: deploy_repo_config CRUD ──────────────────────────────
+
+    #[test]
+    fn test_set_get_repo_deploy_config_roundtrip() {
+        let db = make_db();
+        let repo = db.insert_local_repository("/tmp/cfg-repo", "cfg", None, None).unwrap();
+
+        // Default is empty map
+        let initial = db.get_repo_deploy_config(repo.id).unwrap();
+        assert!(initial.is_empty(), "fresh repo must have empty deploy_repo_config");
+
+        // Write, then read back
+        let mut cfg = HashMap::new();
+        cfg.insert("GO_VERSION".to_string(), "1.26-alpine".to_string());
+        cfg.insert("BINARY_NAME".to_string(), "myapp".to_string());
+        db.set_repo_deploy_config(repo.id, &cfg).unwrap();
+
+        let read_back = db.get_repo_deploy_config(repo.id).unwrap();
+        assert_eq!(read_back, cfg);
+
+        // Overwrite with a different map
+        let mut cfg2 = HashMap::new();
+        cfg2.insert("APP_PORT".to_string(), "9000".to_string());
+        db.set_repo_deploy_config(repo.id, &cfg2).unwrap();
+        let read_back2 = db.get_repo_deploy_config(repo.id).unwrap();
+        assert_eq!(read_back2, cfg2);
+        assert!(!read_back2.contains_key("GO_VERSION"), "overwrite must replace, not merge");
+
+        // Empty-map write returns empty
+        let empty = HashMap::new();
+        db.set_repo_deploy_config(repo.id, &empty).unwrap();
+        let read_back3 = db.get_repo_deploy_config(repo.id).unwrap();
+        assert!(read_back3.is_empty());
+    }
+
+    #[test]
+    fn test_get_repo_deploy_config_missing_repo_returns_empty() {
+        let db = make_db();
+        // Repo id 99999 doesn't exist — should return empty map, not crash.
+        let cfg = db.get_repo_deploy_config(99999).unwrap();
+        assert!(cfg.is_empty());
     }
 }

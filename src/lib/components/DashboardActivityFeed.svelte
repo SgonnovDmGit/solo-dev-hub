@@ -44,6 +44,10 @@
 
   function eventLabel(ev: ActivityEvent): string {
     if (ev.kind === 'repo_rename') return $tStore('dashboard.activity.repoRenamed' as any);
+    // T-000103 Task 6: render v25 migration-conflict summary from `details` JSON.
+    if (ev.kind === 'sync_event' && ev.sync_type === 'migration') {
+      return renderMigrationLabel(ev);
+    }
     const map: Record<string, string> = {
       created: 'dashboard.activity.bugCreated',
       taken: 'dashboard.activity.bugTaken',
@@ -54,6 +58,33 @@
     };
     const k = map[ev.event_type];
     return k ? $tStore(k as any) : ev.event_type;
+  }
+
+  /** T-000103 Task 6: parse `details` JSON for migration events. */
+  function renderMigrationLabel(ev: ActivityEvent): string {
+    if (!ev.details) {
+      return $tStore('timeline.event.sync.migrationNoDetail' as any);
+    }
+    try {
+      const parsed = JSON.parse(ev.details);
+      const conflicts = Array.isArray(parsed?.conflicts) ? parsed.conflicts : [];
+      if (conflicts.length === 0) {
+        return $tStore('timeline.event.sync.migrationNoDetail' as any);
+      }
+      const first = conflicts[0] ?? {};
+      const firstKey = String(first.key ?? '?');
+      const keptEnv = String(first.kept_env ?? '?');
+      const key = conflicts.length === 1
+        ? 'timeline.event.sync.migration'
+        : 'timeline.event.sync.migrationMany';
+      const tmpl = $tStore(key as any);
+      return tmpl
+        .replace('{count}', String(conflicts.length))
+        .replace('{firstKey}', firstKey)
+        .replace('{keptEnv}', keptEnv);
+    } catch {
+      return $tStore('timeline.event.sync.migrationNoDetail' as any);
+    }
   }
 
   function go(ev: ActivityEvent) {

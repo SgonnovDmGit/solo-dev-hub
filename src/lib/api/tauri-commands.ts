@@ -347,6 +347,19 @@ export async function setDeployTarget(id: number, target: string | null): Promis
   return invoke<Repository>('set_deploy_target', { id, target });
 }
 
+// T-000103 Task 1: repo-wide deploy config (placeholder values shared across
+// envs — e.g. GO_VERSION baked into the single Dockerfile).
+export async function getRepoDeployConfig(repoId: number): Promise<Record<string, string>> {
+  return invoke<Record<string, string>>('get_repo_deploy_config', { repoId });
+}
+
+export async function setRepoDeployConfig(
+  repoId: number,
+  config: Record<string, string>,
+): Promise<void> {
+  return invoke<void>('set_repo_deploy_config', { repoId, config });
+}
+
 
 export async function readRepoFiles(repoId: number, relPaths: string[]): Promise<(string | null)[]> {
   return invoke<(string | null)[]>('read_repo_files', { repoId, relPaths });

@@ -1,0 +1,283 @@
+name: @@WORKFLOW_NAME@@
+on:
+  push:
+    branches: [ @@DEPLOY_BRANCH@@ ]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    environment: @@ENV_NAME@@
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REPO_LOWER: ""
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set repository name in lowercase
+        run: echo "REPO_LOWER=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image (prod tag)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args: |
+            @@BUILD_ARGS@@
+          tags: |
+            ghcr.io/${{ env.REPO_LOWER }}:@@IMAGE_TAG@@
+            ghcr.io/${{ env.REPO_LOWER }}:${{ github.sha }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: @@ENV_NAME@@
+    env:
+      REPO_LOWER: ""
+    steps:
+      - name: Set repository name in lowercase
+        run: echo "REPO_LOWER=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker pull ghcr.io/${{ env.REPO_LOWER }}:@@IMAGE_TAG@@
+            docker rm -f @@CONTAINER_NAME@@ || true
+            docker run -d \
+              --name @@CONTAINER_NAME@@ \
+              --restart always \
+              --network @@NETWORK_NAME@@ \
+              --label "com.docker.compose.project=@@COMPOSE_PROJECT@@" \
+              --label "com.docker.compose.service=@@COMPOSE_SERVICE@@" \
+              ghcr.io/${{ env.REPO_LOWER }}:@@IMAGE_TAG@@
+
+  nginx:
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment: @@ENV_NAME@@
+    steps:
+      - name: Upsert NPM proxy host
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            set -e
+            NPM_URL=http://localhost:81
+            DOMAIN=@@DOMAIN@@
+            FORWARD_HOST=@@CONTAINER_NAME@@
+
+            # 1. Get NPM auth token
+            TOKEN_RESP=$(curl -sS -w "\nHTTP_CODE:%{http_code}" -X POST "$NPM_URL/api/tokens" \
+              -H "Content-Type: application/json" \
+              -d "{\"identity\":\"${{ secrets.NPM_EMAIL }}\",\"secret\":\"${{ secrets.NPM_PASSWORD }}\"}")
+
+            HTTP_CODE=$(echo "$TOKEN_RESP" | tail -n1 | sed 's/HTTP_CODE://')
+            BODY=$(echo "$TOKEN_RESP" | sed '$d')
+
+            echo "POST /api/tokens → HTTP $HTTP_CODE"
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "Body: $BODY"
+              exit 1
+            fi
+
+            TOKEN=$(echo "$BODY" | jq -r '.token // empty')
+            if [ -z "$TOKEN" ]; then
+              echo "Token is empty. Body: $BODY"
+              exit 1
+            fi
+            echo "Token OK (length ${#TOKEN})"
+
+            # 1b. Verify the NPM user can see all hosts. Two valid setups:
+            #   (a) role 'admin' — sees everything by default
+            #   (b) non-admin user with permissions.visibility='all' — explicit global scope
+            # Non-admin user with visibility='user' only sees hosts they created — this
+            # breaks the "already in use" cleanup (NPM's POST validation checks the whole DB,
+            # but our GET list returns only this user's scope). Fail fast with a clear message.
+            # NB: /api/users/me does NOT include permissions by default — must pass
+            # ?expand=permissions, otherwise .permissions is absent and visibility parses as "".
+            ME=$(curl -sS "$NPM_URL/api/users/me?expand=permissions" -H "Authorization: Bearer $TOKEN")
+            ROLES=$(echo "$ME" | jq -r '.roles // [] | join(",")')
+            VISIBILITY=$(echo "$ME" | jq -r '.permissions.visibility // ""')
+            if echo ",$ROLES," | grep -q ",admin,"; then
+              echo "NPM user has admin role — full visibility"
+            elif [ "$VISIBILITY" = "all" ]; then
+              echo "NPM user is non-admin but has visibility=all — full visibility"
+            else
+              echo "NPM user $(echo "$ME" | jq -r '.email // "?"') roles=[$ROLES] visibility=$VISIBILITY — insufficient scope."
+              echo "Raw /api/users/me?expand=permissions response (for diagnostics):"
+              echo "$ME" | jq . 2>/dev/null || echo "$ME"
+              echo "Fix (pick one): in NPM admin UI → Users → edit this user:"
+              echo "  (a) tick 'Administrator' role, or"
+              echo "  (b) set 'Visibility' to 'All Items' (non-admin but global scope)."
+              echo "Or change NPM_EMAIL/NPM_PASSWORD secrets to an account that already has one of the above."
+              exit 1
+            fi
+
+            # 2. Look up existing proxy-host (case-insensitive match on domain_names)
+            DOMAIN_LC=$(echo "$DOMAIN" | tr '[:upper:]' '[:lower:]')
+            EXISTING=$(curl -sS "$NPM_URL/api/nginx/proxy-hosts" \
+              -H "Authorization: Bearer $TOKEN" \
+              | jq -c --arg d "$DOMAIN_LC" '.[] | select((.domain_names // []) | map(ascii_downcase) | index($d))')
+
+            EXISTING_ID=$(echo "$EXISTING" | jq -r '.id // empty')
+
+            # Already configured correctly and cert valid — exit, touch nothing
+            if [ -n "$EXISTING_ID" ]; then
+              CURRENT_FORWARD=$(echo "$EXISTING" | jq -r .forward_host)
+              CURRENT_CERT=$(echo "$EXISTING" | jq -r '.certificate_id // 0')
+              CURRENT_SSL=$(echo "$EXISTING" | jq -r '.ssl_forced // false')
+
+              # Verify the current cert is actually valid (expires_on != null)
+              CURRENT_CERT_VALID="no"
+              if [ "$CURRENT_CERT" != "0" ] && [ "$CURRENT_CERT" != "null" ]; then
+                CURRENT_CERT_EXPIRES=$(curl -sS "$NPM_URL/api/nginx/certificates/$CURRENT_CERT" \
+                  -H "Authorization: Bearer $TOKEN" | jq -r '.expires_on // empty')
+                if [ -n "$CURRENT_CERT_EXPIRES" ] && [ "$CURRENT_CERT_EXPIRES" != "null" ]; then
+                  CURRENT_CERT_VALID="yes"
+                fi
+              fi
+
+              if [ "$CURRENT_FORWARD" = "$FORWARD_HOST" ] \
+                && [ "$CURRENT_CERT_VALID" = "yes" ] \
+                && [ "$CURRENT_SSL" = "true" ]; then
+                echo "Proxy host id=$EXISTING_ID already configured & cert valid (forward=$CURRENT_FORWARD, cert=$CURRENT_CERT, expires=$CURRENT_CERT_EXPIRES). Nothing to do."
+                exit 0
+              fi
+
+              # Must recreate. PUT update is unreliable (NPM may skip nginx config
+              # regen on partial payloads) — do a clean DELETE + POST.
+              echo "Proxy host id=$EXISTING_ID needs update (forward=$CURRENT_FORWARD → $FORWARD_HOST, cert_valid=$CURRENT_CERT_VALID, ssl_forced=$CURRENT_SSL). Deleting for clean recreation."
+              DELETE_CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X DELETE "$NPM_URL/api/nginx/proxy-hosts/$EXISTING_ID" \
+                -H "Authorization: Bearer $TOKEN")
+              echo "DELETE /api/nginx/proxy-hosts/$EXISTING_ID → HTTP $DELETE_CODE"
+              if [ "$DELETE_CODE" != "200" ] && [ "$DELETE_CODE" != "204" ]; then
+                echo "Delete failed, aborting"
+                exit 1
+              fi
+              EXISTING_ID=""
+            fi
+
+            # 3. Look up an existing ISSUED LE cert (expires_on != null = actually issued)
+            CERT_ID=$(curl -sS "$NPM_URL/api/nginx/certificates" \
+              -H "Authorization: Bearer $TOKEN" \
+              | jq ".[] | select(.provider==\"letsencrypt\" and (.domain_names | index(\"$DOMAIN\")) and .expires_on != null) | .id" | head -n1)
+
+            # 4. No valid cert — request a new LE one (ports 80 and 443 must be open to internet)
+            if [ -z "$CERT_ID" ]; then
+              echo "Requesting new Let's Encrypt cert for $DOMAIN"
+              CERT_PAYLOAD=$(jq -n \
+                --arg domain "$DOMAIN" \
+                '{provider:"letsencrypt", domain_names:[$domain]}')
+
+              CERT_RESP=$(curl -sS -w "\nHTTP_CODE:%{http_code}" -X POST "$NPM_URL/api/nginx/certificates" \
+                -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+                -d "$CERT_PAYLOAD")
+
+              CERT_HTTP=$(echo "$CERT_RESP" | tail -n1 | sed 's/HTTP_CODE://')
+              CERT_BODY=$(echo "$CERT_RESP" | sed '$d')
+
+              echo "POST /api/nginx/certificates → HTTP $CERT_HTTP"
+
+              if [ "$CERT_HTTP" != "200" ] && [ "$CERT_HTTP" != "201" ]; then
+                echo "Cert creation failed. Body: $CERT_BODY"
+                exit 1
+              fi
+
+              CERT_ID=$(echo "$CERT_BODY" | jq -r '.id // empty')
+              if [ -z "$CERT_ID" ]; then
+                echo "Cert response has no id. Body: $CERT_BODY"
+                exit 1
+              fi
+              echo "Cert requested with id=$CERT_ID, waiting for LE issuance..."
+
+              # Poll until expires_on is populated (max 90s)
+              for i in $(seq 1 45); do
+                EXPIRES=$(curl -sS "$NPM_URL/api/nginx/certificates/$CERT_ID" \
+                  -H "Authorization: Bearer $TOKEN" | jq -r '.expires_on // empty')
+                if [ -n "$EXPIRES" ] && [ "$EXPIRES" != "null" ]; then
+                  echo "Cert $CERT_ID issued (expires $EXPIRES)"
+                  break
+                fi
+                if [ "$i" = "45" ]; then
+                  echo "Cert $CERT_ID did not issue within 90s. Body:"
+                  curl -sS "$NPM_URL/api/nginx/certificates/$CERT_ID" -H "Authorization: Bearer $TOKEN"
+                  exit 1
+                fi
+                sleep 2
+              done
+            else
+              echo "Reusing existing valid cert id=$CERT_ID"
+            fi
+
+            # 5. POST a fresh proxy-host (always POST — PUT update doesn't reliably trigger
+            # nginx regen; any existing proxy-host was deleted in step 2 if it needed updating)
+            PAYLOAD=$(jq -n \
+              --arg domain "$DOMAIN" \
+              --arg host "$FORWARD_HOST" \
+              --argjson cert "$CERT_ID" \
+              '{domain_names:[$domain], forward_scheme:"http", forward_host:$host, forward_port:80, block_exploits:true, allow_websocket_upgrade:false, certificate_id:$cert, ssl_forced:true, http2_support:true, hsts_enabled:false}')
+
+            post_proxy_host() {
+              curl -sS -w "\nHTTP_CODE:%{http_code}" -X POST "$NPM_URL/api/nginx/proxy-hosts" \
+                -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+                -d "$PAYLOAD"
+            }
+
+            echo "Creating proxy host for $DOMAIN with cert_id=$CERT_ID"
+            POST_RESP=$(post_proxy_host)
+            POST_CODE=$(echo "$POST_RESP" | tail -n1 | sed 's/HTTP_CODE://')
+            POST_BODY=$(echo "$POST_RESP" | sed '$d')
+            echo "POST /api/nginx/proxy-hosts → HTTP $POST_CODE"
+
+            # Fallback: NPM rejects the POST because the domain is "already in use".
+            # NPM has 4 host types that can hold a domain: proxy-hosts, redirection-hosts,
+            # dead-hosts, and streams (streams bind to ports not domains, so skip them).
+            # Scan all three domain-holding types, dump what we find for diagnostics,
+            # delete any claiming $DOMAIN (case-insensitive), then retry POST once.
+            if [ "$POST_CODE" = "400" ] && echo "$POST_BODY" | grep -qi "already in use"; then
+              echo "Domain $DOMAIN already in use — running aggressive cleanup across all host types"
+              for host_type in proxy-hosts redirection-hosts dead-hosts; do
+                echo "--- $host_type ---"
+                HOST_LIST=$(curl -sS "$NPM_URL/api/nginx/$host_type" \
+                  -H "Authorization: Bearer $TOKEN")
+                # Diagnostic dump: every row's id + domain_names, so the log shows where the claim lives
+                echo "$HOST_LIST" | jq -r '.[] | "  id=\(.id): \(.domain_names | join(", "))"' 2>/dev/null || echo "  (empty or not an array)"
+                CONFLICT_IDS=$(echo "$HOST_LIST" \
+                  | jq -r --arg d "$DOMAIN_LC" '.[] | select((.domain_names // []) | map(ascii_downcase) | index($d)) | .id' 2>/dev/null)
+                for cid in $CONFLICT_IDS; do
+                  echo "  Deleting conflicting $host_type id=$cid"
+                  curl -sS -o /dev/null -X DELETE "$NPM_URL/api/nginx/$host_type/$cid" \
+                    -H "Authorization: Bearer $TOKEN"
+                done
+              done
+              echo "Retrying POST /api/nginx/proxy-hosts"
+              POST_RESP=$(post_proxy_host)
+              POST_CODE=$(echo "$POST_RESP" | tail -n1 | sed 's/HTTP_CODE://')
+              POST_BODY=$(echo "$POST_RESP" | sed '$d')
+              echo "POST retry → HTTP $POST_CODE"
+            fi
+
+            if [ "$POST_CODE" != "200" ] && [ "$POST_CODE" != "201" ]; then
+              echo "Proxy host creation failed. Body: $POST_BODY"
+              exit 1
+            fi

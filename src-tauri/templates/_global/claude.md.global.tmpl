@@ -32,6 +32,23 @@ Example:
 
 LLM/user policy: either may add / edit / move tasks. When a task is completed, move it (LLM or user) from `todo.md` into `done.md` under the appropriate `## YYYY-MM-DD` section. When adding a new task, LLM **must** include `created_at` = today's date (YYYY-MM-DD). Existing tasks' `created_at` is immutable — never edit it.
 
+### Optional release grouping (recommended for versioned projects)
+
+Tasks may be grouped under `## vX.Y.Z — <short description>` section headers for visual readability when planning across multiple releases:
+
+```
+## v0.31.0 — deploy config split + new template
+
+- [ ] T-000103 | Deploy config split | 6 | high | open | 2026-05-14
+- [ ] T-000107 | SvelteKit deploy template | 3 | medium | open | 2026-05-14
+
+## v1.0.0 — public launch
+
+- [ ] T-000064 | Public flip | 3 | high | open | 2026-04-26
+```
+
+Parser treats `## ...` lines as comments — purely a human-readability aid, no behavioral effect on the task list. Tasks under any header (or no header) are read identically. Use when it helps your planning; skip for small/single-version projects.
+
 ## `docs/done.md`
 
 Structure:

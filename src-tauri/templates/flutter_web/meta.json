@@ -18,12 +18,12 @@
     { "name": "SSH_USER", "multiline": false, "description": "SSH пользователь", "role": "deploy", "scope": "environment" },
     { "name": "SSH_KEY", "multiline": true, "description": "Приватный SSH ключ (OpenSSH PEM)", "role": "deploy", "scope": "environment" },
     { "name": "SSH_PORT", "multiline": false, "description": "SSH порт (обычно 22)", "role": "deploy", "scope": "environment" },
-    { "name": "NPM_EMAIL", "multiline": false, "description": "Email API-пользователя NPM", "role": "deploy", "scope": "repo" },
-    { "name": "NPM_PASSWORD", "multiline": false, "description": "Пароль API-пользователя NPM", "role": "deploy", "scope": "repo" }
+    { "name": "NPM_EMAIL", "multiline": false, "description": "Email API-пользователя NPM", "role": "deploy", "scope": "deploy_repo" },
+    { "name": "NPM_PASSWORD", "multiline": false, "description": "Пароль API-пользователя NPM", "role": "deploy", "scope": "deploy_repo" }
   ],
   "file_targets": {
     "deploy.yml.tmpl": ".github/workflows/deploy-{name}.yml",
     "dockerfile.tmpl": "Dockerfile"
   },
-  "version": 4
+  "version": 5
 }

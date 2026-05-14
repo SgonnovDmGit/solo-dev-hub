@@ -17,8 +17,14 @@
   interface Props {
     deployEnvId: number;
     onBack: () => void;
+    // T-000103 Task 4 → Task 5: parent (DeployScreen) owns repo-wide config
+    // and passes it down for cross-source empty-required validation +
+    // filtering repo-scope placeholders out of the env-specific placeholder
+    // loop. Task 5 consumes it: missingRequired walks all placeholders, but
+    // the render loop skips scope:"repo" entries (managed in parent section).
+    repoConfig?: Record<string, string>;
   }
-  let { deployEnvId, onBack }: Props = $props();
+  let { deployEnvId, onBack, repoConfig = {} }: Props = $props();
 
   interface PlaceholderSpec {
     key: string;
@@ -31,6 +37,10 @@
     // handles empty correctly). Without this flag, an empty value is treated as
     // a required-but-unset field and blocks Generate.
     optional: boolean;
+    // T-000103 Task 5: "repo" means the value is owned at repository level
+    // (rendered by DeployScreen above the env list); "environment" (default)
+    // means per-env value lives in env.extras.
+    scope: 'repo' | 'environment';
   }
 
   // Core 5 — fields with dedicated DB columns in deploy_environments. Stays at 5
@@ -53,14 +63,32 @@
 
   const repo = $derived(env ? ($allRepos.find((r) => r.id === env!.repository_id) ?? null) : null);
 
+  // T-000103 Task 5: placeholders rendered in this component's loop. Excludes
+  // scope:"repo" entries, which DeployScreen renders in the shared section above.
+  const envPlaceholders = $derived(placeholders.filter((p) => p.scope !== 'repo'));
+
   // B-000010a: a placeholder is "required" unless meta.json marks it `optional`.
   // List of currently-empty required placeholders blocks Generate.
-  const requiredKeys = $derived(
-    placeholders.filter((p) => !p.optional).map((p) => p.key),
+  //
+  // T-000103 Task 5: source-of-truth differs per scope —
+  //   scope == 'repo'         → repoConfig (parent prop)
+  //   scope == 'environment'  → formValues (local env.extras-backed map)
+  // Missing repo-scope keys are surfaced separately so the UI can point the
+  // user at the parent "Общие настройки образа" section instead of the local
+  // form (where they don't appear).
+  const missingRequiredEnv = $derived(
+    placeholders
+      .filter((p) => !p.optional && p.scope !== 'repo')
+      .filter((p) => (formValues[p.key] ?? '').trim() === '')
+      .map((p) => p.key),
   );
-  const missingRequired = $derived(
-    requiredKeys.filter((k) => (formValues[k] ?? '').trim() === ''),
+  const missingRequiredRepo = $derived(
+    placeholders
+      .filter((p) => !p.optional && p.scope === 'repo')
+      .filter((p) => (repoConfig[p.key] ?? '').trim() === '')
+      .map((p) => p.key),
   );
+  const missingRequired = $derived([...missingRequiredEnv, ...missingRequiredRepo]);
   const coreComplete = $derived(missingRequired.length === 0);
 
   // M10 review-fix: placeholder values are substituted into generated YAML
@@ -94,6 +122,7 @@
       default: typeof spec?.default === 'string' ? spec.default : '',
       type: typeof spec?.type === 'string' ? spec.type : 'string',
       optional: spec?.optional === true,
+      scope: spec?.scope === 'repo' ? 'repo' : 'environment',
     }));
   }
 
@@ -116,7 +145,9 @@
       }
     }
 
-    // Populate formValues from env.extras + env core-5 + meta defaults fallback
+    // Populate formValues from env.extras + env core-5 + meta defaults fallback.
+    // T-000103 Task 5: skip scope:"repo" placeholders — they're sourced from
+    // repoConfig (parent prop), not from env.extras, and aren't rendered here.
     const next: Record<string, string> = {
       WORKFLOW_NAME: env.workflow_name,
       IMAGE_TAG: env.image_tag,
@@ -126,6 +157,7 @@
     };
     for (const spec of placeholders) {
       if (CORE_KEYS.includes(spec.key)) continue;
+      if (spec.scope === 'repo') continue;
       next[spec.key] = env.extras[spec.key] ?? spec.default;
     }
     formValues = next;
@@ -178,6 +210,9 @@
         const extras: Record<string, string> = {};
         for (const spec of placeholders) {
           if (CORE_KEYS.includes(spec.key)) continue;
+          // T-000103 Task 5: scope:"repo" placeholders persist via DeployScreen's
+          // setRepoDeployConfig autosave, never via env.extras.
+          if (spec.scope === 'repo') continue;
           const v = (formValues[spec.key] ?? '').trim();
           if (v !== '') extras[spec.key] = v;
         }
@@ -258,7 +293,7 @@
     </div>
 
     <section>
-      {#each placeholders as spec (spec.key)}
+      {#each envPlaceholders as spec (spec.key)}
         {@const inputId = `placeholder-${env.id}-${spec.key}`}
         {@const isMissing = !spec.optional && (formValues[spec.key] ?? '').trim() === ''}
         <div class="field" class:missing-required={isMissing} title={spec.description}>
@@ -305,9 +340,15 @@
       />
     </section>
 
-    {#if missingRequired.length > 0}
+    {#if missingRequiredEnv.length > 0}
       <section class="missing-warn">
-        ⚠ {$tStore('deploy.missingRequired' as any) || 'Required fields are empty — fill them before generating'}: {missingRequired.join(', ')}
+        ⚠ {$tStore('deploy.missingRequired' as any) || 'Required fields are empty — fill them before generating'}: {missingRequiredEnv.join(', ')}
+      </section>
+    {/if}
+
+    {#if missingRequiredRepo.length > 0}
+      <section class="missing-warn">
+        ⚠ {($tStore('deploy.missingRequiredRepoScope' as any) || 'Required shared image config is empty — set in "Shared image config" section above: {0}').replace('{0}', missingRequiredRepo.join(', '))}
       </section>
     {/if}
 
@@ -347,7 +388,21 @@
 
 <style>
   .detail { padding: 1rem; }
-  .header { display: flex; align-items: center; gap: 1rem; }
+  /* T-000103 Task 5: keep the env name + back button pinned at the top while
+     scrolling through long secrets / placeholder lists. background fills behind
+     the row so content underneath doesn't bleed through; z-index sits above
+     `.missing-required` red-bordered inputs and the secrets table. */
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+    z-index: 10;
+    padding: 0.5rem 0;
+    margin: -0.5rem 0 0 0;
+  }
   section { margin: 1.5rem 0; }
   .field {
     display: flex;
