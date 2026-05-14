@@ -1,4 +1,5 @@
 use crate::db::AppDb;
+use crate::template_meta;
 use include_dir::{include_dir, Dir};
 
 /// Bundled templates embedded at compile time from `src-tauri/templates/`.
@@ -31,6 +32,15 @@ pub fn seed_bundled_templates(db: &AppDb) -> Result<usize, String> {
             let bundle_content = file
                 .contents_utf8()
                 .ok_or_else(|| format!("Template file {} is not valid UTF-8", file_name))?;
+
+            // v0.31.0 (T-000103 Task 2): strict-validate bundled meta.json at
+            // seed time. A bundled template carrying an invalid scope value is
+            // a developer bug — fail fast at app startup with a clear message
+            // naming the template + the offending field. Non-`meta.json`
+            // files (templates / dockerfiles) skip this check.
+            if file_name == "meta.json" {
+                template_meta::validate_meta_json(lang_key, bundle_content)?;
+            }
 
             let existing = db
                 .get_template_file(lang_key, file_name)

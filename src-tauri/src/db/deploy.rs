@@ -648,7 +648,7 @@ mod tests {
         let meta_hints = vec![
             MetaSecretHint { name: "SSH_HOST".to_string(), role: "deploy".to_string(), scope: "environment".to_string() },
             MetaSecretHint { name: "API_BASE_URL".to_string(), role: "build".to_string(), scope: "environment".to_string() },
-            MetaSecretHint { name: "NPM_EMAIL".to_string(), role: "deploy".to_string(), scope: "repo".to_string() },
+            MetaSecretHint { name: "NPM_EMAIL".to_string(), role: "deploy".to_string(), scope: "deploy_repo".to_string() },
         ];
 
         db.ensure_deploy_secrets_populated(env.id, &repo_secret_names, &meta_hints).unwrap();

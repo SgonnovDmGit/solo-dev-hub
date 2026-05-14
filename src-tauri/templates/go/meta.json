@@ -55,6 +55,7 @@
       "description": { "ru": "Полный Docker Hub тег для базового образа `golang:<тег>`. Примеры: `alpine` (рекомендуется — последний стабильный Go, ~250 MB), `1.26-alpine` (пин на minor), `1.26.0-alpine` (точная patch-версия), `1.26` (Debian, ~800 MB), `bookworm` (Debian, последний). Избегайте просто `latest` — не всегда совпадает с актуальным релизом.", "en": "Full Docker Hub tag for the base image `golang:<tag>`. Examples: `alpine` (recommended — latest stable Go, ~250 MB), `1.26-alpine` (pin to minor), `1.26.0-alpine` (exact patch), `1.26` (Debian, ~800 MB), `bookworm` (Debian, latest). Avoid bare `latest` — not always aligned with current release." },
       "default": "alpine",
       "type": "string",
+      "scope": "repo",
       "auto_detect": {
         "source": "file",
         "path": "go.mod",
@@ -65,19 +66,22 @@
       "label": { "ru": "Имя бинарника", "en": "Binary name" },
       "description": { "ru": "Имя выходного бинарника при go build -o", "en": "Output binary name for go build -o" },
       "default": "app",
-      "type": "string"
+      "type": "string",
+      "scope": "repo"
     },
     "ENTRY_POINT": {
       "label": { "ru": "Entry point", "en": "Entry point" },
       "description": { "ru": "Путь к main-пакету (напр. ./cmd/api/)", "en": "Path to main package (e.g. ./cmd/api/)" },
       "default": "./cmd/api/",
-      "type": "string"
+      "type": "string",
+      "scope": "repo"
     },
     "APP_PORT": {
       "label": { "ru": "Порт приложения", "en": "App port" },
       "description": { "ru": "Порт приложения внутри контейнера (EXPOSE)", "en": "Container port to EXPOSE" },
       "default": "8080",
-      "type": "string"
+      "type": "string",
+      "scope": "repo"
     },
     "ENV_FILE_PATH": {
       "label": { "ru": "Путь к .env на VPS", "en": "Path to .env on VPS" },
@@ -92,12 +96,12 @@
     { "name": "SSH_USER", "multiline": false, "description": "SSH пользователь", "role": "deploy", "scope": "environment" },
     { "name": "SSH_KEY", "multiline": true, "description": "Приватный SSH ключ (OpenSSH PEM)", "role": "deploy", "scope": "environment" },
     { "name": "SSH_PORT", "multiline": false, "description": "SSH порт (обычно 22)", "role": "deploy", "scope": "environment" },
-    { "name": "NPM_EMAIL", "multiline": false, "description": "Email API-пользователя Nginx Proxy Manager", "role": "deploy", "scope": "repo" },
-    { "name": "NPM_PASSWORD", "multiline": false, "description": "Пароль API-пользователя NPM", "role": "deploy", "scope": "repo" }
+    { "name": "NPM_EMAIL", "multiline": false, "description": "Email API-пользователя Nginx Proxy Manager", "role": "deploy", "scope": "deploy_repo" },
+    { "name": "NPM_PASSWORD", "multiline": false, "description": "Пароль API-пользователя NPM", "role": "deploy", "scope": "deploy_repo" }
   ],
   "file_targets": {
     "deploy.yml.tmpl": ".github/workflows/deploy-{name}.yml",
     "dockerfile.tmpl": "Dockerfile"
   },
-  "version": 4
+  "version": 5
 }

@@ -3,6 +3,7 @@ mod export;
 mod keyring_store;
 mod models;
 mod sync;
+mod template_meta;
 mod template_render;
 mod template_seeder;
 
@@ -2421,22 +2422,16 @@ fn validate_env_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse `required_secrets` for a given template (`target` = `language_key`)
+/// from the `templates` SQLite table. v0.31.0+ uses the strict parser in
+/// `template_meta` — custom templates with the obsolete `"scope": "repo"`
+/// secret value fail to load with a UI-friendly error.
 fn parse_meta_secret_hints(db: &AppDb, target: &str) -> Result<Vec<MetaSecretHint>, String> {
     let meta_file = db.get_template_file(target, "meta.json").map_err(|e| e.to_string())?;
     let Some(mf) = meta_file else { return Ok(Vec::new()); };
     let meta: serde_json::Value = serde_json::from_str(&mf.content)
         .map_err(|e| format!("Invalid meta.json: {}", e))?;
-    let Some(arr) = meta.get("required_secrets").and_then(|v| v.as_array()) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for item in arr {
-        let Some(name) = item.get("name").and_then(|v| v.as_str()) else { continue };
-        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("deploy").to_string();
-        let scope = item.get("scope").and_then(|v| v.as_str()).unwrap_or("repo").to_string();
-        out.push(MetaSecretHint { name: name.to_string(), role, scope });
-    }
-    Ok(out)
+    template_meta::parse_meta_secret_hints(target, &meta)
 }
 
 /// Read a single file from a repo by its database id + relative path.
