@@ -47,8 +47,22 @@ fn looks_like_task_id_start(r: &str) -> bool {
 pub fn parse_todo_tasks(content: &str) -> (Vec<TodoTask>, Vec<String>) {
     let mut tasks = Vec::new();
     let mut warnings = Vec::new();
+    // T-000109: track the current release-grouping header. The convention is
+    // `## v0.32.0 — ...` (or just `## v0.32.0`); subsequent task lines inherit
+    // this as their `version` until the next such header. Non-version `##`
+    // headers (e.g. `## Format`) don't reset; they're ignored.
+    let mut current_version = String::new();
     for line in content.lines() {
         let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            // First whitespace-separated token. Accept `v<digit>...` only.
+            if let Some(tok) = rest.split_whitespace().next() {
+                if tok.starts_with('v') && tok.len() > 1 && tok.as_bytes()[1].is_ascii_digit() {
+                    current_version = tok.to_string();
+                }
+            }
+            continue;
+        }
         let rest_opt = trimmed
             .strip_prefix("- [ ] ")
             .or_else(|| trimmed.strip_prefix("- ").filter(|r| looks_like_task_id_start(r)));
@@ -111,6 +125,7 @@ pub fn parse_todo_tasks(content: &str) -> (Vec<TodoTask>, Vec<String>) {
             priority,
             status,
             created_at,
+            version: current_version.clone(),
         });
     }
     (tasks, warnings)
@@ -373,6 +388,57 @@ mod tests {
         assert!(warnings.is_empty(), "got warnings: {:?}", warnings);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "T-045");
+    }
+
+    // ── T-000109: todo.md `## vX.Y.Z` release-grouping inheritance ──────────────
+
+    #[test]
+    fn test_parse_todo_version_header_inheritance() {
+        let md = "# Tasks\n\n\
+                  ## v0.32.0 — pre-v1.0.0 polish\n\
+                  - [ ] T-000109 | Version column | 3 | low | open | 2026-05-14\n\
+                  - [ ] T-000110 | Auto-detect | 2 | medium | open | 2026-05-14\n";
+        let (tasks, warnings) = parse_todo_tasks(md);
+        assert!(warnings.is_empty(), "warnings: {:?}", warnings);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].version, "v0.32.0");
+        assert_eq!(tasks[1].version, "v0.32.0");
+    }
+
+    #[test]
+    fn test_parse_todo_version_header_resets_across_sections() {
+        let md = "## v0.32.0 — minor polish\n\
+                  - [ ] T-000111 | Bare-multiline hint | 1 | low | open | 2026-05-14\n\
+                  ## v1.0.0 — public launch\n\
+                  - [ ] T-000064 | Public flip | 3 | high | open | 2026-04-26\n\
+                  - [ ] T-000074 | Release closure | 1 | high | open | 2026-05-08\n";
+        let (tasks, warnings) = parse_todo_tasks(md);
+        assert!(warnings.is_empty(), "warnings: {:?}", warnings);
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].version, "v0.32.0");
+        assert_eq!(tasks[1].version, "v1.0.0");
+        assert_eq!(tasks[2].version, "v1.0.0");
+    }
+
+    #[test]
+    fn test_parse_todo_no_version_header_yields_empty() {
+        let md = "## Format\n- [ ] T-001 | desc | 2 | high | open | 2026-04-26\n";
+        let (tasks, warnings) = parse_todo_tasks(md);
+        assert!(warnings.is_empty());
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].version, "", "non-version `##` header must not set version");
+    }
+
+    #[test]
+    fn test_parse_todo_tasks_before_first_version_header_yield_empty() {
+        let md = "- [ ] T-001 | early task | 1 | low | open | 2026-04-01\n\
+                  ## v0.32.0\n\
+                  - [ ] T-002 | grouped task | 1 | low | open | 2026-05-14\n";
+        let (tasks, warnings) = parse_todo_tasks(md);
+        assert!(warnings.is_empty());
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].version, "", "task above first version header has no version");
+        assert_eq!(tasks[1].version, "v0.32.0");
     }
 
     #[test]

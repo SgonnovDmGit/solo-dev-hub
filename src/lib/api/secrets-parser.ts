@@ -29,6 +29,10 @@ export function parseEnvText(text: string): ParseResult {
   const lines = text.split('\n');
 
   let i = 0;
+  // Name of the most recently parsed secret on this run. Used to detect the
+  // bare-multiline misuse pattern (`KEY=line1\nline2\nline3` without triple-
+  // quote wrapping) and emit a more helpful error than generic "missing '='".
+  let prevSecretName: string | null = null;
   while (i < lines.length) {
     const rawLine = lines[i];
     const line = rawLine.trim();
@@ -40,7 +44,14 @@ export function parseEnvText(text: string): ParseResult {
 
     const eqIndex = line.indexOf('=');
     if (eqIndex === -1) {
-      errors.push(`Line ${i + 1}: missing '=' separator`);
+      if (prevSecretName !== null) {
+        errors.push(
+          `Line ${i + 1}: looks like a multi-line value for '${prevSecretName}'. Wrap it in triple quotes: ${prevSecretName}="""<newline>...<newline>"""`
+        );
+        prevSecretName = null;
+      } else {
+        errors.push(`Line ${i + 1}: missing '=' separator`);
+      }
       i++;
       continue;
     }
@@ -64,6 +75,7 @@ export function parseEnvText(text: string): ParseResult {
           errors.push(`Line ${startLineNo}: empty value for '${name}'`);
         } else {
           secrets.push({ name, value });
+          prevSecretName = name;
         }
         i++;
         continue;
@@ -100,6 +112,7 @@ export function parseEnvText(text: string): ParseResult {
         errors.push(`Line ${startLineNo}: empty value for '${name}'`);
       } else {
         secrets.push({ name, value });
+        prevSecretName = name;
       }
       continue;
     }
@@ -116,6 +129,7 @@ export function parseEnvText(text: string): ParseResult {
     }
 
     secrets.push({ name, value });
+    prevSecretName = name;
     i++;
   }
 

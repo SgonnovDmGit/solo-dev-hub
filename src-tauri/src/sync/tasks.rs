@@ -106,6 +106,13 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
         };
 
         if let Some(existing) = db_todo_by_id.get(&tt.id) {
+            // T-000109: keep the DB `version` column synced with the current
+            // `## vX.Y.Z` section header above this task in todo.md. User may
+            // move a task between version sections — that's a regular flow.
+            let new_version_opt = if tt.version.is_empty() { None } else { Some(tt.version.as_str()) };
+            if new_version_opt != existing.version.as_deref() {
+                db.update_task_version(existing.id, new_version_opt).map_err(|e| e.to_string())?;
+            }
             // Row exists in DB as todo — check for status change
             let new_status = if tt.status.is_empty() { None } else { Some(tt.status.as_str()) };
             let old_status = existing.status.as_deref();
@@ -150,6 +157,8 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
         } else {
             // New task — insert
             let effort = tt.effort.parse::<f64>().ok();
+            // T-000109: `## vX.Y.Z` section-header version inherited by the parser.
+            let version_opt = if tt.version.is_empty() { None } else { Some(tt.version.as_str()) };
             let row = db.insert_task(
                 repo_id,
                 &tt.id,
@@ -158,7 +167,7 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
                 effort,
                 if tt.priority.is_empty() { None } else { Some(tt.priority.as_str()) },
                 if tt.status.is_empty() { None } else { Some(tt.status.as_str()) },
-                None, // version — not known for todo tasks
+                version_opt,
                 "todo",
                 &created_at,
             ).map_err(|e| e.to_string())?;

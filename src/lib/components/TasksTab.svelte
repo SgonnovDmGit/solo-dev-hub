@@ -3,6 +3,7 @@
   import { syncTasksForRepo, readTasksFromDb } from '$lib/api/tauri-commands';
   import type { Task } from '$lib/types';
   import DataGrid from './DataGrid.svelte';
+  import { compareSemVer } from '$lib/utils/semver';
 
   interface ColumnDef<T> {
     key: keyof T & string;
@@ -15,6 +16,7 @@
     wrap?: boolean;
     sortWeight?: Record<string, number>;
     labelMap?: Record<string, string>;
+    sortCompare?: (a: any, b: any) => number;
   }
 
   interface Props { repoId: number; }
@@ -64,6 +66,17 @@
       },
     },
     { key: 'created_at', label: $tStore('tasks.col.createdAt' as any), sortable: true, render: 'date', flex: 1 },
+    // T-000109: `version` is inherited from the nearest preceding `## vX.Y.Z`
+    // header in todo.md (release-grouping convention). SemVer-aware sort so
+    // v0.10.0 sorts after v0.9.0, not before.
+    {
+      key: 'version',
+      label: $tStore('tasks.col.version' as any),
+      sortable: true,
+      filter: 'text',
+      flex: 0.9,
+      sortCompare: compareSemVer,
+    },
   ]);
 
   async function load() {

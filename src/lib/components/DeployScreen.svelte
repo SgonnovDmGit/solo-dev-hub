@@ -9,7 +9,9 @@
     deleteDeployEnvironment,
     getRepoDeployConfig, setRepoDeployConfig,
     getTemplateFile,
+    readRepoFile,
   } from '$lib/api/tauri-commands';
+  import { runAutoDetect, type AutoDetectSpec } from '$lib/api/auto-detect';
   import {
     createEnvironment, deleteEnvironment as ghDeleteEnvironment,
     splitRepoFullName,
@@ -41,6 +43,7 @@
     label: string;
     description: string;
     default: string;
+    auto_detect?: AutoDetectSpec;
   }
   let repoConfig = $state<Record<string, string>>({});
   let repoScopePlaceholders = $state<RepoScopePlaceholder[]>([]);
@@ -76,6 +79,9 @@
             label: extractLocalized(spec?.label, key),
             description: extractLocalized(spec?.description, ''),
             default: typeof spec?.default === 'string' ? spec.default : '',
+            auto_detect: spec?.auto_detect && typeof spec.auto_detect === 'object'
+              ? (spec.auto_detect as AutoDetectSpec)
+              : undefined,
           });
         }
       }
@@ -94,6 +100,20 @@
       ]);
       repoConfig = config ?? {};
       repoScopePlaceholders = scopePlaceholders;
+
+      // T-000110: run auto_detect for any repo-scope placeholder that has an
+      // `auto_detect` spec AND no stored value. Fills the input and persists
+      // on first detection — user can override freely afterwards. Re-detect
+      // only happens if the user clears the field.
+      const detectedChanges = await runAutoDetectForEmpty(repoId, scopePlaceholders);
+      if (detectedChanges) {
+        try {
+          await setRepoDeployConfig(repoId, { ...repoConfig });
+        } catch (err) {
+          console.warn('Auto-detect persist failed', err);
+        }
+      }
+
       // Default state: expanded if any repo-scope placeholder is empty/unset;
       // collapsed if all have values. Computed once on load — user toggles
       // freely thereafter for this session.
@@ -109,6 +129,26 @@
     } catch (err) {
       addToast(String(err), 'error');
     }
+  }
+
+  async function runAutoDetectForEmpty(
+    repoId: number,
+    scopePlaceholders: RepoScopePlaceholder[],
+  ): Promise<boolean> {
+    let changed = false;
+    for (const p of scopePlaceholders) {
+      if (!p.auto_detect) continue;
+      if ((repoConfig[p.key] ?? '').trim() !== '') continue;
+      const detected = await runAutoDetect(
+        p.auto_detect,
+        (path) => readRepoFile(repoId, path),
+      );
+      if (detected !== null && detected !== '') {
+        repoConfig[p.key] = detected;
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   // Reactive load whenever repo.id or deploy_target changes. Guards with

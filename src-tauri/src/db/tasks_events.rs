@@ -83,6 +83,20 @@ impl AppDb {
         Ok(())
     }
 
+    /// T-000109: write a new value into `tasks.version`. Called by sync when a
+    /// todo.md row's inherited section-header version changes (e.g. the user
+    /// moves the task between `## v0.32.0` and `## v1.0.0` sections), and
+    /// on the todo→done flip to capture the release the task shipped in.
+    pub fn update_task_version(&self, task_id: i64, new_version: Option<&str>) -> SqlResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET version = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![new_version, now, task_id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_task(&self, id: i64) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM tasks WHERE id = ?1", rusqlite::params![id])?;

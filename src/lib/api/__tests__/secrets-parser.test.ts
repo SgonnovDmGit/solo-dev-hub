@@ -140,6 +140,40 @@ describe('parseEnvText', () => {
     expect(r.errors[0]).toMatch(/unexpected|after closing/i);
   });
 
+  // --- v0.32.0 (T-000111): bare-multiline hint ---
+
+  it('emits triple-quote hint when bare-multiline follows a valid secret', () => {
+    const r = parseEnvText('SSH_KEY=-----BEGIN OPENSSH PRIVATE KEY-----\nabc\ndef');
+    expect(r.secrets).toEqual([
+      { name: 'SSH_KEY', value: '-----BEGIN OPENSSH PRIVATE KEY-----' },
+    ]);
+    expect(r.errors.length).toBeGreaterThanOrEqual(1);
+    expect(r.errors[0]).toContain("multi-line value for 'SSH_KEY'");
+    expect(r.errors[0]).toContain('triple quotes');
+    expect(r.errors[0]).toContain('SSH_KEY="""');
+  });
+
+  it('does not emit hint when bare line has no preceding secret', () => {
+    const r = parseEnvText('orphan-line\nanother');
+    expect(r.secrets).toEqual([]);
+    expect(r.errors.length).toBe(2);
+    expect(r.errors[0]).toContain("missing '=' separator");
+    expect(r.errors[1]).toContain("missing '=' separator");
+    // Generic errors — no hint mentioning a key name.
+    expect(r.errors.join('\n')).not.toContain('triple quotes');
+  });
+
+  it('hint mentions the most recent valid secret, not an earlier one', () => {
+    const input = ['FIRST=a', 'SECOND=b', 'orphan'].join('\n');
+    const r = parseEnvText(input);
+    expect(r.secrets).toEqual([
+      { name: 'FIRST', value: 'a' },
+      { name: 'SECOND', value: 'b' },
+    ]);
+    expect(r.errors[0]).toContain("multi-line value for 'SECOND'");
+    expect(r.errors[0]).not.toContain('FIRST');
+  });
+
   it('SSH-key one-liner round-trip: PEM with literal \\n escapes', () => {
     // The user's typical case: paste an SSH key as a one-row value using
     // \n escapes inside double-quotes. Result should be a multi-line PEM.

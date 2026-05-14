@@ -27,14 +27,25 @@
       "description": { "ru": "Папка, куда Vite складывает результат `npm run build` (относительно корня репо). По умолчанию `dist`. Изменить если в `vite.config.js` выставлен другой `build.outDir`.", "en": "Directory where Vite emits `npm run build` artifacts (relative to repo root). Default `dist`. Change if `vite.config.js` sets a different `build.outDir`." },
       "default": "dist",
       "type": "string",
-      "scope": "repo"
+      "scope": "repo",
+      "auto_detect": {
+        "source": "file",
+        "path": ["vite.config.js", "vite.config.ts", "svelte.config.js"],
+        "regex": "outDir[\\s:]*['\"]([^'\"]+)['\"]"
+      }
     },
     "PRE_BUILD_COMMAND": {
       "label": { "ru": "Pre-build команда", "en": "Pre-build command" },
       "description": { "ru": "Команда перед `npm run build` (запускается через `RUN @@PRE_BUILD_COMMAND@@` в Dockerfile). По умолчанию `true` — shell no-op, шаг фактически пропускается. Менять только если перед сборкой нужен codegen, например `npm run paraglide:compile` (Paraglide i18n), `npm run prisma:generate`, `npm run gen:types`.", "en": "Command to run before `npm run build` (executed via `RUN @@PRE_BUILD_COMMAND@@` in Dockerfile). Default `true` — shell no-op, the step is effectively skipped. Override only if codegen is needed before build, e.g. `npm run paraglide:compile` (Paraglide i18n), `npm run prisma:generate`, `npm run gen:types`." },
       "default": "true",
       "type": "string",
-      "scope": "repo"
+      "scope": "repo",
+      "auto_detect": {
+        "source": "file",
+        "path": "package.json",
+        "regex": "\"@inlang/paraglide-js\"",
+        "value_if_match": "npm run paraglide:compile"
+      }
     }
   },
   "required_secrets": [

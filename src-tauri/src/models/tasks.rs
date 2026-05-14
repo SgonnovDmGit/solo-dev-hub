@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 /// F-021: a single open/in-progress task parsed from `docs/todo.md`.
 /// Format: `- [ ] <id> | <description> | <effort> | <priority> | <status>`
+///
+/// T-000109: `version` is derived from the nearest preceding `## vX.Y.Z`
+/// section header in todo.md (de-facto release-grouping convention), never
+/// from the task line itself. Empty when the file has no version headers
+/// or the task sits above the first one.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TodoTask {
     pub id: String,
@@ -10,6 +15,7 @@ pub struct TodoTask {
     pub priority: String,
     pub status: String,
     pub created_at: String,  // YYYY-MM-DD; "" if 5-field legacy
+    pub version: String,     // T-000109: inherited from `## vX.Y.Z` header
 }
 
 #[derive(Debug, Serialize)]
