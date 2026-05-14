@@ -17,8 +17,13 @@
   interface Props {
     deployEnvId: number;
     onBack: () => void;
+    // T-000103 Task 4 → Task 5: parent (DeployScreen) owns repo-wide config
+    // and passes it down for cross-source empty-required validation +
+    // filtering repo-scope placeholders out of the env-specific placeholder
+    // loop. Task 4 only wires the prop; Task 5 consumes it.
+    repoConfig?: Record<string, string>;
   }
-  let { deployEnvId, onBack }: Props = $props();
+  let { deployEnvId, onBack, repoConfig: _repoConfig = {} }: Props = $props();
 
   interface PlaceholderSpec {
     key: string;

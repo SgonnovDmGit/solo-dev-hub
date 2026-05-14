@@ -70,6 +70,9 @@ export const ru = {
   'deploy.missingRequired': 'Обязательные поля пустые — заполните перед генерацией',
   'deploy.githubRequired': 'Требуется GitHub токен и привязка репо к GitHub',
   'deploy.githubTokenRequiredForSecrets': 'Задайте GitHub токен в Настройках для работы со списком секретов этого деплоя.',
+  // T-000103 Task 4: shared (repo-wide) image config section above the env list.
+  'deploy.sharedImageConfig': 'Общие настройки образа',
+  'deploy.sharedImageConfigSubtitle': 'Применяется в Dockerfile; общие для всех env\'ов',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -144,4 +147,7 @@ export const en: Record<keyof typeof ru, string> = {
   'deploy.missingRequired': 'Required fields are empty — fill them before generating',
   'deploy.githubRequired': 'GitHub token + linked GitHub repo required',
   'deploy.githubTokenRequiredForSecrets': 'Set a GitHub token in Settings to load this deployment\'s secrets list.',
+  // T-000103 Task 4: shared (repo-wide) image config section above the env list.
+  'deploy.sharedImageConfig': 'Shared image config',
+  'deploy.sharedImageConfigSubtitle': 'Applied to Dockerfile; same across all envs',
 };

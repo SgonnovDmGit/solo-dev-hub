@@ -2,11 +2,13 @@
   import { selectedRepoId, addToast } from '$lib/stores/ui';
   import { allRepos } from '$lib/stores/repos';
   import { pat } from '$lib/stores/settings';
-  import { tStore } from '$lib/i18n';
+  import { tStore, locale } from '$lib/i18n';
   import type { DeployEnvironment } from '$lib/types';
   import {
     listDeployEnvironments, createDeployEnvironment, cloneDeployEnvironment,
     deleteDeployEnvironment,
+    getRepoDeployConfig, setRepoDeployConfig,
+    getTemplateFile,
   } from '$lib/api/tauri-commands';
   import {
     createEnvironment, deleteEnvironment as ghDeleteEnvironment,
@@ -24,6 +26,114 @@
   // Master view state
   let environments = $state<DeployEnvironment[]>([]);
   let loading = $state(false);
+
+  // ── T-000103 Task 4: shared (repo-wide) image config ─────────────────────────
+  // DeployScreen owns `repoConfig` as the single source of truth for
+  // placeholder values that render into the repo-wide Dockerfile (scope: "repo"
+  // in meta.json). Passed down to DeployDetail as a prop for cross-source
+  // empty-required validation (Task 5).
+  //
+  // Persistence: per-key autosave on `blur`. Mirrors DeploySecretsTable's
+  // optimistic-update pattern (B-000009) — no full reload after save, which
+  // would replace the state map and cause focus loss when the user tabs.
+  interface RepoScopePlaceholder {
+    key: string;
+    label: string;
+    description: string;
+    default: string;
+  }
+  let repoConfig = $state<Record<string, string>>({});
+  let repoScopePlaceholders = $state<RepoScopePlaceholder[]>([]);
+  let sharedSectionExpanded = $state(true);
+  // Guard key includes deploy_target so template swap re-loads the placeholder
+  // set (D6: deploy_repo_config blob preserved across swaps, but the visible
+  // input set changes with the new template's meta.json).
+  let lastLoadedKey = $state<string | null>(null);
+
+  function extractLocalized(v: any, fallback: string): string {
+    if (v == null) return fallback;
+    if (typeof v === 'string') return v;
+    if (typeof v === 'object') {
+      const loc = $locale;
+      return v[loc] ?? v.en ?? v.ru ?? fallback;
+    }
+    return fallback;
+  }
+
+  async function loadRepoScopePlaceholders(deployTarget: string | null | undefined): Promise<RepoScopePlaceholder[]> {
+    if (!deployTarget) return [];
+    try {
+      const metaFile = await getTemplateFile(deployTarget, 'meta.json');
+      if (!metaFile) return [];
+      const meta = JSON.parse(metaFile.content);
+      const placeholders = meta?.placeholders;
+      if (!placeholders || typeof placeholders !== 'object') return [];
+      const out: RepoScopePlaceholder[] = [];
+      for (const [key, spec] of Object.entries(placeholders) as [string, any][]) {
+        if (spec?.scope === 'repo') {
+          out.push({
+            key,
+            label: extractLocalized(spec?.label, key),
+            description: extractLocalized(spec?.description, ''),
+            default: typeof spec?.default === 'string' ? spec.default : '',
+          });
+        }
+      }
+      return out;
+    } catch (err) {
+      console.warn('Failed to load repo-scope placeholders', err);
+      return [];
+    }
+  }
+
+  async function loadRepoConfig(repoId: number, deployTarget: string | null | undefined) {
+    try {
+      const [config, scopePlaceholders] = await Promise.all([
+        getRepoDeployConfig(repoId),
+        loadRepoScopePlaceholders(deployTarget),
+      ]);
+      repoConfig = config ?? {};
+      repoScopePlaceholders = scopePlaceholders;
+      // Default state: expanded if any repo-scope placeholder is empty/unset;
+      // collapsed if all have values. Computed once on load — user toggles
+      // freely thereafter for this session.
+      if (scopePlaceholders.length > 0) {
+        const anyEmpty = scopePlaceholders.some((p) => {
+          const v = (repoConfig[p.key] ?? '').trim();
+          return v === '';
+        });
+        sharedSectionExpanded = anyEmpty;
+      } else {
+        sharedSectionExpanded = false;
+      }
+    } catch (err) {
+      addToast(String(err), 'error');
+    }
+  }
+
+  // Reactive load whenever repo.id or deploy_target changes. Guards with
+  // lastLoadedKey so we don't re-trigger on incidental reactivity (e.g. repo
+  // object identity changes via $allRepos refresh without actual change).
+  $effect(() => {
+    if (!repo) return;
+    const rid = repo.id;
+    const target = repo.deploy_target ?? '';
+    const key = `${rid}:${target}`;
+    if (lastLoadedKey === key) return;
+    lastLoadedKey = key;
+    void loadRepoConfig(rid, repo.deploy_target);
+  });
+
+  async function saveRepoConfigKey(_key: string) {
+    if (!repo) return;
+    try {
+      // Persist the full current map — per-key blur trigger, full-map write.
+      // Backend overwrites the JSON blob; the call is idempotent.
+      await setRepoDeployConfig(repo.id, { ...repoConfig });
+    } catch (err) {
+      addToast(String(err), 'error');
+    }
+  }
 
   // + New deployment form state
   let showNewForm = $state(false);
@@ -141,9 +251,43 @@
   {:else if viewMode === 'detail' && selectedDeployEnvId != null}
     <DeployDetail
       deployEnvId={selectedDeployEnvId}
+      repoConfig={repoConfig}
       onBack={backToList}
     />
   {:else}
+    {#if repoScopePlaceholders.length > 0}
+      <section class="shared-config" class:collapsed={!sharedSectionExpanded}>
+        <button
+          class="shared-config-header"
+          type="button"
+          onclick={() => sharedSectionExpanded = !sharedSectionExpanded}
+          aria-expanded={sharedSectionExpanded}
+        >
+          <span class="chevron" class:expanded={sharedSectionExpanded}>▸</span>
+          <span class="shared-config-title">{$tStore('deploy.sharedImageConfig' as any) || 'Shared image config'}</span>
+          <span class="shared-config-subtitle">{$tStore('deploy.sharedImageConfigSubtitle' as any) || 'Applied to Dockerfile; same across all envs'}</span>
+        </button>
+        {#if sharedSectionExpanded}
+          <div class="shared-config-body">
+            {#each repoScopePlaceholders as p (p.key)}
+              {@const inputId = `repo-config-${p.key}`}
+              <div class="field" title={p.description}>
+                <label for={inputId}>{p.label}:</label>
+                <input
+                  id={inputId}
+                  type="text"
+                  value={repoConfig[p.key] ?? ''}
+                  placeholder={p.default}
+                  oninput={(e) => { repoConfig[p.key] = (e.currentTarget as HTMLInputElement).value; }}
+                  onblur={() => saveRepoConfigKey(p.key)}
+                />
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </section>
+    {/if}
+
     {#if loading}
       <p class="loading">{$tStore('common.loading' as any)}</p>
     {:else if environments.length === 0 && !showNewForm}
@@ -260,4 +404,72 @@
   }
   .cancel-btn:hover:not(:disabled) { background: var(--hover-bg); border-color: var(--text-muted); }
   .cancel-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* T-000103 Task 4: shared (repo-wide) image config section above env list */
+  .shared-config {
+    margin-bottom: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--hover-bg);
+  }
+  .shared-config-header {
+    width: 100%;
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 0.6rem 0.75rem;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+    text-align: left;
+    color: var(--text);
+    font-family: inherit;
+  }
+  .shared-config-header:hover {
+    background: var(--border-light);
+  }
+  .shared-config.collapsed .shared-config-header {
+    border-bottom: 0;
+  }
+  .chevron {
+    display: inline-block;
+    transition: transform 0.15s ease;
+    color: var(--text-muted);
+    font-size: 0.85em;
+    flex-shrink: 0;
+    width: 0.85em;
+  }
+  .chevron.expanded {
+    transform: rotate(90deg);
+  }
+  .shared-config-title {
+    font-weight: 600;
+    font-size: 0.95em;
+  }
+  .shared-config-subtitle {
+    color: var(--text-muted);
+    font-size: 0.85em;
+  }
+  .shared-config-body {
+    padding: 0.4rem 0.75rem 0.75rem 0.75rem;
+    border-top: 1px solid var(--border);
+  }
+  .shared-config-body .field {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 0.4rem 0;
+  }
+  .shared-config-body .field label {
+    min-width: 11rem;
+    text-align: right;
+    flex-shrink: 0;
+    font-size: 0.9em;
+    color: var(--text);
+  }
+  .shared-config-body .field input {
+    flex: 1;
+    padding: 0.4rem;
+    box-sizing: border-box;
+  }
 </style>
