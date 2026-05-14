@@ -152,6 +152,27 @@ pub fn render_dart_defines(secret_names: &[String]) -> String {
         .join(" ")
 }
 
+/// v0.31.0 (T-000107): render `ENV NAME=$NAME` lines for the Vite ARG→ENV
+/// transition in `vite_static/dockerfile.tmpl`. Used as `@@DOCKERFILE_ENVS@@`.
+///
+/// Background: Vite reads `import.meta.env.VITE_*` from the build process's
+/// environment at `npm run build`. Docker `ARG` lives only inside the
+/// Dockerfile statement scope (RUN/FROM/COPY) and is NOT inherited by
+/// spawned processes — so the npm child wouldn't see VITE_*. Each secret
+/// therefore needs an explicit `ENV NAME=$NAME` after the matching `ARG` to
+/// export it into the build-stage environment. Flutter sidesteps this by
+/// reading ARGs via `--dart-define=` directly on the compiler CLI; npm has
+/// no such hook.
+///
+/// Each secret = own `ENV NAME=$NAME` line. Empty input → empty string.
+pub fn render_dockerfile_envs(secret_names: &[String]) -> String {
+    secret_names
+        .iter()
+        .map(|n| format!("ENV {name}=${name}", name = n))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +410,18 @@ mod tests {
     }
 
     #[test]
+    fn test_render_dockerfile_envs_emits_env_lines() {
+        // T-000107: ENV NAME=$NAME per secret, newline-joined. Vite needs
+        // these because `npm run build` reads VITE_* from process.env, not
+        // from Docker's ARG scope.
+        let secrets = vec!["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()];
+        let out = render_dockerfile_envs(&secrets);
+        assert_eq!(out, "ENV VITE_API_BASE=$VITE_API_BASE\nENV VITE_APP_KEY=$VITE_APP_KEY");
+        // Empty input → empty string (symmetric to render_dockerfile_args).
+        assert_eq!(render_dockerfile_envs(&[]), "");
+    }
+
+    #[test]
     fn test_render_dart_defines_emits_one_flag_per_secret() {
         let secrets = vec!["API_BASE_URL".to_string(), "APP_API_KEY".to_string()];
         let out = render_dart_defines(&secrets);
@@ -425,6 +458,78 @@ mod tests {
         // Must still be a valid Dockerfile structure
         assert!(rendered.to_lowercase().contains("from "), "has base image directive");
         assert!(rendered.to_lowercase().contains("copy"), "has COPY directives");
+    }
+
+    /// T-000107: vite_static/dockerfile.tmpl renders with VITE_* build secrets,
+    /// repo-scope placeholders (NODE_VERSION/BUILD_OUTPUT_DIR/PRE_BUILD_COMMAND),
+    /// and the new @@DOCKERFILE_ENVS@@ ARG→ENV transition block.
+    #[test]
+    fn test_vite_static_dockerfile_renders_with_vite_secrets() {
+        let tmpl = include_str!("../templates/vite_static/dockerfile.tmpl");
+        let args = render_dockerfile_args(&["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()]);
+        let envs = render_dockerfile_envs(&["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()]);
+        let v = vars(&[
+            ("NODE_VERSION", "lts-alpine"),
+            ("BUILD_OUTPUT_DIR", "dist"),
+            ("PRE_BUILD_COMMAND", "true"),
+            ("DOCKERFILE_ARGS", args.as_str()),
+            ("DOCKERFILE_ENVS", envs.as_str()),
+        ]);
+        let rendered = render_template(tmpl, &v).expect("vite_static dockerfile must render");
+
+        // Build stage uses correct node image
+        assert!(rendered.contains("FROM node:lts-alpine"), "node base image with NODE_VERSION substituted");
+
+        // ARG NAME and ENV NAME=$NAME both present per VITE_* secret
+        assert!(rendered.contains("ARG VITE_API_BASE"));
+        assert!(rendered.contains("ARG VITE_APP_KEY"));
+        assert!(rendered.contains("ENV VITE_API_BASE=$VITE_API_BASE"));
+        assert!(rendered.contains("ENV VITE_APP_KEY=$VITE_APP_KEY"));
+
+        // npm flow — deterministic lockfile install, no fallback
+        assert!(rendered.contains("RUN npm ci"));
+        assert!(!rendered.contains("npm install"), "deterministic install — no ergonomic fallback");
+
+        // PRE_BUILD_COMMAND (default = shell no-op `true`) and main build
+        assert!(rendered.contains("RUN true"));
+        assert!(rendered.contains("RUN npm run build"));
+
+        // Runtime stage: nginx serves the build output dir
+        assert!(rendered.contains("FROM nginx:alpine"));
+        assert!(rendered.contains("COPY --from=builder /app/dist /usr/share/nginx/html"));
+        assert!(rendered.contains("EXPOSE 80"));
+    }
+
+    /// T-000107: vite_static/deploy.yml.tmpl renders cleanly with VITE_* build
+    /// secrets in the build-args block. Mirrors test_regression_flutter_web_deploy_yml_v04
+    /// — vite shares the deploy stage byte-for-byte with flutter_web.
+    #[test]
+    fn test_vite_static_deploy_yml_renders_clean() {
+        let tmpl = include_str!("../templates/vite_static/deploy.yml.tmpl");
+        let build_args = render_build_args(&["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()]);
+        let v = vars(&[
+            ("WORKFLOW_NAME", "Deploy Vite Static"),
+            ("IMAGE_TAG", "prod"),
+            ("COMPOSE_SERVICE", "lcm-landing-prod"),
+            ("DOMAIN", "lcm.example.com"),
+            ("DEPLOY_BRANCH", "master"),
+            ("ENV_NAME", "prod"),
+            ("NETWORK_NAME", "lcm_prod_proxy-network"),
+            ("CONTAINER_NAME", "lcm-landing-prod"),
+            ("COMPOSE_PROJECT", "lcm_prod"),
+            ("BUILD_ARGS", build_args.as_str()),
+        ]);
+        let rendered = render_template(tmpl, &v).expect("vite_static deploy.yml must render");
+
+        assert!(rendered.contains("name: Deploy Vite Static"));
+        assert!(rendered.contains("branches: [ master ]"));
+        assert!(rendered.contains("environment: prod"), "each job declares environment");
+        assert!(rendered.contains("com.docker.compose.project=lcm_prod"));
+        assert!(rendered.contains("--network lcm_prod_proxy-network"));
+        assert!(rendered.contains("VITE_API_BASE=${{ secrets.VITE_API_BASE }}"));
+        assert!(rendered.contains("VITE_APP_KEY=${{ secrets.VITE_APP_KEY }}"));
+        assert!(rendered.contains("--name lcm-landing-prod"));
+        assert!(rendered.contains("FORWARD_HOST=lcm-landing-prod"));
     }
 
     /// Smoke-regression: Go dockerfile.tmpl renders with SwanQu values.

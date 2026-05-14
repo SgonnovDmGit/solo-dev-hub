@@ -2293,6 +2293,7 @@ pub fn render_files_for_deploy_env(
     vars.insert("BUILD_ARGS".to_string(), template_render::render_build_args(&build_for_this_env));
     vars.insert("RUNTIME_ENV_ARGS".to_string(), template_render::render_runtime_env_args(&runtime_for_this_env));
     vars.insert("DOCKERFILE_ARGS".to_string(), template_render::render_dockerfile_args(&union_build_vec));
+    vars.insert("DOCKERFILE_ENVS".to_string(), template_render::render_dockerfile_envs(&union_build_vec));
     vars.insert("DART_DEFINES".to_string(), template_render::render_dart_defines(&union_build_vec));
 
     // Render each file from the template dir whose file_name is listed in file_targets

@@ -1,0 +1,37 @@
+# Vite static SPA → nginx:alpine.
+# Build stage: node:<NODE_VERSION> compiles the project with `npm run build`,
+# baking VITE_* secrets into the bundle via import.meta.env at compile time.
+# Runtime stage: serves the resulting static files from BUILD_OUTPUT_DIR via nginx.
+
+# ---- Build stage ----
+FROM node:@@NODE_VERSION@@ AS builder
+WORKDIR /app
+
+# Install deps — pure `npm ci` for deterministic, lockfile-pinned resolution.
+# Requires a committed `package-lock.json`. Fails fast on missing / out-of-sync
+# lockfile with a clear error message in GH Actions logs.
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Copy source
+COPY . .
+
+# Build-time env vars. Vite reads import.meta.env.VITE_* from process.env at
+# `npm run build`, so ARG (build-arg passthrough) → ENV (export to spawned
+# npm process) transition is required — bare ARG is not enough.
+@@DOCKERFILE_ARGS@@
+@@DOCKERFILE_ENVS@@
+
+# Optional pre-build step (paraglide compile, prisma generate, custom codegen).
+# Default `true` = shell no-op (step effectively skipped). Override via the
+# repo-scope PRE_BUILD_COMMAND placeholder when codegen is required.
+RUN @@PRE_BUILD_COMMAND@@
+
+# Production build
+RUN npm run build
+
+# ---- Runtime image ----
+FROM nginx:alpine
+COPY --from=builder /app/@@BUILD_OUTPUT_DIR@@ /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

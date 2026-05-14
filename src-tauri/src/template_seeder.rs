@@ -111,6 +111,33 @@ mod tests {
     }
 
     #[test]
+    fn test_seed_inserts_vite_static() {
+        // T-000107: third built-in deploy template — Vite static SPA.
+        let db = make_db();
+        assert!(!db
+            .list_template_languages()
+            .unwrap()
+            .contains(&"vite_static".to_string()));
+
+        let n = seed_bundled_templates(&db).unwrap();
+        assert!(n >= 3, "at least 3 vite_static files seeded among others, got {}", n);
+        assert!(db
+            .list_template_languages()
+            .unwrap()
+            .contains(&"vite_static".to_string()));
+
+        let files = db.list_template_files("vite_static").unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.file_name.as_str()).collect();
+        assert!(names.contains(&"deploy.yml.tmpl"));
+        assert!(names.contains(&"dockerfile.tmpl"));
+        assert!(names.contains(&"meta.json"));
+
+        for f in &files {
+            assert!(!f.is_custom);
+        }
+    }
+
+    #[test]
     fn test_seed_preserves_custom_files() {
         let db = make_db();
         seed_bundled_templates(&db).unwrap();
