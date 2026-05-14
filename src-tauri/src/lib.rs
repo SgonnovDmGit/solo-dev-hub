@@ -694,93 +694,11 @@ fn reject_bug(
     Ok(refreshed.to_view())
 }
 
-// ── Bug Statistics commands (v0.16.0) ────────────────────────────────────────
-//
-// Write-commands below are stubs kept for backward compatibility with the
-// frontend during Session A. Stats are now live-computed directly from the
-// `bugs` and `bug_events` tables (Dashboard / StatsSummary queries) — the
-// incremental counter updates are no-ops. The `bug_stats` VIEW that mediated
-// the v0.16.0..v0.23.x transition was dropped in v23 (T-000058, v0.24.0).
-// Frontend callers (bugs.ts store) will be rewired in Session C to use the
-// DB-centric flow; until then these stubs prevent runtime errors when the
-// old UI triggers events.
-//
-#[tauri::command]
-#[allow(unused_variables)]
-fn increment_bug_stat(
-    db: State<AppDb>,
-    repository_id: i64,
-    severity: String,
-    category: String,
-    date: String,
-) -> Result<(), String> {
-    Ok(())
-}
-
-#[tauri::command]
-#[allow(unused_variables)]
-fn decrement_bug_stat(
-    db: State<AppDb>,
-    repository_id: i64,
-    severity: String,
-    category: String,
-    date: String,
-) -> Result<(), String> {
-    Ok(())
-}
-
-#[tauri::command]
-#[allow(unused_variables)]
-fn add_attempts_stat(
-    db: State<AppDb>,
-    repository_id: i64,
-    severity: String,
-    category: String,
-    date: String,
-    count: i32,
-) -> Result<(), String> {
-    Ok(())
-}
-
-#[tauri::command]
-#[allow(unused_variables)]
-fn subtract_attempts_stat(
-    db: State<AppDb>,
-    repository_id: i64,
-    severity: String,
-    category: String,
-    date: String,
-    count: i32,
-) -> Result<(), String> {
-    Ok(())
-}
-
-#[tauri::command]
-#[allow(unused_variables)]
-fn increment_resolved_stat(
-    db: State<AppDb>,
-    repository_id: i64,
-    severity: String,
-    category: String,
-    date: String,
-) -> Result<(), String> {
-    Ok(())
-}
-
-#[tauri::command]
-#[allow(unused_variables)]
-fn transfer_bug_stat(
-    db: State<AppDb>,
-    repository_id: i64,
-    from_severity: String,
-    from_category: String,
-    to_severity: String,
-    to_category: String,
-    date: String,
-    attempts: i32,
-) -> Result<(), String> {
-    Ok(())
-}
+// ── Stats / Graph summaries ──────────────────────────────────────────────────
+// Stats are live-computed from the `bugs` and `bug_events` tables — no
+// persisted counters, no recalc commands. The legacy `*_stat` write-stubs
+// (kept from v0.16.0 stats-table→VIEW migration) were removed in v0.30.0
+// (T-000093) along with their unused TS wrappers.
 
 #[tauri::command]
 fn get_repo_stats_summary(db: State<AppDb>, repository_id: i64) -> Result<StatsSummary, String> {
@@ -795,26 +713,6 @@ fn get_project_stats_summary(db: State<AppDb>, project_id: i64) -> Result<StatsS
 #[tauri::command]
 fn get_project_graph(db: State<AppDb>, project_id: i64) -> Result<ProjectGraph, String> {
     db.get_project_graph(project_id).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-#[allow(unused_variables)]
-fn reset_repo_stats(db: State<AppDb>, repo_id: i64) -> Result<(), String> {
-    Ok(())
-}
-
-#[tauri::command]
-#[allow(unused_variables)]
-fn reset_all_stats(db: State<AppDb>) -> Result<(), String> {
-    Ok(())
-}
-
-#[tauri::command]
-#[allow(unused_variables)]
-fn recalculate_all_stats(db: State<AppDb>) -> Result<usize, String> {
-    // v0.16.0: VIEW is always-fresh, no recalc needed. Returning 0 signals "no-op"
-    // to the existing UI button (which will be removed/reworked in Session C).
-    Ok(0)
 }
 
 // ── Dashboard v0.17.0 ────────────────────────────────────────────────────────
@@ -2882,19 +2780,10 @@ pub fn run() {
             // Settings
             get_setting,
             set_setting,
-            // Bug statistics
-            increment_bug_stat,
-            decrement_bug_stat,
-            add_attempts_stat,
-            subtract_attempts_stat,
-            increment_resolved_stat,
-            transfer_bug_stat,
+            // Stats / Graph
             get_repo_stats_summary,
             get_project_stats_summary,
             get_project_graph,
-            reset_repo_stats,
-            reset_all_stats,
-            recalculate_all_stats,
             // Dashboard v0.17.0
             read_dashboard,
             // Activity feed v0.19.0

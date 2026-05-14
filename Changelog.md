@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-05-14
+
+Pre-v1.0.0 mechanical refactor bundle. Six tasks (T-000093/094/095/096/097/102) split the four largest Rust modules and the TypeScript `types.ts` by domain. Pure lexical move + extraction — no behavioral change. All test suites stay green (314 cargo, 50 vitest, svelte-check clean).
+
+### Changed
+- **T-000093** Removed 9 no-op `*_stat` Tauri commands (`increment_bug_stat`, `decrement_bug_stat`, `add_attempts_stat`, `subtract_attempts_stat`, `increment_resolved_stat`, `transfer_bug_stat`, `reset_repo_stats`, `reset_all_stats`, `recalculate_all_stats`) — legacy stubs from the v0.16.0 stats-table→VIEW migration with bodies `Ok(())` and no callers. Frontend `tauri-commands.ts` wrappers removed too. Surviving 3 commands (`get_repo_stats_summary`, `get_project_stats_summary`, `get_project_graph`) kept under tightened section header.
+- **T-000094** Split `src-tauri/src/db.rs` (7,314 lines, 261 methods) into `src-tauri/src/db/` directory: `mod.rs` (struct + ctor + free fns + `pub mod`) plus 10 domain sub-modules — `migrations` (967 lines), `projects` (978), `repos` (1,290), `bugs` (1,081), `dashboard` (787), `deploy` (805), `tasks_events` (339), `stats` (427), `timeline` (406), `graph` (194). Multiple `impl AppDb` blocks across files; API surface unchanged.
+- **T-000095** Refactored `run_migrations` god-fn (~530 lines, 24 inline schema blobs) into a single dispatcher array of `(target_version, name, fn)` tuples calling per-version free fns (`mig_v1_initial` through `mig_v24_project_renames`). Each migration is now a standalone fn that takes `&Connection` — easier to read, easier to test, easier to add new ones. Per-migration tests live as neighbors of their migration fns.
+- **T-000096** Extracted `run_count_with_project_filter(&self, base_sql, fixed_params, project_ids)` helper in `db/dashboard.rs`. Four dashboard counter call-sites (`count_active_bugs`, `count_active_bugs_with_severity`, `count_closed_bugs_in_period`, `count_opened_bugs_in_period`) collapsed from ~10 lines of `params_from_iter` + `extend(ids_refs)` boilerplate each to 5–6 lines. More complex queries (avg-attempts, top-hot, bugs-per-day, category-efficiency) kept their own SQL where the helper shape didn't fit.
+- **T-000097** Split `src-tauri/src/sync.rs` (3,054 lines, ~30 free fns) into `src-tauri/src/sync/` directory: `mod.rs` (16-line barrel) plus 5 domain sub-modules — `fs` (path safety + file primitives, 334 lines), `requirements` (rename-replay + nested-folder migration, 489 lines), `claude_md` (CLAUDE.md / project.md section rendering, 872 lines), `bugs` (Bug MD↔DB sync, 900 lines), `tasks` (Task MD↔DB sync, 502 lines). No visibility promotions needed.
+- **T-000102** Split `src-tauri/src/models.rs` (715 lines, 48 structs) into `src-tauri/src/models/` directory: `mod.rs` (barrel) + 10 sub-modules (`core`, `bugs`, `dashboard`, `deploy`, `graph`, `stats`, `sync`, `tasks`, `templates`, `timeline`). Frontend `src/lib/types.ts` (405 lines) collapsed to a 14-line barrel re-exporting from new `src/lib/types/*.ts` mirroring the Rust split. All 40 `from '$lib/types'` call-sites compile unchanged via flat `export *`.
+
+### Tests
+- 314 cargo (unchanged), 50 vitest (unchanged), svelte-check 0/0/0 on 454 files (was 444 — the new `types/*.ts` files counted).
+
 ## [0.29.2] — 2026-05-14
 
 Hotfix collected from the multi-deploy Go dogfood session. Six bug-fixes and one template-rule clarification across the sidebar, deploy screen, dashboard, and Go template.
