@@ -95,14 +95,12 @@ pub struct MetaSecretHint {
 /// Unknown scope values must be rejected at template-load time
 /// (strict mode, no silent fallback). See `parse_meta_placeholder`.
 ///
-/// NOTE: `scope` is currently consumed only by Task 3's schema-aware render
-/// merger (template_render.rs) and Task 4/5's frontend. `#[allow(dead_code)]`
-/// will be removed once Task 3 wires this through.
+/// Consumed by Task 3's schema-aware render merger in `template_render`
+/// (`build_placeholder_vars`) and by the frontend via Task 4/5's UI work.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaPlaceholder {
     /// "repo" | "environment". Absent → treat as "environment".
     #[serde(default)]
-    #[allow(dead_code)]
     pub scope: Option<String>,
 }
 

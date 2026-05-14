@@ -1,3 +1,4 @@
+use crate::models::MetaPlaceholder;
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -5,6 +6,54 @@ use std::sync::OnceLock;
 fn placeholder_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"@@(\w+)@@").expect("valid placeholder regex"))
+}
+
+/// T-000103 Task 3 (v0.31.0): schema-aware placeholder merger.
+///
+/// Iterates over `meta_placeholders` (the parsed `placeholders` section of a
+/// template's `meta.json`) and sources each placeholder's value by its
+/// `scope` field:
+///   - `scope == "repo"`         → look up in `repo_config`
+///   - `scope == "environment"`  → look up in `env_extras` (this is the default
+///                                  when scope is absent)
+///   - other values              → ignored (strict parser already rejected them
+///                                  upstream — this branch is defense-in-depth)
+///
+/// If the chosen source has a non-empty value for the placeholder, that
+/// value is inserted. Otherwise the placeholder is left out of the resulting
+/// map — callers either supply a default from elsewhere (e.g. raw `default`
+/// field on the JSON) before invoking this fn, OR `render_template` will
+/// report a missing-key error.
+///
+/// **Orphan keys are ignored.** Keys that appear in `repo_config` or
+/// `env_extras` but are NOT declared in `meta_placeholders` never reach the
+/// output map — the template substitution pass therefore won't see them.
+/// This is the design point: only the contract declared by the template's
+/// meta.json reaches the renderer; runtime state (extras / repo_config) is
+/// filtered by the schema, not the other way around.
+///
+/// The fn is pure (no I/O), which makes it directly unit-testable.
+pub fn build_placeholder_vars(
+    meta_placeholders: &[(String, MetaPlaceholder)],
+    repo_config: &HashMap<String, String>,
+    env_extras: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    for (name, spec) in meta_placeholders {
+        let source: Option<&String> = match spec.scope.as_deref().unwrap_or("environment") {
+            "repo" => repo_config.get(name),
+            "environment" => env_extras.get(name),
+            _ => None,
+        };
+        if let Some(v) = source {
+            // Empty-string values are treated as "not set" — fall back to whatever
+            // the caller already populated (defaults from meta.json `default`).
+            if !v.is_empty() {
+                out.insert(name.clone(), v.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Render a template by replacing `@@KEY@@` placeholders from `vars`.
@@ -446,5 +495,148 @@ mod tests {
         let rendered = render_template(tmpl, &v).expect("Go dockerfile must render with ARGs");
         assert!(rendered.contains("ARG API_KEY"));
         assert!(rendered.contains("ARG BUILD_TOKEN"));
+    }
+
+    // ── T-000103 Task 3: scope-aware placeholder merger ──────────────────────
+
+    fn ph(scope: Option<&str>) -> MetaPlaceholder {
+        MetaPlaceholder {
+            scope: scope.map(|s| s.to_string()),
+        }
+    }
+
+    fn smap(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_render_uses_repo_scope_for_repo_placeholders() {
+        // Same key name in BOTH repo_config AND env_extras with DIFFERENT
+        // values. Merger must pick by scope:
+        //   - GO_VERSION (scope=repo)        → repo_config value
+        //   - DOMAIN     (scope=environment) → env_extras  value
+        // NOT a chain-merge or last-wins.
+        let meta = vec![
+            ("GO_VERSION".to_string(), ph(Some("repo"))),
+            ("DOMAIN".to_string(), ph(Some("environment"))),
+        ];
+        let repo_config = smap(&[
+            ("GO_VERSION", "1.26-alpine"),
+            // Intentionally also has DOMAIN — must be IGNORED because DOMAIN is
+            // env-scope, not repo-scope.
+            ("DOMAIN", "wrong-source.example.com"),
+        ]);
+        let env_extras = smap(&[
+            // Intentionally also has GO_VERSION — must be IGNORED because
+            // GO_VERSION is repo-scope, not env-scope.
+            ("GO_VERSION", "wrong-source-1.20"),
+            ("DOMAIN", "prod.example.com"),
+        ]);
+
+        let vars = build_placeholder_vars(&meta, &repo_config, &env_extras);
+
+        assert_eq!(
+            vars.get("GO_VERSION").map(|s| s.as_str()),
+            Some("1.26-alpine"),
+            "repo-scope placeholder must come from repo_config",
+        );
+        assert_eq!(
+            vars.get("DOMAIN").map(|s| s.as_str()),
+            Some("prod.example.com"),
+            "environment-scope placeholder must come from env_extras",
+        );
+    }
+
+    #[test]
+    fn test_render_uses_environment_scope_when_scope_absent() {
+        // Placeholders without an explicit scope field default to
+        // "environment" — source from env_extras.
+        let meta = vec![("WORKFLOW_NAME".to_string(), ph(None))];
+        let repo_config = smap(&[("WORKFLOW_NAME", "from_repo")]);
+        let env_extras = smap(&[("WORKFLOW_NAME", "from_env")]);
+
+        let vars = build_placeholder_vars(&meta, &repo_config, &env_extras);
+
+        assert_eq!(
+            vars.get("WORKFLOW_NAME").map(|s| s.as_str()),
+            Some("from_env"),
+            "absent scope defaults to 'environment' — source from env_extras",
+        );
+    }
+
+    #[test]
+    fn test_render_orphan_keys_ignored() {
+        // Keys present in repo_config / env_extras but NOT declared in
+        // meta.placeholders must NEVER reach the output map. Combined with
+        // the strict-key behavior of `render_template` (errors on missing key
+        // in the template), this means orphans are completely inert: the
+        // template never sees them as substitution candidates.
+        let meta = vec![("DECLARED_KEY".to_string(), ph(Some("environment")))];
+        let repo_config = smap(&[
+            ("DECLARED_KEY", "should_not_be_picked_for_env_scope"),
+            ("ORPHAN_REPO_KEY", "ghost1"),
+        ]);
+        let env_extras = smap(&[
+            ("DECLARED_KEY", "the_real_value"),
+            ("ORPHAN_ENV_KEY", "ghost2"),
+        ]);
+
+        let vars = build_placeholder_vars(&meta, &repo_config, &env_extras);
+
+        // Only the declared key reached the output.
+        assert_eq!(vars.len(), 1, "only declared keys may be emitted, got {:?}", vars);
+        assert_eq!(
+            vars.get("DECLARED_KEY").map(|s| s.as_str()),
+            Some("the_real_value"),
+        );
+        assert!(!vars.contains_key("ORPHAN_REPO_KEY"), "orphan in repo_config must be filtered out");
+        assert!(!vars.contains_key("ORPHAN_ENV_KEY"), "orphan in env_extras must be filtered out");
+
+        // Belt-and-suspenders: an actual render pass against a template that
+        // only references DECLARED_KEY should succeed and NOT contain the
+        // ghost values anywhere in its output.
+        let tmpl = "value: @@DECLARED_KEY@@";
+        let rendered = render_template(tmpl, &vars).unwrap();
+        assert_eq!(rendered, "value: the_real_value");
+        assert!(!rendered.contains("ghost1"));
+        assert!(!rendered.contains("ghost2"));
+    }
+
+    #[test]
+    fn test_render_empty_value_in_source_skips_insertion() {
+        // Empty-string in the chosen source is treated as "not set" — caller's
+        // pre-populated default (from meta.json `default` field) must survive.
+        // This matches the existing lib.rs merger behavior: `for (k, v) in
+        // env.extras { if !v.is_empty() { vars.insert(...) } }`.
+        let meta = vec![("ENV_FILE_PATH".to_string(), ph(Some("environment")))];
+        let repo_config: HashMap<String, String> = HashMap::new();
+        let env_extras = smap(&[("ENV_FILE_PATH", "")]);
+
+        let vars = build_placeholder_vars(&meta, &repo_config, &env_extras);
+
+        assert!(
+            !vars.contains_key("ENV_FILE_PATH"),
+            "empty value must NOT shadow caller-supplied default",
+        );
+    }
+
+    #[test]
+    fn test_render_unknown_scope_value_yields_no_value() {
+        // Defense-in-depth: strict parser upstream rejects unknown scope
+        // values, but if one slips through, the merger must not panic or
+        // pick from a random source.
+        let meta = vec![("X".to_string(), ph(Some("weird_scope")))];
+        let repo_config = smap(&[("X", "from_repo")]);
+        let env_extras = smap(&[("X", "from_env")]);
+
+        let vars = build_placeholder_vars(&meta, &repo_config, &env_extras);
+
+        assert!(
+            !vars.contains_key("X"),
+            "unknown scope value must yield nothing — caller falls back to default",
+        );
     }
 }
