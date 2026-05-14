@@ -1,6 +1,6 @@
 [package]
 name = "solo-dev-hub"
-version = "0.30.0"
+version = "0.30.1"
 description = "Solo Dev Hub — desktop app for managing GitHub projects"
 authors = ["you"]
 edition = "2021"

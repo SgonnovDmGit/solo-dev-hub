@@ -4,6 +4,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [0.30.1] — 2026-05-14
+
+Second mechanical refactor pass on top of v0.30.0. Three more splits — `export.rs` by parser domain, `sync/claude_md.rs` un-bundled into three concerns, and `i18n/translations.ts` split by key prefix. Pure lexical move, no behavior change. All test suites unchanged (314 cargo, 50 vitest, svelte-check clean — file count 454 → 489 due to the new `i18n/strings/` files).
+
+### Changed
+- **T-000104** Split `src-tauri/src/export.rs` (1123 lines) into `src-tauri/src/export/` directory: `mod.rs` (barrel) + `util.rs` (shared pipe-parser, escape/unescape) + `bugs.rs` (v2 8-field format generate/parse) + `bugs_legacy.rs` (pre-v2 import path: `parse_header`, `parse_bug_entry`, `parse_markdown_legacy`) + `todo_done.rs` (F-021 todo/done parsers). Commit `4ca36e0`.
+- **T-000105** Un-bundled `src-tauri/src/sync/claude_md.rs` (872 lines, three concerns) into focused files: `claude_md.rs` (448 lines — CLAUDE.md section rendering only), `project_md.rs` (238 lines, new — `generate_project_md` for cross-repo announcement Path lookups), `gitignore.rs` (221 lines, new — `sync_gitignore_section`). Commit `0684235`.
+- **T-000106** Split `src/lib/i18n/translations.ts` (1594 lines, ~727 keys × ru/en flat objects) by key prefix into `src/lib/i18n/strings/<domain>.ts` (35 files, one per top-level prefix). Each file exports `ru` and `en` slices for its domain. Root `translations.ts` (now 116 lines) merges them at module init via spread. `TranslationKey` type-narrowing preserved via `as const`. Commit `336ec38`.
+
+### Tests
+- 314 cargo (unchanged), 50 vitest (unchanged), svelte-check 0/0/0 on 489 files (was 454 — added 35 `i18n/strings/*.ts` files).
+
 ## [0.30.0] — 2026-05-14
 
 Pre-v1.0.0 mechanical refactor bundle. Six tasks (T-000093/094/095/096/097/102) split the four largest Rust modules and the TypeScript `types.ts` by domain. Pure lexical move + extraction — no behavioral change. All test suites stay green (314 cargo, 50 vitest, svelte-check clean).
