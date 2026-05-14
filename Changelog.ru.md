@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-05-14
+
+Pre-v1.0.0 механический refactor-bundle. Шесть задач (T-000093/094/095/096/097/102) разнесли четыре самых больших Rust-модуля и TypeScript `types.ts` по доменам. Чистый лексический move + extraction — поведение не менялось. Все тестовые наборы остаются зелёными (314 cargo, 50 vitest, svelte-check clean).
+
+### Changed
+- **T-000093** Удалены 9 no-op Tauri-команд `*_stat` (`increment_bug_stat`, `decrement_bug_stat`, `add_attempts_stat`, `subtract_attempts_stat`, `increment_resolved_stat`, `transfer_bug_stat`, `reset_repo_stats`, `reset_all_stats`, `recalculate_all_stats`) — legacy-стабы со времён v0.16.0 миграции stats-table→VIEW: тела `Ok(())`, нет вызывающих. Удалены и фронтовые wrapper'ы в `tauri-commands.ts`. Оставшиеся 3 команды (`get_repo_stats_summary`, `get_project_stats_summary`, `get_project_graph`) под подчищенным комментарием-заголовком.
+- **T-000094** `src-tauri/src/db.rs` (7 314 строк, 261 метод) разнесён в директорию `src-tauri/src/db/`: `mod.rs` (struct + ctor + free fns + `pub mod`) плюс 10 доменных под-модулей — `migrations` (967), `projects` (978), `repos` (1290), `bugs` (1081), `dashboard` (787), `deploy` (805), `tasks_events` (339), `stats` (427), `timeline` (406), `graph` (194). Несколько `impl AppDb` блоков в разных файлах; публичный API не менялся.
+- **T-000095** Рефакторинг god-fn `run_migrations` (~530 строк, 24 inline-schema blob'а) → один диспетчер с массивом `(target_version, name, fn)` и per-version free fns (`mig_v1_initial` … `mig_v24_project_renames`). Каждая миграция — самостоятельная fn принимающая `&Connection`: читать проще, тестировать проще, добавлять новые проще. Per-migration тесты живут рядом со своей миграцией.
+- **T-000096** Извлечён хелпер `run_count_with_project_filter(&self, base_sql, fixed_params, project_ids)` в `db/dashboard.rs`. Четыре counter call-site'а (`count_active_bugs`, `count_active_bugs_with_severity`, `count_closed_bugs_in_period`, `count_opened_bugs_in_period`) сжаты с ~10 строк `params_from_iter` + `extend(ids_refs)` boilerplate'а до 5–6 строк. Более сложные queries (avg-attempts, top-hot, bugs-per-day, category-efficiency) оставлены со своим SQL — туда хелпер не ложится чисто.
+- **T-000097** `src-tauri/src/sync.rs` (3 054 строк, ~30 free fns) разнесён в `src-tauri/src/sync/`: `mod.rs` (16-строчный barrel) + 5 под-модулей — `fs` (path safety + file primitives, 334), `requirements` (rename-replay + nested-folder migration, 489), `claude_md` (CLAUDE.md / project.md секция rendering, 872), `bugs` (Bug MD↔DB sync, 900), `tasks` (Task MD↔DB sync, 502). Promotion'ы видимости не понадобились.
+- **T-000102** `src-tauri/src/models.rs` (715 строк, 48 структур) разнесён в `src-tauri/src/models/`: `mod.rs` (barrel) + 10 под-модулей (`core`, `bugs`, `dashboard`, `deploy`, `graph`, `stats`, `sync`, `tasks`, `templates`, `timeline`). Фронтовый `src/lib/types.ts` (405 строк) свёрнут в 14-строчный barrel, re-export'ит из новых `src/lib/types/*.ts` зеркально Rust split'у. Все 40 импортов `from '$lib/types'` компилируются без изменений через flat `export *`.
+
+### Tests
+- 314 cargo (без изменений), 50 vitest (без изменений), svelte-check 0/0/0 на 454 файлах (было 444 — новые `types/*.ts` добавились в счёт).
+
 ## [0.29.2] — 2026-05-14
 
 Hotfix-патч из multi-deploy Go dogfood-сессии. Шесть багфиксов и одно уточнение template-правила в sidebar, deploy-экране, dashboard'е и Go-шаблоне.
