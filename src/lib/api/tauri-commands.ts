@@ -263,36 +263,8 @@ export async function rejectBug(repoId: number, displayId: string): Promise<BugV
   return invoke<BugView>('reject_bug', { repoId, displayId });
 }
 
-// ── Bug stat commands (v0.16.0: VIEW-based read-only) ────────────────────────
-// Old write-side stats are no-op stubs for backward-compat with any callers
-// that haven't been ripped out yet — kept so the UI doesn't error at runtime.
-// Stats are now live-computed from the `bugs` table; no manual increment needed.
+// ── Stats / Graph summaries (v0.22.0 lifetime-only API; live-computed) ───────
 
-export async function incrementBugStat(repositoryId: number, severity: string, category: string, date: string): Promise<void> {
-  return invoke<void>('increment_bug_stat', { repositoryId, severity, category, date });
-}
-
-export async function decrementBugStat(repositoryId: number, severity: string, category: string, date: string): Promise<void> {
-  return invoke<void>('decrement_bug_stat', { repositoryId, severity, category, date });
-}
-
-export async function addAttemptsStat(repositoryId: number, severity: string, category: string, date: string, count: number): Promise<void> {
-  return invoke<void>('add_attempts_stat', { repositoryId, severity, category, date, count });
-}
-
-export async function subtractAttemptsStat(repositoryId: number, severity: string, category: string, date: string, count: number): Promise<void> {
-  return invoke<void>('subtract_attempts_stat', { repositoryId, severity, category, date, count });
-}
-
-export async function incrementResolvedStat(repositoryId: number, severity: string, category: string, date: string): Promise<void> {
-  return invoke<void>('increment_resolved_stat', { repositoryId, severity, category, date });
-}
-
-export async function transferBugStat(repositoryId: number, fromSeverity: string, fromCategory: string, toSeverity: string, toCategory: string, date: string, attempts: number): Promise<void> {
-  return invoke<void>('transfer_bug_stat', { repositoryId, fromSeverity, fromCategory, toSeverity, toCategory, date, attempts });
-}
-
-// v0.22.0 (T-000054): new lifetime-only stats API
 export async function getRepoStatsSummary(repositoryId: number): Promise<StatsSummary> {
   return invoke<StatsSummary>('get_repo_stats_summary', { repositoryId });
 }
@@ -303,18 +275,6 @@ export async function getProjectStatsSummary(projectId: number): Promise<StatsSu
 
 export async function getProjectGraph(projectId: number): Promise<ProjectGraph> {
   return invoke<ProjectGraph>('get_project_graph', { projectId });
-}
-
-export async function resetRepoStats(repositoryId: number): Promise<void> {
-  return invoke<void>('reset_repo_stats', { repositoryId });
-}
-
-export async function resetAllStats(): Promise<void> {
-  return invoke<void>('reset_all_stats');
-}
-
-export async function recalculateAllStats(): Promise<number> {
-  return invoke<number>('recalculate_all_stats');
 }
 
 // ── Requirements sync commands ──────────────────────────────────────────────
