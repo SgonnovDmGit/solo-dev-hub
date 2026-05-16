@@ -362,9 +362,9 @@ Reverse directions (client → server, server → MS) do not exist as announceme
 
 1. **Read your own `docs/project.md`** to discover the recipient's local filesystem path:
    - Server → client: `## Repositories` table, column `Path` for each repo with `role` in {`client`, `admin_client`, `test_client`}.
-   - Microservice → parent server: `## Parent projects` section, each line reads `- **<parent-name>** — server repo: <name> (path: <local-path>)`.
+   - Microservice → parent server: `## Parent projects` table, column `Path` for the row whose `Parent project` matches the target server.
 
-   If the path is missing (rendered as `no local path configured`) or the repo entry is marked `⚠ server repo not resolvable`, **do not write the announcement** — it is not deliverable. Surface the gap to the user (own session log, or a `T-NNNNNN` in `docs/todo.md`).
+   If the path is missing (rendered as `_no local path configured_`) or the row's `Server repo` cell shows `⚠ server repo not resolvable`, **do not write the announcement** — it is not deliverable. Surface the gap to the user (own session log, or a `T-NNNNNN` in `docs/todo.md`).
 
 2. **Pick the next free `NNN`** in the recipient's announcement folder.
    - If the folder does not exist, create it and use `001`.

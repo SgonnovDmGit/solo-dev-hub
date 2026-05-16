@@ -48,17 +48,36 @@ pub fn generate_project_md(db: &AppDb, project_id: i64, repo_root: &Path) -> Res
         md.push('\n');
     }
 
+    // B-000013: unified table layout across all three sections — humans see
+    // the same shape everywhere, LLMs still grep the same marker strings
+    // (`_no local path configured_`, `⚠ server repo not resolvable`).
     md.push_str("## Connected microservices\n\n");
     if ms_ids.is_empty() {
         md.push_str("_No connected microservices._\n\n");
     } else {
+        md.push_str("| Microservice | Server repo | Path | GitHub |\n");
+        md.push_str("|--------------|-------------|------|--------|\n");
         for ms_id in &ms_ids {
             let ms_proj = db.get_project(*ms_id).map_err(|e| e.to_string())?;
-            let srv_label = match db.server_repo_of_microservice(*ms_id) {
-                Ok(srv) => srv.display_name(),
-                Err(_) => "⚠ no server repo".to_string(),
+            let (srv_label, path_label, gh_label) = match db.server_repo_of_microservice(*ms_id) {
+                Ok(srv) => {
+                    let path = srv
+                        .local_path
+                        .clone()
+                        .unwrap_or_else(|| "_no local path configured_".to_string());
+                    let gh = if srv.github_name.is_some() { "✓" } else { "📁 local" };
+                    (srv.display_name(), path, gh.to_string())
+                }
+                Err(_) => (
+                    "⚠ server repo not resolvable".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                ),
             };
-            md.push_str(&format!("- **{}** — server repo: {}\n", ms_proj.name, srv_label));
+            md.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                ms_proj.name, srv_label, path_label, gh_label
+            ));
         }
         md.push('\n');
     }
@@ -71,26 +90,28 @@ pub fn generate_project_md(db: &AppDb, project_id: i64, repo_root: &Path) -> Res
         // can write proactive announcements directly into that filesystem.
         // server_repo_of_microservice() is generic over project_id and
         // returns the server-role repo of any project (despite its name).
+        md.push_str("| Parent project | Server repo | Path | GitHub |\n");
+        md.push_str("|----------------|-------------|------|--------|\n");
         for p in &parents {
-            match db.server_repo_of_microservice(p.id) {
+            let (srv_label, path_label, gh_label) = match db.server_repo_of_microservice(p.id) {
                 Ok(srv) => {
-                    let srv_label = srv.display_name();
-                    let path_label = match srv.local_path.as_deref() {
-                        Some(path) => format!("path: {}", path),
-                        None => "no local path configured".to_string(),
-                    };
-                    md.push_str(&format!(
-                        "- **{}** — server repo: {} ({})\n",
-                        p.name, srv_label, path_label
-                    ));
+                    let path = srv
+                        .local_path
+                        .clone()
+                        .unwrap_or_else(|| "_no local path configured_".to_string());
+                    let gh = if srv.github_name.is_some() { "✓" } else { "📁 local" };
+                    (srv.display_name(), path, gh.to_string())
                 }
-                Err(_) => {
-                    md.push_str(&format!(
-                        "- **{}** — ⚠ server repo not resolvable\n",
-                        p.name
-                    ));
-                }
-            }
+                Err(_) => (
+                    "⚠ server repo not resolvable".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                ),
+            };
+            md.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                p.name, srv_label, path_label, gh_label
+            ));
         }
         md.push('\n');
     }
@@ -181,10 +202,11 @@ mod tests {
         generate_project_md(&db, ms.id, tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
-        // MS-LLM consumes path from this line to write announcements to parent
+        // MS-LLM consumes path from this row to write announcements to parent.
+        // B-000013: unified table layout — parent row carries server repo + path columns.
         assert!(
-            content.contains("- **WebApp** — server repo: web-app-backend (path: /home/dev/web-app-backend)"),
-            "parent rendering should include canonical server-repo name + local path; got:\n{}",
+            content.contains("| WebApp | web-app-backend | /home/dev/web-app-backend | ✓ |"),
+            "parent rendering should include canonical server-repo name + local path in table row; got:\n{}",
             content
         );
     }
@@ -214,9 +236,11 @@ mod tests {
         generate_project_md(&db, ms.id, tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
+        // B-000013: marker string `_no local path configured_` survives the format
+        // change so the announcement-LLM grep stays unchanged.
         assert!(
-            content.contains("- **WebApp** — server repo: web-app-backend (no local path configured)"),
-            "should signal missing path explicitly; got:\n{}",
+            content.contains("| WebApp | web-app-backend | _no local path configured_ | ✓ |"),
+            "should signal missing path explicitly in table row; got:\n{}",
             content
         );
     }
