@@ -24,3 +24,18 @@ export interface RepoRename {
   new_canonical: string;
   renamed_at: string;
 }
+
+/** F-000041: result of `untrack_files`. `untracked` aggregates successful chunks;
+ * `errors` carries one entry per failed chunk (chunk-level granularity, not per-file). */
+export interface UntrackReport {
+  untracked: number;
+  errors: string[];
+}
+
+/** F-000041: payload returned by `list_gitignored_tracked`. `repo_state` is one
+ * of `"clean" | "mid_merge" | "mid_rebase"` — UI gates the Untrack button on `"clean"`. */
+export interface GitignoredListing {
+  files: string[];
+  repo_state: 'clean' | 'mid_merge' | 'mid_rebase' | string;
+  other_staged_count: number;
+}

@@ -13,10 +13,11 @@ use chrono;
 use db::AppDb;
 use models::{
     BugView, CreateDeployEnvironmentArgs, DailyFlowDay, DashboardData, DashboardFilter,
-    DeployEnvironment, DeploySecret, FileBugNote, KpiCard, MetaSecretHint, MigrationReport,
-    Project, ProjectGraph, ReadBugsResult, ReadDoneResult, ReadTodoResult, RenderedFile,
-    RepoRename, Repository, RequirementInfo, StatsSummary, SyncResult, TemplateFile,
-    TemplateLanguage, UpdateDeployEnvironmentArgs, UpsertRepoOutcome, WriteError, WriteResult,
+    DeployEnvironment, DeploySecret, FileBugNote, GitignoredListing, KpiCard, MetaSecretHint,
+    MigrationReport, Project, ProjectGraph, ReadBugsResult, ReadDoneResult, ReadTodoResult,
+    RenderedFile, RepoRename, Repository, RequirementInfo, StatsSummary, SyncResult, TemplateFile,
+    TemplateLanguage, UntrackReport, UpdateDeployEnvironmentArgs, UpsertRepoOutcome, WriteError,
+    WriteResult,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -290,6 +291,99 @@ fn delete_repository(
         }
     }
     Ok(())
+}
+
+// ── F-000041: untrack gitignored files ────────────────────────────────────────
+// Sync commands — `git_ops::*` are sync (subprocess output() blocks) and finish
+// in well under 500ms on realistic repos; an async wrapper would not pay for
+// itself. UI gates the Untrack button on `check_git_available_for_repo` so the
+// two listing/untracking commands are only called when both binary and `.git/`
+// are known to exist.
+
+/// True iff a git binary is discoverable AND the repo has a `local_path`
+/// pointing at something that looks like a git work tree. Lookup failure
+/// (no such repo, no local_path) returns Ok(false) so the UI quietly hides
+/// the Untrack button — symmetric with the missing-local-path UX elsewhere.
+#[tauri::command]
+fn check_git_available_for_repo(db: State<AppDb>, repository_id: i64) -> Result<bool, String> {
+    let repo = match db.get_repository(repository_id) {
+        Ok(r) => r,
+        Err(_) => return Ok(false),
+    };
+    let local_path = match repo.local_path.as_deref() {
+        Some(p) if !p.is_empty() => p,
+        _ => return Ok(false),
+    };
+    let path = Path::new(local_path);
+    Ok(git_ops::check_git_available().is_some() && git_ops::is_git_repo(path))
+}
+
+/// Read `git ls-files -ci --exclude-standard -z` plus repo-state and
+/// other-staged count in one call so the dialog has everything it needs on
+/// open. Callers should have already gated on `check_git_available_for_repo`,
+/// but we re-validate locally (errors here are surfaced to the dialog's error
+/// state — see UntrackGitignoredDialog).
+#[tauri::command]
+fn list_gitignored_tracked(
+    db: State<AppDb>,
+    repository_id: i64,
+) -> Result<GitignoredListing, String> {
+    let repo = db
+        .get_repository(repository_id)
+        .map_err(|e| e.to_string())?;
+    let local_path = repo
+        .local_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| "Repository has no local_path".to_string())?;
+    let path = Path::new(local_path);
+
+    let git = git_ops::check_git_available().ok_or_else(|| "git not available".to_string())?;
+
+    let files = git_ops::list_gitignored_tracked(&git, path)?;
+    let repo_state = match git_ops::detect_repo_state(path) {
+        git_ops::RepoState::Clean => "clean",
+        git_ops::RepoState::MidMerge => "mid_merge",
+        git_ops::RepoState::MidRebase => "mid_rebase",
+    }
+    .to_string();
+    let other_staged_count = git_ops::count_other_staged_changes(&git, path, &files)?;
+
+    let display_files: Vec<String> = files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+
+    Ok(GitignoredListing {
+        files: display_files,
+        repo_state,
+        other_staged_count,
+    })
+}
+
+/// Run `git rm --cached <files...>` for the user-selected subset. Errors are
+/// per-chunk rather than per-file (matches the `git_ops` chunking model);
+/// the dialog displays them as a partial-success toast.
+#[tauri::command]
+fn untrack_files(
+    db: State<AppDb>,
+    repository_id: i64,
+    files: Vec<String>,
+) -> Result<UntrackReport, String> {
+    let repo = db
+        .get_repository(repository_id)
+        .map_err(|e| e.to_string())?;
+    let local_path = repo
+        .local_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| "Repository has no local_path".to_string())?;
+    let path = Path::new(local_path);
+
+    let git = git_ops::check_git_available().ok_or_else(|| "git not available".to_string())?;
+
+    let file_bufs: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
+    git_ops::untrack_files(&git, path, &file_bufs)
 }
 
 // ── Workspace scanner ─────────────────────────────────────────────────────────
@@ -2870,6 +2964,10 @@ pub fn run() {
             update_repo_description,
             // Repo deletion (B-003)
             delete_repository,
+            // F-000041: untrack gitignored files
+            check_git_available_for_repo,
+            list_gitignored_tracked,
+            untrack_files,
             // Workspace scanner
             scan_workspace_for_repos,
             // File-based bugs
