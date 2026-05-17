@@ -4,6 +4,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-05-18
+
+**Public launch.** Solo Dev Hub goes public and becomes MIT-licensed open source. No breaking API changes from v0.34.0 — this release marks the transition from `0.x` (unstable contract) to `1.x` (frozen contract starts here). Tauri identifier (`com.solodevhub.app`) and lib name (`solo_dev_hub_lib`) have been stable since v0.25.0, so autoupdate `v0.34.x → v1.0.0` runs as a normal in-place update on existing installations.
+
+### Changed
+- **T-000064** — `SgonnovDmGit/solo-dev-hub` repository visibility flipped from private to public. The autoupdate endpoint `https://github.com/SgonnovDmGit/solo-dev-hub/releases/latest/download/latest.json` now resolves without GitHub auth — installations on `v0.25.x..v0.34.x` will pick up `v1.0.0` through the in-app updater.
+- **T-000064** — Legacy `SgonnovDmGit/github-repo-manager` repo archived (readonly) with a `moved to solo-dev-hub` redirect note. The full pre-rebrand history stays preserved there for posterity.
+- **T-000074** — Version bump to `1.0.0` across `package.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, `src-tauri/tauri.conf.json`.
+
+### Tests
+- 370 cargo / 72 vitest / 0 svelte issues on 495 files (baseline carried from v0.34.0 — no code changes in this release beyond the version bump).
+
 ## [0.34.0] — 2026-05-17
 
 Final pre-launch patch before v1.0.0 public flip. Two user-visible streams: a one-click "Untrack gitignored files" workflow that removes files from the git index after `.gitignore` rules change post-commit (F-000041 — the project's first local `git` CLI shellout layer), and a project-name pin in the SyncScreen header so cross-repo flows always show context. Plus tightening of the global AI-rules (retro one-block delivery, allow committing / pushing on integration branches, PowerShell `&&` portability rule) and CRLF-normalization via `.gitattributes` to kill phantom Windows diffs.
