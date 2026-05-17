@@ -58,6 +58,8 @@ export const ru = {
   'toast.docsAlreadyExist': 'Все файлы уже актуальны',
   'toast.projectTypeChanged': 'Тип проекта изменён',
   'toast.cycleDetected': 'Цикл: этот микросервис уже подключён транзитивно',
+  'toast.untrackSuccess': 'Очищено из индекса: {0} файлов. Сделай `git commit` для фиксации.',
+  'toast.untrackPartial': 'Очищено: {0}, ошибок: {1}. См. диалог.',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -120,4 +122,6 @@ export const en: Record<keyof typeof ru, string> = {
   'toast.docsAlreadyExist': 'All files already up to date',
   'toast.projectTypeChanged': 'Project type changed',
   'toast.cycleDetected': 'Cycle: this microservice is already connected transitively',
+  'toast.untrackSuccess': 'Untracked {0} files. Run `git commit` to record.',
+  'toast.untrackPartial': 'Untracked: {0}, errors: {1}. See dialog.',
 };

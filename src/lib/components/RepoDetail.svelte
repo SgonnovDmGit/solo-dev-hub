@@ -4,7 +4,7 @@
   import { projects } from '$lib/stores/projects';
   import { currentScreen, selectedRepoId } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
-  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo } from '$lib/api/tauri-commands';
+  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo } from '$lib/api/tauri-commands';
   import type { RepoRename } from '$lib/types';
   import { deleteRepoOnGitHub, splitRepoFullName } from '$lib/api/github';
   import { addToast } from '$lib/stores/ui';
@@ -23,6 +23,7 @@
   import { syncTasksForRepo } from '$lib/api/tauri-commands';
   import RepoChangelogTab from './RepoChangelogTab.svelte';
   import DeployScreen from './DeployScreen.svelte';
+  import UntrackGitignoredDialog from './UntrackGitignoredDialog.svelte';
 
   const roleKeys: Role[] = ['server', 'admin_client', 'client', 'test_client', 'landing', 'tool', 'other'];
   const roles = roleKeys.map((key) => [key, getRoleLabel(key)] as [Role, string]);
@@ -145,6 +146,20 @@
 
   // B-003: deploy target state
   let deployTargetOptions = $state<string[]>([]);
+
+  // F-000041: gate untrack button on git CLI + .git/ availability.
+  // Default false → button not rendered until backend confirms both.
+  let canUntrack = $state(false);
+  let showUntrackDialog = $state(false);
+
+  $effect(() => {
+    canUntrack = false;
+    if (!repo) return;
+    const repoId = repo.id;
+    checkGitAvailableForRepo(repoId)
+      .then((v) => { canUntrack = v; })
+      .catch(() => { canUntrack = false; });
+  });
 
   // F-021: tabs in RepoDetail. T-000080: Deploy moved from separate screen to tab.
   type Tab = 'bugs' | 'tasks' | 'done' | 'changelog' | 'deploy' | 'secrets' | 'stats';
@@ -325,6 +340,13 @@
           </select>
         </div>
 
+        {#if canUntrack}
+          <button class="untrack-gitignored-btn row-action" onclick={() => (showUntrackDialog = true)} type="button" title={$tStore('repo.untrackGitignoredButton' as any)}>
+            <span class="btn-icon">🧹</span>
+            <span class="btn-label">{$tStore('repo.untrackGitignoredButton' as any)}</span>
+          </button>
+        {/if}
+
         <button class="delete-repo-btn row-action" onclick={openDeleteDialog} type="button" disabled={deleting} title={$tStore('repo.deleteButton' as any)}>
           <span class="btn-icon">🗑</span>
           <span class="btn-label">{$tStore('repo.deleteButton' as any)}</span>
@@ -491,6 +513,13 @@
       </div>
     </div>
   </ConfirmDialog>
+{/if}
+
+{#if showUntrackDialog && repo}
+  <UntrackGitignoredDialog
+    repositoryId={repo.id}
+    onClose={() => (showUntrackDialog = false)}
+  />
 {/if}
 
 <style>
@@ -750,6 +779,18 @@
     white-space: nowrap;
   }
   .init-docs-btn:hover { background: var(--surface); border-color: var(--accent); }
+
+  .untrack-gitignored-btn {
+    font-size: 11px;
+    padding: 2px 10px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .untrack-gitignored-btn:hover { background: var(--surface); border-color: var(--accent); }
 
   .delete-repo-btn {
     font-size: 11px;
