@@ -1,5 +1,6 @@
 mod db;
 mod export;
+mod git_ops;
 mod keyring_store;
 mod models;
 mod sync;
