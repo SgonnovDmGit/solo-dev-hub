@@ -4,6 +4,27 @@
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-05-17
+
+Финальный pre-launch patch перед публичным флипом в v1.0.0. Две заметные user-видимые фичи: воркфлоу "Очистить из индекса" (F-000041) одним кликом убирает уже закоммиченные файлы которые после обновления `.gitignore` стали игнорируемыми — первый локальный shellout `git`-бинарника в проекте; и привязка имени проекта в header'е SyncScreen чтобы cross-repo flow всегда показывал контекст. Плюс правка глобальных AI-правил (ретро одним блоком, разрешение коммитить и пушить на integration-ветку, правило `&&` для PowerShell-портабельности) и CRLF-нормализация через `.gitattributes` убирающая фантомные diff'ы на Windows.
+
+### Added
+- F-000041 / T-000119 — backend-модуль `git_ops` обёрткой над локальным `git` CLI: поиск бинарника (PATH + Windows-fallback), детект состояния репо (clean / mid-merge / mid-rebase через marker-файлы), листинг через `git ls-files -ci --exclude-standard -z`, чанковый `git rm --cached`, счётчик других staged-изменений для UI info-предупреждения. Первый subprocess shellout в проекте; 12 новых unit-тестов.
+- F-000041 / T-000120 — три Tauri-команды (`check_git_available_for_repo`, `list_gitignored_tracked`, `untrack_files`) + TS wrappers + boundary DTO (`UntrackReport`, `GitignoredListing`).
+- F-000041 / T-000121 — `UntrackGitignoredDialog.svelte` (Svelte 5 runes, по образцу MergeChoiceDialog): select-all / deselect-all / чекбокс на каждый файл, блок при mid-merge / mid-rebase, info-варнинг при других staged-изменениях, partial-error toast. 🧹 триггер в header'е RepoDetail рядом с 📚 Init docs (housekeeping cluster). 11 i18n-ключей × ru+en + 2 toast-ключа.
+- T-000123 — в header'е SyncScreen теперь отображается текущий проект (`Синхронизация — {project}`) — пользователь сразу видит scope.
+
+### Changed
+- T-000118 — `.gitattributes` добавлен в корень репо: `* text=auto eol=lf` baseline + per-extension overrides для source / data / binary групп. Убирает фантомные CRLF-модификации на Windows с `core.autocrlf=true`.
+- T-000124 — глобальный AI-rules template поджат (распространяется на `~/.claude/CLAUDE.md` при следующем глобальном sync): ретро одним блоком вместо conversation-paced шести ходов; multi-branch flow (dev → master через merge) — ассистент может `git commit` и `git push origin <branch>` на integration-ветку без подтверждения на каждое действие (теги, release-merge'ы и финальный push в master остаются user-only); новая секция "Shell command portability" — избегать `&&` (падает в дефолтном Windows PowerShell 5.1), предпочитать одну команду на вызов или `;` для cross-shell совместимости.
+- Internal: cargo fmt baseline (27 файлов переформатированы до rustfmt-clean) — вынесен отдельным коммитом чтобы feature-изменения не несли format-шум.
+
+### Fixed
+- F-000041 / T-000121 smoke — кнопка Untrack рендерилась посередине row 2 потому что два соседних `.row-action` (margin-left: auto) flex-сиблинга делили доступное пространство. Перенесена в row 1 рядом с Init docs с override margin'а чтобы Init Docs якорил пару к правому краю.
+
+### Tests
+- 370 cargo / 72 vitest / 0 svelte issues на 495 файлах.
+
 ## [0.33.0] — 2026-05-17
 
 Pre-launch polish перед v1.0.0 public flip. Четыре потока: фикс format-консистентности `docs/project.md` (выявлено в dogfood'е), глобальное правил-tightening (scope `docs/handlers.md` + новая секция Release lifecycle), расширение формулы Top-3 hot, интеграция hero/feature скриншотов в README.

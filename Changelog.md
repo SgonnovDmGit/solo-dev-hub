@@ -4,6 +4,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-05-17
+
+Final pre-launch patch before v1.0.0 public flip. Two user-visible streams: a one-click "Untrack gitignored files" workflow that removes files from the git index after `.gitignore` rules change post-commit (F-000041 — the project's first local `git` CLI shellout layer), and a project-name pin in the SyncScreen header so cross-repo flows always show context. Plus tightening of the global AI-rules (retro one-block delivery, allow committing / pushing on integration branches, PowerShell `&&` portability rule) and CRLF-normalization via `.gitattributes` to kill phantom Windows diffs.
+
+### Added
+- F-000041 / T-000119 — backend `git_ops` module wrapping the local `git` CLI: binary discovery (PATH + Windows fallback), repo-state detection (clean / mid-merge / mid-rebase via marker files), `git ls-files -ci --exclude-standard -z` listing, chunked `git rm --cached` batching, other-staged count for the UI info-warning. First subprocess shellout in the project; 12 new unit tests.
+- F-000041 / T-000120 — three Tauri commands (`check_git_available_for_repo`, `list_gitignored_tracked`, `untrack_files`) + TS wrappers + boundary DTOs (`UntrackReport`, `GitignoredListing`).
+- F-000041 / T-000121 — `UntrackGitignoredDialog.svelte` (Svelte 5 runes, modeled on MergeChoiceDialog) with select-all / deselect-all / per-row checkboxes, mid-merge / mid-rebase block, other-staged info-warning, partial-error toast aggregation. 🧹 trigger in RepoDetail header next to 📚 Init docs (housekeeping cluster). 11 i18n keys × ru+en + 2 toast keys.
+- T-000123 — current project name now appears in SyncScreen header (`Sync — {project}`) so the user sees scope at a glance.
+
+### Changed
+- T-000118 — `.gitattributes` added at repo root: `* text=auto eol=lf` baseline + per-extension overrides for source / data / binary file groups. Kills phantom CRLF modifications on Windows hosts with `core.autocrlf=true`.
+- T-000124 — global AI-rules template tightened (propagates to `~/.claude/CLAUDE.md` on next global sync): retro delivered as one block instead of conversation-paced six turns; multi-branch flows (dev → master via merge) — assistant may `git commit` and `git push origin <branch>` on the integration branch without per-action approval (tags + release merges + final master push stay user-only); new section "Shell command portability" — avoid `&&` (fails on Windows PowerShell 5.1 default), prefer one command per invocation or `;` for cross-shell compatibility.
+- Internal: cargo fmt baseline (27 files reformatted to rustfmt-clean) — pulled out as a separate commit so feature changes don't carry format noise.
+
+### Fixed
+- F-000041 / T-000121 smoke finding — Untrack button rendered in the middle of row 2 because two consecutive `.row-action` (margin-left: auto) flex siblings split the available space. Moved to row 1 next to Init docs with a margin override so Init Docs anchors the pair to the right edge.
+
+### Tests
+- 370 cargo / 72 vitest / 0 svelte issues on 495 files.
+
 ## [0.33.0] — 2026-05-17
 
 Pre-launch polish before v1.0.0 public flip. Four streams: `docs/project.md` format consistency fix surfaced during dogfood, global AI-rules tightening (`docs/handlers.md` scope + Release lifecycle section), Top-3 hot formula broadening, and README hero/feature screenshots.
