@@ -8,7 +8,7 @@ Managing 10 GitHub repos as one person hits friction GitHub itself doesn't solve
 
 Solo Dev Hub is a single-window desktop app that organizes your portfolio, **locks every bug into a verifiable AI-agent workflow**, tracks tasks in commit-able Markdown, syncs requirements between repos, and bundles deploy automation — all under one roof.
 
-<!-- TODO screenshot: hero — main app window with sidebar (project tree expanded), Dashboard tab open, period filter set to Quarter, KPI tiles + top-3 hot projects + daily flow chart visible. Width ~1200px, dark theme. -->
+![Solo Dev Hub — Dashboard with portfolio KPIs, top-3 hot projects and daily flow charts](docs/screenshots/hero-dashboard.png)
 
 ## Why?
 
@@ -35,11 +35,17 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 - **PAT in OS keyring** — your GitHub token goes into Windows Credential Manager (OS-level), never SQLite, never `.env`, never a plaintext file.
 - **Single .exe, ~11 MB** — Tauri v2 + WebView2. No Electron bloat. No daemon. No telemetry. The only background network call is the update-checker pinging GitHub Releases once on startup; everything else is on your explicit action.
 
-<!-- TODO screenshot: RepoDetail with Bugs tab open, sidebar collapsed to icons, 4-5 sample bugs visible with different severities and statuses. -->
+![Bugs tab — per-repo bug list with severity, category, status workflow and per-bug attempts counter](docs/screenshots/repo-bugs.png)
 
-<!-- TODO screenshot: ProjectGraph for a project with a server repo (center) + 3-4 connected microservices (ring), dashed lines showing cross-project ms connections. -->
+![Tasks tab — todo.md as a sortable, filterable grid with priority, status and release-version columns](docs/screenshots/repo-tasks.png)
 
-<!-- TODO screenshot: DeployScreen master view (table of deploy environments) + a drill-down DeployDetail for one environment showing per-secret role/scope flags. -->
+![Project architecture graph — server in the center, clients and connected microservices around it (dashed edges for cross-project microservices)](docs/screenshots/project-graph.png)
+
+![Deploy environments — master list of per-repo deploy targets (prod / staging / test, any custom name)](docs/screenshots/repo-deploy-master.png)
+
+![Deploy environment drill-down — per-secret role flags (BUILD / DEPLOY / RUNTIME) and per-env include/override controls](docs/screenshots/repo-deploy-detail.png)
+
+![Requirements Sync — cross-repo REQ flow between client ↔ server ↔ microservice, with sent / responded statuses and one-click confirm](docs/screenshots/requirements-sync.png)
 
 ## Tech Stack
 
@@ -72,7 +78,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 4. Click **🔄 Sync** in the sidebar. The app fetches your repo list from GitHub.
 5. **Organize**: drag repos into projects in the sidebar, or click a repo to assign a role (server / client / microservice / landing / tool / etc.).
 
-<!-- TODO screenshot: Settings screen with the four cards (PAT, Appearance, Workspace, Templates), PAT field obscured but the 👁 reveal toggle visible. -->
+![Settings — GitHub PAT in OS keyring, appearance, workspace and repository templates](docs/screenshots/settings.png)
 
 ### Daily flow
 

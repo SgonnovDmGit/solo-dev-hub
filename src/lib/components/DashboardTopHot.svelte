@@ -11,7 +11,7 @@
 
 {#if projects.length > 0}
   <div class="tophot">
-    <div class="tophot-title">{$tStore('dashboard.topHotTitle' as any)}</div>
+    <div class="tophot-title" title={$tStore('dashboard.topHotFormulaTooltip' as any)}>{$tStore('dashboard.topHotTitle' as any)}</div>
     <div class="tophot-list">
       {#each projects as p, i (p.project_id)}
         <div class="tophot-item">
@@ -25,7 +25,10 @@
                 {p.critical} {$tStore('dashboard.topHotCritShort' as any)} /
               {/if}
               {p.major} {$tStore('dashboard.topHotMajShort' as any)} /
-              {p.active} {$tStore('dashboard.topHotActShort' as any)}
+              {p.active} {$tStore('dashboard.topHotActShort' as any)} /
+              {p.bugs_closed} {$tStore('dashboard.topHotClosedShort' as any)}
+              <span class="sep">·</span>
+              {p.tasks_done} {$tStore('dashboard.topHotTasksShort' as any)}
             </div>
           </div>
         </div>
@@ -58,4 +61,6 @@
   .tophot-name { font-weight: 600; color: var(--text); }
   .tophot-meta { color: var(--text-muted); font-size: 10px; }
   .tophot-meta .crit { color: #ef4444; font-weight: 600; }
+  .tophot-meta .sep { margin: 0 2px; opacity: 0.6; }
+  .tophot-title { cursor: help; }
 </style>

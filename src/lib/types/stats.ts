@@ -24,6 +24,8 @@ export interface HotRepo {
   critical: number;
   major: number;
   active: number;
+  bugs_closed: number;
+  tasks_done: number;
 }
 
 export interface StatsSummary {

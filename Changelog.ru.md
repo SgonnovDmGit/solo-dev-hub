@@ -4,6 +4,25 @@
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-05-17
+
+Pre-launch polish перед v1.0.0 public flip. Четыре потока: фикс format-консистентности `docs/project.md` (выявлено в dogfood'е), глобальное правил-tightening (scope `docs/handlers.md` + новая секция Release lifecycle), расширение формулы Top-3 hot, интеграция hero/feature скриншотов в README.
+
+### Added
+- **T-000112** новая подсекция `## docs/handlers.md` в `# API contract sync` global template'а — определяет опциональный server-side файл internal handler notes (transaction boundaries, side-effect chains, cross-cutting concerns), синкается симметрично с `api.md` в `docs/server-api/handlers.md` (server → client) и `docs/microservice-api/<ms>/handlers.md` (microservice → parent server). Hard rule: handler-level documentation MUST NOT идти в `README.md` (cross-repo sync пропагирует только `api.md` + `handlers.md`; README остаётся sender-side, invisible downstream).
+- **T-000113** новая top-level секция `# Release lifecycle` в global template'е, между `# Phase work workflow` (per-task) и `# Manual-smoke verification`. 11 стадий (Запрос → Анализ → Спека → Ревью спеки → План → Ревью плана → Внедрение → Тест → Закрытие релиза → План на следующий релиз → Ретро) с soft permission-gated transitions и optional loop-backs (по запросу user'а или forced обстоятельствам). Каждая review-стадия — 3-step procedure (само-ревью агентом на ambiguities/contradictions/gaps → уточняющие вопросы user'у если реальные → user OK). Mandatory 6-point retro checklist (что сработало / что не сработало / готовность релиза + проекта / оценка действий LLM в сессии / оценка действий user'а в сессии / process-lessons) сохраняется как `project`-type memory file в auto-memory dir (`retro_v<X_Y_Z>.md`), не коммитится в docs/.
+- **T-000115 + T-000116** Расширение формулы Top-3 hot projects. Новый weighted heat-score `critical × 50 + major × 15 + active × 1 + closed_in_period × 2 + tasks_done_in_period × 1` заменяет прежний "active bugs only" фильтр — task-active проекты теперь всплывают в top-3 когда нет severity-багов нигде. Threshold: любой ненулевой сигнал квалифицирует. `top_hot_projects` SQL принимает `Option<(period_start, period_end)>` — `Some` для dashboard window, `None` для Stats tab lifetime режима (sentinel-даты `0001-01-01` / `9999-12-31`). Frontend chips расширены до `N crit / N maj / N act / N closed · N tasks` (slash для bug-domain, middle-dot перед task-chip); native `title=""` tooltip на section header показывает полную формулу. Тот же фикс отражён в `top_hot_repos_in_project` для consistency со StatsSummary.
+- **T-000073** 8 hero/feature скриншотов интегрированы в `README.md` + `README.ru.md` заменой TODO-placeholder комментариев: dashboard hero (Quarter period, KPI + top-3 hot + daily flow), repo bugs (variety severity/status/attempts), repo tasks (DataGrid с version-колонкой от T-000109), project graph (сервер центр, dashed cross-project edges), deploy master + deploy drill-down (Flutter, BUILD/DEPLOY/RUNTIME role variety), requirements sync (cross-repo REQ flow в 4 направлениях), settings (PAT/Appearance/Workspace/Templates/Global AI rules карточки).
+
+### Changed
+- **`docs/project.md` теперь в gitignore template.** Содержит user-specific локальные filesystem-пути и регенерируется на каждом sync — та же regenerated-view семья что и `docs/todo.md` / `docs/done.md` / `docs/bug-reports.md`. Добавлен в `.gitignore.tmpl`.
+
+### Fixed
+- **B-000013** Консистентность формата секций `docs/project.md`. Секции Connected microservices и Parent projects были bullet-list'ами, а Repositories — markdown-таблицей; теперь все три рендерятся как параллельные таблицы с колонками `| Microservice/Parent project | Server repo | Path | GitHub |`. Маркер-строки `_no local path configured_` и `⚠ server repo not resolvable` перенесены в ячейки таблицы; behavior announcement-LLM grep'а не меняется (матчит docstring text внутри ячеек). Global template `claude.md.global.tmpl` и spec `docs/formats/project-md.md` обновлены под новый табличный формат.
+
+### Tests
+- 358 cargo (354 → +4 от T-000115: tasks-only-qualifies / closed-in-period-contributes / one-critical-dominates-50-tasks / lifetime-mode), 72 vitest (без изменений от v0.32.0), svelte-check 0/0/0 на 493 файлах. T-000114 subagent behavioral verification (3 параллельных general-purpose агентов на симулированных user-prompts → проверка template rule-routing) — все PASSed, refinement rule-текста не понадобился.
+
 ## [0.32.0] — 2026-05-15
 
 Три точечные задачи, закрывающие UX-пробелы от v0.31.0 dogfood'а + одна documentation-driven фича для Tasks-вью. Всё в одну вечернюю сессию.

@@ -50,4 +50,6 @@ pub struct HotRepo {
     pub critical: i64,
     pub major: i64,
     pub active: i64,
+    pub bugs_closed: i64,
+    pub tasks_done: i64,
 }
