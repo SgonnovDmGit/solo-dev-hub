@@ -307,6 +307,12 @@
           <span class="btn-icon">📚</span>
           <span class="btn-label">{$tStore('repo.initDocsButton' as any)}</span>
         </button>
+        {#if canUntrack}
+          <button class="untrack-gitignored-btn row-action" onclick={() => (showUntrackDialog = true)} type="button" title={$tStore('repo.untrackGitignoredButton' as any)}>
+            <span class="btn-icon">🧹</span>
+            <span class="btn-label">{$tStore('repo.untrackGitignoredButton' as any)}</span>
+          </button>
+        {/if}
       </div>
 
       <!-- Row 2: editable chips (Project / Role / Шаблон), Delete прижат вправо -->
@@ -339,13 +345,6 @@
             {/each}
           </select>
         </div>
-
-        {#if canUntrack}
-          <button class="untrack-gitignored-btn row-action" onclick={() => (showUntrackDialog = true)} type="button" title={$tStore('repo.untrackGitignoredButton' as any)}>
-            <span class="btn-icon">🧹</span>
-            <span class="btn-label">{$tStore('repo.untrackGitignoredButton' as any)}</span>
-          </button>
-        {/if}
 
         <button class="delete-repo-btn row-action" onclick={openDeleteDialog} type="button" disabled={deleting} title={$tStore('repo.deleteButton' as any)}>
           <span class="btn-icon">🗑</span>
@@ -781,6 +780,10 @@
   .init-docs-btn:hover { background: var(--surface); border-color: var(--accent); }
 
   .untrack-gitignored-btn {
+    /* Sits immediately to the right of init-docs in meta-row. Init-docs has the
+       row-action margin-left: auto and anchors the pair to the right edge;
+       untrack overrides to a small fixed gap so it doesn't compete for auto. */
+    margin-left: 4px;
     font-size: 11px;
     padding: 2px 10px;
     border-radius: 4px;
