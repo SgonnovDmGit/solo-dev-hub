@@ -801,7 +801,8 @@ fn read_dashboard(db: State<AppDb>, filter: DashboardFilter) -> Result<Dashboard
         None => true,
     };
     let top_hot = if show_top_hot {
-        db.top_hot_projects(pid_slice, 3).map_err(|e| e.to_string())?
+        db.top_hot_projects(pid_slice, Some((p_start, p_end)), 3)
+            .map_err(|e| e.to_string())?
     } else {
         vec![]
     };

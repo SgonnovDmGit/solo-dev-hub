@@ -243,7 +243,8 @@ impl AppDb {
         // Drop conn lock before calling top_hot_repos_in_project (it acquires its own)
         drop(stmt);
         drop(conn);
-        let top_hot_repos = Some(self.top_hot_repos_in_project(project_id, 3)?);
+        // None period → lifetime semantics for Stats tab (closed/tasks all-time).
+        let top_hot_repos = Some(self.top_hot_repos_in_project(project_id, None, 3)?);
 
         Ok(StatsSummary {
             kpi,

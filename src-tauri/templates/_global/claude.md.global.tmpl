@@ -362,9 +362,9 @@ Reverse directions (client → server, server → MS) do not exist as announceme
 
 1. **Read your own `docs/project.md`** to discover the recipient's local filesystem path:
    - Server → client: `## Repositories` table, column `Path` for each repo with `role` in {`client`, `admin_client`, `test_client`}.
-   - Microservice → parent server: `## Parent projects` section, each line reads `- **<parent-name>** — server repo: <name> (path: <local-path>)`.
+   - Microservice → parent server: `## Parent projects` table, column `Path` for the row whose `Parent project` matches the target server.
 
-   If the path is missing (rendered as `no local path configured`) or the repo entry is marked `⚠ server repo not resolvable`, **do not write the announcement** — it is not deliverable. Surface the gap to the user (own session log, or a `T-NNNNNN` in `docs/todo.md`).
+   If the path is missing (rendered as `_no local path configured_`) or the row's `Server repo` cell shows `⚠ server repo not resolvable`, **do not write the announcement** — it is not deliverable. Surface the gap to the user (own session log, or a `T-NNNNNN` in `docs/todo.md`).
 
 2. **Pick the next free `NNN`** in the recipient's announcement folder.
    - If the folder does not exist, create it and use `001`.
@@ -448,6 +448,34 @@ Concretely:
 
 For **breaking surface changes** (removed endpoint, changed response field, changed access level), bump the server's MINOR or MAJOR per `# Versioning (SemVer)` and add an entry to `Changelog.md` under `## [Unreleased]` in the same commit. The trigger is: handler change → contract + Changelog in the same commit. Format details (Conventional Commits, Keep-a-Changelog categories) live in their own sections below.
 
+## `docs/handlers.md` — internal implementation notes
+
+`docs/handlers.md` is **optional**, server-side only, and lives **next to `docs/api.md`** in the same `docs/` folder. If a project keeps one, it documents **internal** handler implementation notes that complement `api.md`:
+
+- Handler-to-handler logic flows (e.g. *"POST /orders fans out to webhook X then enqueues job Y"*)
+- Transaction boundaries (which writes are atomic, which span multiple statements)
+- Error and side-effect chains (rollback semantics, partial-failure handling, retry behavior)
+- Cross-cutting concerns specific to the handler layer: auth middleware order, request-scoped caching, lock ordering, idempotency-key handling
+
+What `handlers.md` is **not**:
+- **Not a public contract.** That is `docs/api.md`. Anything a downstream consumer (client, parent server) reads must be in `api.md`. `handlers.md` is server-internal — synced for transparency, not as a contract.
+- **Not a symbol map** (file paths / line numbers / function signatures). Those references rot too fast to be load-bearing; if you need to find a handler, `grep` is authoritative.
+- **Not a duplicate of `api.md`.** If you find yourself restating request/response shapes, it belongs in `api.md`.
+
+### Sync (already symmetric with api.md)
+
+Sync infrastructure propagates `handlers.md` the same way as `api.md`:
+- **Server → Client:** lands at `docs/server-api/handlers.md` on the client side.
+- **Microservice → Parent server:** lands at `docs/microservice-api/<ms-project-name>/handlers.md` on the parent side.
+
+No additional sync configuration when adopting — if the file exists in the source repo's `docs/`, the next sync picks it up. If the file does not exist, sync skips it silently (symmetric to the existing `api.md` absent-source behavior).
+
+### Hard rule — README is forbidden territory for handler-level docs
+
+Handler-level documentation must **NOT** be written to `README.md`. `README.md` is human-facing project overview (what the project is, how to run it, where to find docs). Handler implementation content belongs in `docs/api.md` (public surface) or `docs/handlers.md` (internal notes). If neither file exists and you need to document a handler, **create the appropriate file** — never extend `README.md` sideways with handler-level material.
+
+This is a routing rule, not a style preference: cross-repo sync only propagates `docs/api.md` and `docs/handlers.md`; anything in `README.md` stays on the sender side and is invisible to downstream consumers.
+
 # Phase work workflow
 
 For any user request, the assistant first **estimates scope** and chooses between two paths:
@@ -475,6 +503,60 @@ For any user request, the assistant first **estimates scope** and chooses betwee
 
 - **Spec location:** path and naming convention for spec files (e.g. `docs/specs/<YYYY-MM-DD>-<phase-name>.md`). Spec files are gitignored unless the project specifies otherwise.
 - **Implementation workflow:** how step 5 executes — subagent-driven (one fresh subagent per task, per-task commits) or sequential (tasks executed in current session, per-task or batched commits).
+
+# Release lifecycle
+
+Higher-level orchestration over `# Phase work workflow` — Phase workflow runs per task during the **Внедрение (Implementation)** stage below; Release lifecycle is the chain that wraps a release end-to-end. Stages are **soft** — the assistant does not gate transitions strictly, but it **must announce** stage transitions in chat and **must request explicit permission** to skip a stage. The lifecycle is for non-trivial release work; trivial fast-lane tasks (per `# Phase work workflow`) bypass the lifecycle entirely.
+
+## Stages
+
+1. **Запрос (Request)** — user kickoff for a release scope, feature batch, or non-trivial task.
+2. **Анализ (Analysis)** — assistant estimates scope, classifies fast-lane vs phase work, surfaces blockers and dependencies, runs the pre-flight server-surface check (per `# API contract sync`) where applicable. Output: a one-message scope picture the user can confirm or redirect.
+3. **Спека (Spec)** — written spec per `# Phase work workflow` step 2 (or chat-thread-as-spec for distributed phase work). Spec includes context, scope, files-to-modify, decisions, and a `## Verification` section per `# Manual-smoke verification in every spec`.
+4. **Ревью спеки (Spec review)** — three-step procedure:
+   - (a) **Assistant self-review** — explicit pass over the spec checking: ambiguities, internal contradictions, logical gaps, missing files-to-modify, mismatched symbol names between sections, missing localisation / i18n cleanup, missing test updates. The assistant reports what it found (or *"no issues"*) in chat.
+   - (b) **Clarification questions** to the user — only if real questions emerge from (a); do not invent questions for show.
+   - (c) **User OK** — explicit approval. At least one full self-review + OK pass is mandatory before any plan or implementation. The user may request additional review passes if the spec changes substantially.
+5. **План (Plan)** — task breakdown into `docs/todo.md` entries (with id, effort, priority), grouped under the appropriate `## vX.Y.Z — ...` header. Each task should map cleanly to a spec decision or verification step.
+6. **Ревью плана (Plan review)** — same three-step procedure as Spec review (4a / 4b / 4c). Self-review checks: scope alignment with spec, missing tasks, over-broad tasks that should split, priority and effort sanity, task ordering / dependencies.
+7. **Внедрение (Implementation)** — task-by-task per `# Phase work workflow` step 5, using the project's implementation workflow (subagent-driven or sequential per project bindings). Each completed task moves from `docs/todo.md` to `docs/done.md` as it lands.
+8. **Тест (Test)** — manual smoke per the spec's `## Verification` section, plus automated suites (`cargo test`, `npm test`, `npm run check`, etc.). Test counts and pass/fail go into Changelog only after the smoke run, never from progress notes.
+9. **Закрытие релиза (Release closure)** — full `# Release closure checklist` (9 steps). Tag command is the user's action; assistant only proposes the exact command and waits.
+10. **План на следующий релиз (Next-release plan)** — review `docs/todo.md` backlog, identify candidates for the next milestone, agree on scope. Output: tasks regrouped under the next `## vX.Y.Z — ...` header.
+11. **Ретро (Retro)** — structured retrospective; see `## Retro` below.
+
+## Stage transitions
+
+- The assistant announces each transition in chat: **«переходим со стадии <X> на стадию <Y>»** (or English equivalent).
+- Skipping a stage requires explicit user permission, requested in plain language: *"можно сразу импл?" / "без ретро в этот раз?" / "skip plan review?"* — assistant proposes the skip with a one-line reason; user acks or declines.
+- Default is **no skipping**.
+- **Loops back to an earlier stage are allowed but not default.** The chain runs forward by default. A loop (e.g. impl reveals a gap → back to Спека for amendment → re-run Ревью спеки → resume Внедрение) happens on **user request** or when **circumstances force it** (newly discovered constraint, missing endpoint surface, broken assumption). Assistant announces loops the same way as forward transitions: *«обнаружилась дыра в спеке, возвращаемся со стадии 7 на стадию 3 для амендмента, ok?»* — user acks. Without an explicit loop announcement, the lifecycle is strictly forward.
+
+## Retro
+
+The retro stage is **expected** at every release closure unless explicitly skipped by the user. It is **cheap self-improvement** and the highest-leverage stage in the lifecycle for refining how LLM and user work together — observations evaporate at session boundary if not captured.
+
+**Storage:** retro contents are saved to the assistant's auto-memory directory as a `project`-type memory file:
+- Path: `<auto-memory-dir>/retro_v<X_Y_Z>.md` (e.g. `retro_v0_33_0.md`).
+- Index entry added to `MEMORY.md`: `- [Retro v0.33.0](retro_v0_33_0.md) — <one-line hook>`.
+
+Not committed to `docs/` or any repo path. Privacy of internal reflections + persistence across sessions = exactly what auto-memory is for. If the retro count grows large enough to make `MEMORY.md` noisy, consolidate older retros into a single *"patterns observed across N retros"* `feedback` memory — defer until it becomes a real problem.
+
+**Checklist (six points — all are mandatory content of the retro memory file):**
+
+1. **Что сработало хорошо.** Collaboration patterns, working modes, decisions, communications worth keeping for next release.
+2. **Что не сработало.** Friction, scope drift, missed workflow steps, communication misses, planning errors, surprises.
+3. **Степень готовности.** Two-level assessment:
+   - **Release readiness** — was the closed release coherent, or are there sharp corners and workarounds that landed?
+   - **Project readiness overall** — current state of the project as a whole: technical debt, stability, distance to upcoming milestones (e.g. v1.0.0 public flip), known holes.
+4. **Оценка действий LLM в текущей сессии.** Retrospective judgment of how the assistant performed in this session specifically — not forward-looking advice (that lives implicitly in point 6). What did the LLM do well, what did it slip on, where did it skip steps it shouldn't have, where did it surprise positively.
+5. **Оценка действий пользователя в текущей сессии.** Retrospective judgment of user-side patterns in this session — communication clarity, decision speed, scope discipline, where redirects came at the right time vs too late.
+6. **Process-level lessons.** Are there observations worth promoting to durable memory? Specifically:
+   - New working-style rules → write as `feedback` memory (with **Why:** and **How to apply:** lines per existing memory format).
+   - New project facts → write as `project` memory.
+   - If yes, write the memory file(s) in the same retro pass and link from `MEMORY.md`.
+
+The retro is conversation-paced: assistant walks through the six points with user input, writes the memory file at the end summarizing what was discussed. User can add, override, or veto any point; the memory file records what was said (or *"not discussed"* for vetoed points).
 
 # Manual-smoke verification in every spec
 

@@ -25,6 +25,8 @@ export interface TopHotProject {
   critical: number;
   major: number;
   active: number;
+  bugs_closed: number;
+  tasks_done: number;
 }
 
 export interface DailyFlowDay {

@@ -113,7 +113,7 @@
   <!-- Top hot repos (project-scope only) -->
   {#if scope === 'project' && summary.top_hot_repos && summary.top_hot_repos.length > 0}
     <div class="stats-card">
-      <div class="section-title">
+      <div class="section-title" title={$tStore('dashboard.topHotFormulaTooltip' as any)}>
         {$tStore('stats.summary.topHotTitle' as any)}
         <span class="count">({$tStore('stats.summary.topHotSubtitle' as any)})</span>
       </div>
@@ -123,12 +123,15 @@
           <div class="hot-name">{topHotName(hot)}</div>
           <div class="hot-meta">
             {#if hot.critical > 0}
-              {@html tf('stats.summary.topHotMeta' as any,
-                `<span class="crit">${hot.critical}</span>`,
-                hot.active)}
+              <span class="crit">{hot.critical} {$tStore('dashboard.topHotCritShort' as any)}</span> /
             {:else}
-              {tf('stats.summary.topHotMetaNoCritical' as any, hot.active)}
+              {hot.critical} {$tStore('dashboard.topHotCritShort' as any)} /
             {/if}
+            {hot.major} {$tStore('dashboard.topHotMajShort' as any)} /
+            {hot.active} {$tStore('dashboard.topHotActShort' as any)} /
+            {hot.bugs_closed} {$tStore('dashboard.topHotClosedShort' as any)}
+            <span class="sep">·</span>
+            {hot.tasks_done} {$tStore('dashboard.topHotTasksShort' as any)}
           </div>
         </div>
       {/each}
@@ -199,6 +202,8 @@
   .hot-name { font-weight: 500; font-size: 12px; color: var(--text); }
   .hot-meta { font-size: 11px; color: var(--text-muted); }
   .hot-meta :global(.crit) { color: var(--danger); font-weight: 600; }
+  .hot-meta :global(.sep) { margin: 0 2px; opacity: 0.6; }
+  .section-title[title] { cursor: help; }
   .cat-row {
     display: grid;
     grid-template-columns: 110px 1fr 80px;

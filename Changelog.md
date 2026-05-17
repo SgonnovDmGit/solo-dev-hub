@@ -4,6 +4,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-05-17
+
+Pre-launch polish before v1.0.0 public flip. Four streams: `docs/project.md` format consistency fix surfaced during dogfood, global AI-rules tightening (`docs/handlers.md` scope + Release lifecycle section), Top-3 hot formula broadening, and README hero/feature screenshots.
+
+### Added
+- **T-000112** new `## docs/handlers.md` subsection in `# API contract sync` of the global template — defines optional server-side internal handler notes file (transaction boundaries, side-effect chains, cross-cutting concerns), syncs symmetrically with `api.md` to `docs/server-api/handlers.md` (server → client) and `docs/microservice-api/<ms>/handlers.md` (microservice → parent server). Includes a hard rule forbidding handler-level documentation in `README.md` (cross-repo sync only propagates `api.md` + `handlers.md`; README stays sender-side, invisible downstream).
+- **T-000113** new `# Release lifecycle` section in the global template, between `# Phase work workflow` (per-task) and `# Manual-smoke verification`. 11 stages (Request → Analysis → Spec → Spec review → Plan → Plan review → Implementation → Test → Release closure → Next-release plan → Retro) with soft permission-gated transitions and optional loop-backs on user request or forced circumstances. Each review stage is a 3-step procedure (assistant self-review for ambiguities/contradictions/gaps → clarification questions if real → user OK). Mandatory 6-point retro checklist (what worked / what didn't / release + project readiness / LLM session retrospective / user session retrospective / process lessons) stored as `project`-type memory file in auto-memory dir (`retro_v<X_Y_Z>.md`), not committed to docs/.
+- **T-000115 + T-000116** Top-3 hot projects formula broadening. New weighted heat-score `critical × 50 + major × 15 + active × 1 + closed_in_period × 2 + tasks_done_in_period × 1` replaces the previous "active bugs only" filter — task-active projects now surface in top-3 when no severity bugs anywhere. Threshold: any non-zero signal qualifies. `top_hot_projects` SQL takes `Option<(period_start, period_end)>` — `Some` for dashboard window, `None` for Stats tab lifetime mode (sentinel `0001-01-01` / `9999-12-31` dates). Frontend chips extend to `N crit / N maj / N act / N closed · N tasks` (slash for bug-domain, middle-dot before task chip); native `title=""` tooltip on section header shows the full formula. Same fix mirrored in `top_hot_repos_in_project` for StatsSummary consistency.
+- **T-000073** 8 hero/feature screenshots integrated into `README.md` + `README.ru.md` replacing TODO-placeholder comments: dashboard hero (Quarter period, KPI + top-3 hot + daily flow), repo bugs (severity/status/attempts variety), repo tasks (DataGrid with version column from T-000109), project graph (server centered, dashed cross-project edges), deploy master + deploy drill-down (Flutter, BUILD/DEPLOY/RUNTIME role variety), requirements sync (cross-repo REQ flow across 4 directions), settings (PAT/Appearance/Workspace/Templates/Global AI rules cards).
+
+### Changed
+- **`docs/project.md` template gitignored.** Contains user-specific local filesystem paths and regenerates on every sync — same regenerated-view family as `docs/todo.md` / `docs/done.md` / `docs/bug-reports.md`. Added to `.gitignore.tmpl`.
+
+### Fixed
+- **B-000013** `docs/project.md` section format consistency. Connected microservices and Parent projects sections were bullet-lists while Repositories was a markdown table — three sections now render as parallel tables with `| Microservice/Parent project | Server repo | Path | GitHub |` columns. Marker strings `_no local path configured_` and `⚠ server repo not resolvable` migrated into table cells; announcement-LLM grep behavior unchanged (matches docstring text inside cells). Global template `claude.md.global.tmpl` and `docs/formats/project-md.md` spec updated to reflect new table format.
+
+### Tests
+- 358 cargo (354 → +4 from T-000115: tasks-only-qualifies / closed-in-period-contributes / one-critical-dominates-50-tasks / lifetime-mode), 72 vitest (unchanged from v0.32.0), svelte-check 0/0/0 on 493 files. T-000114 subagent behavioral verification (3 parallel general-purpose agents simulating user prompts → checking template rule routing) — all PASSed, no rule-text refinement needed.
+
 ## [0.32.0] — 2026-05-15
 
 Three small targeted tasks closing UX gaps from the v0.31.0 dogfood + a documentation-driven feature for the Tasks view. All from a single afternoon session.
