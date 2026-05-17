@@ -223,7 +223,8 @@ mod tests {
     #[test]
     fn test_regression_flutter_web_deploy_yml_v04() {
         let tmpl = include_str!("../templates/flutter_web/deploy.yml.tmpl");
-        let build_args = render_build_args(&["API_BASE_URL".to_string(), "APP_API_KEY".to_string()]);
+        let build_args =
+            render_build_args(&["API_BASE_URL".to_string(), "APP_API_KEY".to_string()]);
         let v = vars(&[
             ("WORKFLOW_NAME", "SwanQu Support — Deploy"),
             ("IMAGE_TAG", "prod"),
@@ -239,13 +240,22 @@ mod tests {
         let rendered = render_template(tmpl, &v).expect("flutter_web deploy.yml must render");
         assert!(rendered.contains("name: SwanQu Support — Deploy"));
         assert!(rendered.contains("branches: [ master ]"));
-        assert!(rendered.contains("environment: prod"), "each job declares environment");
+        assert!(
+            rendered.contains("environment: prod"),
+            "each job declares environment"
+        );
         assert!(rendered.contains("com.docker.compose.project=swan_support_prod"));
         assert!(rendered.contains("--network swan_support_prod_proxy-network"));
         assert!(rendered.contains("API_BASE_URL=${{ secrets.API_BASE_URL }}"));
         assert!(rendered.contains("APP_API_KEY=${{ secrets.APP_API_KEY }}"));
-        assert!(!rendered.contains("CONTAINER_NAME_PROD"), "no hardcoded _PROD suffix");
-        assert!(!rendered.contains("${{ secrets.CONTAINER_NAME }}"), "CONTAINER_NAME is now a placeholder, not a secret");
+        assert!(
+            !rendered.contains("CONTAINER_NAME_PROD"),
+            "no hardcoded _PROD suffix"
+        );
+        assert!(
+            !rendered.contains("${{ secrets.CONTAINER_NAME }}"),
+            "CONTAINER_NAME is now a placeholder, not a secret"
+        );
         assert!(rendered.contains("--name swan-support-prod-frontend"));
         assert!(rendered.contains("FORWARD_HOST=swan-support-prod-frontend"));
     }
@@ -274,15 +284,24 @@ mod tests {
         let rendered = render_template(tmpl, &v).expect("Go deploy.yml must render cleanly");
         assert!(rendered.contains("name: Deploy Go Backend"));
         assert!(rendered.contains("branches: [ main ]"));
-        assert!(rendered.contains("environment: prod"), "job must declare GitHub environment");
+        assert!(
+            rendered.contains("environment: prod"),
+            "job must declare GitHub environment"
+        );
         assert!(rendered.contains("com.docker.compose.service=swan-backend"));
         assert!(rendered.contains("com.docker.compose.project=swan_prod"));
         assert!(rendered.contains("--network swan_prod_proxy-network"));
         assert!(rendered.contains("DOMAIN=backend.swanqu.tech"));
         assert!(rendered.contains("forward_port:8080"));
         assert!(rendered.contains(r#"ENV_FILE="/home/sda1991/swan_backend.env""#));
-        assert!(!rendered.contains("CONTAINER_NAME_PROD"), "legacy hardcoded suffix must be gone");
-        assert!(!rendered.contains("${{ secrets.CONTAINER_NAME }}"), "CONTAINER_NAME is now a placeholder, not a secret");
+        assert!(
+            !rendered.contains("CONTAINER_NAME_PROD"),
+            "legacy hardcoded suffix must be gone"
+        );
+        assert!(
+            !rendered.contains("${{ secrets.CONTAINER_NAME }}"),
+            "CONTAINER_NAME is now a placeholder, not a secret"
+        );
         assert!(rendered.contains("--name swan-backend-prod"));
         assert!(rendered.contains("FORWARD_HOST=swan-backend-prod"));
     }
@@ -290,7 +309,8 @@ mod tests {
     #[test]
     fn test_go_deploy_yml_with_runtime_env_args() {
         let tmpl = include_str!("../templates/go/deploy.yml.tmpl");
-        let runtime = render_runtime_env_args(&["DATABASE_URL".to_string(), "JWT_SECRET".to_string()]);
+        let runtime =
+            render_runtime_env_args(&["DATABASE_URL".to_string(), "JWT_SECRET".to_string()]);
         let v = vars(&[
             ("WORKFLOW_NAME", "Deploy"),
             ("IMAGE_TAG", "prod"),
@@ -370,11 +390,23 @@ mod tests {
         ]);
         let rendered = render_template(tmpl, &v).unwrap();
         // Each secret line must start at exactly 12 spaces — same column as the first.
-        assert!(rendered.contains("            A=${{ secrets.A }}"), "first secret 12-space indent");
-        assert!(rendered.contains("            B=${{ secrets.B }}"), "second secret 12-space indent");
-        assert!(rendered.contains("            C=${{ secrets.C }}"), "third secret 12-space indent");
+        assert!(
+            rendered.contains("            A=${{ secrets.A }}"),
+            "first secret 12-space indent"
+        );
+        assert!(
+            rendered.contains("            B=${{ secrets.B }}"),
+            "second secret 12-space indent"
+        );
+        assert!(
+            rendered.contains("            C=${{ secrets.C }}"),
+            "third secret 12-space indent"
+        );
         // Negative: 10-space prefix would mean wrong indent (sibling of build-args)
-        assert!(!rendered.contains("\n          B=${{ secrets.B }}"), "second secret must NOT be at 10 spaces");
+        assert!(
+            !rendered.contains("\n          B=${{ secrets.B }}"),
+            "second secret must NOT be at 10 spaces"
+        );
     }
 
     #[test]
@@ -416,7 +448,10 @@ mod tests {
         // from Docker's ARG scope.
         let secrets = vec!["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()];
         let out = render_dockerfile_envs(&secrets);
-        assert_eq!(out, "ENV VITE_API_BASE=$VITE_API_BASE\nENV VITE_APP_KEY=$VITE_APP_KEY");
+        assert_eq!(
+            out,
+            "ENV VITE_API_BASE=$VITE_API_BASE\nENV VITE_APP_KEY=$VITE_APP_KEY"
+        );
         // Empty input → empty string (symmetric to render_dockerfile_args).
         assert_eq!(render_dockerfile_envs(&[]), "");
     }
@@ -432,8 +467,16 @@ mod tests {
     #[test]
     fn test_flutter_dockerfile_renders_dynamic_args_and_defines() {
         let tmpl = include_str!("../templates/flutter_web/dockerfile.tmpl");
-        let args = render_dockerfile_args(&["API_BASE_URL".to_string(), "APP_API_KEY".to_string(), "STRIPE_KEY".to_string()]);
-        let defines = render_dart_defines(&["API_BASE_URL".to_string(), "APP_API_KEY".to_string(), "STRIPE_KEY".to_string()]);
+        let args = render_dockerfile_args(&[
+            "API_BASE_URL".to_string(),
+            "APP_API_KEY".to_string(),
+            "STRIPE_KEY".to_string(),
+        ]);
+        let defines = render_dart_defines(&[
+            "API_BASE_URL".to_string(),
+            "APP_API_KEY".to_string(),
+            "STRIPE_KEY".to_string(),
+        ]);
         let v = vars(&[
             ("DOCKERFILE_ARGS", args.as_str()),
             ("DART_DEFINES", defines.as_str()),
@@ -450,14 +493,17 @@ mod tests {
     #[test]
     fn test_flutter_dockerfile_renders_with_empty_args() {
         let tmpl = include_str!("../templates/flutter_web/dockerfile.tmpl");
-        let v = vars(&[
-            ("DOCKERFILE_ARGS", ""),
-            ("DART_DEFINES", ""),
-        ]);
+        let v = vars(&[("DOCKERFILE_ARGS", ""), ("DART_DEFINES", "")]);
         let rendered = render_template(tmpl, &v).expect("must render with no build secrets");
         // Must still be a valid Dockerfile structure
-        assert!(rendered.to_lowercase().contains("from "), "has base image directive");
-        assert!(rendered.to_lowercase().contains("copy"), "has COPY directives");
+        assert!(
+            rendered.to_lowercase().contains("from "),
+            "has base image directive"
+        );
+        assert!(
+            rendered.to_lowercase().contains("copy"),
+            "has COPY directives"
+        );
     }
 
     /// T-000107: vite_static/dockerfile.tmpl renders with VITE_* build secrets,
@@ -466,8 +512,10 @@ mod tests {
     #[test]
     fn test_vite_static_dockerfile_renders_with_vite_secrets() {
         let tmpl = include_str!("../templates/vite_static/dockerfile.tmpl");
-        let args = render_dockerfile_args(&["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()]);
-        let envs = render_dockerfile_envs(&["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()]);
+        let args =
+            render_dockerfile_args(&["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()]);
+        let envs =
+            render_dockerfile_envs(&["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()]);
         let v = vars(&[
             ("NODE_VERSION", "lts-alpine"),
             ("BUILD_OUTPUT_DIR", "dist"),
@@ -478,7 +526,10 @@ mod tests {
         let rendered = render_template(tmpl, &v).expect("vite_static dockerfile must render");
 
         // Build stage uses correct node image
-        assert!(rendered.contains("FROM node:lts-alpine"), "node base image with NODE_VERSION substituted");
+        assert!(
+            rendered.contains("FROM node:lts-alpine"),
+            "node base image with NODE_VERSION substituted"
+        );
 
         // ARG NAME and ENV NAME=$NAME both present per VITE_* secret
         assert!(rendered.contains("ARG VITE_API_BASE"));
@@ -488,7 +539,10 @@ mod tests {
 
         // npm flow — deterministic lockfile install, no fallback
         assert!(rendered.contains("RUN npm ci"));
-        assert!(!rendered.contains("npm install"), "deterministic install — no ergonomic fallback");
+        assert!(
+            !rendered.contains("npm install"),
+            "deterministic install — no ergonomic fallback"
+        );
 
         // PRE_BUILD_COMMAND (default = shell no-op `true`) and main build
         assert!(rendered.contains("RUN true"));
@@ -506,7 +560,8 @@ mod tests {
     #[test]
     fn test_vite_static_deploy_yml_renders_clean() {
         let tmpl = include_str!("../templates/vite_static/deploy.yml.tmpl");
-        let build_args = render_build_args(&["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()]);
+        let build_args =
+            render_build_args(&["VITE_API_BASE".to_string(), "VITE_APP_KEY".to_string()]);
         let v = vars(&[
             ("WORKFLOW_NAME", "Deploy Vite Static"),
             ("IMAGE_TAG", "prod"),
@@ -523,7 +578,10 @@ mod tests {
 
         assert!(rendered.contains("name: Deploy Vite Static"));
         assert!(rendered.contains("branches: [ master ]"));
-        assert!(rendered.contains("environment: prod"), "each job declares environment");
+        assert!(
+            rendered.contains("environment: prod"),
+            "each job declares environment"
+        );
         assert!(rendered.contains("com.docker.compose.project=lcm_prod"));
         assert!(rendered.contains("--network lcm_prod_proxy-network"));
         assert!(rendered.contains("VITE_API_BASE=${{ secrets.VITE_API_BASE }}"));
@@ -557,12 +615,16 @@ mod tests {
         // servers typically embed migrations). User can comment it manually
         // if the project doesn't ship a /src/migrations folder.
         assert!(rendered.contains("COPY --from=builder /src/migrations ./migrations"));
-        assert!(!rendered.contains("# COPY --from=builder /src/migrations"),
-                "migrations COPY must NOT be commented out by default");
+        assert!(
+            !rendered.contains("# COPY --from=builder /src/migrations"),
+            "migrations COPY must NOT be commented out by default"
+        );
         // Regression: guard against the WORKDIR/-o collision that produced
         // `exec: "./app": stat ./app: no such file or directory` when BINARY_NAME defaulted to "app".
-        assert!(!rendered.contains("WORKDIR /app\n\n# git"),
-                "builder WORKDIR must NOT be /app (collides with default BINARY_NAME=app)");
+        assert!(
+            !rendered.contains("WORKDIR /app\n\n# git"),
+            "builder WORKDIR must NOT be /app (collides with default BINARY_NAME=app)"
+        );
     }
 
     #[test]
@@ -580,8 +642,14 @@ mod tests {
         ]);
         let rendered = render_template(tmpl, &v).expect("must render with bare 'alpine' tag");
         assert!(rendered.contains("FROM golang:alpine AS builder"));
-        assert!(!rendered.contains("golang:alpine-alpine"), "no double-suffix");
-        assert!(!rendered.contains("golang:-alpine"), "no leading-dash mangling");
+        assert!(
+            !rendered.contains("golang:alpine-alpine"),
+            "no double-suffix"
+        );
+        assert!(
+            !rendered.contains("golang:-alpine"),
+            "no leading-dash mangling"
+        );
     }
 
     #[test]
@@ -589,7 +657,8 @@ mod tests {
         // B-000010d: DOCKERFILE_ARGS block declares ARG NAME for each build-role
         // secret in the UNION across envs. Empty when no build-role secrets.
         let tmpl = include_str!("../templates/go/dockerfile.tmpl");
-        let args_block = render_dockerfile_args(&["API_KEY".to_string(), "BUILD_TOKEN".to_string()]);
+        let args_block =
+            render_dockerfile_args(&["API_KEY".to_string(), "BUILD_TOKEN".to_string()]);
         let v = vars(&[
             ("GO_VERSION", "1.26"),
             ("BINARY_NAME", "app"),
@@ -692,13 +761,24 @@ mod tests {
         let vars = build_placeholder_vars(&meta, &repo_config, &env_extras);
 
         // Only the declared key reached the output.
-        assert_eq!(vars.len(), 1, "only declared keys may be emitted, got {:?}", vars);
+        assert_eq!(
+            vars.len(),
+            1,
+            "only declared keys may be emitted, got {:?}",
+            vars
+        );
         assert_eq!(
             vars.get("DECLARED_KEY").map(|s| s.as_str()),
             Some("the_real_value"),
         );
-        assert!(!vars.contains_key("ORPHAN_REPO_KEY"), "orphan in repo_config must be filtered out");
-        assert!(!vars.contains_key("ORPHAN_ENV_KEY"), "orphan in env_extras must be filtered out");
+        assert!(
+            !vars.contains_key("ORPHAN_REPO_KEY"),
+            "orphan in repo_config must be filtered out"
+        );
+        assert!(
+            !vars.contains_key("ORPHAN_ENV_KEY"),
+            "orphan in env_extras must be filtered out"
+        );
 
         // Belt-and-suspenders: an actual render pass against a template that
         // only references DECLARED_KEY should succeed and NOT contain the

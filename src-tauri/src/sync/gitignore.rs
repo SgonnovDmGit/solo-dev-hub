@@ -39,7 +39,9 @@ pub fn sync_gitignore_section(template: &str, repo_root: &Path) -> Result<bool, 
         // Orphan: strip any line containing either marker string, keep rest as user content.
         existing
             .lines()
-            .filter(|line| !line.contains("solo-dev-hub:begin") && !line.contains("solo-dev-hub:end"))
+            .filter(|line| {
+                !line.contains("solo-dev-hub:begin") && !line.contains("solo-dev-hub:end")
+            })
             .collect::<Vec<_>>()
             .join("\n")
     } else {
@@ -107,7 +109,10 @@ mod tests {
         assert!(content.contains("solo-dev-hub:end"));
         assert!(content.contains("*.log"));
         assert!(content.contains(".env"));
-        assert!(!content.contains("# Section"), "comments from template NOT carried into block");
+        assert!(
+            !content.contains("# Section"),
+            "comments from template NOT carried into block"
+        );
     }
 
     #[test]
@@ -117,15 +122,22 @@ mod tests {
         fs::write(tmp.path().join(".gitignore"), user).unwrap();
 
         // Template has .env (dup), CLAUDE.* (dup), .claude/ (dup), new ones below
-        let template = "# Секреты\n.env\n\n# AI\nCLAUDE.*\n.claude/\n\n# Docs\ndocs/todo.md\ndocs/done.md";
+        let template =
+            "# Секреты\n.env\n\n# AI\nCLAUDE.*\n.claude/\n\n# Docs\ndocs/todo.md\ndocs/done.md";
         let changed = sync_gitignore_section(template, tmp.path()).unwrap();
         assert!(changed);
 
         let content = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert!(content.starts_with("# Секреты"), "user content preserved at top");
+        assert!(
+            content.starts_with("# Секреты"),
+            "user content preserved at top"
+        );
         assert!(content.contains("*.exe"), "user rules preserved");
         // .env appears ONCE (user's), not duplicated in block
-        assert_eq!(content.matches("\n.env\n").count() + content.matches("\n.env$").count(), 1);
+        assert_eq!(
+            content.matches("\n.env\n").count() + content.matches("\n.env$").count(),
+            1
+        );
         // Block contains only NEW rules (docs/todo.md, docs/done.md)
         let block_start = content.find("solo-dev-hub:begin").unwrap();
         let block_end = content.find("solo-dev-hub:end").unwrap();
@@ -148,14 +160,18 @@ mod tests {
         assert!(!changed, "no changes needed — all duplicates");
 
         let content = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert!(!content.contains("solo-dev-hub"), "no block created when all dup");
+        assert!(
+            !content.contains("solo-dev-hub"),
+            "no block created when all dup"
+        );
     }
 
     #[test]
     fn test_sync_gitignore_rebuilds_block_on_update() {
         let tmp = TempDir::new().unwrap();
         // Initial: user has .env; block has docs/todo.md (now stale)
-        let initial = ".env\n\n# --- solo-dev-hub:begin ---\nold-rule\n# --- solo-dev-hub:end ---\n";
+        let initial =
+            ".env\n\n# --- solo-dev-hub:begin ---\nold-rule\n# --- solo-dev-hub:end ---\n";
         fs::write(tmp.path().join(".gitignore"), initial).unwrap();
 
         // New template: .env (dup with user), new-rule (new), *.bak (new)
@@ -197,11 +213,21 @@ mod tests {
 
         let content = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         assert!(content.contains(".env"), "user content preserved");
-        assert!(content.contains("solo-dev-hub:begin"), "new valid block created");
-        assert!(content.contains("solo-dev-hub:end"), "new valid block created");
+        assert!(
+            content.contains("solo-dev-hub:begin"),
+            "new valid block created"
+        );
+        assert!(
+            content.contains("solo-dev-hub:end"),
+            "new valid block created"
+        );
         assert!(content.contains("new-rule"), "template rule added");
         // Old orphan line was stripped
-        assert_eq!(content.matches("solo-dev-hub:begin").count(), 1, "only one begin marker");
+        assert_eq!(
+            content.matches("solo-dev-hub:begin").count(),
+            1,
+            "only one begin marker"
+        );
     }
 
     #[test]

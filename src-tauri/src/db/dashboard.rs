@@ -52,7 +52,9 @@ impl AppDb {
         let mut params: Vec<&dyn ToSql> = fixed_params.to_vec();
         let ids_refs: Vec<&dyn ToSql> = ids.iter().map(|v| v as &dyn ToSql).collect();
         params.extend(ids_refs);
-        conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| r.get(0))
+        conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| {
+            r.get(0)
+        })
     }
 
     /// Count bugs with status != 'confirmed' (optionally scoped to projects).
@@ -260,19 +262,22 @@ impl AppDb {
             LIMIT ?4",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![period_start, period_end, project_id, limit], |r| {
-                Ok(HotRepo {
-                    repo_id: r.get(0)?,
-                    github_name: r.get(1)?,
-                    // description in DB is nullable; pass through as Option<String>
-                    description: r.get(2)?,
-                    critical: r.get(3)?,
-                    major: r.get(4)?,
-                    active: r.get(5)?,
-                    bugs_closed: r.get(6)?,
-                    tasks_done: r.get(7)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![period_start, period_end, project_id, limit],
+                |r| {
+                    Ok(HotRepo {
+                        repo_id: r.get(0)?,
+                        github_name: r.get(1)?,
+                        // description in DB is nullable; pass through as Option<String>
+                        description: r.get(2)?,
+                        critical: r.get(3)?,
+                        major: r.get(4)?,
+                        active: r.get(5)?,
+                        bugs_closed: r.get(6)?,
+                        tasks_done: r.get(7)?,
+                    })
+                },
+            )?
             .collect::<SqlResult<Vec<_>>>()?;
         Ok(rows)
     }
@@ -378,10 +383,7 @@ impl AppDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
         let ids_vec: Vec<i64> = project_ids.unwrap_or(&[]).to_vec();
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(ids_vec.iter()),
-            row_to_repo,
-        )?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids_vec.iter()), row_to_repo)?;
         rows.collect()
     }
 
@@ -606,16 +608,79 @@ mod tests {
             .unwrap();
 
         // P1: 2 critical → score 2*50 + 2 = 102
-        db.insert_bug(r1.id, 1, "2026-04-01T00:00:00Z", "p1 crit1", "critical", "logic", "created", 0, None, None).unwrap();
-        db.insert_bug(r1.id, 2, "2026-04-01T00:00:00Z", "p1 crit2", "critical", "logic", "created", 0, None, None).unwrap();
+        db.insert_bug(
+            r1.id,
+            1,
+            "2026-04-01T00:00:00Z",
+            "p1 crit1",
+            "critical",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_bug(
+            r1.id,
+            2,
+            "2026-04-01T00:00:00Z",
+            "p1 crit2",
+            "critical",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         // P2: 1 critical + 2 major → score 1*50 + 2*15 + 3 = 83
-        db.insert_bug(r2.id, 1, "2026-04-01T00:00:00Z", "p2 crit", "critical", "logic", "created", 0, None, None).unwrap();
-        db.insert_bug(r2.id, 2, "2026-04-01T00:00:00Z", "p2 maj1", "major", "logic", "created", 0, None, None).unwrap();
-        db.insert_bug(r2.id, 3, "2026-04-01T00:00:00Z", "p2 maj2", "major", "logic", "created", 0, None, None).unwrap();
+        db.insert_bug(
+            r2.id,
+            1,
+            "2026-04-01T00:00:00Z",
+            "p2 crit",
+            "critical",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_bug(
+            r2.id,
+            2,
+            "2026-04-01T00:00:00Z",
+            "p2 maj1",
+            "major",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_bug(
+            r2.id,
+            3,
+            "2026-04-01T00:00:00Z",
+            "p2 maj2",
+            "major",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
 
         let top = db.top_hot_projects(None, None, 3).unwrap();
         assert_eq!(top.len(), 2);
-        assert_eq!(top[0].name, "P1", "P1 (score 102) ranks above P2 (score 83)");
+        assert_eq!(
+            top[0].name, "P1",
+            "P1 (score 102) ranks above P2 (score 83)"
+        );
         assert_eq!(top[0].critical, 2);
         assert_eq!(top[0].bugs_closed, 0);
         assert_eq!(top[0].tasks_done, 0);
@@ -635,11 +700,28 @@ mod tests {
             .insert_local_repository("/tmp/r", "r", Some(p1.id), None)
             .unwrap();
         // Confirmed bug closed 2026-04-24 (outside the queried 2027 period)
-        db.insert_bug(r.id, 1, "2026-04-20T00:00:00Z", "done", "minor", "other", "confirmed", 1, None, Some("2026-04-24T00:00:00Z")).unwrap();
+        db.insert_bug(
+            r.id,
+            1,
+            "2026-04-20T00:00:00Z",
+            "done",
+            "minor",
+            "other",
+            "confirmed",
+            1,
+            None,
+            Some("2026-04-24T00:00:00Z"),
+        )
+        .unwrap();
 
         // Period that excludes the closure → no active, no closed-in-period, no tasks → score 0
-        let top = db.top_hot_projects(None, Some(("2027-01-01", "2027-12-31")), 5).unwrap();
-        assert!(top.is_empty(), "project with zero contribution in period must be excluded");
+        let top = db
+            .top_hot_projects(None, Some(("2027-01-01", "2027-12-31")), 5)
+            .unwrap();
+        assert!(
+            top.is_empty(),
+            "project with zero contribution in period must be excluded"
+        );
     }
 
     #[test]
@@ -652,10 +734,24 @@ mod tests {
             .unwrap();
         // 3 bugs closed 2026-04-24 (inside period)
         for i in 1..=3 {
-            db.insert_bug(r.id, i, "2026-04-20T00:00:00Z", "d", "minor", "logic", "confirmed", 1, None, Some("2026-04-24T00:00:00Z")).unwrap();
+            db.insert_bug(
+                r.id,
+                i,
+                "2026-04-20T00:00:00Z",
+                "d",
+                "minor",
+                "logic",
+                "confirmed",
+                1,
+                None,
+                Some("2026-04-24T00:00:00Z"),
+            )
+            .unwrap();
         }
 
-        let top = db.top_hot_projects(None, Some(("2026-04-20", "2026-04-30")), 5).unwrap();
+        let top = db
+            .top_hot_projects(None, Some(("2026-04-20", "2026-04-30")), 5)
+            .unwrap();
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].bugs_closed, 3, "3 closures inside period");
         assert_eq!(top[0].active, 0);
@@ -673,12 +769,38 @@ mod tests {
             .unwrap();
         // 5 tasks completed in period — no bugs at all
         for i in 1..=5 {
-            let t = db.insert_task(r.id, &format!("T-{:06}", i), "T", "desc", None, None, None, None, "done", "2026-04-20T00:00:00Z").unwrap();
-            db.insert_task_event(t.id, "done", "2026-04-22T10:00:00Z", Some("in-progress"), None).unwrap();
+            let t = db
+                .insert_task(
+                    r.id,
+                    &format!("T-{:06}", i),
+                    "T",
+                    "desc",
+                    None,
+                    None,
+                    None,
+                    None,
+                    "done",
+                    "2026-04-20T00:00:00Z",
+                )
+                .unwrap();
+            db.insert_task_event(
+                t.id,
+                "done",
+                "2026-04-22T10:00:00Z",
+                Some("in-progress"),
+                None,
+            )
+            .unwrap();
         }
 
-        let top = db.top_hot_projects(None, Some(("2026-04-20", "2026-04-30")), 5).unwrap();
-        assert_eq!(top.len(), 1, "task-only project (no bugs) qualifies via task activity");
+        let top = db
+            .top_hot_projects(None, Some(("2026-04-20", "2026-04-30")), 5)
+            .unwrap();
+        assert_eq!(
+            top.len(),
+            1,
+            "task-only project (no bugs) qualifies via task activity"
+        );
         assert_eq!(top[0].tasks_done, 5);
         assert_eq!(top[0].active, 0);
         // score = 0 + 0 + 0 + 0 + 5 = 5 → qualifies
@@ -692,18 +814,50 @@ mod tests {
         let db = make_db();
         let pa = db.create_project("PA", None, "standard").unwrap();
         let pb = db.create_project("PB", None, "standard").unwrap();
-        let ra = db.insert_local_repository("/tmp/pa", "pa", Some(pa.id), None).unwrap();
-        let rb = db.insert_local_repository("/tmp/pb", "pb", Some(pb.id), None).unwrap();
+        let ra = db
+            .insert_local_repository("/tmp/pa", "pa", Some(pa.id), None)
+            .unwrap();
+        let rb = db
+            .insert_local_repository("/tmp/pb", "pb", Some(pb.id), None)
+            .unwrap();
 
         // PA: 1 critical → score 50 + 1 (active) = 51
-        db.insert_bug(ra.id, 1, "2026-04-01T00:00:00Z", "crit", "critical", "logic", "created", 0, None, None).unwrap();
+        db.insert_bug(
+            ra.id,
+            1,
+            "2026-04-01T00:00:00Z",
+            "crit",
+            "critical",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         // PB: 49 tasks done → score 49
         for i in 1..=49 {
-            let t = db.insert_task(rb.id, &format!("T-{:06}", i), "T", "d", None, None, None, None, "done", "2026-04-20T00:00:00Z").unwrap();
-            db.insert_task_event(t.id, "done", "2026-04-22T10:00:00Z", None, None).unwrap();
+            let t = db
+                .insert_task(
+                    rb.id,
+                    &format!("T-{:06}", i),
+                    "T",
+                    "d",
+                    None,
+                    None,
+                    None,
+                    None,
+                    "done",
+                    "2026-04-20T00:00:00Z",
+                )
+                .unwrap();
+            db.insert_task_event(t.id, "done", "2026-04-22T10:00:00Z", None, None)
+                .unwrap();
         }
 
-        let top = db.top_hot_projects(None, Some(("2026-04-20", "2026-04-30")), 5).unwrap();
+        let top = db
+            .top_hot_projects(None, Some(("2026-04-20", "2026-04-30")), 5)
+            .unwrap();
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].name, "PA", "1 critical (51) outranks 49 tasks (49)");
         assert_eq!(top[1].name, "PB");
@@ -738,16 +892,24 @@ mod tests {
         let (_, _, _) = setup_fixture_bugs(&db);
         db.backfill_bug_events_for_existing().unwrap();
 
-        let rows = db.category_efficiency(None, "2026-04-20", "2026-04-24").unwrap();
+        let rows = db
+            .category_efficiency(None, "2026-04-20", "2026-04-24")
+            .unwrap();
 
         // b_open (critical, ui_ux) created Apr 22 — in period, touched=1, not closed
-        let ui = rows.iter().find(|r| r.category == "ui_ux").expect("ui_ux row");
+        let ui = rows
+            .iter()
+            .find(|r| r.category == "ui_ux")
+            .expect("ui_ux row");
         assert_eq!(ui.touched_in_period, 1);
         assert_eq!(ui.closed_in_period, 0);
         assert_eq!(ui.resolution_rate, Some(0.0));
 
         // b_closed (major, logic) — created Apr 20, confirmed Apr 23, fix_attempts=2 — in period
-        let logic = rows.iter().find(|r| r.category == "logic").expect("logic row");
+        let logic = rows
+            .iter()
+            .find(|r| r.category == "logic")
+            .expect("logic row");
         assert_eq!(logic.touched_in_period, 1);
         assert_eq!(logic.closed_in_period, 1);
         assert_eq!(logic.attempts_in_period, 2);
@@ -787,18 +949,96 @@ mod tests {
     fn test_top_hot_repos_in_project_basic_ordering() {
         let db = make_db();
         let p = db.create_project("proj", None, "standard").unwrap();
-        let r1 = db.insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server")).unwrap();
-        let r2 = db.insert_local_repository("/tmp/r2", "r2", Some(p.id), Some("client")).unwrap();
-        let r3 = db.insert_local_repository("/tmp/r3", "r3", Some(p.id), Some("tool")).unwrap();
+        let r1 = db
+            .insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server"))
+            .unwrap();
+        let r2 = db
+            .insert_local_repository("/tmp/r2", "r2", Some(p.id), Some("client"))
+            .unwrap();
+        let r3 = db
+            .insert_local_repository("/tmp/r3", "r3", Some(p.id), Some("tool"))
+            .unwrap();
         // r1: 0 critical, 1 major, 1 active → score 0*50 + 1*15 + 1 = 16
-        db.insert_bug(r1.id, 1, "2026-01-01T00:00:00Z", "d1", "major", "logic", "created", 0, None, None).unwrap();
+        db.insert_bug(
+            r1.id,
+            1,
+            "2026-01-01T00:00:00Z",
+            "d1",
+            "major",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         // r2: 2 critical, 0 major, 2 active → score 2*50 + 0*15 + 2 = 102
-        db.insert_bug(r2.id, 1, "2026-01-01T00:00:00Z", "d2", "critical", "logic", "created", 0, None, None).unwrap();
-        db.insert_bug(r2.id, 2, "2026-01-01T00:00:00Z", "d3", "critical", "ui_ux", "in-progress", 0, None, None).unwrap();
+        db.insert_bug(
+            r2.id,
+            1,
+            "2026-01-01T00:00:00Z",
+            "d2",
+            "critical",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_bug(
+            r2.id,
+            2,
+            "2026-01-01T00:00:00Z",
+            "d3",
+            "critical",
+            "ui_ux",
+            "in-progress",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         // r3: 0 critical, 0 major, 3 active (medium severity) → score 0 + 0 + 3 = 3
-        db.insert_bug(r3.id, 1, "2026-01-01T00:00:00Z", "d4", "medium", "logic", "created", 0, None, None).unwrap();
-        db.insert_bug(r3.id, 2, "2026-01-01T00:00:00Z", "d5", "medium", "logic", "created", 0, None, None).unwrap();
-        db.insert_bug(r3.id, 3, "2026-01-01T00:00:00Z", "d6", "medium", "logic", "testing", 0, None, None).unwrap();
+        db.insert_bug(
+            r3.id,
+            1,
+            "2026-01-01T00:00:00Z",
+            "d4",
+            "medium",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_bug(
+            r3.id,
+            2,
+            "2026-01-01T00:00:00Z",
+            "d5",
+            "medium",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_bug(
+            r3.id,
+            3,
+            "2026-01-01T00:00:00Z",
+            "d6",
+            "medium",
+            "logic",
+            "testing",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
 
         let hot = db.top_hot_repos_in_project(p.id, None, 3).unwrap();
         assert_eq!(hot.len(), 3);
@@ -818,15 +1058,47 @@ mod tests {
         // but DO contribute to bugs_closed (in lifetime mode) — separate accumulators.
         let db = make_db();
         let p = db.create_project("proj", None, "standard").unwrap();
-        let r1 = db.insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server")).unwrap();
-        db.insert_bug(r1.id, 1, "2026-01-01T00:00:00Z", "d1", "critical", "logic", "confirmed", 1, None, Some("2026-01-02T00:00:00Z")).unwrap();
-        db.insert_bug(r1.id, 2, "2026-01-01T00:00:00Z", "d2", "minor", "logic", "created", 0, None, None).unwrap();
+        let r1 = db
+            .insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server"))
+            .unwrap();
+        db.insert_bug(
+            r1.id,
+            1,
+            "2026-01-01T00:00:00Z",
+            "d1",
+            "critical",
+            "logic",
+            "confirmed",
+            1,
+            None,
+            Some("2026-01-02T00:00:00Z"),
+        )
+        .unwrap();
+        db.insert_bug(
+            r1.id,
+            2,
+            "2026-01-01T00:00:00Z",
+            "d2",
+            "minor",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
 
         let hot = db.top_hot_repos_in_project(p.id, None, 5).unwrap();
         assert_eq!(hot.len(), 1);
-        assert_eq!(hot[0].critical, 0, "confirmed critical doesn't count in severity");
+        assert_eq!(
+            hot[0].critical, 0,
+            "confirmed critical doesn't count in severity"
+        );
         assert_eq!(hot[0].active, 1, "only the created minor counts as active");
-        assert_eq!(hot[0].bugs_closed, 1, "the confirmed critical counts as closed (lifetime mode)");
+        assert_eq!(
+            hot[0].bugs_closed, 1,
+            "the confirmed critical counts as closed (lifetime mode)"
+        );
     }
 
     #[test]
@@ -835,15 +1107,49 @@ mod tests {
         // Verifies repo with only out-of-period activity gets filtered.
         let db = make_db();
         let p = db.create_project("proj", None, "standard").unwrap();
-        let r1 = db.insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server")).unwrap();
-        let r2 = db.insert_local_repository("/tmp/r2", "r2", Some(p.id), Some("client")).unwrap();
+        let r1 = db
+            .insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server"))
+            .unwrap();
+        let r2 = db
+            .insert_local_repository("/tmp/r2", "r2", Some(p.id), Some("client"))
+            .unwrap();
         // r1: confirmed Jan 2 (OUTSIDE 2027 query period) → 0 contribution in period
-        db.insert_bug(r1.id, 1, "2026-01-01T00:00:00Z", "d1", "minor", "logic", "confirmed", 1, None, Some("2026-01-02T00:00:00Z")).unwrap();
+        db.insert_bug(
+            r1.id,
+            1,
+            "2026-01-01T00:00:00Z",
+            "d1",
+            "minor",
+            "logic",
+            "confirmed",
+            1,
+            None,
+            Some("2026-01-02T00:00:00Z"),
+        )
+        .unwrap();
         // r2: 1 active minor → score 1 in any window
-        db.insert_bug(r2.id, 1, "2026-01-01T00:00:00Z", "d2", "minor", "logic", "created", 0, None, None).unwrap();
+        db.insert_bug(
+            r2.id,
+            1,
+            "2026-01-01T00:00:00Z",
+            "d2",
+            "minor",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
 
-        let hot = db.top_hot_repos_in_project(p.id, Some(("2027-01-01", "2027-12-31")), 5).unwrap();
-        assert_eq!(hot.len(), 1, "r1 (closure out of period) excluded; r2 (active bug) included");
+        let hot = db
+            .top_hot_repos_in_project(p.id, Some(("2027-01-01", "2027-12-31")), 5)
+            .unwrap();
+        assert_eq!(
+            hot.len(),
+            1,
+            "r1 (closure out of period) excluded; r2 (active bug) included"
+        );
         assert_eq!(hot[0].repo_id, r2.id);
     }
 
@@ -853,13 +1159,43 @@ mod tests {
         // Stats tab default behavior.
         let db = make_db();
         let p = db.create_project("proj", None, "standard").unwrap();
-        let r1 = db.insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server")).unwrap();
+        let r1 = db
+            .insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server"))
+            .unwrap();
         // Only confirmed bugs, all old (2026) — in lifetime mode they contribute via bugs_closed
-        db.insert_bug(r1.id, 1, "2026-01-01T00:00:00Z", "d1", "minor", "logic", "confirmed", 1, None, Some("2026-01-02T00:00:00Z")).unwrap();
-        db.insert_bug(r1.id, 2, "2026-01-01T00:00:00Z", "d2", "minor", "logic", "confirmed", 1, None, Some("2026-01-05T00:00:00Z")).unwrap();
+        db.insert_bug(
+            r1.id,
+            1,
+            "2026-01-01T00:00:00Z",
+            "d1",
+            "minor",
+            "logic",
+            "confirmed",
+            1,
+            None,
+            Some("2026-01-02T00:00:00Z"),
+        )
+        .unwrap();
+        db.insert_bug(
+            r1.id,
+            2,
+            "2026-01-01T00:00:00Z",
+            "d2",
+            "minor",
+            "logic",
+            "confirmed",
+            1,
+            None,
+            Some("2026-01-05T00:00:00Z"),
+        )
+        .unwrap();
 
         let hot = db.top_hot_repos_in_project(p.id, None, 5).unwrap();
-        assert_eq!(hot.len(), 1, "lifetime mode includes repo with historical closed bugs");
+        assert_eq!(
+            hot.len(),
+            1,
+            "lifetime mode includes repo with historical closed bugs"
+        );
         assert_eq!(hot[0].bugs_closed, 2);
         assert_eq!(hot[0].active, 0);
         // score = 0+0+0+2*2+0 = 4 → qualifies

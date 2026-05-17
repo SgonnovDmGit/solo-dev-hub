@@ -14,8 +14,8 @@ pub struct TodoTask {
     pub effort: String,
     pub priority: String,
     pub status: String,
-    pub created_at: String,  // YYYY-MM-DD; "" if 5-field legacy
-    pub version: String,     // T-000109: inherited from `## vX.Y.Z` header
+    pub created_at: String, // YYYY-MM-DD; "" if 5-field legacy
+    pub version: String,    // T-000109: inherited from `## vX.Y.Z` header
 }
 
 #[derive(Debug, Serialize)]

@@ -78,8 +78,8 @@ pub struct UpdateDeployEnvironmentArgs {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaSecretHint {
     pub name: String,
-    pub role: String,     // "build" | "deploy" | "runtime"
-    pub scope: String,    // "deploy_repo" | "environment"
+    pub role: String,  // "build" | "deploy" | "runtime"
+    pub scope: String, // "deploy_repo" | "environment"
 }
 
 /// v0.31.0 (T-000103 Task 2 — schema v5): meta.json `placeholders.<KEY>` shape.

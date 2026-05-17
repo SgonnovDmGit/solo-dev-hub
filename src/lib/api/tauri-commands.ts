@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Project, Repository, FileBugNote, ReadBugsResult, BugView, MigrationReport, StatsSummary, SyncResult, RequirementInfo, RepoRename, TemplateFile, TemplateLanguage, RenderedFile, WriteResult, DashboardFilter, DashboardData, DeployEnvironment, DeploySecret, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, ActivityEvent, Task, SyncTasksReport, TimelineFilter, ProjectGraph } from '$lib/types';
+import type { Project, Repository, FileBugNote, ReadBugsResult, BugView, MigrationReport, StatsSummary, SyncResult, RequirementInfo, RepoRename, TemplateFile, TemplateLanguage, RenderedFile, WriteResult, DashboardFilter, DashboardData, DeployEnvironment, DeploySecret, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, ActivityEvent, Task, SyncTasksReport, TimelineFilter, ProjectGraph, UntrackReport, GitignoredListing } from '$lib/types';
 
 // ── Project commands ──────────────────────────────────────────────────────────
 
@@ -154,6 +154,20 @@ export async function updateRepoDescription(repoId: number, newDescription: stri
 
 export async function deleteRepository(id: number, clearGitLocal: boolean, localPath: string | null): Promise<void> {
   return invoke<void>('delete_repository', { id, clearGitLocal, localPath });
+}
+
+// ── F-000041: untrack gitignored files ──────────────────────────────────────
+
+export async function checkGitAvailableForRepo(repositoryId: number): Promise<boolean> {
+  return invoke<boolean>('check_git_available_for_repo', { repositoryId });
+}
+
+export async function listGitignoredTracked(repositoryId: number): Promise<GitignoredListing> {
+  return invoke<GitignoredListing>('list_gitignored_tracked', { repositoryId });
+}
+
+export async function untrackFiles(repositoryId: number, files: string[]): Promise<UntrackReport> {
+  return invoke<UntrackReport>('untrack_files', { repositoryId, files });
 }
 
 export async function scanWorkspaceForRepos(workspaceRoot: string, githubNames: string[]): Promise<Record<string, string>> {

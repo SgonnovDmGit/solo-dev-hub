@@ -23,8 +23,9 @@ impl AppDb {
 
     fn row_to_deploy_env(row: &rusqlite::Row) -> SqlResult<DeployEnvironment> {
         let extras_json: String = row.get::<_, String>(9).unwrap_or_else(|_| "{}".to_string());
-        let extras = serde_json::from_str::<std::collections::HashMap<String, String>>(&extras_json)
-            .unwrap_or_default();
+        let extras =
+            serde_json::from_str::<std::collections::HashMap<String, String>>(&extras_json)
+                .unwrap_or_default();
         Ok(DeployEnvironment {
             id: row.get(0)?,
             repository_id: row.get(1)?,
@@ -77,8 +78,7 @@ impl AppDb {
         args: &CreateDeployEnvironmentArgs,
     ) -> SqlResult<DeployEnvironment> {
         let conn = self.conn.lock().unwrap();
-        let extras_json = serde_json::to_string(&args.extras)
-            .unwrap_or_else(|_| "{}".to_string());
+        let extras_json = serde_json::to_string(&args.extras).unwrap_or_else(|_| "{}".to_string());
         // Compute next sort_order as max(existing) + 1
         let next_sort: i64 = conn.query_row(
             "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM deploy_environments WHERE repository_id = ?1",
@@ -91,9 +91,15 @@ impl AppDb {
               domain, deploy_branch, sort_order, extras, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, CURRENT_TIMESTAMP)",
             rusqlite::params![
-                args.repository_id, args.name, args.workflow_name, args.image_tag,
-                args.compose_service, args.domain, args.deploy_branch,
-                next_sort, extras_json,
+                args.repository_id,
+                args.name,
+                args.workflow_name,
+                args.image_tag,
+                args.compose_service,
+                args.domain,
+                args.deploy_branch,
+                next_sort,
+                extras_json,
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -106,8 +112,7 @@ impl AppDb {
         args: &UpdateDeployEnvironmentArgs,
     ) -> SqlResult<DeployEnvironment> {
         let conn = self.conn.lock().unwrap();
-        let extras_json = serde_json::to_string(&args.extras)
-            .unwrap_or_else(|_| "{}".to_string());
+        let extras_json = serde_json::to_string(&args.extras).unwrap_or_else(|_| "{}".to_string());
         conn.execute(
             "UPDATE deploy_environments SET
                 workflow_name = ?2,
@@ -119,17 +124,27 @@ impl AppDb {
                 updated_at = CURRENT_TIMESTAMP
              WHERE id = ?1",
             rusqlite::params![
-                args.id, args.workflow_name, args.image_tag,
-                args.compose_service, args.domain, args.deploy_branch, extras_json,
+                args.id,
+                args.workflow_name,
+                args.image_tag,
+                args.compose_service,
+                args.domain,
+                args.deploy_branch,
+                extras_json,
             ],
         )?;
         drop(conn);
-        Ok(self.get_deploy_environment(args.id)?.expect("update target must exist"))
+        Ok(self
+            .get_deploy_environment(args.id)?
+            .expect("update target must exist"))
     }
 
     pub fn delete_deploy_environment(&self, id: i64) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM deploy_environments WHERE id = ?1", rusqlite::params![id])?;
+        conn.execute(
+            "DELETE FROM deploy_environments WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
         Ok(())
     }
 
@@ -214,7 +229,8 @@ impl AppDb {
         source_id: i64,
         new_name: &str,
     ) -> SqlResult<DeployEnvironment> {
-        let src = self.get_deploy_environment(source_id)?
+        let src = self
+            .get_deploy_environment(source_id)?
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         let args = CreateDeployEnvironmentArgs {
             repository_id: src.repository_id,
@@ -264,16 +280,18 @@ impl AppDb {
         use std::collections::{HashMap, HashSet};
         let hints_by_name: HashMap<&str, &MetaSecretHint> =
             meta_hints.iter().map(|h| (h.name.as_str(), h)).collect();
-        let all_names: HashSet<&str> = repo_secret_names.iter().map(|s| s.as_str())
+        let all_names: HashSet<&str> = repo_secret_names
+            .iter()
+            .map(|s| s.as_str())
             .chain(meta_hints.iter().map(|h| h.name.as_str()))
             .collect();
 
         let conn = self.conn.lock().unwrap();
         let existing: HashSet<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT secret_name FROM deploy_secrets WHERE deploy_env_id = ?1",
-            )?;
-            let x: HashSet<String> = stmt.query_map(rusqlite::params![deploy_env_id], |r| r.get::<_, String>(0))?
+            let mut stmt =
+                conn.prepare("SELECT secret_name FROM deploy_secrets WHERE deploy_env_id = ?1")?;
+            let x: HashSet<String> = stmt
+                .query_map(rusqlite::params![deploy_env_id], |r| r.get::<_, String>(0))?
                 .filter_map(Result::ok)
                 .collect();
             x
@@ -315,14 +333,18 @@ impl AppDb {
     /// v0.18.0: sync-trigger called after a new repo-level GitHub secret is successfully
     /// PUT. Adds a deploy_secrets row (included=1, role='deploy', override_enabled=0)
     /// for every existing deploy_environments of this repo. Idempotent via INSERT OR IGNORE.
-    pub fn register_repo_secret_in_deploys(&self, repo_id: i64, secret_name: &str) -> SqlResult<()> {
+    pub fn register_repo_secret_in_deploys(
+        &self,
+        repo_id: i64,
+        secret_name: &str,
+    ) -> SqlResult<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let env_ids: Vec<i64> = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM deploy_environments WHERE repository_id = ?1",
-            )?;
-            let x: Vec<i64> = stmt.query_map(rusqlite::params![repo_id], |r| r.get::<_, i64>(0))?
+            let mut stmt =
+                tx.prepare("SELECT id FROM deploy_environments WHERE repository_id = ?1")?;
+            let x: Vec<i64> = stmt
+                .query_map(rusqlite::params![repo_id], |r| r.get::<_, i64>(0))?
                 .filter_map(Result::ok)
                 .collect();
             x
@@ -350,7 +372,9 @@ mod tests {
 
     fn seed_repo_for_deploy_tests(db: &AppDb) -> (i64, i64) {
         let p = db.create_project("p1", None, "tool").unwrap();
-        let r = db.insert_local_repository("/tmp/r1", "r1", Some(p.id), None).unwrap();
+        let r = db
+            .insert_local_repository("/tmp/r1", "r1", Some(p.id), None)
+            .unwrap();
         (p.id, r.id)
     }
 
@@ -404,9 +428,12 @@ mod tests {
         let args = CreateDeployEnvironmentArgs {
             repository_id: r,
             name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
+            workflow_name: "W".to_string(),
+            image_tag: "l".to_string(),
+            compose_service: "s".to_string(),
+            domain: "d".to_string(),
+            deploy_branch: "m".to_string(),
+            extras: Default::default(),
         };
         db.insert_deploy_environment(&args).unwrap();
         let err = db.insert_deploy_environment(&args).unwrap_err();
@@ -420,12 +447,18 @@ mod tests {
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
 
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "old".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "old.com".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "old".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "old.com".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
 
         let mut extras = std::collections::HashMap::new();
         extras.insert("APP_PORT".to_string(), "8080".to_string());
@@ -437,7 +470,8 @@ mod tests {
             domain: "new.com".to_string(),
             deploy_branch: "main".to_string(),
             extras,
-        }).unwrap();
+        })
+        .unwrap();
 
         let updated = db.get_deploy_environment(env.id).unwrap().unwrap();
         assert_eq!(updated.name, "prod", "name MUST remain unchanged");
@@ -453,12 +487,18 @@ mod tests {
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
 
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "test".to_string(),
-            workflow_name: "W".to_string(), image_tag: "t".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "test".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "t".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
 
         db.delete_deploy_environment(env.id).unwrap();
         assert!(db.get_deploy_environment(env.id).unwrap().is_none());
@@ -472,16 +512,21 @@ mod tests {
         let (_p, r) = seed_repo_for_deploy_tests(&db);
 
         let mk = |name: &str| CreateDeployEnvironmentArgs {
-            repository_id: r, name: name.to_string(),
-            workflow_name: "W".to_string(), image_tag: "t".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
+            repository_id: r,
+            name: name.to_string(),
+            workflow_name: "W".to_string(),
+            image_tag: "t".to_string(),
+            compose_service: "s".to_string(),
+            domain: "d".to_string(),
+            deploy_branch: "m".to_string(),
+            extras: Default::default(),
         };
         let a = db.insert_deploy_environment(&mk("prod")).unwrap();
         let b = db.insert_deploy_environment(&mk("test")).unwrap();
         let c = db.insert_deploy_environment(&mk("stg")).unwrap();
 
-        db.reorder_deploy_environments(r, &[c.id, a.id, b.id]).unwrap();
+        db.reorder_deploy_environments(r, &[c.id, a.id, b.id])
+            .unwrap();
         let list = db.list_deploy_environments(r).unwrap();
         let names: Vec<_> = list.iter().map(|e| e.name.clone()).collect();
         assert_eq!(names, vec!["stg", "prod", "test"]);
@@ -493,21 +538,32 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
 
-        db.upsert_deploy_secret(env.id, "SSH_HOST", Some("deploy"), true, true).unwrap();
-        db.upsert_deploy_secret(env.id, "NPM_EMAIL", Some("deploy"), true, false).unwrap();
-        db.upsert_deploy_secret(env.id, "UNUSED", None, false, false).unwrap();
+        db.upsert_deploy_secret(env.id, "SSH_HOST", Some("deploy"), true, true)
+            .unwrap();
+        db.upsert_deploy_secret(env.id, "NPM_EMAIL", Some("deploy"), true, false)
+            .unwrap();
+        db.upsert_deploy_secret(env.id, "UNUSED", None, false, false)
+            .unwrap();
 
         let secrets = db.list_deploy_secrets(env.id).unwrap();
         assert_eq!(secrets.len(), 3);
-        let by_name: std::collections::HashMap<_, _> = secrets.iter()
-            .map(|s| (s.secret_name.clone(), s.clone())).collect();
+        let by_name: std::collections::HashMap<_, _> = secrets
+            .iter()
+            .map(|s| (s.secret_name.clone(), s.clone()))
+            .collect();
         assert_eq!(by_name["SSH_HOST"].role, Some("deploy".to_string()));
         assert!(by_name["SSH_HOST"].included);
         assert!(by_name["SSH_HOST"].override_enabled);
@@ -521,15 +577,23 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
 
-        db.upsert_deploy_secret(env.id, "X", Some("build"), true, false).unwrap();
-        db.upsert_deploy_secret(env.id, "X", Some("runtime"), true, true).unwrap();
+        db.upsert_deploy_secret(env.id, "X", Some("build"), true, false)
+            .unwrap();
+        db.upsert_deploy_secret(env.id, "X", Some("runtime"), true, true)
+            .unwrap();
 
         let secrets = db.list_deploy_secrets(env.id).unwrap();
         assert_eq!(secrets.len(), 1);
@@ -543,14 +607,22 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
-        db.upsert_deploy_secret(env.id, "A", Some("deploy"), true, false).unwrap();
-        db.upsert_deploy_secret(env.id, "B", Some("deploy"), true, false).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
+        db.upsert_deploy_secret(env.id, "A", Some("deploy"), true, false)
+            .unwrap();
+        db.upsert_deploy_secret(env.id, "B", Some("deploy"), true, false)
+            .unwrap();
 
         db.delete_deploy_secret(env.id, "A").unwrap();
         let list = db.list_deploy_secrets(env.id).unwrap();
@@ -564,13 +636,20 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
-        db.upsert_deploy_secret(env.id, "X", Some("deploy"), true, false).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
+        db.upsert_deploy_secret(env.id, "X", Some("deploy"), true, false)
+            .unwrap();
 
         db.delete_deploy_environment(env.id).unwrap();
         let list = db.list_deploy_secrets(env.id).unwrap();
@@ -587,30 +666,47 @@ mod tests {
         let mut extras = std::collections::HashMap::new();
         extras.insert("APP_PORT".to_string(), "8080".to_string());
         extras.insert("NETWORK_NAME".to_string(), "goapp_prod_net".to_string());
-        let src = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "Prod Deploy".to_string(), image_tag: "prod".to_string(),
-            compose_service: "backend".to_string(), domain: "x.com".to_string(),
-            deploy_branch: "master".to_string(), extras,
-        }).unwrap();
-        db.upsert_deploy_secret(src.id, "SSH_HOST", Some("deploy"), true, true).unwrap();
-        db.upsert_deploy_secret(src.id, "NPM_EMAIL", Some("deploy"), true, false).unwrap();
-        db.upsert_deploy_secret(src.id, "EXCLUDED", None, false, false).unwrap();
+        let src = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "Prod Deploy".to_string(),
+                image_tag: "prod".to_string(),
+                compose_service: "backend".to_string(),
+                domain: "x.com".to_string(),
+                deploy_branch: "master".to_string(),
+                extras,
+            })
+            .unwrap();
+        db.upsert_deploy_secret(src.id, "SSH_HOST", Some("deploy"), true, true)
+            .unwrap();
+        db.upsert_deploy_secret(src.id, "NPM_EMAIL", Some("deploy"), true, false)
+            .unwrap();
+        db.upsert_deploy_secret(src.id, "EXCLUDED", None, false, false)
+            .unwrap();
 
         let cloned = db.clone_deploy_environment(src.id, "test").unwrap();
         assert_eq!(cloned.name, "test");
         assert_eq!(cloned.repository_id, r);
         assert_eq!(cloned.workflow_name, "Prod Deploy");
         assert_eq!(cloned.extras.get("APP_PORT"), Some(&"8080".to_string()));
-        assert_eq!(cloned.extras.get("NETWORK_NAME"), Some(&"goapp_prod_net".to_string()));
+        assert_eq!(
+            cloned.extras.get("NETWORK_NAME"),
+            Some(&"goapp_prod_net".to_string())
+        );
         assert_ne!(cloned.id, src.id);
 
         let secrets = db.list_deploy_secrets(cloned.id).unwrap();
         assert_eq!(secrets.len(), 3);
-        let by_name: std::collections::HashMap<_, _> = secrets.iter()
-            .map(|s| (s.secret_name.clone(), s.clone())).collect();
+        let by_name: std::collections::HashMap<_, _> = secrets
+            .iter()
+            .map(|s| (s.secret_name.clone(), s.clone()))
+            .collect();
         assert!(by_name["SSH_HOST"].included);
-        assert!(by_name["SSH_HOST"].override_enabled, "override_enabled flag preserved");
+        assert!(
+            by_name["SSH_HOST"].override_enabled,
+            "override_enabled flag preserved"
+        );
         assert!(!by_name["EXCLUDED"].included);
         std::mem::forget(tmp);
     }
@@ -620,12 +716,18 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let src = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
+        let src = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
 
         let err = db.clone_deploy_environment(src.id, "prod").unwrap_err();
         assert!(err.to_string().contains("UNIQUE"), "got: {}", err);
@@ -637,25 +739,46 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
 
         let repo_secret_names = vec!["SSH_HOST".to_string(), "NPM_EMAIL".to_string()];
         let meta_hints = vec![
-            MetaSecretHint { name: "SSH_HOST".to_string(), role: "deploy".to_string(), scope: "environment".to_string() },
-            MetaSecretHint { name: "API_BASE_URL".to_string(), role: "build".to_string(), scope: "environment".to_string() },
-            MetaSecretHint { name: "NPM_EMAIL".to_string(), role: "deploy".to_string(), scope: "deploy_repo".to_string() },
+            MetaSecretHint {
+                name: "SSH_HOST".to_string(),
+                role: "deploy".to_string(),
+                scope: "environment".to_string(),
+            },
+            MetaSecretHint {
+                name: "API_BASE_URL".to_string(),
+                role: "build".to_string(),
+                scope: "environment".to_string(),
+            },
+            MetaSecretHint {
+                name: "NPM_EMAIL".to_string(),
+                role: "deploy".to_string(),
+                scope: "deploy_repo".to_string(),
+            },
         ];
 
-        db.ensure_deploy_secrets_populated(env.id, &repo_secret_names, &meta_hints).unwrap();
+        db.ensure_deploy_secrets_populated(env.id, &repo_secret_names, &meta_hints)
+            .unwrap();
 
         let secrets = db.list_deploy_secrets(env.id).unwrap();
-        let by_name: std::collections::HashMap<_, _> = secrets.iter()
-            .map(|s| (s.secret_name.clone(), s.clone())).collect();
+        let by_name: std::collections::HashMap<_, _> = secrets
+            .iter()
+            .map(|s| (s.secret_name.clone(), s.clone()))
+            .collect();
         assert_eq!(secrets.len(), 3);
         assert_eq!(by_name["SSH_HOST"].role, Some("deploy".to_string()));
         assert!(by_name["SSH_HOST"].override_enabled);
@@ -672,25 +795,37 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
 
         let repo_secret_names = vec!["DB_HOST".to_string(), "MASTER_KEY".to_string()];
         let meta_hints: Vec<MetaSecretHint> = vec![];
 
-        db.ensure_deploy_secrets_populated(env.id, &repo_secret_names, &meta_hints).unwrap();
+        db.ensure_deploy_secrets_populated(env.id, &repo_secret_names, &meta_hints)
+            .unwrap();
 
         let secrets = db.list_deploy_secrets(env.id).unwrap();
-        let by_name: std::collections::HashMap<_, _> = secrets.iter()
-            .map(|s| (s.secret_name.clone(), s.clone())).collect();
+        let by_name: std::collections::HashMap<_, _> = secrets
+            .iter()
+            .map(|s| (s.secret_name.clone(), s.clone()))
+            .collect();
         assert_eq!(by_name["DB_HOST"].role, Some("runtime".to_string()));
         assert_eq!(by_name["MASTER_KEY"].role, Some("runtime".to_string()));
         assert!(by_name["DB_HOST"].included);
-        assert!(!by_name["DB_HOST"].override_enabled, "scope defaults to repo (override off)");
+        assert!(
+            !by_name["DB_HOST"].override_enabled,
+            "scope defaults to repo (override off)"
+        );
         std::mem::forget(tmp);
     }
 
@@ -699,24 +834,42 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
 
         let old_hints = vec![
-            MetaSecretHint { name: "SSH_HOST".to_string(), role: "deploy".to_string(), scope: "environment".to_string() },
-            MetaSecretHint { name: "CONTAINER_NAME".to_string(), role: "deploy".to_string(), scope: "environment".to_string() },
+            MetaSecretHint {
+                name: "SSH_HOST".to_string(),
+                role: "deploy".to_string(),
+                scope: "environment".to_string(),
+            },
+            MetaSecretHint {
+                name: "CONTAINER_NAME".to_string(),
+                role: "deploy".to_string(),
+                scope: "environment".to_string(),
+            },
         ];
-        db.ensure_deploy_secrets_populated(env.id, &["SSH_HOST".to_string()], &old_hints).unwrap();
+        db.ensure_deploy_secrets_populated(env.id, &["SSH_HOST".to_string()], &old_hints)
+            .unwrap();
         assert_eq!(db.list_deploy_secrets(env.id).unwrap().len(), 2);
 
-        let new_hints = vec![
-            MetaSecretHint { name: "SSH_HOST".to_string(), role: "deploy".to_string(), scope: "environment".to_string() },
-        ];
-        db.ensure_deploy_secrets_populated(env.id, &["SSH_HOST".to_string()], &new_hints).unwrap();
+        let new_hints = vec![MetaSecretHint {
+            name: "SSH_HOST".to_string(),
+            role: "deploy".to_string(),
+            scope: "environment".to_string(),
+        }];
+        db.ensure_deploy_secrets_populated(env.id, &["SSH_HOST".to_string()], &new_hints)
+            .unwrap();
 
         let secrets = db.list_deploy_secrets(env.id).unwrap();
         assert_eq!(secrets.len(), 1);
@@ -729,22 +882,35 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
         let repo_secrets = vec!["X".to_string()];
         let hints = vec![];
 
-        db.ensure_deploy_secrets_populated(env.id, &repo_secrets, &hints).unwrap();
-        db.upsert_deploy_secret(env.id, "X", Some("runtime"), true, true).unwrap();
-        db.ensure_deploy_secrets_populated(env.id, &repo_secrets, &hints).unwrap();
+        db.ensure_deploy_secrets_populated(env.id, &repo_secrets, &hints)
+            .unwrap();
+        db.upsert_deploy_secret(env.id, "X", Some("runtime"), true, true)
+            .unwrap();
+        db.ensure_deploy_secrets_populated(env.id, &repo_secrets, &hints)
+            .unwrap();
 
         let secrets = db.list_deploy_secrets(env.id).unwrap();
         assert_eq!(secrets.len(), 1);
-        assert_eq!(secrets[0].role, Some("runtime".to_string()), "user edit preserved");
+        assert_eq!(
+            secrets[0].role,
+            Some("runtime".to_string()),
+            "user edit preserved"
+        );
         assert!(secrets[0].override_enabled, "user edit preserved");
     }
 
@@ -753,18 +919,30 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let e1 = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
-        let e2 = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "test".to_string(),
-            workflow_name: "W2".to_string(), image_tag: "t".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "dev".to_string(), extras: Default::default(),
-        }).unwrap();
+        let e1 = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
+        let e2 = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "test".to_string(),
+                workflow_name: "W2".to_string(),
+                image_tag: "t".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "dev".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
 
         db.register_repo_secret_in_deploys(r, "NEW_SECRET").unwrap();
 
@@ -772,7 +950,11 @@ mod tests {
         assert_eq!(s1.len(), 1);
         assert_eq!(s1[0].secret_name, "NEW_SECRET");
         assert!(s1[0].included);
-        assert_eq!(s1[0].role, Some("deploy".to_string()), "default role is 'deploy'");
+        assert_eq!(
+            s1[0].role,
+            Some("deploy".to_string()),
+            "default role is 'deploy'"
+        );
         assert!(!s1[0].override_enabled);
 
         let s2 = db.list_deploy_secrets(e2.id).unwrap();
@@ -786,19 +968,30 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AppDb::new(tmp.path().join("test.db")).unwrap();
         let (_p, r) = seed_repo_for_deploy_tests(&db);
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: r, name: "prod".to_string(),
-            workflow_name: "W".to_string(), image_tag: "l".to_string(),
-            compose_service: "s".to_string(), domain: "d".to_string(),
-            deploy_branch: "m".to_string(), extras: Default::default(),
-        }).unwrap();
-        db.upsert_deploy_secret(env.id, "EXISTING", Some("runtime"), true, true).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras: Default::default(),
+            })
+            .unwrap();
+        db.upsert_deploy_secret(env.id, "EXISTING", Some("runtime"), true, true)
+            .unwrap();
 
         db.register_repo_secret_in_deploys(r, "EXISTING").unwrap();
 
         let s = db.list_deploy_secrets(env.id).unwrap();
         assert_eq!(s.len(), 1);
-        assert_eq!(s[0].role, Some("runtime".to_string()), "existing role preserved");
+        assert_eq!(
+            s[0].role,
+            Some("runtime".to_string()),
+            "existing role preserved"
+        );
         assert!(s[0].override_enabled, "existing override preserved");
         std::mem::forget(tmp);
     }

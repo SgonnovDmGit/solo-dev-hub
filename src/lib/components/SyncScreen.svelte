@@ -2,6 +2,7 @@
   import { selectedProjectId, currentScreen } from '$lib/stores/ui';
   import { addToast } from '$lib/stores/ui';
   import { allRepos } from '$lib/stores/repos';
+  import { projects } from '$lib/stores/projects';
   import { tStore } from '$lib/i18n';
   import { syncProject, listProjectRequirements, confirmRequirement } from '$lib/api/tauri-commands';
   import { getDisplayName, type RequirementInfo } from '$lib/types';
@@ -11,6 +12,11 @@
   let loading = $state(true);
 
   const projectId = $derived($selectedProjectId);
+  // T-000123: surface the current project in the header so the user knows
+  // which scope this sync is acting on (was generic "Synchronize" only).
+  const projectName = $derived(
+    $projects.find((p) => p.id === projectId)?.name ?? ''
+  );
 
   async function loadRequirements() {
     if (!projectId) return;
@@ -151,7 +157,7 @@
 <div class="sync-screen">
   <div class="header">
     <button class="ghost back-btn" onclick={goBack}>{$tStore('sync.back')}</button>
-    <h2>{$tStore('sync.title')}</h2>
+    <h2>{$tStore('sync.title')}{projectName ? ` — ${projectName}` : ''}</h2>
     <button
       class="sync-btn"
       onclick={handleSync}

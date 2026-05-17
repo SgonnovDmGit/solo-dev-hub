@@ -28,6 +28,25 @@ pub struct SyncResult {
     pub errors: Vec<String>,
 }
 
+/// F-000041: report from `untrack_files`. `untracked` = total file count
+/// successfully removed from the git index across all chunks; `errors` =
+/// per-chunk stderr captures (chunk-level granularity, not per-file).
+#[derive(Debug, Clone, Serialize)]
+pub struct UntrackReport {
+    pub untracked: usize,
+    pub errors: Vec<String>,
+}
+
+/// F-000041: payload for the list-gitignored Tauri command. `repo_state` is
+/// the stringified `git_ops::RepoState` — UI gates the Untrack button on
+/// `"clean"`. `other_staged_count` excludes files about to be untracked.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitignoredListing {
+    pub files: Vec<String>,
+    pub repo_state: String,
+    pub other_staged_count: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SyncEvent {
     pub id: i64,

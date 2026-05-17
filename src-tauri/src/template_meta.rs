@@ -83,15 +83,12 @@ pub fn parse_meta_secret_hints(
     };
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
-        let name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                format!(
-                    "Template '{}' has a required_secrets entry missing 'name'.",
-                    template_name
-                )
-            })?;
+        let name = item.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            format!(
+                "Template '{}' has a required_secrets entry missing 'name'.",
+                template_name
+            )
+        })?;
         let role = item
             .get("role")
             .and_then(|v| v.as_str())
@@ -182,7 +179,10 @@ mod tests {
         assert!(err.contains("'deploy_repo'"), "error names the new value");
         assert!(err.contains("NPM_EMAIL"), "error names the secret");
         assert!(err.contains("'go'"), "error names the template");
-        assert!(err.contains("v0.31.0"), "error names the version that introduced rename");
+        assert!(
+            err.contains("v0.31.0"),
+            "error names the version that introduced rename"
+        );
     }
 
     #[test]
@@ -287,7 +287,10 @@ mod tests {
         assert_eq!(phs.len(), 2);
         let by_name: std::collections::HashMap<_, _> = phs.into_iter().collect();
         assert_eq!(by_name["GO_VERSION"].scope.as_deref(), Some("repo"));
-        assert!(by_name["DOMAIN"].scope.is_none(), "absent scope stays None — consumer defaults to environment");
+        assert!(
+            by_name["DOMAIN"].scope.is_none(),
+            "absent scope stays None — consumer defaults to environment"
+        );
     }
 
     #[test]

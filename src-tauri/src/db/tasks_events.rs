@@ -103,7 +103,11 @@ impl AppDb {
         Ok(())
     }
 
-    pub fn list_tasks_by_repo(&self, repository_id: i64, source: &str) -> SqlResult<Vec<crate::models::Task>> {
+    pub fn list_tasks_by_repo(
+        &self,
+        repository_id: i64,
+        source: &str,
+    ) -> SqlResult<Vec<crate::models::Task>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, repository_id, task_id, prefix, description, effort, priority, status, version, source, created_at, updated_at
@@ -145,7 +149,10 @@ impl AppDb {
         Ok(())
     }
 
-    pub fn list_task_events_by_task(&self, task_id: i64) -> SqlResult<Vec<crate::models::TaskEvent>> {
+    pub fn list_task_events_by_task(
+        &self,
+        task_id: i64,
+    ) -> SqlResult<Vec<crate::models::TaskEvent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, task_id, event_type, ts, from_status, to_status
@@ -201,7 +208,11 @@ impl AppDb {
         Ok(())
     }
 
-    pub fn list_sync_events(&self, limit: u32, offset: u32) -> SqlResult<Vec<crate::models::SyncEvent>> {
+    pub fn list_sync_events(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> SqlResult<Vec<crate::models::SyncEvent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, repository_id, sync_type, ts, change_count, details
@@ -239,7 +250,11 @@ impl AppDb {
         Ok(())
     }
 
-    pub fn list_deploy_events(&self, limit: u32, offset: u32) -> SqlResult<Vec<crate::models::DeployEvent>> {
+    pub fn list_deploy_events(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> SqlResult<Vec<crate::models::DeployEvent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, deploy_env_id, repository_id, action, ts, details
@@ -270,11 +285,23 @@ mod tests {
     #[test]
     fn test_insert_task_returns_row_with_id() {
         let db = make_db();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", None, None).unwrap();
-        let task = db.insert_task(
-            repo.id, "T-042", "T", "Some task",
-            Some(4.0), Some("high"), Some("open"), None, "todo", "2026-04-26",
-        ).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", None, None)
+            .unwrap();
+        let task = db
+            .insert_task(
+                repo.id,
+                "T-042",
+                "T",
+                "Some task",
+                Some(4.0),
+                Some("high"),
+                Some("open"),
+                None,
+                "todo",
+                "2026-04-26",
+            )
+            .unwrap();
         assert_eq!(task.task_id, "T-042");
         assert_eq!(task.prefix, "T");
         assert_eq!(task.priority.as_deref(), Some("high"));
@@ -283,9 +310,35 @@ mod tests {
     #[test]
     fn test_list_tasks_by_repo_filters_source() {
         let db = make_db();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", None, None).unwrap();
-        db.insert_task(repo.id, "T-001", "T", "Open task", Some(2.0), Some("medium"), Some("open"), None, "todo", "2026-04-20").unwrap();
-        db.insert_task(repo.id, "T-002", "T", "Done task", None, None, None, Some("v0.20.0"), "done", "2026-04-19").unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", None, None)
+            .unwrap();
+        db.insert_task(
+            repo.id,
+            "T-001",
+            "T",
+            "Open task",
+            Some(2.0),
+            Some("medium"),
+            Some("open"),
+            None,
+            "todo",
+            "2026-04-20",
+        )
+        .unwrap();
+        db.insert_task(
+            repo.id,
+            "T-002",
+            "T",
+            "Done task",
+            None,
+            None,
+            None,
+            Some("v0.20.0"),
+            "done",
+            "2026-04-19",
+        )
+        .unwrap();
         let todos = db.list_tasks_by_repo(repo.id, "todo").unwrap();
         let dones = db.list_tasks_by_repo(repo.id, "done").unwrap();
         assert_eq!(todos.len(), 1);
@@ -297,9 +350,31 @@ mod tests {
     #[test]
     fn test_insert_task_event_links_to_task() {
         let db = make_db();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", None, None).unwrap();
-        let task = db.insert_task(repo.id, "T-001", "T", "Test", Some(1.0), Some("low"), Some("open"), None, "todo", "2026-04-26").unwrap();
-        db.insert_task_event(task.id, "created", "2026-04-26T00:00:00Z", None, Some("open")).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", None, None)
+            .unwrap();
+        let task = db
+            .insert_task(
+                repo.id,
+                "T-001",
+                "T",
+                "Test",
+                Some(1.0),
+                Some("low"),
+                Some("open"),
+                None,
+                "todo",
+                "2026-04-26",
+            )
+            .unwrap();
+        db.insert_task_event(
+            task.id,
+            "created",
+            "2026-04-26T00:00:00Z",
+            None,
+            Some("open"),
+        )
+        .unwrap();
         let events = db.list_task_events_by_task(task.id).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "created");
@@ -308,23 +383,37 @@ mod tests {
     #[test]
     fn test_mark_tasks_migrated_sets_timestamp() {
         let db = make_db();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", None, None).unwrap();
-        db.mark_tasks_migrated(repo.id, "2026-04-26T12:00:00Z").unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", None, None)
+            .unwrap();
+        db.mark_tasks_migrated(repo.id, "2026-04-26T12:00:00Z")
+            .unwrap();
         assert!(db.get_tasks_migrated_at(repo.id).unwrap().is_some());
     }
 
     #[test]
     fn test_get_tasks_migrated_at_null_when_unset() {
         let db = make_db();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", None, None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", None, None)
+            .unwrap();
         assert!(db.get_tasks_migrated_at(repo.id).unwrap().is_none());
     }
 
     #[test]
     fn test_insert_sync_event_with_repo_id() {
         let db = make_db();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", None, None).unwrap();
-        db.insert_sync_event(Some(repo.id), "project_sync", "2026-04-26T10:00:00Z", 3, None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", None, None)
+            .unwrap();
+        db.insert_sync_event(
+            Some(repo.id),
+            "project_sync",
+            "2026-04-26T10:00:00Z",
+            3,
+            None,
+        )
+        .unwrap();
         let events = db.list_sync_events(10, 0).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].sync_type, "project_sync");
@@ -334,7 +423,8 @@ mod tests {
     #[test]
     fn test_insert_sync_event_portfolio_wide_null_repo() {
         let db = make_db();
-        db.insert_sync_event(None, "tasks", "2026-04-26T10:00:00Z", 0, None).unwrap();
+        db.insert_sync_event(None, "tasks", "2026-04-26T10:00:00Z", 0, None)
+            .unwrap();
         let events = db.list_sync_events(10, 0).unwrap();
         assert_eq!(events.len(), 1);
         assert!(events[0].repository_id.is_none());
@@ -343,8 +433,17 @@ mod tests {
     #[test]
     fn test_insert_deploy_event_with_details_json() {
         let db = make_db();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", None, None).unwrap();
-        db.insert_deploy_event(None, repo.id, "render", "2026-04-26T10:00:00Z", Some(r#"{"env":"prod"}"#)).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", None, None)
+            .unwrap();
+        db.insert_deploy_event(
+            None,
+            repo.id,
+            "render",
+            "2026-04-26T10:00:00Z",
+            Some(r#"{"env":"prod"}"#),
+        )
+        .unwrap();
         let events = db.list_deploy_events(10, 0).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, "render");

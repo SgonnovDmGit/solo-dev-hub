@@ -42,7 +42,11 @@ pub fn generate_project_md(db: &AppDb, project_id: i64, repo_root: &Path) -> Res
             let name = r.display_name();
             let role = r.role.as_deref().unwrap_or("—");
             let path = r.local_path.as_deref().unwrap_or("—");
-            let gh = if r.github_name.is_some() { "✓" } else { "📁 local" };
+            let gh = if r.github_name.is_some() {
+                "✓"
+            } else {
+                "📁 local"
+            };
             md.push_str(&format!("| {} | {} | {} | {} |\n", name, role, path, gh));
         }
         md.push('\n');
@@ -65,7 +69,11 @@ pub fn generate_project_md(db: &AppDb, project_id: i64, repo_root: &Path) -> Res
                         .local_path
                         .clone()
                         .unwrap_or_else(|| "_no local path configured_".to_string());
-                    let gh = if srv.github_name.is_some() { "✓" } else { "📁 local" };
+                    let gh = if srv.github_name.is_some() {
+                        "✓"
+                    } else {
+                        "📁 local"
+                    };
                     (srv.display_name(), path, gh.to_string())
                 }
                 Err(_) => (
@@ -99,7 +107,11 @@ pub fn generate_project_md(db: &AppDb, project_id: i64, repo_root: &Path) -> Res
                         .local_path
                         .clone()
                         .unwrap_or_else(|| "_no local path configured_".to_string());
-                    let gh = if srv.github_name.is_some() { "✓" } else { "📁 local" };
+                    let gh = if srv.github_name.is_some() {
+                        "✓"
+                    } else {
+                        "📁 local"
+                    };
                     (srv.display_name(), path, gh.to_string())
                 }
                 Err(_) => (
@@ -141,9 +153,14 @@ mod tests {
     #[test]
     fn test_generate_project_md_standard_with_repos() {
         let db = make_test_db();
-        let proj = db.create_project("WebApp", Some("My web application"), "standard").unwrap();
-        let repo = db.upsert_repository("owner/web-backend", None, None, None, None, None).unwrap();
-        db.assign_repository(repo.id, Some(proj.id), Some("server")).unwrap();
+        let proj = db
+            .create_project("WebApp", Some("My web application"), "standard")
+            .unwrap();
+        let repo = db
+            .upsert_repository("owner/web-backend", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(repo.id, Some(proj.id), Some("server"))
+            .unwrap();
 
         let tmp = TempDir::new().unwrap();
         generate_project_md(&db, proj.id, tmp.path()).unwrap();
@@ -163,8 +180,11 @@ mod tests {
         let db = make_test_db();
         let parent = db.create_project("Parent", None, "standard").unwrap();
         let ms = db.create_project("AuthMS", None, "microservice").unwrap();
-        let ms_repo = db.upsert_repository("owner/auth-backend", None, None, None, None, None).unwrap();
-        db.assign_repository(ms_repo.id, Some(ms.id), Some("server")).unwrap();
+        let ms_repo = db
+            .upsert_repository("owner/auth-backend", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(ms_repo.id, Some(ms.id), Some("server"))
+            .unwrap();
         db.connect_microservice(parent.id, ms.id).unwrap();
 
         let tmp = TempDir::new().unwrap();

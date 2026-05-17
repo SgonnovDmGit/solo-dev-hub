@@ -53,8 +53,8 @@ fn write_claude_section(claude_md_path: &Path, rendered: &str) -> Result<(), Str
 
     match (has_begin, has_end) {
         (true, true) => {
-            let re = Regex::new(r"(?s)<!--\s*manager:begin\s*-->.*?<!--\s*manager:end\s*-->")
-                .unwrap();
+            let re =
+                Regex::new(r"(?s)<!--\s*manager:begin\s*-->.*?<!--\s*manager:end\s*-->").unwrap();
             let updated = re.replace(&content, section.as_str()).to_string();
             fs::write(claude_md_path, updated).map_err(|e| e.to_string())?;
         }
@@ -110,68 +110,69 @@ fn render_claude_section(
     project_id: Option<i64>,
     repo_role: Option<&str>,
 ) -> Result<String, String> {
-    let (name, type_display, description, repos_table, ms_block, parents_block) =
-        if let Some(pid) = project_id {
-            let project = db.get_project(pid).map_err(|e| e.to_string())?;
-            let repos = db
-                .list_repos_by_project(Some(pid))
-                .map_err(|e| e.to_string())?;
-            let ms_ids = db
-                .list_project_microservices(pid)
-                .map_err(|e| e.to_string())?;
-            let parents = db
-                .list_parents_of_microservice(pid)
-                .map_err(|e| e.to_string())?;
+    let (name, type_display, description, repos_table, ms_block, parents_block) = if let Some(pid) =
+        project_id
+    {
+        let project = db.get_project(pid).map_err(|e| e.to_string())?;
+        let repos = db
+            .list_repos_by_project(Some(pid))
+            .map_err(|e| e.to_string())?;
+        let ms_ids = db
+            .list_project_microservices(pid)
+            .map_err(|e| e.to_string())?;
+        let parents = db
+            .list_parents_of_microservice(pid)
+            .map_err(|e| e.to_string())?;
 
-            let td = match project.project_type.as_str() {
-                "microservice" => "⚙ Microservice",
-                _ => "📁 Standard",
-            };
+        let td = match project.project_type.as_str() {
+            "microservice" => "⚙ Microservice",
+            _ => "📁 Standard",
+        };
 
-            let mut rt = String::new();
-            if repos.is_empty() {
-                rt.push_str("_No repositories._");
-            } else {
-                rt.push_str("| Repository | Role |\n|------------|------|\n");
-                for r in &repos {
-                    rt.push_str(&format!(
-                        "| {} | {} |\n",
-                        r.display_name(),
-                        r.role.as_deref().unwrap_or("—")
-                    ));
-                }
-            }
-
-            let mut mb = String::new();
-            if ms_ids.is_empty() {
-                mb.push_str("_No connected microservices._");
-            } else {
-                for ms_id in &ms_ids {
-                    if let Ok(ms_proj) = db.get_project(*ms_id) {
-                        mb.push_str(&format!("- {}\n", ms_proj.name));
-                    }
-                }
-            }
-
-            let mut pb = String::new();
-            if parents.is_empty() {
-                pb.push_str("_No parent projects._");
-            } else {
-                for p in &parents {
-                    pb.push_str(&format!("- {}\n", p.name));
-                }
-            }
-
-            (
-                project.name,
-                td.to_string(),
-                project.description.unwrap_or_default(),
-                rt,
-                mb,
-                pb,
-            )
+        let mut rt = String::new();
+        if repos.is_empty() {
+            rt.push_str("_No repositories._");
         } else {
-            (
+            rt.push_str("| Repository | Role |\n|------------|------|\n");
+            for r in &repos {
+                rt.push_str(&format!(
+                    "| {} | {} |\n",
+                    r.display_name(),
+                    r.role.as_deref().unwrap_or("—")
+                ));
+            }
+        }
+
+        let mut mb = String::new();
+        if ms_ids.is_empty() {
+            mb.push_str("_No connected microservices._");
+        } else {
+            for ms_id in &ms_ids {
+                if let Ok(ms_proj) = db.get_project(*ms_id) {
+                    mb.push_str(&format!("- {}\n", ms_proj.name));
+                }
+            }
+        }
+
+        let mut pb = String::new();
+        if parents.is_empty() {
+            pb.push_str("_No parent projects._");
+        } else {
+            for p in &parents {
+                pb.push_str(&format!("- {}\n", p.name));
+            }
+        }
+
+        (
+            project.name,
+            td.to_string(),
+            project.description.unwrap_or_default(),
+            rt,
+            mb,
+            pb,
+        )
+    } else {
+        (
                 "—".to_string(),
                 "—".to_string(),
                 "Global AI instructions (configured by the user in Solo Dev Hub). For per-project context see CLAUDE.md of the specific repo.".to_string(),
@@ -179,7 +180,7 @@ fn render_claude_section(
                 "_not applicable_".to_string(),
                 "_not applicable_".to_string(),
             )
-        };
+    };
 
     let role_display = repo_role.unwrap_or("—");
 
@@ -215,7 +216,9 @@ mod tests {
     #[test]
     fn test_update_claude_section_creates_file_if_missing() {
         let db = make_test_db();
-        let proj = db.create_project("TestP", Some("Desc"), "standard").unwrap();
+        let proj = db
+            .create_project("TestP", Some("Desc"), "standard")
+            .unwrap();
         let tmp = TempDir::new().unwrap();
         let claude = tmp.path().join("CLAUDE.md");
 
@@ -238,7 +241,10 @@ mod tests {
         update_claude_md_section(&db, Some(proj.id), None, &claude).unwrap();
 
         let content = fs::read_to_string(&claude).unwrap();
-        assert!(content.starts_with("# My custom rules"), "user content preserved at top");
+        assert!(
+            content.starts_with("# My custom rules"),
+            "user content preserved at top"
+        );
         assert!(content.contains("manager:begin"));
         assert!(content.contains("App"));
     }
@@ -333,7 +339,10 @@ mod tests {
 
         let content = fs::read_to_string(&claude).unwrap();
         assert!(content.contains("manager:begin"));
-        assert!(content.contains("—"), "global placeholders should contain dashes");
+        assert!(
+            content.contains("—"),
+            "global placeholders should contain dashes"
+        );
         assert!(content.contains("Global AI instructions"));
         assert!(content.contains("_not applicable_"));
     }
@@ -357,7 +366,8 @@ mod tests {
         fs::create_dir_all(&docs).unwrap();
         fs::write(docs.join("todo.md"), "existing user content").unwrap();
 
-        let created = copy_doc_skeleton_if_missing("# New skeleton", tmp.path(), "todo.md").unwrap();
+        let created =
+            copy_doc_skeleton_if_missing("# New skeleton", tmp.path(), "todo.md").unwrap();
         assert!(!created);
         assert_eq!(
             fs::read_to_string(docs.join("todo.md")).unwrap(),
@@ -372,7 +382,10 @@ mod tests {
         let created = copy_doc_skeleton_if_missing("  \n  ", tmp.path(), "bug-reports.md").unwrap();
         assert!(!created);
         assert!(!tmp.path().join("docs/bug-reports.md").exists());
-        assert!(!tmp.path().join("docs").exists(), "docs dir not created for empty template");
+        assert!(
+            !tmp.path().join("docs").exists(),
+            "docs dir not created for empty template"
+        );
     }
 
     /// Simulates init_docs_for_repo on a bare folder (local-only repo, no .git).
@@ -380,9 +393,21 @@ mod tests {
     #[test]
     fn test_init_docs_flow_on_bare_folder() {
         let db = make_test_db();
-        let todo_t = db.get_template_file("_global", "todo.md.tmpl").unwrap().unwrap().content;
-        let bugs_t = db.get_template_file("_global", "bug-reports.md.tmpl").unwrap().unwrap().content;
-        let gi_t = db.get_template_file("_global", ".gitignore.tmpl").unwrap().unwrap().content;
+        let todo_t = db
+            .get_template_file("_global", "todo.md.tmpl")
+            .unwrap()
+            .unwrap()
+            .content;
+        let bugs_t = db
+            .get_template_file("_global", "bug-reports.md.tmpl")
+            .unwrap()
+            .unwrap()
+            .content;
+        let gi_t = db
+            .get_template_file("_global", ".gitignore.tmpl")
+            .unwrap()
+            .unwrap()
+            .content;
         assert!(!todo_t.trim().is_empty());
         assert!(!bugs_t.trim().is_empty());
         assert!(!gi_t.trim().is_empty());
@@ -394,7 +419,10 @@ mod tests {
         let c2 = copy_doc_skeleton_if_missing(&bugs_t, base, "bug-reports.md").unwrap();
         let c3 = sync_gitignore_section(&gi_t, base).unwrap();
 
-        assert!(c1 && c2 && c3, "all 3 skeletons should be created on bare folder");
+        assert!(
+            c1 && c2 && c3,
+            "all 3 skeletons should be created on bare folder"
+        );
         assert!(base.join("docs/todo.md").exists());
         assert!(base.join("docs/bug-reports.md").exists());
         let gi_content = fs::read_to_string(base.join(".gitignore")).unwrap();

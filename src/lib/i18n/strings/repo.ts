@@ -26,6 +26,7 @@ export const ru = {
   'repo.deployTarget': 'Шаблон деплоя',
   'repo.deployTargetNone': '— без шаблона —',
   'repo.initDocsButton': 'Обновить документацию репозитория',
+  'repo.untrackGitignoredButton': 'Очистить из индекса',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -56,4 +57,5 @@ export const en: Record<keyof typeof ru, string> = {
   'repo.deployTarget': 'Deploy template',
   'repo.deployTargetNone': '— none —',
   'repo.initDocsButton': 'Update repo docs',
+  'repo.untrackGitignoredButton': 'Untrack gitignored',
 };
