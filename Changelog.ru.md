@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-05-18
+
+**Публичный релиз.** Solo Dev Hub становится open source под лицензией MIT. Breaking API changes относительно v0.34.0 нет — релиз маркирует переход с `0.x` (unstable contract) на `1.x` (frozen contract starts here). Tauri identifier (`com.solodevhub.app`) и lib name (`solo_dev_hub_lib`) стабильны с v0.25.0, autoupdate `v0.34.x → v1.0.0` проходит как обычный in-place апдейт.
+
+### Changed
+- **T-000064** — репо `SgonnovDmGit/solo-dev-hub` переключён с private на public. Эндпойнт autoupdate `https://github.com/SgonnovDmGit/solo-dev-hub/releases/latest/download/latest.json` теперь резолвится без GitHub auth — установки на `v0.25.x..v0.34.x` подхватят `v1.0.0` через встроенный апдейтер.
+- **T-000064** — старый репо `SgonnovDmGit/github-repo-manager` заархивирован (readonly) с redirect-нотой `moved to solo-dev-hub`. Полная история pre-rebrand сохранена там.
+- **T-000074** — version bump в `1.0.0` по `package.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, `src-tauri/tauri.conf.json`.
+
+### Tests
+- 370 cargo / 72 vitest / 0 svelte issues на 495 файлах (baseline унаследован от v0.34.0 — кодовых изменений в этом релизе кроме version bump нет).
+
 ## [0.34.0] — 2026-05-17
 
 Финальный pre-launch patch перед публичным флипом в v1.0.0. Две заметные user-видимые фичи: воркфлоу "Очистить из индекса" (F-000041) одним кликом убирает уже закоммиченные файлы которые после обновления `.gitignore` стали игнорируемыми — первый локальный shellout `git`-бинарника в проекте; и привязка имени проекта в header'е SyncScreen чтобы cross-repo flow всегда показывал контекст. Плюс правка глобальных AI-правил (ретро одним блоком, разрешение коммитить и пушить на integration-ветку, правило `&&` для PowerShell-портабельности) и CRLF-нормализация через `.gitattributes` убирающая фантомные diff'ы на Windows.
