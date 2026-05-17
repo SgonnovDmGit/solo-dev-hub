@@ -13,9 +13,9 @@ use db::AppDb;
 use models::{
     BugView, CreateDeployEnvironmentArgs, DailyFlowDay, DashboardData, DashboardFilter,
     DeployEnvironment, DeploySecret, FileBugNote, KpiCard, MetaSecretHint, MigrationReport,
-    Project, ProjectGraph, ReadBugsResult, ReadDoneResult, ReadTodoResult, RenderedFile, RepoRename,
-    Repository, RequirementInfo, StatsSummary, SyncResult, TemplateFile, TemplateLanguage,
-    UpdateDeployEnvironmentArgs, UpsertRepoOutcome, WriteError, WriteResult,
+    Project, ProjectGraph, ReadBugsResult, ReadDoneResult, ReadTodoResult, RenderedFile,
+    RepoRename, Repository, RequirementInfo, StatsSummary, SyncResult, TemplateFile,
+    TemplateLanguage, UpdateDeployEnvironmentArgs, UpsertRepoOutcome, WriteError, WriteResult,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -179,22 +179,26 @@ fn assign_repository(
 
 #[tauri::command]
 fn reorder_project(db: State<AppDb>, id: i64, direction: String) -> Result<(), String> {
-    db.reorder_project(id, &direction).map_err(|e| e.to_string())
+    db.reorder_project(id, &direction)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn reorder_repo(db: State<AppDb>, repo_id: i64, direction: String) -> Result<(), String> {
-    db.reorder_repo(repo_id, &direction).map_err(|e| e.to_string())
+    db.reorder_repo(repo_id, &direction)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn rebalance_repo_group(db: State<AppDb>, ordered_ids: Vec<i64>) -> Result<(), String> {
-    db.rebalance_repo_group(&ordered_ids).map_err(|e| e.to_string())
+    db.rebalance_repo_group(&ordered_ids)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn rebalance_projects(db: State<AppDb>, ordered_ids: Vec<i64>) -> Result<(), String> {
-    db.rebalance_projects(&ordered_ids).map_err(|e| e.to_string())
+    db.rebalance_projects(&ordered_ids)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -576,11 +580,7 @@ fn create_bug(
 /// Sets `confirmed_at` to current UTC. Row stays in DB with status='confirmed';
 /// it drops out of MD on regen.
 #[tauri::command]
-fn resolve_bug(
-    db: State<AppDb>,
-    repo_id: i64,
-    display_id: String,
-) -> Result<BugView, String> {
+fn resolve_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<BugView, String> {
     let bug = db
         .get_bug_by_display_id(repo_id, &display_id)
         .map_err(|e| e.to_string())?
@@ -594,8 +594,14 @@ fn resolve_bug(
     let now = db::utc_now_rfc3339();
     db.update_bug_status(bug.id, "confirmed", None, Some(&now))
         .map_err(|e| e.to_string())?;
-    db.insert_bug_event(bug.id, "confirmed", Some("testing"), Some("confirmed"), &now)
-        .map_err(|e| e.to_string())?;
+    db.insert_bug_event(
+        bug.id,
+        "confirmed",
+        Some("testing"),
+        Some("confirmed"),
+        &now,
+    )
+    .map_err(|e| e.to_string())?;
     let refreshed = db
         .get_bug_by_id(bug.id)
         .map_err(|e| e.to_string())?
@@ -626,13 +632,9 @@ fn update_bug_fields(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("bug {} not found", display_id))?;
     // Map comment: None → don't touch; Some("") → clear to NULL; Some("x") → set
-    let comment_arg = comment.as_ref().map(|s| {
-        if s.is_empty() {
-            None
-        } else {
-            Some(s.as_str())
-        }
-    });
+    let comment_arg = comment
+        .as_ref()
+        .map(|s| if s.is_empty() { None } else { Some(s.as_str()) });
     db.update_bug_fields(
         bug.id,
         description.as_deref(),
@@ -667,11 +669,7 @@ fn delete_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<(), 
 /// Row stays in MD — `rejected` is not terminal, next fix attempt loops
 /// back to `in-progress → testing`.
 #[tauri::command]
-fn reject_bug(
-    db: State<AppDb>,
-    repo_id: i64,
-    display_id: String,
-) -> Result<BugView, String> {
+fn reject_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<BugView, String> {
     let bug = db
         .get_bug_by_display_id(repo_id, &display_id)
         .map_err(|e| e.to_string())?
@@ -703,12 +701,14 @@ fn reject_bug(
 
 #[tauri::command]
 fn get_repo_stats_summary(db: State<AppDb>, repository_id: i64) -> Result<StatsSummary, String> {
-    db.stats_summary_for_repo(repository_id).map_err(|e| e.to_string())
+    db.stats_summary_for_repo(repository_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn get_project_stats_summary(db: State<AppDb>, project_id: i64) -> Result<StatsSummary, String> {
-    db.stats_summary_for_project(project_id).map_err(|e| e.to_string())
+    db.stats_summary_for_project(project_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -871,9 +871,8 @@ fn aggregate_tasks_done(
     for r in repos {
         if let Some(lp) = &r.local_path {
             let done_path = std::path::PathBuf::from(lp).join("docs").join("done.md");
-            let entries =
-                crate::export::parse_done_entries_in_period(&done_path, start, end)
-                    .map_err(|e| e.to_string())?;
+            let entries = crate::export::parse_done_entries_in_period(&done_path, start, end)
+                .map_err(|e| e.to_string())?;
             total += entries.iter().map(|(_, n)| n).sum::<i64>();
         }
     }
@@ -896,19 +895,17 @@ fn tasks_daily_flow(
     for r in repos {
         if let Some(lp) = &r.local_path {
             let done_path = std::path::PathBuf::from(lp).join("docs").join("done.md");
-            let entries =
-                crate::export::parse_done_entries_in_period(&done_path, start, end)
-                    .map_err(|e| e.to_string())?;
+            let entries = crate::export::parse_done_entries_in_period(&done_path, start, end)
+                .map_err(|e| e.to_string())?;
             for (date, count) in entries {
                 *per_day.entry(date).or_insert(0) += count;
             }
         }
     }
 
-    let start_d = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
-        .map_err(|e| e.to_string())?;
-    let end_d = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d")
-        .map_err(|e| e.to_string())?;
+    let start_d =
+        chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").map_err(|e| e.to_string())?;
+    let end_d = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d").map_err(|e| e.to_string())?;
     let today = chrono::Local::now().date_naive();
 
     let mut out = Vec::new();
@@ -1109,7 +1106,9 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
         if let Err(e) = sync::copy_doc_skeleton_if_missing(&todo_template, base, "todo.md") {
             errors.push(format!("todo.md for {}: {}", label, e));
         }
-        if let Err(e) = sync::copy_doc_skeleton_if_missing(&bug_reports_template, base, "bug-reports.md") {
+        if let Err(e) =
+            sync::copy_doc_skeleton_if_missing(&bug_reports_template, base, "bug-reports.md")
+        {
             errors.push(format!("bug-reports.md for {}: {}", label, e));
         }
     }
@@ -1154,7 +1153,9 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
         if let Err(e) = sync::copy_doc_skeleton_if_missing(&todo_template, base, "todo.md") {
             errors.push(format!("todo.md for {}: {}", label, e));
         }
-        if let Err(e) = sync::copy_doc_skeleton_if_missing(&bug_reports_template, base, "bug-reports.md") {
+        if let Err(e) =
+            sync::copy_doc_skeleton_if_missing(&bug_reports_template, base, "bug-reports.md")
+        {
             errors.push(format!("bug-reports.md for {}: {}", label, e));
         }
     }
@@ -1234,8 +1235,9 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                                 }
                             }
                         }
-                        Err(e) => errors
-                            .push(format!("List renames for client {}: {}", client.id, e)),
+                        Err(e) => {
+                            errors.push(format!("List renames for client {}: {}", client.id, e))
+                        }
                     }
                     let srv_client_dir = client_requirements_parent.join(&client_name);
 
@@ -1266,16 +1268,14 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                     // 0.9.0: api.md + handlers.md target moved to docs/server-api/
                     // Auto-migrate old docs/api.md to docs/server-api/api.md.
                     let old_api = client_base.join("docs").join("api.md");
-                    let new_api = client_base
-                        .join("docs")
-                        .join("server-api")
-                        .join("api.md");
+                    let new_api = client_base.join("docs").join("server-api").join("api.md");
                     if old_api.exists() && !new_api.exists() {
                         match sync::migrate_file(&old_api, &new_api) {
                             Ok(()) => migrated += 1,
                             Err(e) => errors.push(format!(
                                 "Migrate api.md on {}: {}",
-                                client.display_name(), e
+                                client.display_name(),
+                                e
                             )),
                         }
                     }
@@ -1286,9 +1286,11 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                         match sync::copy_file_if_changed(&srv_api, &new_api) {
                             Ok(true) => copied += 1,
                             Ok(false) => {}
-                            Err(e) => {
-                                errors.push(format!("Copy api.md -> {}: {}", client.display_name(), e))
-                            }
+                            Err(e) => errors.push(format!(
+                                "Copy api.md -> {}: {}",
+                                client.display_name(),
+                                e
+                            )),
                         }
                     }
                     // M5 review-fix: `api.md` absent → silent skip, symmetric
@@ -1312,7 +1314,8 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                             Ok(false) => {}
                             Err(e) => errors.push(format!(
                                 "Copy handlers.md -> {}: {}",
-                                client.display_name(), e
+                                client.display_name(),
+                                e
                             )),
                         }
                     }
@@ -1345,7 +1348,8 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                 if let Err(e) = sync::ensure_root_exists(ms_base) {
                     errors.push(format!(
                         "Microservice {}: {}",
-                        ms_server_repo.display_name(), e
+                        ms_server_repo.display_name(),
+                        e
                     ));
                     continue;
                 }
@@ -1361,7 +1365,7 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                     }
                 };
                 let ms_name = ms_project.name; // retained for microservice-api/<ms_name>/ path
-                // F-033: REQ sync folders use canonical repo name, not project name.
+                                               // F-033: REQ sync folders use canonical repo name, not project name.
                 let ms_canonical = ms_server_repo.canonical_folder_name();
                 let parent_folder = srv.canonical_folder_name();
                 let ms_req_parent = srv_base.join("docs").join("microservice-requirements");
@@ -1469,8 +1473,7 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                             }
                         }
                     }
-                    Err(e) => errors
-                        .push(format!("List renames for server {}: {}", srv.id, e)),
+                    Err(e) => errors.push(format!("List renames for server {}: {}", srv.id, e)),
                 }
 
                 // F-033 Stage 1f Case C: migrate flat server-requirements/*.md to nested
@@ -1501,11 +1504,8 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                             .collect()
                     };
                     let mut case_c_warnings = Vec::new();
-                    match sync::migrate_flat_to_nested(
-                        &ms_srv_parent,
-                        lookup,
-                        &mut case_c_warnings,
-                    ) {
+                    match sync::migrate_flat_to_nested(&ms_srv_parent, lookup, &mut case_c_warnings)
+                    {
                         Ok(n) => migrated += n,
                         Err(e) => errors.push(format!("Case C migration: {}", e)),
                     }
@@ -1554,7 +1554,8 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                         Ok(false) => {}
                         Err(e) => errors.push(format!(
                             "Copy ms api.md from {}: {}",
-                            ms_server_repo.display_name(), e
+                            ms_server_repo.display_name(),
+                            e
                         )),
                     }
                 }
@@ -1570,7 +1571,8 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
                         Ok(false) => {}
                         Err(e) => errors.push(format!(
                             "Copy ms handlers.md from {}: {}",
-                            ms_server_repo.display_name(), e
+                            ms_server_repo.display_name(),
+                            e
                         )),
                     }
                 }
@@ -1675,7 +1677,9 @@ fn list_project_requirements(
                     }
 
                     // Show api.md + handlers.md sync status (server → client, docs/server-api/)
-                    for (name, src_filename) in [("api.md", "api.md"), ("handlers.md", "handlers.md")] {
+                    for (name, src_filename) in
+                        [("api.md", "api.md"), ("handlers.md", "handlers.md")]
+                    {
                         let srv_file = srv_base.join("docs").join(src_filename);
                         if !srv_file.exists() {
                             continue;
@@ -1707,10 +1711,9 @@ fn list_project_requirements(
 
                     // Also check server side for reqs that may only exist there
                     for req_file in sync::scan_requirements(&srv_client_dir) {
-                        if result
-                            .iter()
-                            .any(|r| r.filename == req_file && r.source_repo == client.display_name())
-                        {
+                        if result.iter().any(|r| {
+                            r.filename == req_file && r.source_repo == client.display_name()
+                        }) {
                             continue;
                         }
                         let response_name = req_file.replace(".md", ".response.md");
@@ -2176,7 +2179,8 @@ fn get_repo_deploy_config(
     db: State<AppDb>,
     repo_id: i64,
 ) -> Result<HashMap<String, String>, String> {
-    db.get_repo_deploy_config(repo_id).map_err(|e| e.to_string())
+    db.get_repo_deploy_config(repo_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2206,20 +2210,28 @@ pub fn render_files_for_deploy_env(
     db: &AppDb,
     deploy_env_id: i64,
 ) -> Result<Vec<RenderedFile>, String> {
-    let env = db.get_deploy_environment(deploy_env_id)
+    let env = db
+        .get_deploy_environment(deploy_env_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("deploy_environment {} not found", deploy_env_id))?;
-    let repo = db.get_repository(env.repository_id).map_err(|e| e.to_string())?;
-    let target = repo.deploy_target.clone()
+    let repo = db
+        .get_repository(env.repository_id)
+        .map_err(|e| e.to_string())?;
+    let target = repo
+        .deploy_target
+        .clone()
         .ok_or_else(|| "No deploy target set for this repository".to_string())?;
 
     // Load meta.json for file_targets + placeholder defaults
-    let meta_file = db.get_template_file(&target, "meta.json")
+    let meta_file = db
+        .get_template_file(&target, "meta.json")
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("meta.json missing for language '{}'", target))?;
     let meta: serde_json::Value = serde_json::from_str(&meta_file.content)
         .map_err(|e| format!("Invalid meta.json: {}", e))?;
-    let file_targets = meta.get("file_targets").and_then(|v| v.as_object())
+    let file_targets = meta
+        .get("file_targets")
+        .and_then(|v| v.as_object())
         .ok_or_else(|| "meta.json missing 'file_targets'".to_string())?;
 
     // T-000103 Task 3: parse meta.placeholders strict (also gives us each
@@ -2229,22 +2241,34 @@ pub fn render_files_for_deploy_env(
     // T-000103 Task 3: fetch repo-wide deploy config (placeholder values for
     // repo-scope keys like GO_VERSION that render a single repo-wide
     // Dockerfile). Empty map on first render before user fills anything in.
-    let repo_config = db.get_repo_deploy_config(env.repository_id).map_err(|e| e.to_string())?;
+    let repo_config = db
+        .get_repo_deploy_config(env.repository_id)
+        .map_err(|e| e.to_string())?;
 
     // Gather build/runtime secrets for THIS env
-    let secrets = db.list_deploy_secrets(deploy_env_id).map_err(|e| e.to_string())?;
-    let build_for_this_env: Vec<String> = secrets.iter()
+    let secrets = db
+        .list_deploy_secrets(deploy_env_id)
+        .map_err(|e| e.to_string())?;
+    let build_for_this_env: Vec<String> = secrets
+        .iter()
         .filter(|s| s.included && s.role.as_deref() == Some("build"))
-        .map(|s| s.secret_name.clone()).collect();
-    let runtime_for_this_env: Vec<String> = secrets.iter()
+        .map(|s| s.secret_name.clone())
+        .collect();
+    let runtime_for_this_env: Vec<String> = secrets
+        .iter()
         .filter(|s| s.included && s.role.as_deref() == Some("runtime"))
-        .map(|s| s.secret_name.clone()).collect();
+        .map(|s| s.secret_name.clone())
+        .collect();
 
     // UNION build-role secrets across ALL envs of this repo (for shared Dockerfile)
-    let all_envs = db.list_deploy_environments(env.repository_id).map_err(|e| e.to_string())?;
+    let all_envs = db
+        .list_deploy_environments(env.repository_id)
+        .map_err(|e| e.to_string())?;
     let mut union_build: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for e in &all_envs {
-        let esec = db.list_deploy_secrets(e.id).map_err(|err| err.to_string())?;
+        let esec = db
+            .list_deploy_secrets(e.id)
+            .map_err(|err| err.to_string())?;
         for s in esec {
             if s.included && s.role.as_deref() == Some("build") {
                 union_build.insert(s.secret_name);
@@ -2279,7 +2303,9 @@ pub fn render_files_for_deploy_env(
     // Schema-aware merge: pick each declared placeholder's value from the
     // correct source based on its scope. Orphan keys in either source are
     // ignored.
-    for (k, v) in template_render::build_placeholder_vars(&meta_placeholders, &repo_config, &env.extras) {
+    for (k, v) in
+        template_render::build_placeholder_vars(&meta_placeholders, &repo_config, &env.extras)
+    {
         vars.insert(k, v);
     }
     // Core 5 from deploy_env typed columns (overrides defaults — these
@@ -2291,11 +2317,26 @@ pub fn render_files_for_deploy_env(
     vars.insert("DEPLOY_BRANCH".to_string(), env.deploy_branch.clone());
     // v0.18.0-specific synthetic placeholders (not declared in meta.placeholders)
     vars.insert("ENV_NAME".to_string(), env.name.clone());
-    vars.insert("BUILD_ARGS".to_string(), template_render::render_build_args(&build_for_this_env));
-    vars.insert("RUNTIME_ENV_ARGS".to_string(), template_render::render_runtime_env_args(&runtime_for_this_env));
-    vars.insert("DOCKERFILE_ARGS".to_string(), template_render::render_dockerfile_args(&union_build_vec));
-    vars.insert("DOCKERFILE_ENVS".to_string(), template_render::render_dockerfile_envs(&union_build_vec));
-    vars.insert("DART_DEFINES".to_string(), template_render::render_dart_defines(&union_build_vec));
+    vars.insert(
+        "BUILD_ARGS".to_string(),
+        template_render::render_build_args(&build_for_this_env),
+    );
+    vars.insert(
+        "RUNTIME_ENV_ARGS".to_string(),
+        template_render::render_runtime_env_args(&runtime_for_this_env),
+    );
+    vars.insert(
+        "DOCKERFILE_ARGS".to_string(),
+        template_render::render_dockerfile_args(&union_build_vec),
+    );
+    vars.insert(
+        "DOCKERFILE_ENVS".to_string(),
+        template_render::render_dockerfile_envs(&union_build_vec),
+    );
+    vars.insert(
+        "DART_DEFINES".to_string(),
+        template_render::render_dart_defines(&union_build_vec),
+    );
 
     // Render each file from the template dir whose file_name is listed in file_targets
     let all_files = db.list_template_files(&target).map_err(|e| e.to_string())?;
@@ -2306,7 +2347,10 @@ pub fn render_files_for_deploy_env(
         };
         let target_path = target_path_tmpl.replace("{name}", &env.name);
         let content = template_render::render_template(&f.content, &vars)?;
-        rendered.push(RenderedFile { path: target_path, content });
+        rendered.push(RenderedFile {
+            path: target_path,
+            content,
+        });
     }
     Ok(rendered)
 }
@@ -2324,14 +2368,12 @@ fn list_deploy_environments(
     db: State<AppDb>,
     repo_id: i64,
 ) -> Result<Vec<DeployEnvironment>, String> {
-    db.list_deploy_environments(repo_id).map_err(|e| e.to_string())
+    db.list_deploy_environments(repo_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn get_deploy_environment(
-    db: State<AppDb>,
-    id: i64,
-) -> Result<Option<DeployEnvironment>, String> {
+fn get_deploy_environment(db: State<AppDb>, id: i64) -> Result<Option<DeployEnvironment>, String> {
     db.get_deploy_environment(id).map_err(|e| e.to_string())
 }
 
@@ -2341,7 +2383,8 @@ fn create_deploy_environment(
     args: CreateDeployEnvironmentArgs,
 ) -> Result<DeployEnvironment, String> {
     validate_env_name(&args.name)?;
-    db.insert_deploy_environment(&args).map_err(|e| e.to_string())
+    db.insert_deploy_environment(&args)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2351,7 +2394,8 @@ fn clone_deploy_environment(
     new_name: String,
 ) -> Result<DeployEnvironment, String> {
     validate_env_name(&new_name)?;
-    db.clone_deploy_environment(source_id, &new_name).map_err(|e| e.to_string())
+    db.clone_deploy_environment(source_id, &new_name)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2359,7 +2403,8 @@ fn update_deploy_environment(
     db: State<AppDb>,
     args: UpdateDeployEnvironmentArgs,
 ) -> Result<DeployEnvironment, String> {
-    db.update_deploy_environment(&args).map_err(|e| e.to_string())
+    db.update_deploy_environment(&args)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2373,15 +2418,14 @@ fn reorder_deploy_environments(
     repo_id: i64,
     ordered_ids: Vec<i64>,
 ) -> Result<(), String> {
-    db.reorder_deploy_environments(repo_id, &ordered_ids).map_err(|e| e.to_string())
+    db.reorder_deploy_environments(repo_id, &ordered_ids)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn list_deploy_secrets(
-    db: State<AppDb>,
-    deploy_env_id: i64,
-) -> Result<Vec<DeploySecret>, String> {
-    db.list_deploy_secrets(deploy_env_id).map_err(|e| e.to_string())
+fn list_deploy_secrets(db: State<AppDb>, deploy_env_id: i64) -> Result<Vec<DeploySecret>, String> {
+    db.list_deploy_secrets(deploy_env_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2393,8 +2437,14 @@ fn upsert_deploy_secret(
     included: bool,
     override_enabled: bool,
 ) -> Result<(), String> {
-    db.upsert_deploy_secret(deploy_env_id, &secret_name, role.as_deref(), included, override_enabled)
-        .map_err(|e| e.to_string())
+    db.upsert_deploy_secret(
+        deploy_env_id,
+        &secret_name,
+        role.as_deref(),
+        included,
+        override_enabled,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2403,7 +2453,8 @@ fn delete_deploy_secret(
     deploy_env_id: i64,
     secret_name: String,
 ) -> Result<(), String> {
-    db.delete_deploy_secret(deploy_env_id, &secret_name).map_err(|e| e.to_string())
+    db.delete_deploy_secret(deploy_env_id, &secret_name)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2413,9 +2464,13 @@ fn ensure_deploy_secrets_populated(
     repo_secret_names: Vec<String>,
 ) -> Result<(), String> {
     // Parse meta.json to get hints
-    let env = db.get_deploy_environment(deploy_env_id).map_err(|e| e.to_string())?
+    let env = db
+        .get_deploy_environment(deploy_env_id)
+        .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("deploy_env {} not found", deploy_env_id))?;
-    let repo = db.get_repository(env.repository_id).map_err(|e| e.to_string())?;
+    let repo = db
+        .get_repository(env.repository_id)
+        .map_err(|e| e.to_string())?;
     let target = repo.deploy_target.clone().unwrap_or_default();
     let hints = if target.is_empty() {
         Vec::new()
@@ -2432,7 +2487,8 @@ fn register_repo_secret_in_deploys(
     repo_id: i64,
     secret_name: String,
 ) -> Result<(), String> {
-    db.register_repo_secret_in_deploys(repo_id, &secret_name).map_err(|e| e.to_string())
+    db.register_repo_secret_in_deploys(repo_id, &secret_name)
+        .map_err(|e| e.to_string())
 }
 
 fn validate_env_name(name: &str) -> Result<(), String> {
@@ -2442,8 +2498,14 @@ fn validate_env_name(name: &str) -> Result<(), String> {
     if name.len() > 255 {
         return Err("Environment name too long (max 255)".to_string());
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        return Err("Environment name must contain only letters, digits, hyphens and underscores".to_string());
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(
+            "Environment name must contain only letters, digits, hyphens and underscores"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -2453,10 +2515,14 @@ fn validate_env_name(name: &str) -> Result<(), String> {
 /// `template_meta` — custom templates with the obsolete `"scope": "repo"`
 /// secret value fail to load with a UI-friendly error.
 fn parse_meta_secret_hints(db: &AppDb, target: &str) -> Result<Vec<MetaSecretHint>, String> {
-    let meta_file = db.get_template_file(target, "meta.json").map_err(|e| e.to_string())?;
-    let Some(mf) = meta_file else { return Ok(Vec::new()); };
-    let meta: serde_json::Value = serde_json::from_str(&mf.content)
-        .map_err(|e| format!("Invalid meta.json: {}", e))?;
+    let meta_file = db
+        .get_template_file(target, "meta.json")
+        .map_err(|e| e.to_string())?;
+    let Some(mf) = meta_file else {
+        return Ok(Vec::new());
+    };
+    let meta: serde_json::Value =
+        serde_json::from_str(&mf.content).map_err(|e| format!("Invalid meta.json: {}", e))?;
     template_meta::parse_meta_secret_hints(target, &meta)
 }
 
@@ -2643,7 +2709,10 @@ fn write_deploy_files(
 // ── v0.20.0: Task sync commands ───────────────────────────────────────────────
 
 #[tauri::command]
-fn sync_tasks_for_repo_cmd(db: State<AppDb>, repo_id: i64) -> Result<crate::sync::SyncTasksReport, String> {
+fn sync_tasks_for_repo_cmd(
+    db: State<AppDb>,
+    repo_id: i64,
+) -> Result<crate::sync::SyncTasksReport, String> {
     let result = crate::sync::sync_tasks_for_repo(&db, repo_id)?;
     if result.events_emitted > 0 || result.imported > 0 {
         let _ = db.insert_sync_event(
@@ -2659,12 +2728,14 @@ fn sync_tasks_for_repo_cmd(db: State<AppDb>, repo_id: i64) -> Result<crate::sync
 
 #[tauri::command]
 fn read_tasks_from_db(db: State<AppDb>, repo_id: i64) -> Result<Vec<crate::models::Task>, String> {
-    db.list_tasks_by_repo(repo_id, "todo").map_err(|e| e.to_string())
+    db.list_tasks_by_repo(repo_id, "todo")
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn read_done_from_db(db: State<AppDb>, repo_id: i64) -> Result<Vec<crate::models::Task>, String> {
-    db.list_tasks_by_repo(repo_id, "done").map_err(|e| e.to_string())
+    db.list_tasks_by_repo(repo_id, "done")
+        .map_err(|e| e.to_string())
 }
 
 // ── v0.20.0: Event recording commands (called from TS after GitHub API calls) ─
@@ -2684,7 +2755,8 @@ fn record_deploy_secret_event(
         action.as_str(),
         &chrono::Utc::now().to_rfc3339(),
         Some(&details),
-    ).map_err(|e| e.to_string())
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2701,7 +2773,8 @@ fn record_secret_event(
         &chrono::Utc::now().to_rfc3339(),
         1,
         Some(&details),
-    ).map_err(|e| e.to_string())
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2711,7 +2784,8 @@ fn read_timeline(
     offset: u32,
     limit: u32,
 ) -> Result<Vec<crate::models::ActivityEvent>, String> {
-    db.read_timeline_filtered(&filter, offset, limit).map_err(|e| e.to_string())
+    db.read_timeline_filtered(&filter, offset, limit)
+        .map_err(|e| e.to_string())
 }
 
 // ── App entry point ───────────────────────────────────────────────────────────
@@ -2892,7 +2966,9 @@ mod render_deploy_tests {
         std::mem::forget(tmp);
         seed_bundled_templates(&db).unwrap();
         let project = db.create_project("p", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r", "r", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r", "r", Some(project.id), None)
+            .unwrap();
         db.set_deploy_target(repo.id, Some("go")).unwrap();
         // T-000103 Task 3: repo-scope placeholders (GO_VERSION, BINARY_NAME,
         // ENTRY_POINT, APP_PORT) now live in `repositories.deploy_repo_config`,
@@ -2907,23 +2983,25 @@ mod render_deploy_tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         db.set_repo_deploy_config(repo.id, &repo_config).unwrap();
-        let env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: repo.id,
-            name: "prod".to_string(),
-            workflow_name: "Deploy".to_string(),
-            image_tag: "latest".to_string(),
-            compose_service: "backend".to_string(),
-            domain: "x.com".to_string(),
-            deploy_branch: "master".to_string(),
-            extras: {
-                // Env-scope placeholders only — repo-scope ones moved to repo_config above.
-                let mut m = std::collections::HashMap::new();
-                m.insert("ENV_FILE_PATH".to_string(), "".to_string());
-                m.insert("NETWORK_NAME".to_string(), "app_prod_net".to_string());
-                m.insert("COMPOSE_PROJECT".to_string(), "app_prod".to_string());
-                m
-            },
-        }).unwrap();
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: repo.id,
+                name: "prod".to_string(),
+                workflow_name: "Deploy".to_string(),
+                image_tag: "latest".to_string(),
+                compose_service: "backend".to_string(),
+                domain: "x.com".to_string(),
+                deploy_branch: "master".to_string(),
+                extras: {
+                    // Env-scope placeholders only — repo-scope ones moved to repo_config above.
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("ENV_FILE_PATH".to_string(), "".to_string());
+                    m.insert("NETWORK_NAME".to_string(), "app_prod_net".to_string());
+                    m.insert("COMPOSE_PROJECT".to_string(), "app_prod".to_string());
+                    m
+                },
+            })
+            .unwrap();
         (db, repo.id, env.id)
     }
 
@@ -2931,15 +3009,22 @@ mod render_deploy_tests {
     fn test_render_for_env_produces_deploy_yml_with_env_name() {
         let (db, _repo, env_id) = setup();
         // Seed 1 runtime secret for this env
-        db.upsert_deploy_secret(env_id, "DATABASE_URL", Some("runtime"), true, true).unwrap();
+        db.upsert_deploy_secret(env_id, "DATABASE_URL", Some("runtime"), true, true)
+            .unwrap();
         let files = render_files_for_deploy_env(&db, env_id).unwrap();
 
-        let deploy_yml = files.iter().find(|f| f.path == ".github/workflows/deploy-prod.yml")
+        let deploy_yml = files
+            .iter()
+            .find(|f| f.path == ".github/workflows/deploy-prod.yml")
             .expect("deploy-prod.yml must be produced");
         assert!(deploy_yml.content.contains("environment: prod"));
-        assert!(deploy_yml.content.contains("--env DATABASE_URL=\"${{ secrets.DATABASE_URL }}\""));
+        assert!(deploy_yml
+            .content
+            .contains("--env DATABASE_URL=\"${{ secrets.DATABASE_URL }}\""));
         assert!(deploy_yml.content.contains("--network app_prod_net"));
-        assert!(deploy_yml.content.contains("com.docker.compose.project=app_prod"));
+        assert!(deploy_yml
+            .content
+            .contains("com.docker.compose.project=app_prod"));
     }
 
     #[test]
@@ -2948,28 +3033,34 @@ mod render_deploy_tests {
         // T-000103 Task 3: repo-scope keys live in deploy_repo_config (seeded
         // by setup() for both envs of this repo). Only env-scope keys go in
         // each env's `extras`.
-        let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: repo_id,
-            name: "test".to_string(),
-            workflow_name: "Deploy test".to_string(),
-            image_tag: "test".to_string(),
-            compose_service: "backend".to_string(),
-            domain: "test.x.com".to_string(),
-            deploy_branch: "dev".to_string(),
-            extras: {
-                let mut m = std::collections::HashMap::new();
-                m.insert("ENV_FILE_PATH".to_string(), "".to_string());
-                m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
-                m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
-                m
-            },
-        }).unwrap();
+        let test_env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: repo_id,
+                name: "test".to_string(),
+                workflow_name: "Deploy test".to_string(),
+                image_tag: "test".to_string(),
+                compose_service: "backend".to_string(),
+                domain: "test.x.com".to_string(),
+                deploy_branch: "dev".to_string(),
+                extras: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("ENV_FILE_PATH".to_string(), "".to_string());
+                    m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
+                    m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
+                    m
+                },
+            })
+            .unwrap();
 
         let prod_files = render_files_for_deploy_env(&db, prod_id).unwrap();
         let test_files = render_files_for_deploy_env(&db, test_env.id).unwrap();
 
-        assert!(prod_files.iter().any(|f| f.path == ".github/workflows/deploy-prod.yml"));
-        assert!(test_files.iter().any(|f| f.path == ".github/workflows/deploy-test.yml"));
+        assert!(prod_files
+            .iter()
+            .any(|f| f.path == ".github/workflows/deploy-prod.yml"));
+        assert!(test_files
+            .iter()
+            .any(|f| f.path == ".github/workflows/deploy-test.yml"));
     }
 
     #[test]
@@ -2980,28 +3071,38 @@ mod render_deploy_tests {
         // T-000103 Task 3: repo-scope keys live in deploy_repo_config (seeded
         // by setup()). Only env-scope keys go in `extras`.
         let (db, repo_id, prod_id) = setup();
-        let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: repo_id,
-            name: "test".to_string(),
-            workflow_name: "Deploy test".to_string(),
-            image_tag: "test".to_string(),
-            compose_service: "backend".to_string(),
-            domain: "test.x.com".to_string(),
-            deploy_branch: "dev".to_string(),
-            extras: {
-                let mut m = std::collections::HashMap::new();
-                m.insert("ENV_FILE_PATH".to_string(), "".to_string());
-                m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
-                m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
-                m
-            },
-        }).unwrap();
+        let test_env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: repo_id,
+                name: "test".to_string(),
+                workflow_name: "Deploy test".to_string(),
+                image_tag: "test".to_string(),
+                compose_service: "backend".to_string(),
+                domain: "test.x.com".to_string(),
+                deploy_branch: "dev".to_string(),
+                extras: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("ENV_FILE_PATH".to_string(), "".to_string());
+                    m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
+                    m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
+                    m
+                },
+            })
+            .unwrap();
 
         let prod_files = render_files_for_deploy_env(&db, prod_id).unwrap();
         let test_files = render_files_for_deploy_env(&db, test_env.id).unwrap();
 
-        let prod_yml = &prod_files.iter().find(|f| f.path.ends_with("deploy-prod.yml")).unwrap().content;
-        let test_yml = &test_files.iter().find(|f| f.path.ends_with("deploy-test.yml")).unwrap().content;
+        let prod_yml = &prod_files
+            .iter()
+            .find(|f| f.path.ends_with("deploy-prod.yml"))
+            .unwrap()
+            .content;
+        let test_yml = &test_files
+            .iter()
+            .find(|f| f.path.ends_with("deploy-test.yml"))
+            .unwrap()
+            .content;
 
         // Prod-specific values present in prod, absent from test.
         assert!(prod_yml.contains("environment: prod"));
@@ -3009,8 +3110,14 @@ mod render_deploy_tests {
         assert!(prod_yml.contains("com.docker.compose.project=app_prod"));
         assert!(prod_yml.contains("branches: [ master ]"));
         assert!(prod_yml.contains("DOMAIN=x.com"));
-        assert!(!prod_yml.contains("app_test_net"), "prod must not leak test network");
-        assert!(!prod_yml.contains("test.x.com"), "prod must not leak test domain");
+        assert!(
+            !prod_yml.contains("app_test_net"),
+            "prod must not leak test network"
+        );
+        assert!(
+            !prod_yml.contains("test.x.com"),
+            "prod must not leak test domain"
+        );
 
         // Test-specific values present in test, absent from prod.
         assert!(test_yml.contains("environment: test"));
@@ -3018,8 +3125,14 @@ mod render_deploy_tests {
         assert!(test_yml.contains("com.docker.compose.project=app_test"));
         assert!(test_yml.contains("branches: [ dev ]"));
         assert!(test_yml.contains("DOMAIN=test.x.com"));
-        assert!(!test_yml.contains("app_prod_net"), "test must not leak prod network");
-        assert!(!test_yml.contains("DOMAIN=x.com\n"), "test must not leak prod domain");
+        assert!(
+            !test_yml.contains("app_prod_net"),
+            "test must not leak prod network"
+        );
+        assert!(
+            !test_yml.contains("DOMAIN=x.com\n"),
+            "test must not leak prod domain"
+        );
     }
 
     #[test]
@@ -3027,37 +3140,67 @@ mod render_deploy_tests {
         // Each env's runtime secrets must appear only in that env's deploy.yml.
         // T-000103 Task 3: APP_PORT lives in deploy_repo_config (seeded by setup()).
         let (db, repo_id, prod_id) = setup();
-        let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: repo_id,
-            name: "test".to_string(),
-            workflow_name: "Deploy test".to_string(),
-            image_tag: "test".to_string(),
-            compose_service: "backend".to_string(),
-            domain: "test.x.com".to_string(),
-            deploy_branch: "dev".to_string(),
-            extras: {
-                let mut m = std::collections::HashMap::new();
-                m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
-                m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
-                m.insert("ENV_FILE_PATH".to_string(), "".to_string());
-                m
-            },
-        }).unwrap();
+        let test_env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: repo_id,
+                name: "test".to_string(),
+                workflow_name: "Deploy test".to_string(),
+                image_tag: "test".to_string(),
+                compose_service: "backend".to_string(),
+                domain: "test.x.com".to_string(),
+                deploy_branch: "dev".to_string(),
+                extras: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
+                    m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
+                    m.insert("ENV_FILE_PATH".to_string(), "".to_string());
+                    m
+                },
+            })
+            .unwrap();
 
         // Per-env runtime secrets: prod gets DATABASE_URL_PROD, test gets DATABASE_URL_TEST.
-        db.upsert_deploy_secret(prod_id, "DATABASE_URL_PROD", Some("runtime"), true, true).unwrap();
-        db.upsert_deploy_secret(test_env.id, "DATABASE_URL_TEST", Some("runtime"), true, true).unwrap();
+        db.upsert_deploy_secret(prod_id, "DATABASE_URL_PROD", Some("runtime"), true, true)
+            .unwrap();
+        db.upsert_deploy_secret(
+            test_env.id,
+            "DATABASE_URL_TEST",
+            Some("runtime"),
+            true,
+            true,
+        )
+        .unwrap();
 
         let prod_files = render_files_for_deploy_env(&db, prod_id).unwrap();
         let test_files = render_files_for_deploy_env(&db, test_env.id).unwrap();
 
-        let prod_yml = &prod_files.iter().find(|f| f.path.ends_with("deploy-prod.yml")).unwrap().content;
-        let test_yml = &test_files.iter().find(|f| f.path.ends_with("deploy-test.yml")).unwrap().content;
+        let prod_yml = &prod_files
+            .iter()
+            .find(|f| f.path.ends_with("deploy-prod.yml"))
+            .unwrap()
+            .content;
+        let test_yml = &test_files
+            .iter()
+            .find(|f| f.path.ends_with("deploy-test.yml"))
+            .unwrap()
+            .content;
 
-        assert!(prod_yml.contains("DATABASE_URL_PROD"), "prod must reference its own runtime secret");
-        assert!(!prod_yml.contains("DATABASE_URL_TEST"), "prod must not leak test runtime secret");
-        assert!(test_yml.contains("DATABASE_URL_TEST"), "test must reference its own runtime secret");
-        assert!(!test_yml.contains("DATABASE_URL_PROD"), "test must not leak prod runtime secret");
+        assert!(
+            prod_yml.contains("DATABASE_URL_PROD"),
+            "prod must reference its own runtime secret"
+        );
+        assert!(
+            !prod_yml.contains("DATABASE_URL_TEST"),
+            "prod must not leak test runtime secret"
+        );
+        assert!(
+            test_yml.contains("DATABASE_URL_TEST"),
+            "test must reference its own runtime secret"
+        );
+        assert!(
+            !test_yml.contains("DATABASE_URL_PROD"),
+            "test must not leak prod runtime secret"
+        );
     }
 
     #[test]
@@ -3073,29 +3216,39 @@ mod render_deploy_tests {
         // so identical-rendered-Dockerfile becomes a structural guarantee, not
         // a coincidence-of-matching-extras).
         let (db, repo_id, prod_id) = setup();
-        let test_env = db.insert_deploy_environment(&CreateDeployEnvironmentArgs {
-            repository_id: repo_id,
-            name: "test".to_string(),
-            workflow_name: "Deploy test".to_string(),
-            image_tag: "test".to_string(),
-            compose_service: "backend".to_string(),
-            domain: "test.x.com".to_string(),
-            deploy_branch: "dev".to_string(),
-            extras: {
-                let mut m = std::collections::HashMap::new();
-                m.insert("ENV_FILE_PATH".to_string(), "".to_string());
-                // Env-specific values differ from prod — must NOT affect Dockerfile.
-                m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
-                m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
-                m
-            },
-        }).unwrap();
+        let test_env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: repo_id,
+                name: "test".to_string(),
+                workflow_name: "Deploy test".to_string(),
+                image_tag: "test".to_string(),
+                compose_service: "backend".to_string(),
+                domain: "test.x.com".to_string(),
+                deploy_branch: "dev".to_string(),
+                extras: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("ENV_FILE_PATH".to_string(), "".to_string());
+                    // Env-specific values differ from prod — must NOT affect Dockerfile.
+                    m.insert("NETWORK_NAME".to_string(), "app_test_net".to_string());
+                    m.insert("COMPOSE_PROJECT".to_string(), "app_test".to_string());
+                    m
+                },
+            })
+            .unwrap();
 
         let prod_files = render_files_for_deploy_env(&db, prod_id).unwrap();
         let test_files = render_files_for_deploy_env(&db, test_env.id).unwrap();
 
-        let prod_dockerfile = &prod_files.iter().find(|f| f.path == "Dockerfile").unwrap().content;
-        let test_dockerfile = &test_files.iter().find(|f| f.path == "Dockerfile").unwrap().content;
+        let prod_dockerfile = &prod_files
+            .iter()
+            .find(|f| f.path == "Dockerfile")
+            .unwrap()
+            .content;
+        let test_dockerfile = &test_files
+            .iter()
+            .find(|f| f.path == "Dockerfile")
+            .unwrap()
+            .content;
         assert_eq!(
             prod_dockerfile, test_dockerfile,
             "Go Dockerfile is repo-wide; identical extras must render identical Dockerfile"

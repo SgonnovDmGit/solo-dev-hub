@@ -22,20 +22,36 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
     (1, "initial_schema", mig_v1_initial),
     (2, "bug_notes_category", mig_v2_bug_notes_category),
     (3, "repositories_local_path", mig_v3_local_path),
-    (4, "repositories_role_check_expanded", mig_v4_role_check_expanded),
+    (
+        4,
+        "repositories_role_check_expanded",
+        mig_v4_role_check_expanded,
+    ),
     (5, "project_microservices", mig_v5_project_microservices),
     (6, "bug_stats_v1", mig_v6_bug_stats_v1),
     (7, "bug_stats_v2_with_date", mig_v7_bug_stats_v2),
-    (8, "bug_stats_resolved_count", mig_v8_bug_stats_resolved_count),
+    (
+        8,
+        "bug_stats_resolved_count",
+        mig_v8_bug_stats_resolved_count,
+    ),
     (9, "repositories_github_id", mig_v9_repositories_github_id),
     (10, "templates_table", mig_v10_templates),
     (11, "deploy_target_and_manifests", mig_v11_deploy_manifests),
-    (12, "project_type_microservices_rebuild", mig_v12_project_type),
+    (
+        12,
+        "project_type_microservices_rebuild",
+        mig_v12_project_type,
+    ),
     (13, "github_name_nullable", mig_v13_github_name_nullable),
     (14, "manual_ordering_sort_order", mig_v14_sort_order),
     (15, "deploy_extras_json", mig_v15_deploy_extras),
     (16, "repo_renames_log", mig_v16_repo_renames),
-    (17, "drop_bug_file_path_setting", mig_v17_drop_bug_file_path_setting),
+    (
+        17,
+        "drop_bug_file_path_setting",
+        mig_v17_drop_bug_file_path_setting,
+    ),
     (18, "bugs_sot_table", mig_v18_bugs_sot),
     (19, "bug_events_log", mig_v19_bug_events),
     (20, "deploy_environments_multi", mig_v20_deploy_environments),
@@ -677,7 +693,9 @@ fn mig_v25_data_move(conn: &Connection) -> SqlResult<()> {
                 |row| row.get::<_, String>(0),
             )
             .ok();
-        let Some(meta_str) = meta_content else { continue };
+        let Some(meta_str) = meta_content else {
+            continue;
+        };
 
         // Parse meta.json. If invalid JSON → skip (don't crash migration).
         let meta: serde_json::Value = match serde_json::from_str(&meta_str) {
@@ -798,8 +816,8 @@ fn mig_v25_data_move(conn: &Connection) -> SqlResult<()> {
         }
 
         // Persist deploy_repo_config on the repo.
-        let repo_config_json = serde_json::to_string(&repo_config)
-            .unwrap_or_else(|_| "{}".to_string());
+        let repo_config_json =
+            serde_json::to_string(&repo_config).unwrap_or_else(|_| "{}".to_string());
         conn.execute(
             "UPDATE repositories SET deploy_repo_config = ?1 WHERE id = ?2",
             rusqlite::params![repo_config_json, repo_id],
@@ -871,20 +889,24 @@ mod tests {
         let db = make_db();
         let conn = db.conn.lock().unwrap();
         // Table exists
-        let count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='bug_events'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='bug_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1, "bug_events table must exist");
 
         // Three indexes created
-        let idx_count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+        let idx_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
              AND name IN ('idx_bug_events_bug','idx_bug_events_ts','idx_bug_events_type_ts')",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(idx_count, 3, "three bug_events indexes expected");
 
         // idx_bugs_confirmed_at partial index also created
@@ -900,8 +922,23 @@ mod tests {
     fn test_db_migration_v19_bug_events_check_constraint() {
         let db = make_db();
         // A bug is needed for the FK to be satisfied
-        let repo = db.insert_local_repository("/tmp/r1", "r1", None, None).unwrap();
-        let bug = db.insert_bug(repo.id, 1, "2026-01-01T00:00:00Z", "desc", "minor", "other", "created", 0, None, None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", None, None)
+            .unwrap();
+        let bug = db
+            .insert_bug(
+                repo.id,
+                1,
+                "2026-01-01T00:00:00Z",
+                "desc",
+                "minor",
+                "other",
+                "created",
+                0,
+                None,
+                None,
+            )
+            .unwrap();
 
         let conn = db.conn.lock().unwrap();
         // Valid event_type inserts
@@ -909,7 +946,8 @@ mod tests {
             "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status)
              VALUES (?1, 'created', '2026-01-01T00:00:00Z', NULL, 'created')",
             [bug.id],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Invalid event_type rejected
         let bad = conn.execute(
@@ -1015,43 +1053,77 @@ mod tests {
         // because we're using the real CURRENT DB which already has v20 applied;
         // for this smoke test we use the NEW deploy_environments table directly).
         let project = db.create_project("p1", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/test-repo", "test-repo", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/test-repo", "test-repo", Some(project.id), None)
+            .unwrap();
 
         // New schema invariant: deploy_environments table exists + has expected columns.
         let conn = db.conn.lock().unwrap();
-        let cols: Vec<String> = conn.prepare("PRAGMA table_info(deploy_environments)")
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(deploy_environments)")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .filter_map(Result::ok)
             .collect();
-        for expected in &["id", "repository_id", "name", "workflow_name", "image_tag",
-                           "compose_service", "domain", "deploy_branch", "sort_order",
-                           "extras", "updated_at"] {
-            assert!(cols.contains(&expected.to_string()), "missing column {}", expected);
+        for expected in &[
+            "id",
+            "repository_id",
+            "name",
+            "workflow_name",
+            "image_tag",
+            "compose_service",
+            "domain",
+            "deploy_branch",
+            "sort_order",
+            "extras",
+            "updated_at",
+        ] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "missing column {}",
+                expected
+            );
         }
 
         // deploy_secrets table exists
-        let cols2: Vec<String> = conn.prepare("PRAGMA table_info(deploy_secrets)")
+        let cols2: Vec<String> = conn
+            .prepare("PRAGMA table_info(deploy_secrets)")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .filter_map(Result::ok)
             .collect();
-        for expected in &["id", "deploy_env_id", "secret_name", "role",
-                           "included", "override_enabled", "sort_order"] {
-            assert!(cols2.contains(&expected.to_string()), "missing deploy_secrets column {}", expected);
+        for expected in &[
+            "id",
+            "deploy_env_id",
+            "secret_name",
+            "role",
+            "included",
+            "override_enabled",
+            "sort_order",
+        ] {
+            assert!(
+                cols2.contains(&expected.to_string()),
+                "missing deploy_secrets column {}",
+                expected
+            );
         }
 
         // deploy_manifests dropped
-        let manifest_exists: bool = conn.query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='deploy_manifests'",
-            [], |_| Ok(true),
-        ).unwrap_or(false);
+        let manifest_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='deploy_manifests'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
         // user_version bumped (v20 migration ran; v21..v25 also applied on fresh DB)
-        let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
         assert_eq!(version, 25);
 
         drop(conn);
@@ -1070,7 +1142,9 @@ mod tests {
         let path = tmp.path().join("test.db");
         let db = AppDb::new(path).unwrap();
         let project = db.create_project("p1", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", Some(project.id), None)
+            .unwrap();
 
         let conn = db.conn.lock().unwrap();
         conn.execute(
@@ -1078,13 +1152,16 @@ mod tests {
              compose_service, domain, deploy_branch, extras)
              VALUES (?1, 'prod', 'Deploy', 'latest', 'backend', 'x.com', 'master', '{}')",
             rusqlite::params![repo.id],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let (name, branch): (String, String) = conn.query_row(
-            "SELECT name, deploy_branch FROM deploy_environments WHERE repository_id = ?1",
-            rusqlite::params![repo.id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (name, branch): (String, String) = conn
+            .query_row(
+                "SELECT name, deploy_branch FROM deploy_environments WHERE repository_id = ?1",
+                rusqlite::params![repo.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(name, "prod");
         assert_eq!(branch, "master");
 
@@ -1101,7 +1178,10 @@ mod tests {
             [],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(count, 4, "4 new tables expected (tasks, task_events, sync_events, deploy_events)");
+        assert_eq!(
+            count, 4,
+            "4 new tables expected (tasks, task_events, sync_events, deploy_events)"
+        );
     }
 
     #[test]
@@ -1145,7 +1225,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 0, "bug_stats VIEW should be dropped by v23, but still exists");
+        assert_eq!(
+            count, 0,
+            "bug_stats VIEW should be dropped by v23, but still exists"
+        );
 
         // No `bug_stats` table either (it was dropped in v18 when the VIEW
         // replaced it; ensure v23 didn't accidentally recreate the legacy table).
@@ -1192,7 +1275,9 @@ mod tests {
         let path = tmp.path().join("test.db");
         let db = AppDb::new(path).unwrap();
         let project = db.create_project("p1", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", Some(project.id), None)
+            .unwrap();
 
         let conn = db.conn.lock().unwrap();
         conn.execute(
@@ -1200,17 +1285,20 @@ mod tests {
              compose_service, domain, deploy_branch, extras)
              VALUES (?1, 'prod', 'Deploy', 'latest', 'svc', 'x.com', 'master', '{}')",
             rusqlite::params![repo.id],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         db.delete_repository(repo.id).unwrap();
 
         let conn = db.conn.lock().unwrap();
-        let remaining: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM deploy_environments WHERE repository_id = ?1",
-            rusqlite::params![repo.id],
-            |r| r.get(0),
-        ).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM deploy_environments WHERE repository_id = ?1",
+                rusqlite::params![repo.id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(remaining, 0, "deploy_environments row must cascade-delete");
         drop(conn);
         std::mem::forget(tmp);
@@ -1245,7 +1333,8 @@ mod tests {
             "INSERT INTO templates (language_key, file_name, content, is_custom)
              VALUES (?1, 'meta.json', ?2, 0)",
             rusqlite::params![language_key, meta.to_string()],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     fn seed_template_without_repo_scope(db: &AppDb, language_key: &str) {
@@ -1262,11 +1351,18 @@ mod tests {
             "INSERT INTO templates (language_key, file_name, content, is_custom)
              VALUES (?1, 'meta.json', ?2, 0)",
             rusqlite::params![language_key, meta.to_string()],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     /// Insert a deploy_env row with the given name, sort_order, and extras map.
-    fn insert_env(db: &AppDb, repo_id: i64, name: &str, sort_order: i64, extras: serde_json::Value) -> i64 {
+    fn insert_env(
+        db: &AppDb,
+        repo_id: i64,
+        name: &str,
+        sort_order: i64,
+        extras: serde_json::Value,
+    ) -> i64 {
         let conn = db.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO deploy_environments
@@ -1284,7 +1380,8 @@ mod tests {
             "SELECT deploy_repo_config FROM repositories WHERE id = ?1",
             rusqlite::params![repo_id],
             |r| r.get::<_, String>(0),
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     fn get_env_extras(db: &AppDb, env_id: i64) -> String {
@@ -1293,7 +1390,8 @@ mod tests {
             "SELECT extras FROM deploy_environments WHERE id = ?1",
             rusqlite::params![env_id],
             |r| r.get::<_, String>(0),
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     fn count_migration_events(db: &AppDb) -> i64 {
@@ -1302,7 +1400,8 @@ mod tests {
             "SELECT COUNT(*) FROM sync_events WHERE sync_type = 'migration'",
             [],
             |r| r.get(0),
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1312,7 +1411,9 @@ mod tests {
         // is stripped from env.extras.
         let db = make_db();
         let project = db.create_project("p", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", Some(project.id), None)
+            .unwrap();
         db.set_deploy_target(repo.id, Some("go")).unwrap();
         seed_template_with_repo_scope(&db, "go", &["GO_VERSION"]);
         let env_id = insert_env(
@@ -1330,14 +1431,27 @@ mod tests {
 
         let repo_config: std::collections::HashMap<String, String> =
             serde_json::from_str(&get_repo_config(&db, repo.id)).unwrap();
-        assert_eq!(repo_config.get("GO_VERSION").map(|s| s.as_str()), Some("1.26-alpine"));
+        assert_eq!(
+            repo_config.get("GO_VERSION").map(|s| s.as_str()),
+            Some("1.26-alpine")
+        );
 
         let env_extras: std::collections::HashMap<String, String> =
             serde_json::from_str(&get_env_extras(&db, env_id)).unwrap();
-        assert!(!env_extras.contains_key("GO_VERSION"), "GO_VERSION must be stripped from env extras");
-        assert_eq!(env_extras.get("APP_PORT").map(|s| s.as_str()), Some("8080"),
-            "env-scope keys must remain in extras");
-        assert_eq!(count_migration_events(&db), 0, "no conflict → no sync_events row");
+        assert!(
+            !env_extras.contains_key("GO_VERSION"),
+            "GO_VERSION must be stripped from env extras"
+        );
+        assert_eq!(
+            env_extras.get("APP_PORT").map(|s| s.as_str()),
+            Some("8080"),
+            "env-scope keys must remain in extras"
+        );
+        assert_eq!(
+            count_migration_events(&db),
+            0,
+            "no conflict → no sync_events row"
+        );
     }
 
     #[test]
@@ -1345,11 +1459,25 @@ mod tests {
         // 2 envs with identical GO_VERSION value → no sync_event row, just lift.
         let db = make_db();
         let project = db.create_project("p", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r2", "r2", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r2", "r2", Some(project.id), None)
+            .unwrap();
         db.set_deploy_target(repo.id, Some("go")).unwrap();
         seed_template_with_repo_scope(&db, "go", &["GO_VERSION"]);
-        let prod = insert_env(&db, repo.id, "prod", 0, serde_json::json!({"GO_VERSION": "1.26-alpine"}));
-        let test = insert_env(&db, repo.id, "test", 1, serde_json::json!({"GO_VERSION": "1.26-alpine"}));
+        let prod = insert_env(
+            &db,
+            repo.id,
+            "prod",
+            0,
+            serde_json::json!({"GO_VERSION": "1.26-alpine"}),
+        );
+        let test = insert_env(
+            &db,
+            repo.id,
+            "test",
+            1,
+            serde_json::json!({"GO_VERSION": "1.26-alpine"}),
+        );
 
         let conn = db.conn.lock().unwrap();
         mig_v25_data_move(&conn).unwrap();
@@ -1357,7 +1485,10 @@ mod tests {
 
         let repo_config: std::collections::HashMap<String, String> =
             serde_json::from_str(&get_repo_config(&db, repo.id)).unwrap();
-        assert_eq!(repo_config.get("GO_VERSION").map(|s| s.as_str()), Some("1.26-alpine"));
+        assert_eq!(
+            repo_config.get("GO_VERSION").map(|s| s.as_str()),
+            Some("1.26-alpine")
+        );
         // Both envs stripped
         let prod_extras: std::collections::HashMap<String, String> =
             serde_json::from_str(&get_env_extras(&db, prod)).unwrap();
@@ -1365,8 +1496,11 @@ mod tests {
         let test_extras: std::collections::HashMap<String, String> =
             serde_json::from_str(&get_env_extras(&db, test)).unwrap();
         assert!(!test_extras.contains_key("GO_VERSION"));
-        assert_eq!(count_migration_events(&db), 0,
-            "identical values across envs → no conflict logged");
+        assert_eq!(
+            count_migration_events(&db),
+            0,
+            "identical values across envs → no conflict logged"
+        );
     }
 
     #[test]
@@ -1376,11 +1510,25 @@ mod tests {
         // logged with details JSON.
         let db = make_db();
         let project = db.create_project("p", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r3", "r3", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r3", "r3", Some(project.id), None)
+            .unwrap();
         db.set_deploy_target(repo.id, Some("go")).unwrap();
         seed_template_with_repo_scope(&db, "go", &["GO_VERSION"]);
-        insert_env(&db, repo.id, "prod", 0, serde_json::json!({"GO_VERSION": "1.26-alpine"}));
-        insert_env(&db, repo.id, "test", 1, serde_json::json!({"GO_VERSION": "alpine"}));
+        insert_env(
+            &db,
+            repo.id,
+            "prod",
+            0,
+            serde_json::json!({"GO_VERSION": "1.26-alpine"}),
+        );
+        insert_env(
+            &db,
+            repo.id,
+            "test",
+            1,
+            serde_json::json!({"GO_VERSION": "alpine"}),
+        );
 
         let conn = db.conn.lock().unwrap();
         mig_v25_data_move(&conn).unwrap();
@@ -1388,17 +1536,22 @@ mod tests {
 
         let repo_config: std::collections::HashMap<String, String> =
             serde_json::from_str(&get_repo_config(&db, repo.id)).unwrap();
-        assert_eq!(repo_config.get("GO_VERSION").map(|s| s.as_str()), Some("1.26-alpine"),
-            "first env by sort_order ASC wins");
+        assert_eq!(
+            repo_config.get("GO_VERSION").map(|s| s.as_str()),
+            Some("1.26-alpine"),
+            "first env by sort_order ASC wins"
+        );
 
         // sync_events row exists with sync_type='migration' and details parseable
         let conn = db.conn.lock().unwrap();
-        let (sync_type, change_count, details): (String, i64, String) = conn.query_row(
-            "SELECT sync_type, change_count, details FROM sync_events
+        let (sync_type, change_count, details): (String, i64, String) = conn
+            .query_row(
+                "SELECT sync_type, change_count, details FROM sync_events
              WHERE repository_id = ?1 AND sync_type = 'migration'",
-            rusqlite::params![repo.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap();
+                rusqlite::params![repo.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
         assert_eq!(sync_type, "migration");
         assert_eq!(change_count, 1, "1 conflicting key");
         let parsed: serde_json::Value = serde_json::from_str(&details).unwrap();
@@ -1407,11 +1560,20 @@ mod tests {
         let c = &conflicts[0];
         assert_eq!(c.get("key").and_then(|v| v.as_str()), Some("GO_VERSION"));
         assert_eq!(c.get("kept_env").and_then(|v| v.as_str()), Some("prod"));
-        assert_eq!(c.get("kept_value").and_then(|v| v.as_str()), Some("1.26-alpine"));
+        assert_eq!(
+            c.get("kept_value").and_then(|v| v.as_str()),
+            Some("1.26-alpine")
+        );
         let discarded = c.get("discarded").and_then(|v| v.as_array()).unwrap();
         assert_eq!(discarded.len(), 1);
-        assert_eq!(discarded[0].get("env").and_then(|v| v.as_str()), Some("test"));
-        assert_eq!(discarded[0].get("value").and_then(|v| v.as_str()), Some("alpine"));
+        assert_eq!(
+            discarded[0].get("env").and_then(|v| v.as_str()),
+            Some("test")
+        );
+        assert_eq!(
+            discarded[0].get("value").and_then(|v| v.as_str()),
+            Some("alpine")
+        );
     }
 
     #[test]
@@ -1420,30 +1582,44 @@ mod tests {
         // must NOT touch that repo (no strip, no overwrite).
         let db = make_db();
         let project = db.create_project("p", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r4", "r4", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r4", "r4", Some(project.id), None)
+            .unwrap();
         db.set_deploy_target(repo.id, Some("go")).unwrap();
         seed_template_with_repo_scope(&db, "go", &["GO_VERSION"]);
-        let env_id = insert_env(&db, repo.id, "prod", 0,
-            serde_json::json!({"GO_VERSION": "from-env"}));
+        let env_id = insert_env(
+            &db,
+            repo.id,
+            "prod",
+            0,
+            serde_json::json!({"GO_VERSION": "from-env"}),
+        );
 
         // Pre-seed deploy_repo_config so the idempotency guard kicks in.
         let conn = db.conn.lock().unwrap();
         conn.execute(
             "UPDATE repositories SET deploy_repo_config = ?1 WHERE id = ?2",
             rusqlite::params![r#"{"GO_VERSION":"preseeded"}"#, repo.id],
-        ).unwrap();
+        )
+        .unwrap();
         mig_v25_data_move(&conn).unwrap();
         drop(conn);
 
         // Repo config NOT overwritten
         let repo_config: std::collections::HashMap<String, String> =
             serde_json::from_str(&get_repo_config(&db, repo.id)).unwrap();
-        assert_eq!(repo_config.get("GO_VERSION").map(|s| s.as_str()), Some("preseeded"));
+        assert_eq!(
+            repo_config.get("GO_VERSION").map(|s| s.as_str()),
+            Some("preseeded")
+        );
         // Env extras NOT stripped
         let env_extras: std::collections::HashMap<String, String> =
             serde_json::from_str(&get_env_extras(&db, env_id)).unwrap();
-        assert_eq!(env_extras.get("GO_VERSION").map(|s| s.as_str()), Some("from-env"),
-            "env extras must NOT be touched on idempotent re-run");
+        assert_eq!(
+            env_extras.get("GO_VERSION").map(|s| s.as_str()),
+            Some("from-env"),
+            "env extras must NOT be touched on idempotent re-run"
+        );
     }
 
     #[test]
@@ -1453,11 +1629,18 @@ mod tests {
         // env.extras untouched.
         let db = make_db();
         let project = db.create_project("p", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r5", "r5", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r5", "r5", Some(project.id), None)
+            .unwrap();
         db.set_deploy_target(repo.id, Some("flutter_web")).unwrap();
         seed_template_without_repo_scope(&db, "flutter_web");
-        let env_id = insert_env(&db, repo.id, "prod", 0,
-            serde_json::json!({"DOMAIN": "example.com"}));
+        let env_id = insert_env(
+            &db,
+            repo.id,
+            "prod",
+            0,
+            serde_json::json!({"DOMAIN": "example.com"}),
+        );
 
         let conn = db.conn.lock().unwrap();
         mig_v25_data_move(&conn).unwrap();
@@ -1466,8 +1649,11 @@ mod tests {
         assert_eq!(get_repo_config(&db, repo.id), "{}");
         let env_extras: std::collections::HashMap<String, String> =
             serde_json::from_str(&get_env_extras(&db, env_id)).unwrap();
-        assert_eq!(env_extras.get("DOMAIN").map(|s| s.as_str()), Some("example.com"),
-            "env-scope keys untouched");
+        assert_eq!(
+            env_extras.get("DOMAIN").map(|s| s.as_str()),
+            Some("example.com"),
+            "env-scope keys untouched"
+        );
         assert_eq!(count_migration_events(&db), 0);
     }
 
@@ -1477,10 +1663,17 @@ mod tests {
         // meta.json row). Must not error, must not touch any data.
         let db = make_db();
         let project = db.create_project("p", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r6", "r6", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r6", "r6", Some(project.id), None)
+            .unwrap();
         db.set_deploy_target(repo.id, Some("unknown_xyz")).unwrap();
-        let env_id = insert_env(&db, repo.id, "prod", 0,
-            serde_json::json!({"GO_VERSION": "1.26-alpine"}));
+        let env_id = insert_env(
+            &db,
+            repo.id,
+            "prod",
+            0,
+            serde_json::json!({"GO_VERSION": "1.26-alpine"}),
+        );
 
         let conn = db.conn.lock().unwrap();
         mig_v25_data_move(&conn).unwrap();
@@ -1489,11 +1682,16 @@ mod tests {
         assert_eq!(get_repo_config(&db, repo.id), "{}");
         let env_extras: std::collections::HashMap<String, String> =
             serde_json::from_str(&get_env_extras(&db, env_id)).unwrap();
-        assert_eq!(env_extras.get("GO_VERSION").map(|s| s.as_str()), Some("1.26-alpine"));
+        assert_eq!(
+            env_extras.get("GO_VERSION").map(|s| s.as_str()),
+            Some("1.26-alpine")
+        );
 
         // Repo with deploy_target = NULL: also a no-op. We can also test the
         // NULL case by using a fresh repo without set_deploy_target.
-        let repo2 = db.insert_local_repository("/tmp/r7", "r7", Some(project.id), None).unwrap();
+        let repo2 = db
+            .insert_local_repository("/tmp/r7", "r7", Some(project.id), None)
+            .unwrap();
         assert!(repo2.deploy_target.is_none());
         let conn = db.conn.lock().unwrap();
         mig_v25_data_move(&conn).unwrap();
@@ -1506,7 +1704,9 @@ mod tests {
         // Sanity check: column exists with default '{}' on every repo row.
         let db = make_db();
         let _proj = db.create_project("p", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r-col", "r-col", None, None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r-col", "r-col", None, None)
+            .unwrap();
         assert_eq!(get_repo_config(&db, repo.id), "{}");
     }
 }

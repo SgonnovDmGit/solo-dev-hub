@@ -39,15 +39,15 @@ pub struct Bug {
 /// (not present in MD-facing `FileBugNote`). UI-only — never serialized to MD.
 #[derive(Debug, Serialize, Clone)]
 pub struct BugView {
-    pub id: String,              // display_id, "B-000042"
-    pub date: String,            // YYYY-MM-DD (date portion of created_at)
+    pub id: String,   // display_id, "B-000042"
+    pub date: String, // YYYY-MM-DD (date portion of created_at)
     pub description: String,
     pub severity: String,
     pub category: String,
     pub status: String,
     pub fix_attempts: i32,
     pub comment: Option<String>,
-    pub confirmed_at: Option<String>,  // YYYY-MM-DD or None
+    pub confirmed_at: Option<String>, // YYYY-MM-DD or None
 }
 
 impl Bug {

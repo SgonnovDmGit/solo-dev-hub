@@ -63,7 +63,11 @@ pub fn valid_transition(from: &str, to: &str) -> bool {
 /// timestamp is truncated to `YYYY-MM-DD` (first 10 chars) to match the MD
 /// contract. `confirmed_at` is not in MD — lives in DB only.
 fn bug_to_file_note(bug: &Bug) -> FileBugNote {
-    let date = bug.created_at.get(..10).unwrap_or(&bug.created_at).to_string();
+    let date = bug
+        .created_at
+        .get(..10)
+        .unwrap_or(&bug.created_at)
+        .to_string();
     FileBugNote {
         id: bug.display_id.clone(),
         date,
@@ -412,10 +416,10 @@ mod tests {
     fn test_valid_transition_whitelist() {
         // Forward progress
         assert!(valid_transition("created", "in-progress"));
-        assert!(valid_transition("created", "testing"));          // quick-fix shortcut
+        assert!(valid_transition("created", "testing")); // quick-fix shortcut
         assert!(valid_transition("in-progress", "testing"));
         assert!(valid_transition("rejected", "in-progress"));
-        assert!(valid_transition("rejected", "testing"));         // retry after rejection
+        assert!(valid_transition("rejected", "testing")); // retry after rejection
 
         // UI-only paths via ✓/✗ buttons (resolve_bug / reject_bug commands).
         // NOT reachable via LLM MD edit — otherwise LLM could bypass the
@@ -582,8 +586,14 @@ mod tests {
         reconcile_bugs_for_repo(&db, rid).unwrap();
 
         let b = db.get_bug_by_display_id(rid, "B-000001").unwrap().unwrap();
-        assert_eq!(b.status, "testing", "LLM cannot bypass user-verification gate");
-        assert!(b.confirmed_at.is_none(), "confirmed_at set only via UI resolve_bug");
+        assert_eq!(
+            b.status, "testing",
+            "LLM cannot bypass user-verification gate"
+        );
+        assert!(
+            b.confirmed_at.is_none(),
+            "confirmed_at set only via UI resolve_bug"
+        );
     }
 
     #[test]
@@ -734,9 +744,7 @@ mod tests {
         // LLM updates comment only (no status change).
         write_bug_reports_md(
             tmp.path(),
-            &[
-                "- B-000001 | 2026-03-01 | bug | minor | other | in-progress | 0 | debugging now",
-            ],
+            &["- B-000001 | 2026-03-01 | bug | minor | other | in-progress | 0 | debugging now"],
         );
         reconcile_bugs_for_repo(&db, rid).unwrap();
 
@@ -778,16 +786,41 @@ mod tests {
         // v0.21.1: confirmed bugs appear in MD until LLM-acknowledged
         // (archived_from_md_at IS NULL). Both active and unacknowledged-confirmed rows show.
         let (db, tmp, rid) = setup_repo_with_dir();
-        db.insert_bug(rid, 1, "2026-03-01T00:00:00Z", "active", "minor", "other",
-                      "created", 0, None, None).unwrap();
-        db.insert_bug(rid, 2, "2026-03-02T00:00:00Z", "fresh-confirm", "minor", "other",
-                      "confirmed", 1, None, Some("2026-04-24T10:00:00Z")).unwrap();
+        db.insert_bug(
+            rid,
+            1,
+            "2026-03-01T00:00:00Z",
+            "active",
+            "minor",
+            "other",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_bug(
+            rid,
+            2,
+            "2026-03-02T00:00:00Z",
+            "fresh-confirm",
+            "minor",
+            "other",
+            "confirmed",
+            1,
+            None,
+            Some("2026-04-24T10:00:00Z"),
+        )
+        .unwrap();
 
         regenerate_bugs_md(&db, rid).unwrap();
 
         let md = read_bug_reports_md(tmp.path());
         assert!(md.contains("B-000001"), "active bug must appear in MD");
-        assert!(md.contains("B-000002"), "fresh confirmed (not yet acknowledged) must appear");
+        assert!(
+            md.contains("B-000002"),
+            "fresh confirmed (not yet acknowledged) must appear"
+        );
     }
 
     #[test]
@@ -812,11 +845,15 @@ mod tests {
             conn.execute(
                 "UPDATE bugs SET archived_from_md_at = NULL WHERE display_id = 'B-000001'",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         regenerate_bugs_md(&db, rid).unwrap();
         let md_with_confirmed = read_bug_reports_md(tmp.path());
-        assert!(md_with_confirmed.contains("B-000001"), "fresh-confirmed must be in MD");
+        assert!(
+            md_with_confirmed.contains("B-000001"),
+            "fresh-confirmed must be in MD"
+        );
 
         // LLM edit: removes the confirmed row.
         write_bug_reports_md(tmp.path(), &[]);
@@ -825,11 +862,20 @@ mod tests {
         reconcile_bugs_for_repo(&db, rid).unwrap();
 
         let b = db.get_bug_by_display_id(rid, "B-000001").unwrap().unwrap();
-        assert!(b.archived_from_md_at.is_some(), "reconcile must mark archived");
-        assert_eq!(b.status, "confirmed", "DB row stays as confirmed for history");
+        assert!(
+            b.archived_from_md_at.is_some(),
+            "reconcile must mark archived"
+        );
+        assert_eq!(
+            b.status, "confirmed",
+            "DB row stays as confirmed for history"
+        );
 
         let md_after = read_bug_reports_md(tmp.path());
-        assert!(!md_after.contains("B-000001"), "archived row no longer in MD");
+        assert!(
+            !md_after.contains("B-000001"),
+            "archived row no longer in MD"
+        );
     }
 
     #[test]
@@ -837,17 +883,43 @@ mod tests {
         // v0.21.1: once LLM acknowledged a confirmed row (archived_from_md_at set),
         // it's permanently excluded from MD. DB row still exists for history.
         let (db, tmp, rid) = setup_repo_with_dir();
-        db.insert_bug(rid, 1, "2026-03-01T00:00:00Z", "active", "minor", "other",
-                      "created", 0, None, None).unwrap();
-        let archived_bug = db.insert_bug(rid, 2, "2026-03-02T00:00:00Z", "archived", "minor", "other",
-                                         "confirmed", 1, None, Some("2026-04-24T10:00:00Z")).unwrap();
+        db.insert_bug(
+            rid,
+            1,
+            "2026-03-01T00:00:00Z",
+            "active",
+            "minor",
+            "other",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let archived_bug = db
+            .insert_bug(
+                rid,
+                2,
+                "2026-03-02T00:00:00Z",
+                "archived",
+                "minor",
+                "other",
+                "confirmed",
+                1,
+                None,
+                Some("2026-04-24T10:00:00Z"),
+            )
+            .unwrap();
         db.mark_bug_archived_from_md(archived_bug.id).unwrap();
 
         regenerate_bugs_md(&db, rid).unwrap();
 
         let md = read_bug_reports_md(tmp.path());
         assert!(md.contains("B-000001"));
-        assert!(!md.contains("B-000002"), "archived confirmed must drop from MD");
+        assert!(
+            !md.contains("B-000002"),
+            "archived confirmed must drop from MD"
+        );
     }
 
     #[test]

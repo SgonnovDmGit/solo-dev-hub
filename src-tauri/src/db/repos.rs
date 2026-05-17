@@ -59,8 +59,7 @@ impl AppDb {
                     // F-033: log rename to repo_renames so sync-preamble can rename
                     // counterparty-side folders (client-requirements/<X>, etc.) on fs.
                     // Canonical = last segment after '/' for GitHub names.
-                    let old_canonical =
-                        existing_name.rsplit('/').next().unwrap_or("").to_string();
+                    let old_canonical = existing_name.rsplit('/').next().unwrap_or("").to_string();
                     let new_canonical = github_name.rsplit('/').next().unwrap_or("").to_string();
                     if !old_canonical.is_empty()
                         && !new_canonical.is_empty()
@@ -166,7 +165,15 @@ impl AppDb {
                         language = ?4, last_pushed_at = ?5, github_id = ?6,
                         updated_at = CURRENT_TIMESTAMP
                      WHERE id = ?7",
-                    rusqlite::params![github_name, github_url, description, language, last_pushed_at, github_id, local_id],
+                    rusqlite::params![
+                        github_name,
+                        github_url,
+                        description,
+                        language,
+                        last_pushed_at,
+                        github_id,
+                        local_id
+                    ],
                 )?;
                 let repo = conn.query_row(
                     "SELECT id, project_id, github_name, github_url, role, description, language, last_pushed_at, added_at, updated_at, local_path, github_id, deploy_target
@@ -210,7 +217,15 @@ impl AppDb {
                 language = ?4, last_pushed_at = ?5, github_id = ?6,
                 updated_at = CURRENT_TIMESTAMP
              WHERE id = ?7",
-            rusqlite::params![github_name, github_url, description, language, last_pushed_at, github_id, local_id],
+            rusqlite::params![
+                github_name,
+                github_url,
+                description,
+                language,
+                last_pushed_at,
+                github_id,
+                local_id
+            ],
         )?;
         conn.query_row(
             "SELECT id, project_id, github_name, github_url, role, description, language, last_pushed_at, added_at, updated_at, local_path, github_id, deploy_target
@@ -349,12 +364,14 @@ impl AppDb {
             )?;
         } else {
             // wrap-around: move to opposite end of group
-            let edge: i64 = conn.query_row(
-                wrap_agg_sql,
-                rusqlite::params![project_id],
-                |row| row.get(0),
-            )?;
-            let new_order = if direction == "up" { edge + 10 } else { edge - 10 };
+            let edge: i64 = conn.query_row(wrap_agg_sql, rusqlite::params![project_id], |row| {
+                row.get(0)
+            })?;
+            let new_order = if direction == "up" {
+                edge + 10
+            } else {
+                edge - 10
+            };
             conn.execute(
                 "UPDATE repositories SET sort_order = ?1 WHERE id = ?2",
                 rusqlite::params![new_order, repo_id],
@@ -682,7 +699,9 @@ mod tests {
         let path = tmp.path().join("test.db");
         let db = AppDb::new(path).unwrap();
         let project = db.create_project("p1", None, "tool").unwrap();
-        let repo = db.insert_local_repository("/tmp/r1", "r1", Some(project.id), None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", Some(project.id), None)
+            .unwrap();
 
         let conn = db.conn.lock().unwrap();
         // Insert a child row in deploy_environments
@@ -691,17 +710,20 @@ mod tests {
              compose_service, domain, deploy_branch, extras)
              VALUES (?1, 'prod', 'Deploy', 'latest', 'svc', 'x.com', 'master', '{}')",
             rusqlite::params![repo.id],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         db.delete_repository(repo.id).unwrap();
 
         let conn = db.conn.lock().unwrap();
-        let remaining: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM deploy_environments WHERE repository_id = ?1",
-            rusqlite::params![repo.id],
-            |r| r.get(0),
-        ).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM deploy_environments WHERE repository_id = ?1",
+                rusqlite::params![repo.id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(remaining, 0);
         drop(conn);
         std::mem::forget(tmp);
@@ -877,18 +899,15 @@ mod tests {
     fn test_b007_ambiguous_when_multiple_local_match() {
         let db = make_db();
         // Two local rows with same basename
-        let a = db.insert_local_repository("/a/my-app", "First", None, None).unwrap();
-        let b = db.insert_local_repository("/b/my-app", "Second", None, None).unwrap();
+        let a = db
+            .insert_local_repository("/a/my-app", "First", None, None)
+            .unwrap();
+        let b = db
+            .insert_local_repository("/b/my-app", "Second", None, None)
+            .unwrap();
 
         let outcome = db
-            .upsert_repository_with_outcome(
-                "owner/my-app",
-                None,
-                Some("From GH"),
-                None,
-                None,
-                None,
-            )
+            .upsert_repository_with_outcome("owner/my-app", None, Some("From GH"), None, None, None)
             .unwrap();
 
         match outcome {
@@ -914,17 +933,12 @@ mod tests {
     fn test_b007_inserts_when_no_local_match() {
         let db = make_db();
         // Local-only with different basename
-        let local = db.insert_local_repository("/tmp/something-else", "X", None, None).unwrap();
+        let local = db
+            .insert_local_repository("/tmp/something-else", "X", None, None)
+            .unwrap();
 
         let outcome = db
-            .upsert_repository_with_outcome(
-                "owner/my-app",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .upsert_repository_with_outcome("owner/my-app", None, None, None, None, None)
             .unwrap();
         match outcome {
             UpsertRepoOutcome::Inserted { repo } => {
@@ -941,16 +955,11 @@ mod tests {
     #[test]
     fn test_b007_basename_match_is_case_insensitive() {
         let db = make_db();
-        let local = db.insert_local_repository("/tmp/My-App", "Local", None, None).unwrap();
+        let local = db
+            .insert_local_repository("/tmp/My-App", "Local", None, None)
+            .unwrap();
         let outcome = db
-            .upsert_repository_with_outcome(
-                "owner/my-app",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .upsert_repository_with_outcome("owner/my-app", None, None, None, None, None)
             .unwrap();
         match outcome {
             UpsertRepoOutcome::Merged { repo, .. } => {
@@ -963,8 +972,12 @@ mod tests {
     #[test]
     fn test_b007_resolve_merge_with_local_updates_chosen() {
         let db = make_db();
-        let a = db.insert_local_repository("/a/my-app", "First", None, None).unwrap();
-        let _b = db.insert_local_repository("/b/my-app", "Second", None, None).unwrap();
+        let a = db
+            .insert_local_repository("/a/my-app", "First", None, None)
+            .unwrap();
+        let _b = db
+            .insert_local_repository("/b/my-app", "Second", None, None)
+            .unwrap();
         // User picked first candidate
         let resolved = db
             .resolve_merge_with_local(
@@ -989,17 +1002,14 @@ mod tests {
     #[test]
     fn test_b007_force_insert_creates_new_entry() {
         let db = make_db();
-        let _a = db.insert_local_repository("/a/my-app", "First", None, None).unwrap();
-        let _b = db.insert_local_repository("/b/my-app", "Second", None, None).unwrap();
+        let _a = db
+            .insert_local_repository("/a/my-app", "First", None, None)
+            .unwrap();
+        let _b = db
+            .insert_local_repository("/b/my-app", "Second", None, None)
+            .unwrap();
         let new_repo = db
-            .force_insert_github_repo(
-                "owner/my-app",
-                None,
-                Some("From GH"),
-                None,
-                None,
-                Some(77),
-            )
+            .force_insert_github_repo("owner/my-app", None, Some("From GH"), None, None, Some(77))
             .unwrap();
         assert_eq!(new_repo.github_name.as_deref(), Some("owner/my-app"));
         let total = db.list_all_repos().unwrap().len();
@@ -1038,7 +1048,13 @@ mod tests {
         let o1 = conn_sort_order_project(&db, p1.id);
         let o2 = conn_sort_order_project(&db, p2.id);
         let o3 = conn_sort_order_project(&db, p3.id);
-        assert!(o3 < o2 && o2 < o1, "newer project must have smaller sort_order; got {} < {} < {}", o3, o2, o1);
+        assert!(
+            o3 < o2 && o2 < o1,
+            "newer project must have smaller sort_order; got {} < {} < {}",
+            o3,
+            o2,
+            o1
+        );
         // And list_projects returns them in order newest → oldest.
         let list = db.list_projects().unwrap();
         assert_eq!(list[0].id, p3.id);
@@ -1050,8 +1066,12 @@ mod tests {
     fn test_f025_new_repo_gets_group_max_plus_10() {
         let db = make_db();
         let p = db.create_project("P", None, "standard").unwrap();
-        let r1 = db.insert_local_repository("/a", "a", Some(p.id), None).unwrap();
-        let r2 = db.insert_local_repository("/b", "b", Some(p.id), None).unwrap();
+        let r1 = db
+            .insert_local_repository("/a", "a", Some(p.id), None)
+            .unwrap();
+        let r2 = db
+            .insert_local_repository("/b", "b", Some(p.id), None)
+            .unwrap();
         let o1 = conn_sort_order_repo(&db, r1.id);
         let o2 = conn_sort_order_repo(&db, r2.id);
         assert!(o2 > o1, "second repo in group must sort after first");
@@ -1101,8 +1121,12 @@ mod tests {
     fn test_f025_reorder_repo_within_project() {
         let db = make_db();
         let p = db.create_project("p", None, "standard").unwrap();
-        let r1 = db.insert_local_repository("/a", "a", Some(p.id), Some("server")).unwrap();
-        let r2 = db.insert_local_repository("/b", "b", Some(p.id), Some("client")).unwrap();
+        let r1 = db
+            .insert_local_repository("/a", "a", Some(p.id), Some("server"))
+            .unwrap();
+        let r2 = db
+            .insert_local_repository("/b", "b", Some(p.id), Some("client"))
+            .unwrap();
         let o1 = conn_sort_order_repo(&db, r1.id);
         let o2 = conn_sort_order_repo(&db, r2.id);
         db.reorder_repo(r2.id, "up").unwrap();
@@ -1115,9 +1139,15 @@ mod tests {
     fn test_f025_rebalance_repo_group_sets_10_20_30() {
         let db = make_db();
         let p = db.create_project("p", None, "standard").unwrap();
-        let r1 = db.insert_local_repository("/a", "a", Some(p.id), None).unwrap();
-        let r2 = db.insert_local_repository("/b", "b", Some(p.id), None).unwrap();
-        let r3 = db.insert_local_repository("/c", "c", Some(p.id), None).unwrap();
+        let r1 = db
+            .insert_local_repository("/a", "a", Some(p.id), None)
+            .unwrap();
+        let r2 = db
+            .insert_local_repository("/b", "b", Some(p.id), None)
+            .unwrap();
+        let r3 = db
+            .insert_local_repository("/c", "c", Some(p.id), None)
+            .unwrap();
         // Manual reorder: r3, r1, r2
         db.rebalance_repo_group(&[r3.id, r1.id, r2.id]).unwrap();
         assert_eq!(conn_sort_order_repo(&db, r3.id), 10);
@@ -1129,11 +1159,18 @@ mod tests {
     fn test_f025_auto_sort_all_restores_role_formula() {
         let db = make_db();
         let p = db.create_project("p", None, "standard").unwrap();
-        let server = db.insert_local_repository("/a", "z-server", Some(p.id), Some("server")).unwrap();
-        let client = db.insert_local_repository("/b", "a-client", Some(p.id), Some("client")).unwrap();
-        let tool = db.insert_local_repository("/c", "m-tool", Some(p.id), Some("tool")).unwrap();
+        let server = db
+            .insert_local_repository("/a", "z-server", Some(p.id), Some("server"))
+            .unwrap();
+        let client = db
+            .insert_local_repository("/b", "a-client", Some(p.id), Some("client"))
+            .unwrap();
+        let tool = db
+            .insert_local_repository("/c", "m-tool", Some(p.id), Some("tool"))
+            .unwrap();
         // Mess up orders
-        db.rebalance_repo_group(&[client.id, server.id, tool.id]).unwrap();
+        db.rebalance_repo_group(&[client.id, server.id, tool.id])
+            .unwrap();
         db.auto_sort_all().unwrap();
         // server (role 0) < client (role 2) < tool (role 6)
         let server_o = conn_sort_order_repo(&db, server.id);
@@ -1151,9 +1188,15 @@ mod tests {
     fn test_f025_auto_sort_all_alphabetical_within_same_role() {
         let db = make_db();
         let p = db.create_project("p", None, "standard").unwrap();
-        let z = db.insert_local_repository("/a", "zebra", Some(p.id), Some("client")).unwrap();
-        let a = db.insert_local_repository("/b", "alpha", Some(p.id), Some("client")).unwrap();
-        let m = db.insert_local_repository("/c", "milk", Some(p.id), Some("client")).unwrap();
+        let z = db
+            .insert_local_repository("/a", "zebra", Some(p.id), Some("client"))
+            .unwrap();
+        let a = db
+            .insert_local_repository("/b", "alpha", Some(p.id), Some("client"))
+            .unwrap();
+        let m = db
+            .insert_local_repository("/c", "milk", Some(p.id), Some("client"))
+            .unwrap();
         db.auto_sort_all().unwrap();
         // Same role → alphabetical by description (which doubles as github_name fallback)
         let a_o = conn_sort_order_repo(&db, a.id);
@@ -1180,12 +1223,19 @@ mod tests {
         let db = make_db();
         let p1 = db.create_project("p1", None, "standard").unwrap();
         let p2 = db.create_project("p2", None, "standard").unwrap();
-        let _r1 = db.insert_local_repository("/a", "a", Some(p2.id), Some("server")).unwrap();
-        let _r2 = db.insert_local_repository("/b", "b", Some(p2.id), Some("client")).unwrap();
+        let _r1 = db
+            .insert_local_repository("/a", "a", Some(p2.id), Some("server"))
+            .unwrap();
+        let _r2 = db
+            .insert_local_repository("/b", "b", Some(p2.id), Some("client"))
+            .unwrap();
         // r3 starts in p1, then moves to p2
-        let r3 = db.insert_local_repository("/c", "c", Some(p1.id), Some("tool")).unwrap();
+        let r3 = db
+            .insert_local_repository("/c", "c", Some(p1.id), Some("tool"))
+            .unwrap();
         let r3_before = conn_sort_order_repo(&db, r3.id);
-        db.assign_repository(r3.id, Some(p2.id), Some("tool")).unwrap();
+        db.assign_repository(r3.id, Some(p2.id), Some("tool"))
+            .unwrap();
         // r3 should now have sort_order > all p2 originals
         let r3_after = conn_sort_order_repo(&db, r3.id);
         assert!(r3_after > r3_before);
@@ -1223,7 +1273,9 @@ mod tests {
     #[test]
     fn test_update_repo_description_logs_rename_for_local_only() {
         let db = make_db();
-        let r = db.insert_local_repository("/tmp/x", "Old Name", None, None).unwrap();
+        let r = db
+            .insert_local_repository("/tmp/x", "Old Name", None, None)
+            .unwrap();
         let _u = db.update_repo_description(r.id, "New Name").unwrap();
         let renames = db.list_renames_for_repo(r.id).unwrap();
         assert_eq!(renames.len(), 1);
@@ -1234,7 +1286,9 @@ mod tests {
     #[test]
     fn test_update_repo_description_no_rename_on_same_description() {
         let db = make_db();
-        let r = db.insert_local_repository("/tmp/x", "Same", None, None).unwrap();
+        let r = db
+            .insert_local_repository("/tmp/x", "Same", None, None)
+            .unwrap();
         db.update_repo_description(r.id, "Same").unwrap();
         let renames = db.list_renames_for_repo(r.id).unwrap();
         assert!(renames.is_empty());
@@ -1257,15 +1311,34 @@ mod tests {
     #[test]
     fn test_delete_repo_cascades_bugs() {
         let db = make_db();
-        let repo = db.insert_local_repository("/tmp/r", "r", None, None).unwrap();
-        let bug = db.insert_bug(repo.id, 1, "2026-01-01T00:00:00Z", "x", "minor", "other", "created", 0, None, None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r", "r", None, None)
+            .unwrap();
+        let bug = db
+            .insert_bug(
+                repo.id,
+                1,
+                "2026-01-01T00:00:00Z",
+                "x",
+                "minor",
+                "other",
+                "created",
+                0,
+                None,
+                None,
+            )
+            .unwrap();
         let conn = db.conn.lock().unwrap();
-        let before: i64 = conn.query_row("SELECT COUNT(*) FROM bugs", [], |r| r.get(0)).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bugs", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(before, 1);
         drop(conn);
         db.delete_repository(repo.id).unwrap();
         let conn = db.conn.lock().unwrap();
-        let after: i64 = conn.query_row("SELECT COUNT(*) FROM bugs", [], |r| r.get(0)).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bugs", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(after, 0);
         let _ = bug;
     }
@@ -1275,8 +1348,12 @@ mod tests {
     #[test]
     fn test_multiple_local_repos_coexist() {
         let db = make_db();
-        let _a = db.insert_local_repository("/tmp/a", "A", None, None).unwrap();
-        let _b = db.insert_local_repository("/tmp/b", "B", None, None).unwrap();
+        let _a = db
+            .insert_local_repository("/tmp/a", "A", None, None)
+            .unwrap();
+        let _b = db
+            .insert_local_repository("/tmp/b", "B", None, None)
+            .unwrap();
         let count: i64 = {
             let conn = db.conn.lock().unwrap();
             conn.query_row(
@@ -1293,7 +1370,11 @@ mod tests {
     fn test_github_name_unique_still_enforced_for_non_null() {
         let db = make_db();
         let conn = db.conn.lock().unwrap();
-        conn.execute("INSERT INTO repositories (github_name) VALUES ('owner/repo')", []).unwrap();
+        conn.execute(
+            "INSERT INTO repositories (github_name) VALUES ('owner/repo')",
+            [],
+        )
+        .unwrap();
         let result = conn.execute(
             "INSERT INTO repositories (github_name) VALUES ('owner/repo')",
             [],
@@ -1318,7 +1399,12 @@ mod tests {
         let db = make_db();
         let proj = db.create_project("Test", None, "standard").unwrap();
         let repo = db
-            .insert_local_repository("/tmp/assigned", "Assigned Folder", Some(proj.id), Some("server"))
+            .insert_local_repository(
+                "/tmp/assigned",
+                "Assigned Folder",
+                Some(proj.id),
+                Some("server"),
+            )
             .unwrap();
         assert_eq!(repo.project_id, Some(proj.id));
         assert_eq!(repo.role, Some("server".to_string()));
@@ -1329,11 +1415,16 @@ mod tests {
     #[test]
     fn test_set_get_repo_deploy_config_roundtrip() {
         let db = make_db();
-        let repo = db.insert_local_repository("/tmp/cfg-repo", "cfg", None, None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/cfg-repo", "cfg", None, None)
+            .unwrap();
 
         // Default is empty map
         let initial = db.get_repo_deploy_config(repo.id).unwrap();
-        assert!(initial.is_empty(), "fresh repo must have empty deploy_repo_config");
+        assert!(
+            initial.is_empty(),
+            "fresh repo must have empty deploy_repo_config"
+        );
 
         // Write, then read back
         let mut cfg = HashMap::new();
@@ -1350,7 +1441,10 @@ mod tests {
         db.set_repo_deploy_config(repo.id, &cfg2).unwrap();
         let read_back2 = db.get_repo_deploy_config(repo.id).unwrap();
         assert_eq!(read_back2, cfg2);
-        assert!(!read_back2.contains_key("GO_VERSION"), "overwrite must replace, not merge");
+        assert!(
+            !read_back2.contains_key("GO_VERSION"),
+            "overwrite must replace, not merge"
+        );
 
         // Empty-map write returns empty
         let empty = HashMap::new();

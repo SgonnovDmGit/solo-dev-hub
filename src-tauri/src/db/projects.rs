@@ -273,9 +273,8 @@ impl AppDb {
 
         // Projects — alphabetical
         let proj_ids: Vec<i64> = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM projects ORDER BY LOWER(name) ASC, id ASC",
-            )?;
+            let mut stmt =
+                tx.prepare("SELECT id FROM projects ORDER BY LOWER(name) ASC, id ASC")?;
             let ids = stmt
                 .query_map([], |row| row.get::<_, i64>(0))?
                 .collect::<SqlResult<Vec<i64>>>()?;
@@ -519,7 +518,8 @@ impl AppDb {
                 .map_err(|e| e.to_string())?;
             if parent_count > 0 {
                 return Err(
-                    "Project is connected to parents as a microservice — disconnect first".to_string(),
+                    "Project is connected to parents as a microservice — disconnect first"
+                        .to_string(),
                 );
             }
             conn.execute(
@@ -598,7 +598,10 @@ impl AppDb {
 
     pub fn delete_setting(&self, key: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM settings WHERE key = ?1", rusqlite::params![key])?;
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            rusqlite::params![key],
+        )?;
         Ok(())
     }
 
@@ -741,8 +744,11 @@ mod tests {
     fn test_update_project_description_only_no_rename_log() {
         // T-000092: description-only edit must NOT create a project_renames row.
         let db = make_db();
-        let p = db.create_project("Stable MS", None, "microservice").unwrap();
-        db.update_project(p.id, "Stable MS", Some("new desc")).unwrap();
+        let p = db
+            .create_project("Stable MS", None, "microservice")
+            .unwrap();
+        db.update_project(p.id, "Stable MS", Some("new desc"))
+            .unwrap();
         let renames = db.list_renames_for_project(p.id).unwrap();
         assert!(renames.is_empty());
     }
@@ -812,9 +818,7 @@ mod tests {
         let db = make_db();
         let parent = db.create_project("parent", None, "standard").unwrap();
         let target = db.create_project("not-ms", None, "standard").unwrap();
-        let err = db
-            .connect_microservice(parent.id, target.id)
-            .unwrap_err();
+        let err = db.connect_microservice(parent.id, target.id).unwrap_err();
         assert!(err.contains("not of type"));
     }
 
@@ -838,7 +842,7 @@ mod tests {
         let c = make_ms_project(&db, "C", true);
         db.connect_microservice(a, b).unwrap(); // A → B
         db.connect_microservice(b, c).unwrap(); // B → C
-        // C → A would form A → B → C → A
+                                                // C → A would form A → B → C → A
         let err = db.connect_microservice(c, a).unwrap_err();
         assert!(err.contains("Cycle"));
     }
@@ -944,7 +948,8 @@ mod tests {
     #[test]
     fn test_template_upsert_and_get() {
         let db = make_db();
-        db.upsert_template_file("go", "Dockerfile", "FROM scratch", false).unwrap();
+        db.upsert_template_file("go", "Dockerfile", "FROM scratch", false)
+            .unwrap();
         let f = db.get_template_file("go", "Dockerfile").unwrap().unwrap();
         assert_eq!(f.language_key, "go");
         assert_eq!(f.file_name, "Dockerfile");
@@ -952,7 +957,8 @@ mod tests {
         assert!(!f.is_custom);
 
         // Upsert overwrite
-        db.upsert_template_file("go", "Dockerfile", "FROM alpine", true).unwrap();
+        db.upsert_template_file("go", "Dockerfile", "FROM alpine", true)
+            .unwrap();
         let f = db.get_template_file("go", "Dockerfile").unwrap().unwrap();
         assert_eq!(f.content, "FROM alpine");
         assert!(f.is_custom);
@@ -967,9 +973,12 @@ mod tests {
     #[test]
     fn test_template_list_languages_and_files() {
         let db = make_db();
-        db.upsert_template_file("go", "Dockerfile", "x", false).unwrap();
-        db.upsert_template_file("go", "compose.yml", "x", false).unwrap();
-        db.upsert_template_file("rust", "Dockerfile", "x", false).unwrap();
+        db.upsert_template_file("go", "Dockerfile", "x", false)
+            .unwrap();
+        db.upsert_template_file("go", "compose.yml", "x", false)
+            .unwrap();
+        db.upsert_template_file("rust", "Dockerfile", "x", false)
+            .unwrap();
         let langs = db.list_template_languages().unwrap();
         assert_eq!(langs, vec!["go".to_string(), "rust".to_string()]);
         let go_files = db.list_template_files("go").unwrap();

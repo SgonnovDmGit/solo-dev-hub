@@ -185,7 +185,12 @@ where
                     fs::create_dir_all(dst_dir).map_err(|e| e.to_string())?;
                 }
                 fs::rename(&flat, &dst).map_err(|e| {
-                    format!("Case C: rename {} -> {}: {}", flat.display(), dst.display(), e)
+                    format!(
+                        "Case C: rename {} -> {}: {}",
+                        flat.display(),
+                        dst.display(),
+                        e
+                    )
                 })?;
                 migrated += 1;
             }
@@ -226,9 +231,8 @@ where
                     ));
                     continue;
                 }
-                fs::remove_file(&flat).map_err(|e| {
-                    format!("Case C: remove flat source {}: {}", flat.display(), e)
-                })?;
+                fs::remove_file(&flat)
+                    .map_err(|e| format!("Case C: remove flat source {}: {}", flat.display(), e))?;
                 migrated += 1;
             }
         }
@@ -277,7 +281,11 @@ mod tests {
         fs::create_dir_all(parent.join("new-name")).unwrap();
 
         let result = replay_rename_in_dir(parent, "old-name", "new-name").unwrap();
-        assert_eq!(result, RenameOutcome::Collision, "both dirs present → collision");
+        assert_eq!(
+            result,
+            RenameOutcome::Collision,
+            "both dirs present → collision"
+        );
         assert!(parent.join("old-name").exists(), "old preserved");
         assert!(parent.join("new-name").exists(), "new preserved");
     }
@@ -300,7 +308,9 @@ mod tests {
         fs::write(parent.join("ProjectName/REQ-001.md"), "data").unwrap();
 
         let mut warnings = Vec::new();
-        let result = migrate_subfolder_rename(parent, "ProjectName", "repo-canonical", &mut warnings).unwrap();
+        let result =
+            migrate_subfolder_rename(parent, "ProjectName", "repo-canonical", &mut warnings)
+                .unwrap();
         assert!(result);
         assert!(!parent.join("ProjectName").exists());
         assert!(parent.join("repo-canonical/REQ-001.md").exists());

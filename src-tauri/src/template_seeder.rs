@@ -120,7 +120,11 @@ mod tests {
             .contains(&"vite_static".to_string()));
 
         let n = seed_bundled_templates(&db).unwrap();
-        assert!(n >= 3, "at least 3 vite_static files seeded among others, got {}", n);
+        assert!(
+            n >= 3,
+            "at least 3 vite_static files seeded among others, got {}",
+            n
+        );
         assert!(db
             .list_template_languages()
             .unwrap()

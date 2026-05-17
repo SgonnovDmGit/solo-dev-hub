@@ -86,11 +86,13 @@ impl AppDb {
             )?,
         };
         let days_history: i64 = match &lifetime_since {
-            Some(d) => conn.query_row(
-                "SELECT CAST(julianday(date('now')) - julianday(?1) AS INTEGER)",
-                rusqlite::params![d],
-                |r| r.get(0),
-            ).unwrap_or(0),
+            Some(d) => conn
+                .query_row(
+                    "SELECT CAST(julianday(date('now')) - julianday(?1) AS INTEGER)",
+                    rusqlite::params![d],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
             None => 0,
         };
 
@@ -108,8 +110,17 @@ impl AppDb {
                 let category: String = r.get(0)?;
                 let total: i64 = r.get(1)?;
                 let closed: i64 = r.get(2)?;
-                let percent = if total == 0 { 0.0 } else { (closed as f64 / total as f64) * 100.0 };
-                Ok(CategoryBar { category, total, closed, percent })
+                let percent = if total == 0 {
+                    0.0
+                } else {
+                    (closed as f64 / total as f64) * 100.0
+                };
+                Ok(CategoryBar {
+                    category,
+                    total,
+                    closed,
+                    percent,
+                })
             })?
             .collect::<SqlResult<Vec<_>>>()?;
 
@@ -148,7 +159,10 @@ impl AppDb {
             |r| r.get(0),
         )?;
         let created_total: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM bugs b JOIN repositories r ON b.repository_id = r.id{}", scope_filter),
+            &format!(
+                "SELECT COUNT(*) FROM bugs b JOIN repositories r ON b.repository_id = r.id{}",
+                scope_filter
+            ),
             rusqlite::params![project_id],
             |r| r.get(0),
         )?;
@@ -206,11 +220,13 @@ impl AppDb {
             },
         };
         let days_history: i64 = match &lifetime_since {
-            Some(d) => conn.query_row(
-                "SELECT CAST(julianday(date('now')) - julianday(?1) AS INTEGER)",
-                rusqlite::params![d],
-                |r| r.get(0),
-            ).unwrap_or(0),
+            Some(d) => conn
+                .query_row(
+                    "SELECT CAST(julianday(date('now')) - julianday(?1) AS INTEGER)",
+                    rusqlite::params![d],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
             None => 0,
         };
 
@@ -235,8 +251,17 @@ impl AppDb {
                 let category: String = r.get(0)?;
                 let total: i64 = r.get(1)?;
                 let closed: i64 = r.get(2)?;
-                let percent = if total == 0 { 0.0 } else { (closed as f64 / total as f64) * 100.0 };
-                Ok(CategoryBar { category, total, closed, percent })
+                let percent = if total == 0 {
+                    0.0
+                } else {
+                    (closed as f64 / total as f64) * 100.0
+                };
+                Ok(CategoryBar {
+                    category,
+                    total,
+                    closed,
+                    percent,
+                })
             })?
             .collect::<SqlResult<Vec<_>>>()?;
 
@@ -301,7 +326,9 @@ mod tests {
     fn test_stats_summary_for_repo_basic() {
         let db = make_db();
         let p = db.create_project("P", None, "standard").unwrap();
-        let r = db.insert_local_repository("/tmp/r", "r", Some(p.id), Some("server")).unwrap();
+        let r = db
+            .insert_local_repository("/tmp/r", "r", Some(p.id), Some("server"))
+            .unwrap();
         seed_bug(&db, r.id, "2026-04-01", "critical", "logic", 2, "confirmed");
         seed_bug(&db, r.id, "2026-04-02", "major", "ui_ux", 0, "in-progress");
         seed_bug(&db, r.id, "2026-04-03", "minor", "ui_ux", 1, "testing");
@@ -312,7 +339,10 @@ mod tests {
         assert_eq!(s.kpi.created_total, 3);
         assert_eq!(s.kpi.active_critical, 0); // critical one was confirmed
         assert!(s.lifetime_since.is_some());
-        assert!(s.top_hot_repos.is_none(), "repo-scope must not include top_hot");
+        assert!(
+            s.top_hot_repos.is_none(),
+            "repo-scope must not include top_hot"
+        );
         assert!(s.repo_count.is_none());
         assert!(!s.categories.is_empty());
     }
@@ -321,19 +351,26 @@ mod tests {
     fn test_stats_summary_for_repo_empty_falls_back_to_added_at() {
         let db = make_db();
         let p = db.create_project("P", None, "standard").unwrap();
-        let r = db.insert_local_repository("/tmp/r", "r", Some(p.id), Some("server")).unwrap();
+        let r = db
+            .insert_local_repository("/tmp/r", "r", Some(p.id), Some("server"))
+            .unwrap();
         // No bugs → lifetime_since falls back to repositories.added_at
         let s = db.stats_summary_for_repo(r.id).unwrap();
         assert_eq!(s.kpi.active, 0);
         assert_eq!(s.kpi.closed_total, 0);
-        assert!(s.lifetime_since.is_some(), "fallback to added_at must yield a date");
+        assert!(
+            s.lifetime_since.is_some(),
+            "fallback to added_at must yield a date"
+        );
     }
 
     #[test]
     fn test_stats_summary_for_repo_categories_sorted_by_percent_closed_desc() {
         let db = make_db();
         let p = db.create_project("P", None, "standard").unwrap();
-        let r = db.insert_local_repository("/tmp/r", "r", Some(p.id), Some("server")).unwrap();
+        let r = db
+            .insert_local_repository("/tmp/r", "r", Some(p.id), Some("server"))
+            .unwrap();
         // logic: 2 bugs, both confirmed → 100%
         seed_bug(&db, r.id, "2026-04-01", "critical", "logic", 2, "confirmed");
         seed_bug(&db, r.id, "2026-04-02", "critical", "logic", 1, "confirmed");
@@ -341,7 +378,15 @@ mod tests {
         seed_bug(&db, r.id, "2026-04-03", "minor", "ui_ux", 0, "confirmed");
         seed_bug(&db, r.id, "2026-04-04", "minor", "ui_ux", 0, "in-progress");
         // database: 1 bug, 0 confirmed → 0%
-        seed_bug(&db, r.id, "2026-04-05", "major", "database", 0, "in-progress");
+        seed_bug(
+            &db,
+            r.id,
+            "2026-04-05",
+            "major",
+            "database",
+            0,
+            "in-progress",
+        );
 
         let s = db.stats_summary_for_repo(r.id).unwrap();
         assert_eq!(s.categories.len(), 3);
@@ -355,7 +400,9 @@ mod tests {
     fn test_stats_summary_for_repo_avg_and_median_attempts() {
         let db = make_db();
         let p = db.create_project("P", None, "standard").unwrap();
-        let r = db.insert_local_repository("/tmp/r", "r", Some(p.id), Some("server")).unwrap();
+        let r = db
+            .insert_local_repository("/tmp/r", "r", Some(p.id), Some("server"))
+            .unwrap();
         // Confirmed bugs with attempts: 1, 2, 3, 5. avg=2.75, median=upper-mid=3.
         seed_bug(&db, r.id, "2026-04-01", "minor", "ui_ux", 1, "confirmed");
         seed_bug(&db, r.id, "2026-04-02", "minor", "ui_ux", 2, "confirmed");
@@ -371,12 +418,17 @@ mod tests {
         // B-000013: rejected bugs must count as active (not closed).
         let db = make_db();
         let p = db.create_project("P", None, "standard").unwrap();
-        let r = db.insert_local_repository("/tmp/r", "r", Some(p.id), Some("server")).unwrap();
+        let r = db
+            .insert_local_repository("/tmp/r", "r", Some(p.id), Some("server"))
+            .unwrap();
         seed_bug(&db, r.id, "2026-04-01", "critical", "logic", 2, "rejected");
         seed_bug(&db, r.id, "2026-04-02", "minor", "ui_ux", 0, "created");
         seed_bug(&db, r.id, "2026-04-03", "minor", "ui_ux", 1, "confirmed");
         let s = db.stats_summary_for_repo(r.id).unwrap();
-        assert_eq!(s.kpi.active, 2, "rejected + created must both count as active");
+        assert_eq!(
+            s.kpi.active, 2,
+            "rejected + created must both count as active"
+        );
         assert_eq!(s.kpi.active_critical, 1, "rejected critical must count");
         assert_eq!(s.kpi.closed_total, 1);
     }
@@ -385,9 +437,21 @@ mod tests {
     fn test_stats_summary_for_project_aggregates_across_repos_with_top_hot() {
         let db = make_db();
         let p = db.create_project("P", None, "standard").unwrap();
-        let r1 = db.insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server")).unwrap();
-        let r2 = db.insert_local_repository("/tmp/r2", "r2", Some(p.id), Some("client")).unwrap();
-        seed_bug(&db, r1.id, "2026-04-01", "critical", "logic", 1, "in-progress");
+        let r1 = db
+            .insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server"))
+            .unwrap();
+        let r2 = db
+            .insert_local_repository("/tmp/r2", "r2", Some(p.id), Some("client"))
+            .unwrap();
+        seed_bug(
+            &db,
+            r1.id,
+            "2026-04-01",
+            "critical",
+            "logic",
+            1,
+            "in-progress",
+        );
         seed_bug(&db, r2.id, "2026-04-02", "major", "ui_ux", 0, "in-progress");
         seed_bug(&db, r2.id, "2026-04-03", "minor", "ui_ux", 0, "confirmed");
 
@@ -418,8 +482,10 @@ mod tests {
     fn test_stats_summary_for_project_repos_no_bugs() {
         let db = make_db();
         let p = db.create_project("P", None, "standard").unwrap();
-        db.insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server")).unwrap();
-        db.insert_local_repository("/tmp/r2", "r2", Some(p.id), Some("client")).unwrap();
+        db.insert_local_repository("/tmp/r1", "r1", Some(p.id), Some("server"))
+            .unwrap();
+        db.insert_local_repository("/tmp/r2", "r2", Some(p.id), Some("client"))
+            .unwrap();
         // No bugs → lifetime_since falls back to MIN(repos.added_at).
         let s = db.stats_summary_for_project(p.id).unwrap();
         assert_eq!(s.repo_count, Some(2));

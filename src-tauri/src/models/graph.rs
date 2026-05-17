@@ -18,10 +18,10 @@ pub enum GraphEdgeKind {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GraphNode {
-    pub id: String,                  // "repo:42" or "project:7"
-    pub label: String,               // display_name (repo) or project.name
+    pub id: String,    // "repo:42" or "project:7"
+    pub label: String, // display_name (repo) or project.name
     pub kind: GraphNodeKind,
-    pub role: Option<String>,        // 'server' | 'client' | 'landing' | 'tool' | 'microservice' | None
+    pub role: Option<String>, // 'server' | 'client' | 'landing' | 'tool' | 'microservice' | None
     pub repo_id: Option<i64>,
     pub project_id: Option<i64>,
 }

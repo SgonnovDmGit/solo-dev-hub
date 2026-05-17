@@ -441,8 +441,7 @@ impl AppDb {
     pub fn backfill_bug_events_for_existing(&self) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
 
-        let existing: i64 =
-            conn.query_row("SELECT COUNT(*) FROM bug_events", [], |r| r.get(0))?;
+        let existing: i64 = conn.query_row("SELECT COUNT(*) FROM bug_events", [], |r| r.get(0))?;
         if existing > 0 {
             return Ok(());
         }
@@ -486,8 +485,8 @@ impl AppDb {
                 let span = (end - start).num_seconds().max(1);
 
                 for i in 0..fix_attempts {
-                    let t = start
-                        + chrono::Duration::seconds(((i + 1) * span) / (fix_attempts + 1));
+                    let t =
+                        start + chrono::Duration::seconds(((i + 1) * span) / (fix_attempts + 1));
                     conn.execute(
                         "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status)
                          VALUES (?1, 'entered_testing', ?2, 'in-progress', 'testing')",
@@ -635,8 +634,10 @@ mod tests {
         let db = make_db();
         let rid = make_repo(&db);
         let b = seed_bug(&db, rid, "2026-03-29", "minor", "ui_ux", 0, "created");
-        db.update_bug_status(b.id, "in-progress", None, None).unwrap();
-        db.update_bug_status(b.id, "testing", Some(1), None).unwrap();
+        db.update_bug_status(b.id, "in-progress", None, None)
+            .unwrap();
+        db.update_bug_status(b.id, "testing", Some(1), None)
+            .unwrap();
         let refreshed = db.get_bug_by_id(b.id).unwrap().unwrap();
         assert_eq!(refreshed.status, "testing");
         assert_eq!(refreshed.fix_attempts, 1);
@@ -646,7 +647,10 @@ mod tests {
             .unwrap();
         let refreshed = db.get_bug_by_id(b.id).unwrap().unwrap();
         assert_eq!(refreshed.status, "confirmed");
-        assert_eq!(refreshed.confirmed_at.as_deref(), Some("2026-04-24T10:00:00Z"));
+        assert_eq!(
+            refreshed.confirmed_at.as_deref(),
+            Some("2026-04-24T10:00:00Z")
+        );
     }
 
     #[test]
@@ -704,7 +708,8 @@ mod tests {
         let db = make_db();
         let rid = make_repo(&db);
         assert!(db.get_bugs_migrated_at(rid).unwrap().is_none());
-        db.set_bugs_migrated_at(rid, "2026-04-24T10:00:00Z").unwrap();
+        db.set_bugs_migrated_at(rid, "2026-04-24T10:00:00Z")
+            .unwrap();
         assert_eq!(
             db.get_bugs_migrated_at(rid).unwrap().as_deref(),
             Some("2026-04-24T10:00:00Z")
@@ -719,16 +724,7 @@ mod tests {
         let db = make_db();
         let rid = make_repo(&db);
         db.insert_bug(
-            rid,
-            1,
-            &ts,
-            "seed",
-            "minor",
-            "other",
-            "created",
-            0,
-            None,
-            None,
+            rid, 1, &ts, "seed", "minor", "other", "created", 0, None, None,
         )
         .unwrap();
         let parsed: Option<String> = db
@@ -741,7 +737,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(parsed.is_some(), "SQLite date() should parse rfc3339 timestamp");
+        assert!(
+            parsed.is_some(),
+            "SQLite date() should parse rfc3339 timestamp"
+        );
     }
 
     // ── Bug events (A3, v0.17.0) ─────────────────────────────────────────────
@@ -749,7 +748,9 @@ mod tests {
     #[test]
     fn test_insert_bug_event_writes_row() {
         let db = make_db();
-        let repo = db.insert_local_repository("/tmp/r", "r", None, None).unwrap();
+        let repo = db
+            .insert_local_repository("/tmp/r", "r", None, None)
+            .unwrap();
         let bug = db
             .insert_bug(
                 repo.id,
@@ -981,7 +982,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n_attempts, 1, "guard must force 1 synthetic attempt for corrupt legacy");
+        assert_eq!(
+            n_attempts, 1,
+            "guard must force 1 synthetic attempt for corrupt legacy"
+        );
     }
 
     #[test]
@@ -1059,14 +1063,8 @@ mod tests {
         let ts2 = "2026-04-24T12:00:00Z";
         db.update_bug_status(bug.id, "confirmed", None, Some(ts2))
             .unwrap();
-        db.insert_bug_event(
-            bug.id,
-            "confirmed",
-            Some("testing"),
-            Some("confirmed"),
-            ts2,
-        )
-        .unwrap();
+        db.insert_bug_event(bug.id, "confirmed", Some("testing"), Some("confirmed"), ts2)
+            .unwrap();
 
         let conn = db.conn.lock().unwrap();
         let n: i64 = conn
@@ -1076,6 +1074,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 3, "expected 3 events: created + entered_testing + confirmed");
+        assert_eq!(
+            n, 3,
+            "expected 3 events: created + entered_testing + confirmed"
+        );
     }
 }

@@ -63,9 +63,11 @@ pub fn parse_todo_tasks(content: &str) -> (Vec<TodoTask>, Vec<String>) {
             }
             continue;
         }
-        let rest_opt = trimmed
-            .strip_prefix("- [ ] ")
-            .or_else(|| trimmed.strip_prefix("- ").filter(|r| looks_like_task_id_start(r)));
+        let rest_opt = trimmed.strip_prefix("- [ ] ").or_else(|| {
+            trimmed
+                .strip_prefix("- ")
+                .filter(|r| looks_like_task_id_start(r))
+        });
         let Some(rest) = rest_opt else { continue };
         let parts: Vec<String> = split_pipe_respecting_escape(rest)
             .into_iter()
@@ -246,12 +248,7 @@ pub fn parse_done_entries_in_period(
                         d.to_string()
                     } else {
                         // DD.MM.YYYY or DD/MM/YYYY → YYYY-MM-DD
-                        format!(
-                            "{}-{}-{}",
-                            &d[6..10],
-                            &d[3..5],
-                            &d[0..2]
-                        )
+                        format!("{}-{}-{}", &d[6..10], &d[3..5], &d[0..2])
                     }
                 });
         } else if trimmed.starts_with("- ") {
@@ -319,7 +316,10 @@ mod tests {
         assert_eq!(tasks.len(), 3);
         assert_eq!(tasks[0].id, "D-000001");
         assert_eq!(tasks[1].id, "D-000002");
-        assert_eq!(tasks[2].id, "T-001", "explicit legacy 3-digit id kept untouched");
+        assert_eq!(
+            tasks[2].id, "T-001",
+            "explicit legacy 3-digit id kept untouched"
+        );
     }
 
     #[test]
@@ -426,7 +426,10 @@ mod tests {
         let (tasks, warnings) = parse_todo_tasks(md);
         assert!(warnings.is_empty());
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].version, "", "non-version `##` header must not set version");
+        assert_eq!(
+            tasks[0].version, "",
+            "non-version `##` header must not set version"
+        );
     }
 
     #[test]
@@ -437,7 +440,10 @@ mod tests {
         let (tasks, warnings) = parse_todo_tasks(md);
         assert!(warnings.is_empty());
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].version, "", "task above first version header has no version");
+        assert_eq!(
+            tasks[0].version, "",
+            "task above first version header has no version"
+        );
         assert_eq!(tasks[1].version, "v0.32.0");
     }
 
@@ -505,7 +511,6 @@ mod tests {
         assert_eq!(tasks[1].created_at, "2026-04-26");
     }
 
-
     /// B-002 retry#4: regression против реального `docs/done.md` этого репо.
     /// Парсер не должен panic'ить, hang'ить или возвращать нереальные результаты
     /// на фактическом файле пользователя (134 строки, смесь форматов: с id и без,
@@ -514,14 +519,22 @@ mod tests {
     fn test_parse_done_real_file_does_not_panic() {
         let content = include_str!("../../../docs/done.md");
         let (tasks, warnings) = parse_done_tasks(content);
-        eprintln!("done.md stats: {} tasks, {} warnings", tasks.len(), warnings.len());
+        eprintln!(
+            "done.md stats: {} tasks, {} warnings",
+            tasks.len(),
+            warnings.len()
+        );
         if let Some(first) = tasks.first() {
-            eprintln!("first task id={:?} desc={:?} date={:?} version={:?}",
-                first.id, first.description, first.date, first.version);
+            eprintln!(
+                "first task id={:?} desc={:?} date={:?} version={:?}",
+                first.id, first.description, first.date, first.version
+            );
         }
         if let Some(last) = tasks.last() {
-            eprintln!("last task id={:?} desc={:?} date={:?} version={:?}",
-                last.id, last.description, last.date, last.version);
+            eprintln!(
+                "last task id={:?} desc={:?} date={:?} version={:?}",
+                last.id, last.description, last.date, last.version
+            );
         }
         assert!(tasks.len() + warnings.len() > 0);
     }
@@ -571,7 +584,8 @@ mod tests {
              - T-003 | Third | v0.2\n\n\
              ## 2026-04-25\n\
              - T-004 | Outside period | v0.3\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = parse_done_entries_in_period(&path, "2026-04-20", "2026-04-24").unwrap();
         // Expected: 2026-04-20 -> 2, 2026-04-22 -> 1, others omitted
@@ -588,7 +602,8 @@ mod tests {
             std::path::Path::new("/no/such/file.md"),
             "2026-04-01",
             "2026-04-30",
-        ).unwrap();
+        )
+        .unwrap();
         assert!(r.is_empty());
     }
 
@@ -627,7 +642,8 @@ mod tests {
 
     #[test]
     fn test_parse_todo_7_or_more_fields_joined_into_description() {
-        let input = "- [ ] T-001 | Multi pipe \\| not escaped | wat | 4 | high | open | 2026-04-26\n";
+        let input =
+            "- [ ] T-001 | Multi pipe \\| not escaped | wat | 4 | high | open | 2026-04-26\n";
         let (tasks, _) = parse_todo_tasks(input);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "T-001");

@@ -126,7 +126,9 @@ mod tests {
         let md = generate_bug_reports(&bugs);
         assert!(md.contains("# Bug reports"));
         assert!(md.contains("## Open bugs"));
-        assert!(md.contains("B-001 | 2026-03-29 | App crashes on login | major | auth | open | 0 |"));
+        assert!(
+            md.contains("B-001 | 2026-03-29 | App crashes on login | major | auth | open | 0 |")
+        );
     }
 
     #[test]
@@ -157,8 +159,24 @@ mod tests {
     #[test]
     fn test_roundtrip_v2() {
         let original = vec![
-            make_file_bug("B-001", "2026-03-29", "Crash", "critical", "ui", "open", Some("Needs fix")),
-            make_file_bug("B-002", "2026-03-28", "Layout broken", "minor", "ui", "in-progress", None),
+            make_file_bug(
+                "B-001",
+                "2026-03-29",
+                "Crash",
+                "critical",
+                "ui",
+                "open",
+                Some("Needs fix"),
+            ),
+            make_file_bug(
+                "B-002",
+                "2026-03-28",
+                "Layout broken",
+                "minor",
+                "ui",
+                "in-progress",
+                None,
+            ),
         ];
         let md = generate_bug_reports(&original);
         let (parsed, warnings) = parse_bug_reports(&md);
@@ -184,18 +202,40 @@ mod tests {
             None,
         )];
         let md = generate_bug_reports(&original);
-        assert!(md.contains(r"/error\|warning/"), "generate must escape | as \\|");
+        assert!(
+            md.contains(r"/error\|warning/"),
+            "generate must escape | as \\|"
+        );
         let (parsed, warnings) = parse_bug_reports(&md);
         assert!(warnings.is_empty());
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].description, "Regex /error|warning/ breaks log parser");
+        assert_eq!(
+            parsed[0].description,
+            "Regex /error|warning/ breaks log parser"
+        );
     }
 
     #[test]
     fn test_confirmed_included() {
         let bugs = vec![
-            make_file_bug("B-001", "2026-03-29", "Open bug", "major", "c", "open", None),
-            make_file_bug("B-002", "2026-03-29", "Confirmed bug", "minor", "c", "confirmed", None),
+            make_file_bug(
+                "B-001",
+                "2026-03-29",
+                "Open bug",
+                "major",
+                "c",
+                "open",
+                None,
+            ),
+            make_file_bug(
+                "B-002",
+                "2026-03-29",
+                "Confirmed bug",
+                "minor",
+                "c",
+                "confirmed",
+                None,
+            ),
         ];
         let md = generate_bug_reports(&bugs);
         assert!(md.contains("B-001"));
