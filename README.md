@@ -54,7 +54,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 - **Backend** — Rust: SQLite via `rusqlite`, file I/O for sync, Windows Credential Manager via `keyring`
 - **GitHub API** — `@octokit/rest` (called directly from the JS side, never proxied through Rust)
 - **Graph** — Cytoscape.js with concentric layout, theme-aware
-- **i18n** — Russian (default) + English, ~390 type-safe keys, no runtime dependency
+- **i18n** — Russian (default) + English, ~750 type-safe keys, no runtime dependency
 - **Autoupdate** — `tauri-plugin-updater` with Ed25519 signing; production builds via GitHub Actions on `v*` tag push
 
 ## Getting started
@@ -82,7 +82,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 
 ### Daily flow
 
-- **Sidebar** shows your projects → repos. Click a repo → tabs for Bugs / Tasks / Done / Changelog / Stats / Secrets.
+- **Sidebar** shows your projects → repos. Click a repo → tabs for Bugs / Tasks / Done / Changelog / Deploy / Secrets / Stats.
 - **Add a bug** via "+ Add bug" — instantly committable in `docs/bug-reports.md` (the MD is a view; SQLite is the SoT).
 - **Dashboard** (📊 in the sidebar) — portfolio-wide KPIs filtered by period and projects.
 - **Timeline** (📅) — chronological event feed across the whole portfolio.
@@ -107,8 +107,8 @@ npm run tauri dev          # local dev with hot reload
 ### Tests
 
 ```bash
-cd src-tauri && cargo test --lib   # ~290 Rust tests
-npm test                            # vitest frontend (~40 tests)
+cd src-tauri && cargo test --lib   # ~370 Rust tests
+npm test                            # vitest frontend (~70 tests)
 npm run check                       # svelte-check
 ```
 
@@ -117,8 +117,8 @@ npm run check                       # svelte-check
 Production releases are built by GitHub Actions on `v*` tag push — never build locally for distribution (unsigned, no `latest.json`):
 
 ```bash
-git tag -a v0.25.0 -m "v0.25.0"
-git push origin master v0.25.0
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin master vX.Y.Z
 ```
 
 The full release runbook (key rotation, CI troubleshooting, hotfix flow) — [docs/RELEASING.md](docs/RELEASING.md).
@@ -129,9 +129,11 @@ The full release runbook (key rotation, CI troubleshooting, hotfix flow) — [do
 
 ## Roadmap
 
-- **v0.25.0** *(current cycle)* — pre-rebrand cleanup: display-name flip, branches workflow, README polish.
-- **v1.0.0** — public launch. Technical identifier rebrand, repo flips from private to public, README and Releases become visible to the world.
-- **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning) + read-only API viewer screen.
+- **v1.0.0** *(current — 2026-05-18)* — public launch, MIT-licensed open source, frozen-contract era begins.
+- **v1.0.x** — post-launch polish: internal refactors (`lib.rs` / `tauri-commands.ts` splits, decomposing the 570-line `sync_project` handler), `docs/ARCHITECTURE.md` for contributors, SQLite ER-graph, in-app multilingual help screen.
+- **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix, REQ auto-accept with `## Status:` frontmatter.
+
+Full backlog and per-version task lists — [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Support development
 
