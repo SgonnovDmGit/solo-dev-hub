@@ -6,6 +6,7 @@
 
 use crate::models::UntrackReport;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -15,11 +16,29 @@ use std::process::Command;
 #[derive(Debug, Clone)]
 pub struct GitBinary(pub PathBuf);
 
+// B-000014: on Windows release builds a bare `Command::new("git")` flashes a
+// console window every time the subprocess starts. CREATE_NO_WINDOW suppresses
+// it. Every production callsite below goes through `spawn_cmd` so the flag is
+// applied uniformly; tests can keep using `Command::new` directly.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn spawn_cmd(program: impl AsRef<OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// PATH-first probe; on Windows, fall back to the two standard Git-for-Windows
 /// install locations before giving up. Returns `None` if no usable binary is
 /// found — callers must handle this (UI hides the Untrack button).
 pub fn check_git_available() -> Option<GitBinary> {
-    if let Ok(out) = Command::new("git").arg("--version").output() {
+    if let Ok(out) = spawn_cmd("git").arg("--version").output() {
         if out.status.success() {
             return Some(GitBinary(PathBuf::from("git")));
         }
@@ -33,7 +52,7 @@ pub fn check_git_available() -> Option<GitBinary> {
         ] {
             let path = PathBuf::from(candidate);
             if path.exists() {
-                if let Ok(out) = Command::new(&path).arg("--version").output() {
+                if let Ok(out) = spawn_cmd(&path).arg("--version").output() {
                     if out.status.success() {
                         return Some(GitBinary(path));
                     }
@@ -80,7 +99,7 @@ pub fn detect_repo_state(local_path: &Path) -> RepoState {
 /// is whitespace-safe (filenames with spaces, newlines, quotes all survive).
 /// Git writes UTF-8 to stdout regardless of platform.
 pub fn list_gitignored_tracked(git: &GitBinary, local_path: &Path) -> Result<Vec<PathBuf>, String> {
-    let out = Command::new(&git.0)
+    let out = spawn_cmd(&git.0)
         .args(["ls-files", "-ci", "--exclude-standard", "-z"])
         .current_dir(local_path)
         .output()
@@ -111,7 +130,7 @@ pub fn untrack_files(
     };
 
     for chunk in chunk_files(files, 100) {
-        let out = Command::new(&git.0)
+        let out = spawn_cmd(&git.0)
             .arg("rm")
             .arg("--cached")
             .args(&chunk)
@@ -137,7 +156,7 @@ pub fn count_other_staged_changes(
     local_path: &Path,
     exclude: &[PathBuf],
 ) -> Result<usize, String> {
-    let out = Command::new(&git.0)
+    let out = spawn_cmd(&git.0)
         .args(["diff", "--cached", "--name-only", "-z"])
         .current_dir(local_path)
         .output()

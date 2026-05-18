@@ -298,7 +298,7 @@
         <span class="meta-text">{$tStore('repoDetail.labelLastPushed')}: {formatDate(repo.last_pushed_at)}</span>
         <span class="meta-dot">·</span>
         {#if repo.local_path}
-          <span class="local-path ok">📁 {repo.local_path}</span>
+          <span class="local-path ok" title={repo.local_path}>📁 {repo.local_path}</span>
         {:else}
           <span class="local-path warn">⚠ {$tStore('repo.localPathNotFound' as any)}</span>
         {/if}
@@ -705,6 +705,14 @@
   .local-path {
     font-size: 11px;
     font-family: monospace;
+    /* B-000015: cap visible width so a deeply nested path doesn't push the
+       row-action buttons (init-docs / untrack-gitignored) onto the next line.
+       Full path is available on hover via the `title` attribute. */
+    max-width: 40ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
 
   .local-path.ok {
