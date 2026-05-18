@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-05-18
+
+Фикс инфраструктуры release-signing. Первый реальный end-to-end autoupdate цикл на публичном репо (v1.0.0 → v1.0.1) всплыл давнюю latent рассинхронизацию: `tauri.conf.json` нёс pubkey (`7135A97A3C3F89EF`) который **не** соответствовал приватнику в GH Secret `TAURI_SIGNING_PRIVATE_KEY` (`4D58133D6147291E`). Расхождение появилось в момент прошлой keypair-ротации — новый приватник записали в GH Secret, но соответствующий pubkey забыли пропагировать в `tauri.conf.json`. Каждый последующий релиз отправлял installer'ы чьи `.sig` верифицируются ключом которому embedded в бинаре pubkey не доверяет — невидимо пока репо был приватный (autoupdate endpoint требовал auth), невидимо пока все ставились вручную с локальных сборок, всплыло как только открылся реальный autoupdate path.
+
+### Fixed
+- **Verification подписи в autoupdate end-to-end**. Pubkey в `src-tauri/tauri.conf.json` приведён к `4D58133D6147291E` — матчит реальный CI signing key. Начиная с v1.0.2 новые installs вкомпилируют правильный pubkey и успешно verify'ят подписи.
+- **⚠ Существующим v1.0.0 и v1.0.1 installs необходима разовая ручная переустановка.** Эти бинари вкомпилировали stale pubkey и продолжат отвергать v1.0.2 (и любые будущие) подписанные updates через autoupdate. Решение: скачать `Solo.Dev.Hub_1.0.2_x64-setup.exe` со страницы этого релиза и запустить один раз. После этого autoupdate работает automatically для всех будущих релизов. Новые installs от v1.0.2 onwards не затронуты.
+
+### Tests
+- 370 cargo / 72 vitest / 0 svelte issues на 495 файлах (нет кодовых изменений кроме manifest version bump и pubkey field в `tauri.conf.json` — baseline унаследован от v1.0.1).
+
 ## [1.0.1] — 2026-05-18
 
 Первый post-launch патч. Два бага из dogfood'а на v1.0.0 — оба регрессии от F-000041 (первый local `git` CLI shellout проекта, появившийся в v0.34.0) и layout'а path-row рядом с ним.

@@ -4,6 +4,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-05-18
+
+Release-signing infrastructure fix. The first actual end-to-end autoupdate cycle on the public repo (v1.0.0 → v1.0.1) surfaced a long-standing latent mismatch: `tauri.conf.json` carried a pubkey (`7135A97A3C3F89EF`) that did not correspond to the private key in the CI `TAURI_SIGNING_PRIVATE_KEY` secret (`4D58133D6147291E`). The two had drifted apart at a past keypair rotation where the new private key was written into the GH Secret but the matching pubkey was never propagated to `tauri.conf.json`. Every release from that point onward shipped installers whose `.sig` verified against a key the embedded binary did not trust — invisible while the repo was private (autoupdate endpoint required auth), invisible while everyone installed manually from local builds, but it broke the moment a real autoupdate path opened.
+
+### Fixed
+- **Autoupdate signature verification end-to-end**. Pubkey in `src-tauri/tauri.conf.json` realigned to `4D58133D6147291E`, matching the actual CI signing key. From v1.0.2 onwards new installs embed the correct pubkey and verify signatures successfully.
+- **⚠ One-time manual reinstall required for existing v1.0.0 and v1.0.1 installs.** The bug means those binaries embed the stale pubkey and will continue rejecting v1.0.2 (and any future) signed updates from autoupdate. Workaround: download `Solo.Dev.Hub_1.0.2_x64-setup.exe` from this release page and run it once. After that, autoupdate works automatically for all future releases. New installs from v1.0.2 onwards have no impact.
+
+### Tests
+- 370 cargo / 72 vitest / 0 svelte issues on 495 files (no code change beyond the manifest version bump and the pubkey field in `tauri.conf.json` — baseline carried from v1.0.1).
+
 ## [1.0.1] — 2026-05-18
 
 First post-launch patch. Two dogfood-surfaced bugs in v1.0.0 — both regressions introduced by F-000041 (the project's first local `git` CLI shellout, shipped in v0.34.0) and the v0.34.0 path-row layout that landed under it.

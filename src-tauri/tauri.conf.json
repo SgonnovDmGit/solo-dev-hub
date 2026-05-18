@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Solo Dev Hub",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "identifier": "com.solodevhub.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -42,7 +42,7 @@
       "endpoints": [
         "https://github.com/SgonnovDmGit/solo-dev-hub/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcxMzVBOTdBM0MzRjg5RUYKUldUdmlUODhlcWsxY1VlakZiU2dlT1kwYkFmWkxZNUlvSG1GNFJlKzllaTh5aTNnT01acWpkK3AK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRENTgxMzNENjE0NzI5MUUKUldRZUtVZGhQUk5ZVFdtekw2TUpib29uSDRSRnFISERuVjNLOXNSRkVmN0N5WnpmR1pLdkgrc0IK"
     }
   }
 }
