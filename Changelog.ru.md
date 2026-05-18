@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-05-18
+
+Первый post-launch патч. Два бага из dogfood'а на v1.0.0 — оба регрессии от F-000041 (первый local `git` CLI shellout проекта, появившийся в v0.34.0) и layout'а path-row рядом с ним.
+
+### Fixed
+- **B-000014** (critical) — на Windows release-сборке при каждом клике по репо в сайдбаре мигало окно консоли. Root cause: `$effect` для `canUntrack` в `RepoDetail.svelte` дёргает `check_git_available_for_repo` → backend спавнит `git --version` через bare `std::process::Command::new`, на Windows-GUI-хосте subprocess наследует `STARTUPINFO` без `CREATE_NO_WINDOW` → cmd.exe всплывает на время жизни subprocess'а. Добавил helper `spawn_cmd()` который ставит `CREATE_NO_WINDOW` (`0x08000000`) через `CommandExt::creation_flags` на Windows; применил ко всем 5 production-callsite'ам в `git_ops.rs` (`check_git_available` × 2, `list_gitignored_tracked`, `untrack_files`, `count_other_staged_changes`). `#[cfg(windows)]` — no-op на macOS/Linux. Test-callsite'ы оставил на bare `Command::new` — `cargo test` на Windows гоняется в console host где флаг не имеет значения.
+- **B-000015** (major) — двухчастная проблема, всплывшая по ходу smoke. Часть 1: глубоко вложенный путь в `.local-path` (например `📁 F:\Development\some\long\subdir\to\repo`) выталкивал кнопки `📚 Init docs` и `🧹 Untrack` на следующую строку `meta-row`. Закаппил `.local-path`: `max-width: 40ch` + `overflow: hidden` + `text-overflow: ellipsis` + `white-space: nowrap` + `min-width: 0` (последнее обязательно чтобы flex-child реально сократился); полный путь по hover через `title`. Часть 2 (retest): при каждой смене репо обе row-action кнопки моргали. Root cause: `$effect` для `canUntrack` синхронно ставил `false` ДО запуска async backend-проверки, поэтому `{#if canUntrack}` вырывал untrack-кнопку из DOM и возвращал обратно через ms, init-docs визуально подёргивался от flex-row reflow. Убрал sync-reset, добавил stale-response guard (`repo?.id === repoId`) чтобы более медленный ответ для репо A не перезаписывал более быстрый ответ для репо B при быстром клике A → B.
+
+### Tests
+- 370 cargo / 72 vitest / 0 svelte issues на 495 файлах.
+
 ## [1.0.0] — 2026-05-18
 
 **Публичный релиз.** Solo Dev Hub становится open source под лицензией MIT. Breaking API changes относительно v0.34.0 нет — релиз маркирует переход с `0.x` (unstable contract) на `1.x` (frozen contract starts here). Tauri identifier (`com.solodevhub.app`) и lib name (`solo_dev_hub_lib`) стабильны с v0.25.0, autoupdate `v0.34.x → v1.0.0` проходит как обычный in-place апдейт.

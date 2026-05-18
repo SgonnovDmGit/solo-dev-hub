@@ -152,13 +152,25 @@
   let canUntrack = $state(false);
   let showUntrackDialog = $state(false);
 
+  // B-000015 follow-up: do NOT reset canUntrack synchronously on repo change —
+  // that caused the untrack button to flash out + back in on every sidebar
+  // click (and the init-docs button next to it visually jittered from the
+  // flex-row reflow). Keep the previous value until the async check resolves.
+  // Stale-response guard (`repo?.id === repoId`) protects against the case
+  // where user clicks repo A → repo B and A's response arrives after B's.
   $effect(() => {
-    canUntrack = false;
-    if (!repo) return;
+    if (!repo) {
+      canUntrack = false;
+      return;
+    }
     const repoId = repo.id;
     checkGitAvailableForRepo(repoId)
-      .then((v) => { canUntrack = v; })
-      .catch(() => { canUntrack = false; });
+      .then((v) => {
+        if (repo?.id === repoId) canUntrack = v;
+      })
+      .catch(() => {
+        if (repo?.id === repoId) canUntrack = false;
+      });
   });
 
   // F-021: tabs in RepoDetail. T-000080: Deploy moved from separate screen to tab.
@@ -298,7 +310,7 @@
         <span class="meta-text">{$tStore('repoDetail.labelLastPushed')}: {formatDate(repo.last_pushed_at)}</span>
         <span class="meta-dot">·</span>
         {#if repo.local_path}
-          <span class="local-path ok">📁 {repo.local_path}</span>
+          <span class="local-path ok" title={repo.local_path}>📁 {repo.local_path}</span>
         {:else}
           <span class="local-path warn">⚠ {$tStore('repo.localPathNotFound' as any)}</span>
         {/if}
@@ -705,6 +717,14 @@
   .local-path {
     font-size: 11px;
     font-family: monospace;
+    /* B-000015: cap visible width so a deeply nested path doesn't push the
+       row-action buttons (init-docs / untrack-gitignored) onto the next line.
+       Full path is available on hover via the `title` attribute. */
+    max-width: 40ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
 
   .local-path.ok {
