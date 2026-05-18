@@ -4,6 +4,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-05-18
+
+First post-launch patch. Two dogfood-surfaced bugs in v1.0.0 — both regressions introduced by F-000041 (the project's first local `git` CLI shellout, shipped in v0.34.0) and the v0.34.0 path-row layout that landed under it.
+
+### Fixed
+- **B-000014** (critical) — on Windows release builds a console window flashed every time the user clicked a repository in the sidebar. Root cause: the `$effect` for `canUntrack` in `RepoDetail.svelte` calls `check_git_available_for_repo` → backend spawns `git --version` via bare `std::process::Command::new`, which on Windows-GUI-host inherits `STARTUPINFO` with no `CREATE_NO_WINDOW` flag → cmd.exe pops up for the subprocess lifetime. Added a `spawn_cmd()` helper that sets `CREATE_NO_WINDOW` (`0x08000000`) via `CommandExt::creation_flags` on Windows; applied to all 5 production callsites in `git_ops.rs` (`check_git_available` × 2, `list_gitignored_tracked`, `untrack_files`, `count_other_staged_changes`). `#[cfg(windows)]` — no-op on macOS/Linux. Test callsites left on bare `Command::new` — `cargo test` on Windows runs in a console host where the flag is moot.
+- **B-000015** (major) — two-part issue surfaced during smoke. Part 1: a deeply nested `.local-path` (e.g. `📁 F:\Development\some\long\subdir\to\repo`) pushed the `📚 Init docs` and `🧹 Untrack` row-action buttons onto the next line of `meta-row`. Capped `.local-path` with `max-width: 40ch` + `overflow: hidden` + `text-overflow: ellipsis` + `white-space: nowrap` + `min-width: 0` (last required so the flex child actually shrinks); full path available on hover via the `title` attribute. Part 2 (retest finding): on every repo switch, the two row-action buttons flickered. Root cause: the `canUntrack` `$effect` reset to `false` synchronously before kicking off the async backend check, so the `{#if canUntrack}` block tore the untrack button out of the DOM and re-added it ~ms later, with the init-docs button visibly jittering from the flex-row reflow. Dropped the sync reset and added a stale-response guard (`repo?.id === repoId`) so a slower response for repo A cannot overwrite a faster response for repo B when the user clicks A → B in quick succession.
+
+### Tests
+- 370 cargo / 72 vitest / 0 svelte issues on 495 files.
+
 ## [1.0.0] — 2026-05-18
 
 **Public launch.** Solo Dev Hub goes public and becomes MIT-licensed open source. No breaking API changes from v0.34.0 — this release marks the transition from `0.x` (unstable contract) to `1.x` (frozen contract starts here). Tauri identifier (`com.solodevhub.app`) and lib name (`solo_dev_hub_lib`) have been stable since v0.25.0, so autoupdate `v0.34.x → v1.0.0` runs as a normal in-place update on existing installations.
