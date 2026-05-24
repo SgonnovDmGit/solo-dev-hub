@@ -16,11 +16,14 @@
   import DashboardCategoryBars from './DashboardCategoryBars.svelte';
   import DashboardActivityFeed from './DashboardActivityFeed.svelte';
 
-  onMount(() => {
-    loadDashboard();
-  });
-
   let refreshing = $state(false);
+
+  onMount(() => {
+    // Mount = same semantics as the ↻ button — pick up any MD-side changes
+    // (LLM-edited bug-reports.md / todo.md / done.md) that happened while the
+    // app was closed or while user was on a different screen, then read DB.
+    handleRefresh();
+  });
 
   // B-000016 (dogfood follow-up): ↻ runs portfolio-wide MD→DB reconcile
   // (bugs + tasks across every repo) and THEN reloads dashboard data. Without
