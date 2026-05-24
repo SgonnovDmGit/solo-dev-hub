@@ -1675,6 +1675,132 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
         }
     }
 
+    // B-000019/B-000020: MS-driven sync — when the current project is a
+    // microservice, fan out to each connected parent server. Mirrors the
+    // parent-driven block above but with the MS as initiator. Without this,
+    // pressing Sync on an MS project is a no-op (its clients/microservices
+    // loops are empty), so api.md edits never propagate and parents stay out
+    // of sync until they happen to trigger Sync themselves. Rename-replay is
+    // intentionally not duplicated here — parent-driven sync remains the
+    // authority for that, this block does the steady-state file copies only.
+    if project_type == "microservice" {
+        if let Some(ms_server) = server {
+            if let Some(ref ms_path) = ms_server.local_path {
+                let ms_base = Path::new(ms_path);
+                if let Err(e) = sync::ensure_root_exists(ms_base) {
+                    errors.push(format!("Microservice {}: {}", ms_server.display_name(), e));
+                } else {
+                    let ms_canonical = ms_server.canonical_folder_name();
+                    let ms_project_name = db
+                        .get_project(project_id)
+                        .map(|p| p.name)
+                        .unwrap_or_default();
+                    let parents = db
+                        .list_parents_of_microservice(project_id)
+                        .unwrap_or_default();
+                    for parent_project in &parents {
+                        let parent_repos = match db.list_repos_by_project(Some(parent_project.id)) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                errors.push(format!(
+                                    "Parent {} list repos: {}",
+                                    parent_project.name, e
+                                ));
+                                continue;
+                            }
+                        };
+                        let Some(parent_server) = parent_repos
+                            .iter()
+                            .find(|r| r.role.as_deref() == Some("server"))
+                        else {
+                            errors.push(format!(
+                                "Parent {}: no server-repo found",
+                                parent_project.name
+                            ));
+                            continue;
+                        };
+                        let Some(ref parent_local) = parent_server.local_path else {
+                            errors.push(format!(
+                                "Parent {} ({}): server-repo has no local_path",
+                                parent_project.name,
+                                parent_server.display_name()
+                            ));
+                            continue;
+                        };
+                        let parent_base = Path::new(parent_local);
+                        if let Err(e) = sync::ensure_root_exists(parent_base) {
+                            errors.push(format!(
+                                "Parent {} ({}): {}",
+                                parent_project.name,
+                                parent_server.display_name(),
+                                e
+                            ));
+                            continue;
+                        }
+                        let parent_canonical = parent_server.canonical_folder_name();
+
+                        // MS → parent: api.md + handlers.md
+                        for filename in ["api.md", "handlers.md"] {
+                            let src = ms_base.join("docs").join(filename);
+                            if !src.exists() {
+                                continue;
+                            }
+                            let dst = parent_base
+                                .join("docs")
+                                .join("microservice-api")
+                                .join(&ms_project_name)
+                                .join(filename);
+                            match sync::copy_file_if_changed(&src, &dst) {
+                                Ok(true) => copied += 1,
+                                Ok(false) => {}
+                                Err(e) => errors.push(format!(
+                                    "Copy {} -> parent {}: {}",
+                                    filename, parent_project.name, e
+                                )),
+                            }
+                        }
+
+                        // parent → MS: REQ-*.md (source of truth on parent side)
+                        let parent_ms_dir = parent_base
+                            .join("docs")
+                            .join("microservice-requirements")
+                            .join(&ms_canonical);
+                        let ms_parent_dir = ms_base
+                            .join("docs")
+                            .join("server-requirements")
+                            .join(&parent_canonical);
+                        for req_file in sync::scan_requirements(&parent_ms_dir) {
+                            let src = parent_ms_dir.join(&req_file);
+                            let dst = ms_parent_dir.join(&req_file);
+                            match sync::copy_file_if_changed(&src, &dst) {
+                                Ok(true) => copied += 1,
+                                Ok(false) => {}
+                                Err(e) => errors.push(format!(
+                                    "Copy {} from parent {} to MS: {}",
+                                    req_file, parent_project.name, e
+                                )),
+                            }
+                        }
+
+                        // MS → parent: *.response.md (source of truth on MS side)
+                        for resp_file in sync::scan_responses(&ms_parent_dir) {
+                            let src = ms_parent_dir.join(&resp_file);
+                            let dst = parent_ms_dir.join(&resp_file);
+                            match sync::copy_file_if_changed(&src, &dst) {
+                                Ok(true) => responses += 1,
+                                Ok(false) => {}
+                                Err(e) => errors.push(format!(
+                                    "Copy {} from MS to parent {}: {}",
+                                    resp_file, parent_project.name, e
+                                )),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // v0.20.0: record sync event. SyncResult fields per models.rs:282 — copied + responses + migrated
     let total_changes = (copied + responses + migrated) as i64;
     let _ = db.insert_sync_event(
