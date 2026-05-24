@@ -39,7 +39,15 @@
         <span class="period">{rangeText($currentPeriod)}</span>
       </div>
     </div>
-    <DashboardFilters />
+    <div class="header-actions">
+      <DashboardFilters />
+      <button
+        class="ghost mini refresh-btn"
+        onclick={() => loadDashboard()}
+        disabled={$dashboardLoading}
+        title={$tStore('dashboard.refresh' as any)}
+        type="button">{$dashboardLoading ? '⟳' : '↻'}</button>
+    </div>
   </div>
 
   {#if $dashboardLoading && !$dashboardData}
@@ -99,6 +107,10 @@
     padding-bottom: 10px; border-bottom: 1px solid var(--border);
     gap: 12px; flex-wrap: wrap;
   }
+  .header-actions { display: flex; align-items: center; gap: 8px; }
+  .refresh-btn { font-size: 14px; padding: 0 6px; color: var(--text-muted); }
+  .refresh-btn:hover:not(:disabled) { color: var(--accent); }
+  .refresh-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .dash-title { font-size: 16px; font-weight: 700; margin: 0 0 3px 0; }
   .range-line { font-size: 10.5px; color: var(--text-muted); line-height: 1.4; }
   .range-line .period { color: var(--text); font-weight: 600; }
