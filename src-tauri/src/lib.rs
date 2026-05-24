@@ -3081,31 +3081,36 @@ pub fn run() {
             // (taskbar = 64 physical, 1:1) and lower DPIs (clean 0.5×/0.25×).
             //
             // B-000017 (v1.0.x): on high-DPI monitors (3072×1920 + 200% Win11
-            // modern taskbar = ~48-96 physical px request), 64-frame produces
-            // non-integer downscale → softness. tauri::image::Image holds a
-            // single RGBA bitmap (no multi-frame ICO support), so we can't ship
-            // per-DPI frames through this API. The fix is one big SDH-crop
-            // source that downscales cleanly at any DPI Windows asks for.
+            // modern taskbar = ~48-96 physical px request), 64-frame produced
+            // non-integer downscale → softness. First retry used the ios/
+            // AppIcon-512@2x.png SDH-crop @ 1024 — still blurry: the source
+            // had concentric rings and hexagonal traces that aliased to noise
+            // at small taskbar sizes regardless of source resolution.
             //
-            // ios/AppIcon-512@2x.png is the SDH-crop at 1024×1024 — same design
-            // language as 64x64.png (SDH letters dominate, simple hexagonal
-            // frame), just rendered at higher fidelity. Adds ~1MB to the binary
-            // but covers any taskbar request 16-256 px with clean area-filter
-            // downscale, with future headroom for 400%+ DPI displays.
+            // B-000017 v2: switched to a purpose-designed taskbar icon —
+            // sdh-runtime.png is a 1024×1024 flat-top hex (electric blue
+            // #3b82f6) with bold white SDH letters, no decorative details.
+            // Simple two-colour design → area-filter downscale clean at any
+            // taskbar size 16-256 px. Source is checked-in SVG-derived PNG
+            // (see docs/superpowers/plans/2026-05-24-sdh-icon-v2.html for the
+            // generator and other variants explored). Adds ~55KB to the
+            // binary (vs prior 1MB SDH-crop), so net binary shrinks.
             //
-            // This does NOT affect the .exe file icon (still full 10-frame
-            // icon.ico via embed_resource — Explorer / start-menu pick correct
-            // frame for each context).
+            // tauri::image::Image holds a single RGBA bitmap (no multi-frame
+            // ICO support), so this one frame serves every DPI Windows asks
+            // for. Does NOT affect the .exe file icon (still full 10-frame
+            // icon.ico via embed_resource — Explorer / start-menu pick the
+            // correct frame for each context).
             use tauri::Manager;
             if let Some(window) = app.get_webview_window("main") {
-                let icon_bytes = include_bytes!("../icons/ios/AppIcon-512@2x.png");
+                let icon_bytes = include_bytes!("../icons/sdh-runtime.png");
                 match tauri::image::Image::from_bytes(icon_bytes) {
                     Ok(icon) => {
                         if let Err(e) = window.set_icon(icon) {
                             eprintln!("warn: failed to set window icon: {}", e);
                         }
                     }
-                    Err(e) => eprintln!("warn: failed to decode AppIcon-512@2x.png: {}", e),
+                    Err(e) => eprintln!("warn: failed to decode sdh-runtime.png: {}", e),
                 }
             }
             Ok(())
