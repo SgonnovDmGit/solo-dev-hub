@@ -3087,18 +3087,26 @@ pub fn run() {
             // had concentric rings and hexagonal traces that aliased to noise
             // at small taskbar sizes regardless of source resolution.
             //
-            // B-000017 v3: purpose-designed taskbar icon. sdh-runtime.png is
-            // a 1024×1024 flat-top hex (indigo-600 #4f46e5) with white
-            // hub-spokes glyph inside — central node + 6 spokes radiating to
-            // 6 outer nodes aligned with the hex vertices. Brand-relevant
-            // (the "Hub" in "Solo Dev Hub") and geometrically locked to the
-            // hex (spokes hit vertices). Indigo-600 matches the original
-            // SDH logo's purple-violet palette more closely than electric
-            // blue. v1 used 64×64 SDH-crop, v2 tried 1024 SDH-crop letters
-            // (rejected — "D" merged into "O" on small taskbar render).
-            // Generator and explored variants at
-            // docs/superpowers/plans/2026-05-24-sdh-icon-v2.html. Source is
-            // ~70KB PNG.
+            // B-000017 v4: two-layer taskbar icon. sdh-runtime.png is a
+            // 1024×1024 PNG with three nested layers:
+            //   1. rounded-square outer (indigo-900 #312e81) — fills the
+            //      canvas like Excel/Word/Slack neighbour icons, so SDH
+            //      doesn't render smaller than them in the taskbar.
+            //   2. inner flat-top hex (indigo-600 #4f46e5) — preserves the
+            //      brand hex silhouette inside the square frame.
+            //   3. white Y-tree glyph (central node + 3 branches at
+            //      90°/210°/330°) — hub+tree metaphor for "Solo Dev Hub".
+            //
+            // Iterations: v1=64×64 SDH-crop (blurry on high-DPI),
+            // v2=1024 SDH-crop letters (rejected — "D" merged with "O"),
+            // v3=hex-only G7 hub-spokes (rendered smaller than neighbours
+            // due to hex's ~25% transparent corners). v4 fixes the
+            // fill-ratio problem by giving the canvas a full rounded-square
+            // fill while keeping the hex as a visible inner element.
+            //
+            // Generator + explored variants at
+            // docs/superpowers/plans/2026-05-24-sdh-icon-v2.html.
+            // ~60KB PNG.
             //
             // tauri::image::Image holds a single RGBA bitmap (no multi-frame
             // ICO support), so this one frame serves every DPI Windows asks
