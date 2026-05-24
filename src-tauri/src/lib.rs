@@ -3034,27 +3034,37 @@ pub fn run() {
             // window icon comes from `bundle.icon` (icon.ico) and tao stores it
             // as a single tao::Icon — it picks the largest frame (256×256 = our
             // full logo, NOT the SDH-crop). Windows then downscales that to the
-            // requested taskbar size (64×64 at 200% DPI), producing blur and
-            // showing the wrong design.
+            // requested taskbar size, producing blur and showing the wrong design.
             //
-            // Forcing the SDH-crop 64×64 PNG as the window icon: at 200% DPI
-            // taskbar requests 64 physical px → 1:1 match, no scaling, sharp.
-            // For 16/32 logical sizes Windows downscales 64×64 with integer
-            // ratios (0.5×, 0.25×) which stays clean.
+            // B-000010 (v0.23.0) forced 64×64 SDH-crop here: clean at 200% DPI
+            // (taskbar = 64 physical, 1:1) and lower DPIs (clean 0.5×/0.25×).
+            //
+            // B-000017 (v1.0.x): on high-DPI monitors (3072×1920 + 200% Win11
+            // modern taskbar = ~48-96 physical px request), 64-frame produces
+            // non-integer downscale → softness. tauri::image::Image holds a
+            // single RGBA bitmap (no multi-frame ICO support), so we can't ship
+            // per-DPI frames through this API. The fix is one big SDH-crop
+            // source that downscales cleanly at any DPI Windows asks for.
+            //
+            // ios/AppIcon-512@2x.png is the SDH-crop at 1024×1024 — same design
+            // language as 64x64.png (SDH letters dominate, simple hexagonal
+            // frame), just rendered at higher fidelity. Adds ~1MB to the binary
+            // but covers any taskbar request 16-256 px with clean area-filter
+            // downscale, with future headroom for 400%+ DPI displays.
             //
             // This does NOT affect the .exe file icon (still full 10-frame
             // icon.ico via embed_resource — Explorer / start-menu pick correct
             // frame for each context).
             use tauri::Manager;
             if let Some(window) = app.get_webview_window("main") {
-                let icon_bytes = include_bytes!("../icons/64x64.png");
+                let icon_bytes = include_bytes!("../icons/ios/AppIcon-512@2x.png");
                 match tauri::image::Image::from_bytes(icon_bytes) {
                     Ok(icon) => {
                         if let Err(e) = window.set_icon(icon) {
                             eprintln!("warn: failed to set window icon: {}", e);
                         }
                     }
-                    Err(e) => eprintln!("warn: failed to decode 64x64.png: {}", e),
+                    Err(e) => eprintln!("warn: failed to decode AppIcon-512@2x.png: {}", e),
                 }
             }
             Ok(())
