@@ -3070,61 +3070,33 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .setup(|app| {
-            // B-000010: override the window icon explicitly. Tauri's default
-            // window icon comes from `bundle.icon` (icon.ico) and tao stores it
-            // as a single tao::Icon — it picks the largest frame (256×256 = our
-            // full logo, NOT the SDH-crop). Windows then downscales that to the
-            // requested taskbar size, producing blur and showing the wrong design.
+        .setup(|_app| {
+            // B-000017 v5 (reverted v3+v4 set_icon override): comparing
+            // against a sibling Tauri-2 + Svelte app (MySafeSpace) on the
+            // same Win11 high-DPI display revealed that the default Tauri
+            // window-icon path (NO programmatic set_icon) renders sharp
+            // because Tauri/tao does pick the right frame from icon.ico's
+            // multi-frame resource for each context (taskbar / alt-tab /
+            // title). Earlier explicit set_icon attempts (v1=64×64 PNG,
+            // v3=hub-spokes PNG, v4=square-frame PNG) forced a single RGBA
+            // bitmap on every DPI context — Windows then downscaled with
+            // poor filtering on non-integer ratios. Removing the override
+            // restores multi-frame ICO behaviour for free.
             //
-            // B-000010 (v0.23.0) forced 64×64 SDH-crop here: clean at 200% DPI
-            // (taskbar = 64 physical, 1:1) and lower DPIs (clean 0.5×/0.25×).
+            // The original B-000010 comment claimed default Tauri picked
+            // "the largest frame and downscaled it" — that was likely true
+            // of an earlier tao version; current Tauri 2.x handles
+            // multi-frame ICO correctly. icon.ico already has the right
+            // frames (16/20/24/32/40/48/64/96/128/256, SDH-crop on small,
+            // full logo on large) per the B-000010 rebuild — no changes
+            // needed there.
             //
-            // B-000017 (v1.0.x): on high-DPI monitors (3072×1920 + 200% Win11
-            // modern taskbar = ~48-96 physical px request), 64-frame produced
-            // non-integer downscale → softness. First retry used the ios/
-            // AppIcon-512@2x.png SDH-crop @ 1024 — still blurry: the source
-            // had concentric rings and hexagonal traces that aliased to noise
-            // at small taskbar sizes regardless of source resolution.
+            // Does NOT affect the .exe file icon either way (still
+            // multi-frame icon.ico via tauri-bundler's embedded resource).
             //
-            // B-000017 v4: two-layer taskbar icon. sdh-runtime.png is a
-            // 1024×1024 PNG with three nested layers:
-            //   1. rounded-square outer (indigo-900 #312e81) — fills the
-            //      canvas like Excel/Word/Slack neighbour icons, so SDH
-            //      doesn't render smaller than them in the taskbar.
-            //   2. inner flat-top hex (indigo-600 #4f46e5) — preserves the
-            //      brand hex silhouette inside the square frame.
-            //   3. white Y-tree glyph (central node + 3 branches at
-            //      90°/210°/330°) — hub+tree metaphor for "Solo Dev Hub".
-            //
-            // Iterations: v1=64×64 SDH-crop (blurry on high-DPI),
-            // v2=1024 SDH-crop letters (rejected — "D" merged with "O"),
-            // v3=hex-only G7 hub-spokes (rendered smaller than neighbours
-            // due to hex's ~25% transparent corners). v4 fixes the
-            // fill-ratio problem by giving the canvas a full rounded-square
-            // fill while keeping the hex as a visible inner element.
-            //
-            // Generator + explored variants at
-            // docs/superpowers/plans/2026-05-24-sdh-icon-v2.html.
-            // ~60KB PNG.
-            //
-            // tauri::image::Image holds a single RGBA bitmap (no multi-frame
-            // ICO support), so this one frame serves every DPI Windows asks
-            // for. Does NOT affect the .exe file icon (still full 10-frame
-            // icon.ico via embed_resource — Explorer / start-menu pick the
-            // correct frame for each context).
-            use tauri::Manager;
-            if let Some(window) = app.get_webview_window("main") {
-                let icon_bytes = include_bytes!("../icons/sdh-runtime.png");
-                match tauri::image::Image::from_bytes(icon_bytes) {
-                    Ok(icon) => {
-                        if let Err(e) = window.set_icon(icon) {
-                            eprintln!("warn: failed to set window icon: {}", e);
-                        }
-                    }
-                    Err(e) => eprintln!("warn: failed to decode sdh-runtime.png: {}", e),
-                }
-            }
+            // Generator + explored override variants left at
+            // docs/superpowers/plans/2026-05-24-sdh-icon-v2.html for
+            // history.
             Ok(())
         })
         .manage(db)
