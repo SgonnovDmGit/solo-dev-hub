@@ -7,6 +7,8 @@
     loadDashboard,
   } from '$lib/stores/dashboard';
   import { tStore } from '$lib/i18n';
+  import { reconcileAllProjects } from '$lib/api/tauri-commands';
+  import { addToast } from '$lib/stores/ui';
   import DashboardFilters from './DashboardFilters.svelte';
   import DashboardKpi from './DashboardKpi.svelte';
   import DashboardTopHot from './DashboardTopHot.svelte';
@@ -17,6 +19,27 @@
   onMount(() => {
     loadDashboard();
   });
+
+  let refreshing = $state(false);
+
+  // B-000016 (dogfood follow-up): ↻ runs portfolio-wide MD→DB reconcile
+  // (bugs + tasks across every repo) and THEN reloads dashboard data. Without
+  // the reconcile step, LLM-edited bug-reports.md / todo.md / done.md changes
+  // wouldn't reflect until the user manually syncs the matching project.
+  async function handleRefresh() {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      const report = await reconcileAllProjects();
+      if (report.errors.length > 0) {
+        addToast(report.errors.join('; '), 'warning');
+      }
+    } catch (e) {
+      addToast(String(e), 'error');
+    }
+    await loadDashboard();
+    refreshing = false;
+  }
 
   function rateFmt(v: number): string {
     return `${Math.round(v)}%`;
@@ -43,10 +66,10 @@
       <DashboardFilters />
       <button
         class="ghost mini refresh-btn"
-        onclick={() => loadDashboard()}
-        disabled={$dashboardLoading}
+        onclick={handleRefresh}
+        disabled={refreshing || $dashboardLoading}
         title={$tStore('dashboard.refresh' as any)}
-        type="button">{$dashboardLoading ? '⟳' : '↻'}</button>
+        type="button">{refreshing || $dashboardLoading ? '⟳' : '↻'}</button>
     </div>
   </div>
 

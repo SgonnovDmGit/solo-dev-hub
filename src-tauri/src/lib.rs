@@ -617,6 +617,47 @@ fn reconcile_bugs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<(), String>
     sync::reconcile_bugs_for_repo(&db, repo_id)
 }
 
+#[derive(serde::Serialize)]
+struct ReconcileAllReport {
+    repos_scanned: usize,
+    errors: Vec<String>,
+}
+
+/// B-000016 (dogfood follow-up): portfolio-wide reconcile for Dashboard ↻.
+/// Walks every repo and runs MD→DB reconcile for bugs + tasks. No cross-repo
+/// file copies (those live in `sync_project` per-project). "Not migrated yet"
+/// errors are suppressed — that's normal for newly added repos before their
+/// first ensure_*_migrated call. All other errors are collected so the UI can
+/// surface them via toast without aborting the rest of the walk.
+#[tauri::command]
+fn reconcile_all_projects(db: State<AppDb>) -> Result<ReconcileAllReport, String> {
+    let repos = db.list_all_repos().map_err(|e| e.to_string())?;
+    let repos_scanned = repos.len();
+    let mut errors: Vec<String> = Vec::new();
+
+    for r in repos {
+        // Bugs reconcile — silent-skip pre-migration state.
+        if let Err(e) = sync::reconcile_bugs_for_repo(&db, r.id) {
+            if !e.contains("not migrated") {
+                errors.push(format!("Bugs {}: {}", r.display_name(), e));
+            }
+        }
+        // Tasks reconcile — same silent-skip rule. SyncTasksReport.events_emitted
+        // is informational; we don't surface it (the user sees the effect in the
+        // refreshed Dashboard numbers).
+        if let Err(e) = sync::sync_tasks_for_repo(&db, r.id) {
+            if !e.contains("not migrated") {
+                errors.push(format!("Tasks {}: {}", r.display_name(), e));
+            }
+        }
+    }
+
+    Ok(ReconcileAllReport {
+        repos_scanned,
+        errors,
+    })
+}
+
 /// List bugs for a repo as frontend DTOs. `include_confirmed=false` excludes
 /// archived bugs (default for BugNotes list view). `=true` includes them
 /// (used when user toggles "Показать закрытые").
@@ -3112,6 +3153,7 @@ pub fn run() {
             // Bugs (v0.16.0, SQLite SoT)
             ensure_bugs_migrated,
             reconcile_bugs_for_repo,
+            reconcile_all_projects,
             read_bugs_from_db,
             count_confirmed_bugs,
             create_bug,
