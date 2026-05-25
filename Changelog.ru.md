@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [1.0.4] — 2026-05-25
+
+Template-only мини-патч — gitignore шаблон для managed репозиториев пропускал один folder-паттерн и имел trailing-slash несостыковку на другом. Downstream impact: любой managed репо чей `.gitignore` был сгенерирован из этого шаблона до v1.0.4 может иметь `docs/microservice-announcements/` untracked-but-visible в git status, плюс `docs/server-announcements` матчит loose файлы (не только папку).
+
+### Fixed
+- **`src-tauri/templates/_global/.gitignore.tmpl`** — добавлен `docs/microservice-announcements/` (симметрия к `docs/server-announcements/`; оба — recipient-side acknowledgement-by-delete каналы по правилам `# Cross-repo announcements`, ни тот ни другой не должен попадать в git history). Добавлен trailing `/` к `docs/server-announcements` чтобы паттерн однозначно матчил папку, а не одноимённые loose файлы. Существующие managed репо подхватят оба паттерна при следующем "Sync global rules".
+
+### Tests
+- 376 cargo / 72 vitest / 0 svelte issues (без изменений — template-only).
+
 ## [1.0.3] — 2026-05-25
 
 Dogfood-патч — пять багов всплыли в ежедневном использовании v1.0.2, плюс унификация brand identity и bump Tauri runtime, выпавший из расследования B-000017.
