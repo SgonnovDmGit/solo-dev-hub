@@ -508,13 +508,35 @@
   }
 
   /* flat: panel is the sole content of a dedicated tab — no border-top (tab-nav already draws a divider) and no vertical padding (the tab wrapper provides it). */
+  /* T-000129: in flat mode the panel fills its tab — flex column so .new-secrets
+     can grow to absorb the unused vertical real estate below the existing-secrets
+     list. Without this cascade .secrets-textarea stays pinned at rows="4" (~70px)
+     and leaves half the viewport blank on wide screens. */
   .secrets-section.flat {
     border-top: none;
     padding: 0;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
 
   .secrets-section.flat .secrets-body {
     padding-top: 0;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .secrets-section.flat .new-secrets {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .secrets-section.flat .new-secrets .secrets-textarea {
+    flex: 1;
+    min-height: 70px;
   }
 
   .secrets-toggle {

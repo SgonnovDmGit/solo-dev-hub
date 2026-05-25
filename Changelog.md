@@ -4,6 +4,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.0.5] — 2026-05-25
+
+UX polish patch — two small dogfood-surfaced annoyances. Reject-bug dialog button label was semantically off ("Подтвердить" / "Confirm" on a dialog whose header literally says "Отклонить баг" / "Reject bug" — the verb on the button didn't match the action). SecretsPanel bulk-paste textarea was pinned at `rows="4"` (~70px) regardless of viewport — on a 1337px-tall window the input occupied 5% of vertical real estate, the rest sat empty. Both are CSS / i18n-only — no Rust touched.
+
+### Changed
+- **`dialog.confirm` i18n key** — `Подтвердить` / `Confirm` → `ОК` / `OK`. Affects every `ConfirmDialog` site (13 usages: bug delete, bug reject, deploy env delete, GlobalClaudeEditor discard, project type change, project delete, repo delete, secrets bulk delete, project secrets push, sidebar project delete, template revert). The header of each dialog already names the action — the button just needs to be a confirmation primitive. Closes B-000022.
+
+### Fixed
+- **T-000129** — SecretsPanel bulk-paste textarea now grows vertically to fill the Секреты tab. `.secrets-section.flat` cascades `flex: 1 / min-height: 0 / display: flex column` through `.secrets-body` → `.new-secrets` → `.secrets-textarea`, so the textarea absorbs whatever vertical space is left after the existing-secrets list. Minimum height kept at 70px for short windows; resize-vertical handle preserved. On a 1080p+ window with a handful of existing secrets the bulk-paste field now spans the rest of the viewport.
+
+### Tests
+- 376 cargo / 72 vitest / 0 svelte issues (unchanged — CSS/i18n only).
+
 ## [1.0.4] — 2026-05-25
 
 Template-only mini-patch — gitignore template for managed repos was missing one folder pattern and had a trailing-slash inconsistency on another. Downstream impact: any managed repo whose `.gitignore` was generated from this template before v1.0.4 may have `docs/microservice-announcements/` untracked-but-visible in git status, plus `docs/server-announcements` matching loose files (not just the folder).

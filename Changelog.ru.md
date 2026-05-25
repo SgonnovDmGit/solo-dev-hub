@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [1.0.5] — 2026-05-25
+
+UX-polish патч — две dogfood-всплывшие мелочи. Кнопка confirm в reject-bug диалоге была семантически кривая («Подтвердить» / «Confirm» на диалоге чей заголовок буквально «Отклонить баг» / «Reject bug» — глагол на кнопке не матчил действие). SecretsPanel массовое поле пасты залочено на `rows="4"` (~70px) независимо от viewport'а — на 1337px-высоком окне инпут занимал 5% vertical real estate, остальное стояло пустым. Оба фикса — CSS / i18n only, Rust не трогали.
+
+### Changed
+- **`dialog.confirm` i18n key** — `Подтвердить` / `Confirm` → `ОК` / `OK`. Затрагивает каждый `ConfirmDialog` site (13 usages: удаление бага, reject бага, удаление deploy env, GlobalClaudeEditor discard, project type change, удаление проекта, удаление репо, secrets bulk delete, project secrets push, sidebar project delete, template revert). Заголовок диалога уже называет action — кнопке достаточно быть confirmation primitive. Закрывает B-000022.
+
+### Fixed
+- **T-000129** — SecretsPanel bulk-paste textarea теперь растёт вертикально заполняя таб Секреты. `.secrets-section.flat` каскадит `flex: 1 / min-height: 0 / display: flex column` через `.secrets-body` → `.new-secrets` → `.secrets-textarea`, так что textarea абсорбирует всё vertical-пространство оставшееся после existing-secrets списка. Минимум высоты сохранён 70px для коротких окон; resize-vertical handle preserved. На 1080p+ окне с парой existing-секретов bulk-paste поле теперь spans остаток viewport'а.
+
+### Tests
+- 376 cargo / 72 vitest / 0 svelte issues (без изменений — CSS/i18n only).
+
 ## [1.0.4] — 2026-05-25
 
 Template-only мини-патч — gitignore шаблон для managed репозиториев пропускал один folder-паттерн и имел trailing-slash несостыковку на другом. Downstream impact: любой managed репо чей `.gitignore` был сгенерирован из этого шаблона до v1.0.4 может иметь `docs/microservice-announcements/` untracked-but-visible в git status, плюс `docs/server-announcements` матчит loose файлы (не только папку).
