@@ -607,7 +607,7 @@
         title={$tStore('sidebar.createProject')}
         disabled={showNewProjectForm || showLocalFolderForm}
       >
-        +
+        ➕
       </button>
       <button
         class="ghost"
@@ -911,6 +911,13 @@
   .header-actions button {
     font-size: 13px;
     padding: 3px 7px;
+    /* B-000018: equal-box ритм — '+' (узкий ASCII) и 📁 (широкий emoji) визуально
+       расходились ~30% по ширине. min-width + flex-center выравнивают рамку
+       независимо от ширины глифа. */
+    min-width: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
 
   .sync-btn {

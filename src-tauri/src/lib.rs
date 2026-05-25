@@ -617,6 +617,47 @@ fn reconcile_bugs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<(), String>
     sync::reconcile_bugs_for_repo(&db, repo_id)
 }
 
+#[derive(serde::Serialize)]
+struct ReconcileAllReport {
+    repos_scanned: usize,
+    errors: Vec<String>,
+}
+
+/// B-000016 (dogfood follow-up): portfolio-wide reconcile for Dashboard ↻.
+/// Walks every repo and runs MD→DB reconcile for bugs + tasks. No cross-repo
+/// file copies (those live in `sync_project` per-project). "Not migrated yet"
+/// errors are suppressed — that's normal for newly added repos before their
+/// first ensure_*_migrated call. All other errors are collected so the UI can
+/// surface them via toast without aborting the rest of the walk.
+#[tauri::command]
+fn reconcile_all_projects(db: State<AppDb>) -> Result<ReconcileAllReport, String> {
+    let repos = db.list_all_repos().map_err(|e| e.to_string())?;
+    let repos_scanned = repos.len();
+    let mut errors: Vec<String> = Vec::new();
+
+    for r in repos {
+        // Bugs reconcile — silent-skip pre-migration state.
+        if let Err(e) = sync::reconcile_bugs_for_repo(&db, r.id) {
+            if !e.contains("not migrated") {
+                errors.push(format!("Bugs {}: {}", r.display_name(), e));
+            }
+        }
+        // Tasks reconcile — same silent-skip rule. SyncTasksReport.events_emitted
+        // is informational; we don't surface it (the user sees the effect in the
+        // refreshed Dashboard numbers).
+        if let Err(e) = sync::sync_tasks_for_repo(&db, r.id) {
+            if !e.contains("not migrated") {
+                errors.push(format!("Tasks {}: {}", r.display_name(), e));
+            }
+        }
+    }
+
+    Ok(ReconcileAllReport {
+        repos_scanned,
+        errors,
+    })
+}
+
 /// List bugs for a repo as frontend DTOs. `include_confirmed=false` excludes
 /// archived bugs (default for BugNotes list view). `=true` includes them
 /// (used when user toggles "Показать закрытые").
@@ -649,6 +690,10 @@ fn create_bug(
     severity: String,
     category: String,
 ) -> Result<BugView, String> {
+    // T-000128: ingest any pending LLM MD edits (status/comment) BEFORE the
+    // DB mutation so the final regen doesn't overwrite them with stale DB
+    // state. "not migrated" errors are expected on first call and ignored.
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
     let nid = db.next_numeric_id(repo_id).map_err(|e| e.to_string())?;
     let now = db::utc_now_rfc3339();
     let bug = db
@@ -676,6 +721,8 @@ fn create_bug(
 /// it drops out of MD on regen.
 #[tauri::command]
 fn resolve_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<BugView, String> {
+    // T-000128: reconcile LLM MD edits before reading + mutating.
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
     let bug = db
         .get_bug_by_display_id(repo_id, &display_id)
         .map_err(|e| e.to_string())?
@@ -722,6 +769,9 @@ fn update_bug_fields(
     category: Option<String>,
     comment: Option<String>,
 ) -> Result<BugView, String> {
+    // T-000128: reconcile LLM MD edits before user-field update so LLM
+    // status/comment edits aren't clobbered by the final regen.
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
     let bug = db
         .get_bug_by_display_id(repo_id, &display_id)
         .map_err(|e| e.to_string())?
@@ -751,6 +801,8 @@ fn update_bug_fields(
 /// stays in DB for history.
 #[tauri::command]
 fn delete_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<(), String> {
+    // T-000128: reconcile LLM MD edits for OTHER bugs before deleting this one.
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
     let bug = db
         .get_bug_by_display_id(repo_id, &display_id)
         .map_err(|e| e.to_string())?
@@ -765,6 +817,9 @@ fn delete_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<(), 
 /// back to `in-progress → testing`.
 #[tauri::command]
 fn reject_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<BugView, String> {
+    // T-000128: reconcile LLM MD edits before rejecting (LLM may have edited
+    // comment with rejection rationale that should reach DB first).
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
     let bug = db
         .get_bug_by_display_id(repo_id, &display_id)
         .map_err(|e| e.to_string())?
@@ -1675,6 +1730,132 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
         }
     }
 
+    // B-000019/B-000020: MS-driven sync — when the current project is a
+    // microservice, fan out to each connected parent server. Mirrors the
+    // parent-driven block above but with the MS as initiator. Without this,
+    // pressing Sync on an MS project is a no-op (its clients/microservices
+    // loops are empty), so api.md edits never propagate and parents stay out
+    // of sync until they happen to trigger Sync themselves. Rename-replay is
+    // intentionally not duplicated here — parent-driven sync remains the
+    // authority for that, this block does the steady-state file copies only.
+    if project_type == "microservice" {
+        if let Some(ms_server) = server {
+            if let Some(ref ms_path) = ms_server.local_path {
+                let ms_base = Path::new(ms_path);
+                if let Err(e) = sync::ensure_root_exists(ms_base) {
+                    errors.push(format!("Microservice {}: {}", ms_server.display_name(), e));
+                } else {
+                    let ms_canonical = ms_server.canonical_folder_name();
+                    let ms_project_name = db
+                        .get_project(project_id)
+                        .map(|p| p.name)
+                        .unwrap_or_default();
+                    let parents = db
+                        .list_parents_of_microservice(project_id)
+                        .unwrap_or_default();
+                    for parent_project in &parents {
+                        let parent_repos = match db.list_repos_by_project(Some(parent_project.id)) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                errors.push(format!(
+                                    "Parent {} list repos: {}",
+                                    parent_project.name, e
+                                ));
+                                continue;
+                            }
+                        };
+                        let Some(parent_server) = parent_repos
+                            .iter()
+                            .find(|r| r.role.as_deref() == Some("server"))
+                        else {
+                            errors.push(format!(
+                                "Parent {}: no server-repo found",
+                                parent_project.name
+                            ));
+                            continue;
+                        };
+                        let Some(ref parent_local) = parent_server.local_path else {
+                            errors.push(format!(
+                                "Parent {} ({}): server-repo has no local_path",
+                                parent_project.name,
+                                parent_server.display_name()
+                            ));
+                            continue;
+                        };
+                        let parent_base = Path::new(parent_local);
+                        if let Err(e) = sync::ensure_root_exists(parent_base) {
+                            errors.push(format!(
+                                "Parent {} ({}): {}",
+                                parent_project.name,
+                                parent_server.display_name(),
+                                e
+                            ));
+                            continue;
+                        }
+                        let parent_canonical = parent_server.canonical_folder_name();
+
+                        // MS → parent: api.md + handlers.md
+                        for filename in ["api.md", "handlers.md"] {
+                            let src = ms_base.join("docs").join(filename);
+                            if !src.exists() {
+                                continue;
+                            }
+                            let dst = parent_base
+                                .join("docs")
+                                .join("microservice-api")
+                                .join(&ms_project_name)
+                                .join(filename);
+                            match sync::copy_file_if_changed(&src, &dst) {
+                                Ok(true) => copied += 1,
+                                Ok(false) => {}
+                                Err(e) => errors.push(format!(
+                                    "Copy {} -> parent {}: {}",
+                                    filename, parent_project.name, e
+                                )),
+                            }
+                        }
+
+                        // parent → MS: REQ-*.md (source of truth on parent side)
+                        let parent_ms_dir = parent_base
+                            .join("docs")
+                            .join("microservice-requirements")
+                            .join(&ms_canonical);
+                        let ms_parent_dir = ms_base
+                            .join("docs")
+                            .join("server-requirements")
+                            .join(&parent_canonical);
+                        for req_file in sync::scan_requirements(&parent_ms_dir) {
+                            let src = parent_ms_dir.join(&req_file);
+                            let dst = ms_parent_dir.join(&req_file);
+                            match sync::copy_file_if_changed(&src, &dst) {
+                                Ok(true) => copied += 1,
+                                Ok(false) => {}
+                                Err(e) => errors.push(format!(
+                                    "Copy {} from parent {} to MS: {}",
+                                    req_file, parent_project.name, e
+                                )),
+                            }
+                        }
+
+                        // MS → parent: *.response.md (source of truth on MS side)
+                        for resp_file in sync::scan_responses(&ms_parent_dir) {
+                            let src = ms_parent_dir.join(&resp_file);
+                            let dst = parent_ms_dir.join(&resp_file);
+                            match sync::copy_file_if_changed(&src, &dst) {
+                                Ok(true) => responses += 1,
+                                Ok(false) => {}
+                                Err(e) => errors.push(format!(
+                                    "Copy {} from MS to parent {}: {}",
+                                    resp_file, parent_project.name, e
+                                )),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // v0.20.0: record sync event. SyncResult fields per models.rs:282 — copied + responses + migrated
     let total_changes = (copied + responses + migrated) as i64;
     let _ = db.insert_sync_event(
@@ -2082,95 +2263,18 @@ fn confirm_requirement(
     source_repo_id: i64,
     target_repo_id: i64,
 ) -> Result<(), String> {
+    // B-000021: paths are derived from source_repo + target_repo directly via
+    // sync::confirm_pair. `project_id` is kept in the signature for frontend
+    // compatibility and audit-trail purposes but plays no role in path
+    // resolution — confirm works symmetrically from either side's SyncScreen.
+    let _ = project_id;
     let source_repo = db
         .get_repository(source_repo_id)
         .map_err(|e| e.to_string())?;
-    let all_repos = db
-        .list_repos_by_project(Some(project_id))
+    let target_repo = db
+        .get_repository(target_repo_id)
         .map_err(|e| e.to_string())?;
-    let server = all_repos
-        .iter()
-        .find(|r| r.role.as_deref() == Some("server"));
-
-    let response_name = filename.replace(".md", ".response.md");
-
-    if let Some(srv) = server {
-        if let Some(ref srv_path) = srv.local_path {
-            let srv_base = Path::new(srv_path);
-
-            if let Some(ref source_path) = source_repo.local_path {
-                let source_base = Path::new(source_path);
-                let source_role = source_repo.role.as_deref().unwrap_or("");
-
-                if matches!(source_role, "client" | "admin_client" | "test_client") {
-                    let client_req_dir = source_base.join("docs").join("backend-requirements");
-                    // F-033: canonical_folder_name() is the single source of truth.
-                    let client_name = source_repo.canonical_folder_name();
-                    let srv_client_dir = srv_base
-                        .join("docs")
-                        .join("client-requirements")
-                        .join(&client_name);
-
-                    sync::remove_file_if_exists(&client_req_dir.join(&filename))?;
-                    sync::remove_file_if_exists(&client_req_dir.join(&response_name))?;
-                    sync::remove_file_if_exists(&srv_client_dir.join(&filename))?;
-                    sync::remove_file_if_exists(&srv_client_dir.join(&response_name))?;
-                } else if source_role == "server" {
-                    // F-012: server is source → microservice-project is target.
-                    // Resolve only the SPECIFIC target microservice — earlier
-                    // versions iterated all connected MS, which deleted REQ-NNN
-                    // pairs from sibling MSes when filenames collided across
-                    // independent NNN sequences (v0.27.1 review C1).
-                    let microservice_ids = db
-                        .list_project_microservices(project_id)
-                        .map_err(|e| e.to_string())?;
-
-                    for ms_project_id in &microservice_ids {
-                        let Ok(ms_server_repo) = db.server_repo_of_microservice(*ms_project_id)
-                        else {
-                            continue;
-                        };
-                        // Disambiguation: only the SPECIFIC target. Earlier
-                        // code matched by filename-existence, which deleted
-                        // sibling MS pairs when NNN collided.
-                        if ms_server_repo.id != target_repo_id {
-                            continue;
-                        }
-                        if let Some(ref ms_path) = ms_server_repo.local_path {
-                            let ms_base = Path::new(ms_path);
-                            // F-033: canonical repo names for sync folders.
-                            let ms_canonical = ms_server_repo.canonical_folder_name();
-                            let parent_folder = srv.canonical_folder_name();
-                            let srv_ms_dir = srv_base
-                                .join("docs")
-                                .join("microservice-requirements")
-                                .join(&ms_canonical);
-                            let ms_srv_dir = ms_base
-                                .join("docs")
-                                .join("server-requirements")
-                                .join(&parent_folder);
-
-                            sync::remove_file_if_exists(&srv_ms_dir.join(&filename))?;
-                            sync::remove_file_if_exists(&srv_ms_dir.join(&response_name))?;
-                            sync::remove_file_if_exists(&ms_srv_dir.join(&filename))?;
-                            sync::remove_file_if_exists(&ms_srv_dir.join(&response_name))?;
-                        }
-                    }
-                } else {
-                    // Source role is neither client nor server (e.g. `tool` /
-                    // `landing` / null). REQ flow is not defined for these —
-                    // surface explicitly instead of silently no-op'ing
-                    // (review M8).
-                    return Err(format!(
-                        "Unexpected source repo role for REQ confirm: {:?}",
-                        source_repo.role
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(())
+    sync::confirm_pair(&source_repo, &target_repo, &filename)
 }
 
 // ── Rename log (F-033) ────────────────────────────────────────────────────────
@@ -2903,34 +3007,33 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .setup(|app| {
-            // B-000010: override the window icon explicitly. Tauri's default
-            // window icon comes from `bundle.icon` (icon.ico) and tao stores it
-            // as a single tao::Icon — it picks the largest frame (256×256 = our
-            // full logo, NOT the SDH-crop). Windows then downscales that to the
-            // requested taskbar size (64×64 at 200% DPI), producing blur and
-            // showing the wrong design.
+        .setup(|_app| {
+            // B-000017 v5 (reverted v3+v4 set_icon override): comparing
+            // against a sibling Tauri-2 + Svelte app (MySafeSpace) on the
+            // same Win11 high-DPI display revealed that the default Tauri
+            // window-icon path (NO programmatic set_icon) renders sharp
+            // because Tauri/tao does pick the right frame from icon.ico's
+            // multi-frame resource for each context (taskbar / alt-tab /
+            // title). Earlier explicit set_icon attempts (v1=64×64 PNG,
+            // v3=hub-spokes PNG, v4=square-frame PNG) forced a single RGBA
+            // bitmap on every DPI context — Windows then downscaled with
+            // poor filtering on non-integer ratios. Removing the override
+            // restores multi-frame ICO behaviour for free.
             //
-            // Forcing the SDH-crop 64×64 PNG as the window icon: at 200% DPI
-            // taskbar requests 64 physical px → 1:1 match, no scaling, sharp.
-            // For 16/32 logical sizes Windows downscales 64×64 with integer
-            // ratios (0.5×, 0.25×) which stays clean.
+            // The original B-000010 comment claimed default Tauri picked
+            // "the largest frame and downscaled it" — that was likely true
+            // of an earlier tao version; current Tauri 2.x handles
+            // multi-frame ICO correctly. icon.ico already has the right
+            // frames (16/20/24/32/40/48/64/96/128/256, SDH-crop on small,
+            // full logo on large) per the B-000010 rebuild — no changes
+            // needed there.
             //
-            // This does NOT affect the .exe file icon (still full 10-frame
-            // icon.ico via embed_resource — Explorer / start-menu pick correct
-            // frame for each context).
-            use tauri::Manager;
-            if let Some(window) = app.get_webview_window("main") {
-                let icon_bytes = include_bytes!("../icons/64x64.png");
-                match tauri::image::Image::from_bytes(icon_bytes) {
-                    Ok(icon) => {
-                        if let Err(e) = window.set_icon(icon) {
-                            eprintln!("warn: failed to set window icon: {}", e);
-                        }
-                    }
-                    Err(e) => eprintln!("warn: failed to decode 64x64.png: {}", e),
-                }
-            }
+            // Does NOT affect the .exe file icon either way (still
+            // multi-frame icon.ico via tauri-bundler's embedded resource).
+            //
+            // Generator + explored override variants left at
+            // docs/superpowers/plans/2026-05-24-sdh-icon-v2.html for
+            // history.
             Ok(())
         })
         .manage(db)
@@ -2976,6 +3079,7 @@ pub fn run() {
             // Bugs (v0.16.0, SQLite SoT)
             ensure_bugs_migrated,
             reconcile_bugs_for_repo,
+            reconcile_all_projects,
             read_bugs_from_db,
             count_confirmed_bugs,
             create_bug,

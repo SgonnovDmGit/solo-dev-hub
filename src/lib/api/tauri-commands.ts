@@ -238,6 +238,16 @@ export async function reconcileBugsForRepo(repoId: number): Promise<void> {
   return invoke<void>('reconcile_bugs_for_repo', { repoId });
 }
 
+export interface ReconcileAllReport {
+  repos_scanned: number;
+  errors: string[];
+}
+
+/** Portfolio-wide MD→DB reconcile for bugs + tasks (no cross-repo file copies). */
+export async function reconcileAllProjects(): Promise<ReconcileAllReport> {
+  return invoke<ReconcileAllReport>('reconcile_all_projects');
+}
+
 export async function readBugsFromDb(repoId: number, includeConfirmed: boolean): Promise<BugView[]> {
   return invoke<BugView[]>('read_bugs_from_db', { repoId, includeConfirmed });
 }

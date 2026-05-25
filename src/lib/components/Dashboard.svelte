@@ -7,6 +7,8 @@
     loadDashboard,
   } from '$lib/stores/dashboard';
   import { tStore } from '$lib/i18n';
+  import { reconcileAllProjects } from '$lib/api/tauri-commands';
+  import { addToast } from '$lib/stores/ui';
   import DashboardFilters from './DashboardFilters.svelte';
   import DashboardKpi from './DashboardKpi.svelte';
   import DashboardTopHot from './DashboardTopHot.svelte';
@@ -14,9 +16,33 @@
   import DashboardCategoryBars from './DashboardCategoryBars.svelte';
   import DashboardActivityFeed from './DashboardActivityFeed.svelte';
 
+  let refreshing = $state(false);
+
   onMount(() => {
-    loadDashboard();
+    // Mount = same semantics as the ↻ button — pick up any MD-side changes
+    // (LLM-edited bug-reports.md / todo.md / done.md) that happened while the
+    // app was closed or while user was on a different screen, then read DB.
+    handleRefresh();
   });
+
+  // B-000016 (dogfood follow-up): ↻ runs portfolio-wide MD→DB reconcile
+  // (bugs + tasks across every repo) and THEN reloads dashboard data. Without
+  // the reconcile step, LLM-edited bug-reports.md / todo.md / done.md changes
+  // wouldn't reflect until the user manually syncs the matching project.
+  async function handleRefresh() {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      const report = await reconcileAllProjects();
+      if (report.errors.length > 0) {
+        addToast(report.errors.join('; '), 'warning');
+      }
+    } catch (e) {
+      addToast(String(e), 'error');
+    }
+    await loadDashboard();
+    refreshing = false;
+  }
 
   function rateFmt(v: number): string {
     return `${Math.round(v)}%`;
@@ -39,7 +65,15 @@
         <span class="period">{rangeText($currentPeriod)}</span>
       </div>
     </div>
-    <DashboardFilters />
+    <div class="header-actions">
+      <DashboardFilters />
+      <button
+        class="ghost mini refresh-btn"
+        onclick={handleRefresh}
+        disabled={refreshing || $dashboardLoading}
+        title={$tStore('dashboard.refresh' as any)}
+        type="button">{refreshing || $dashboardLoading ? '⟳' : '↻'}</button>
+    </div>
   </div>
 
   {#if $dashboardLoading && !$dashboardData}
@@ -99,6 +133,10 @@
     padding-bottom: 10px; border-bottom: 1px solid var(--border);
     gap: 12px; flex-wrap: wrap;
   }
+  .header-actions { display: flex; align-items: center; gap: 8px; }
+  .refresh-btn { font-size: 14px; padding: 0 6px; color: var(--text-muted); }
+  .refresh-btn:hover:not(:disabled) { color: var(--accent); }
+  .refresh-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .dash-title { font-size: 16px; font-weight: 700; margin: 0 0 3px 0; }
   .range-line { font-size: 10.5px; color: var(--text-muted); line-height: 1.4; }
   .range-line .period { color: var(--text); font-weight: 600; }

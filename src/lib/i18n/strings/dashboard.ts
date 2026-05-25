@@ -1,6 +1,7 @@
 export const ru = {
   'dashboard.title': 'Дашборд',
   'dashboard.tooltip': 'Общая статистика',
+  'dashboard.refresh': 'Обновить данные',
   'dashboard.byCategory': 'По классам ошибок',
   'dashboard.bySeverity': 'По приоритетам',
   'dashboard.byStatus': 'По статусу',
@@ -73,6 +74,7 @@ export const ru = {
 export const en: Record<keyof typeof ru, string> = {
   'dashboard.title': 'Dashboard',
   'dashboard.tooltip': 'Global statistics',
+  'dashboard.refresh': 'Refresh data',
   'dashboard.byCategory': 'By Category',
   'dashboard.bySeverity': 'By Severity',
   'dashboard.byStatus': 'By Status',
