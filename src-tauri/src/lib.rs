@@ -690,6 +690,10 @@ fn create_bug(
     severity: String,
     category: String,
 ) -> Result<BugView, String> {
+    // T-000128: ingest any pending LLM MD edits (status/comment) BEFORE the
+    // DB mutation so the final regen doesn't overwrite them with stale DB
+    // state. "not migrated" errors are expected on first call and ignored.
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
     let nid = db.next_numeric_id(repo_id).map_err(|e| e.to_string())?;
     let now = db::utc_now_rfc3339();
     let bug = db
@@ -717,6 +721,8 @@ fn create_bug(
 /// it drops out of MD on regen.
 #[tauri::command]
 fn resolve_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<BugView, String> {
+    // T-000128: reconcile LLM MD edits before reading + mutating.
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
     let bug = db
         .get_bug_by_display_id(repo_id, &display_id)
         .map_err(|e| e.to_string())?
@@ -763,6 +769,9 @@ fn update_bug_fields(
     category: Option<String>,
     comment: Option<String>,
 ) -> Result<BugView, String> {
+    // T-000128: reconcile LLM MD edits before user-field update so LLM
+    // status/comment edits aren't clobbered by the final regen.
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
     let bug = db
         .get_bug_by_display_id(repo_id, &display_id)
         .map_err(|e| e.to_string())?
@@ -792,6 +801,8 @@ fn update_bug_fields(
 /// stays in DB for history.
 #[tauri::command]
 fn delete_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<(), String> {
+    // T-000128: reconcile LLM MD edits for OTHER bugs before deleting this one.
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
     let bug = db
         .get_bug_by_display_id(repo_id, &display_id)
         .map_err(|e| e.to_string())?
@@ -806,6 +817,9 @@ fn delete_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<(), 
 /// back to `in-progress → testing`.
 #[tauri::command]
 fn reject_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<BugView, String> {
+    // T-000128: reconcile LLM MD edits before rejecting (LLM may have edited
+    // comment with rejection rationale that should reach DB first).
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
     let bug = db
         .get_bug_by_display_id(repo_id, &display_id)
         .map_err(|e| e.to_string())?

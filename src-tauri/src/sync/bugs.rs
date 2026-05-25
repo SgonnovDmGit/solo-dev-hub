@@ -969,4 +969,64 @@ mod tests {
             .unwrap();
         assert_eq!(ev_type, "taken");
     }
+
+    /// T-000128 regression: UI mutation commands (create_bug / resolve_bug /
+    /// update_bug_fields / delete_bug / reject_bug in lib.rs) must call
+    /// `reconcile_bugs_for_repo` BEFORE their DB mutation so pending LLM MD
+    /// edits ingest first. Without that, the final `regenerate_bugs_md`
+    /// overwrites the LLM's MD changes with stale DB state.
+    ///
+    /// This test exercises the FIXED pattern (reconcile → mutate → regen)
+    /// and asserts LLM's status+comment edit on bug A survives a fresh
+    /// "+ Add bug" insertion of bug B. If a future refactor drops the
+    /// leading reconcile call from any of those 5 lib.rs commands, the
+    /// hand-trace pattern documented here is the contract being broken.
+    #[test]
+    fn test_t000128_reconcile_before_mutate_preserves_llm_edits() {
+        let (db, tmp, rid) = setup_repo_with_dir();
+        write_bug_reports_md(
+            tmp.path(),
+            &["- B-001 | 2026-03-01 | first | minor | other | created | 0 |"],
+        );
+        migrate_bugs_for_repo(&db, rid).unwrap();
+
+        // LLM edits MD: B-000001 created → testing + comment.
+        write_bug_reports_md(
+            tmp.path(),
+            &["- B-000001 | 2026-03-01 | first | minor | other | testing | 0 | done"],
+        );
+
+        // Fixed UI command sequence: reconcile FIRST, then DB mutation,
+        // then regen. Mirrors the lib.rs `create_bug` body after T-000128.
+        reconcile_bugs_for_repo(&db, rid).unwrap();
+        let nid = db.next_numeric_id(rid).unwrap();
+        db.insert_bug(
+            rid,
+            nid,
+            "2026-05-25T00:00:00Z",
+            "second",
+            "minor",
+            "other",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        regenerate_bugs_md(&db, rid).unwrap();
+
+        let md = read_bug_reports_md(tmp.path());
+        assert!(md.contains("B-000001"), "B-000001 row preserved");
+        assert!(md.contains("B-000002"), "new B-000002 row added");
+        assert!(md.contains("| testing |"), "LLM status edit preserved");
+        assert!(md.contains("done"), "LLM comment preserved");
+
+        let b1 = db.get_bug_by_display_id(rid, "B-000001").unwrap().unwrap();
+        assert_eq!(b1.status, "testing");
+        assert_eq!(
+            b1.fix_attempts, 1,
+            "created→testing transition bumped fix_attempts"
+        );
+        assert_eq!(b1.comment.as_deref(), Some("done"));
+    }
 }
