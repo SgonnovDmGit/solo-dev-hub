@@ -4,6 +4,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.0.4] — 2026-05-25
+
+Template-only mini-patch — gitignore template for managed repos was missing one folder pattern and had a trailing-slash inconsistency on another. Downstream impact: any managed repo whose `.gitignore` was generated from this template before v1.0.4 may have `docs/microservice-announcements/` untracked-but-visible in git status, plus `docs/server-announcements` matching loose files (not just the folder).
+
+### Fixed
+- **`src-tauri/templates/_global/.gitignore.tmpl`** — added `docs/microservice-announcements/` (symmetric to `docs/server-announcements/`; both are recipient-side acknowledgement-by-delete channels per `# Cross-repo announcements` rules — neither belongs in git history). Added trailing `/` to `docs/server-announcements` so the pattern unambiguously matches the folder, not loose files of the same name. Existing managed repos will pick up both patterns on next "Sync global rules" run.
+
+### Tests
+- 376 cargo / 72 vitest / 0 svelte issues (unchanged — template-only change).
+
 ## [1.0.3] — 2026-05-25
 
 Dogfood patch — five bugs surfaced in daily use of v1.0.2, plus brand-identity unification and a Tauri-runtime bump that fell out of the B-000017 investigation.
