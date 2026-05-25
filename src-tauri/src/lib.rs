@@ -2249,95 +2249,18 @@ fn confirm_requirement(
     source_repo_id: i64,
     target_repo_id: i64,
 ) -> Result<(), String> {
+    // B-000021: paths are derived from source_repo + target_repo directly via
+    // sync::confirm_pair. `project_id` is kept in the signature for frontend
+    // compatibility and audit-trail purposes but plays no role in path
+    // resolution — confirm works symmetrically from either side's SyncScreen.
+    let _ = project_id;
     let source_repo = db
         .get_repository(source_repo_id)
         .map_err(|e| e.to_string())?;
-    let all_repos = db
-        .list_repos_by_project(Some(project_id))
+    let target_repo = db
+        .get_repository(target_repo_id)
         .map_err(|e| e.to_string())?;
-    let server = all_repos
-        .iter()
-        .find(|r| r.role.as_deref() == Some("server"));
-
-    let response_name = filename.replace(".md", ".response.md");
-
-    if let Some(srv) = server {
-        if let Some(ref srv_path) = srv.local_path {
-            let srv_base = Path::new(srv_path);
-
-            if let Some(ref source_path) = source_repo.local_path {
-                let source_base = Path::new(source_path);
-                let source_role = source_repo.role.as_deref().unwrap_or("");
-
-                if matches!(source_role, "client" | "admin_client" | "test_client") {
-                    let client_req_dir = source_base.join("docs").join("backend-requirements");
-                    // F-033: canonical_folder_name() is the single source of truth.
-                    let client_name = source_repo.canonical_folder_name();
-                    let srv_client_dir = srv_base
-                        .join("docs")
-                        .join("client-requirements")
-                        .join(&client_name);
-
-                    sync::remove_file_if_exists(&client_req_dir.join(&filename))?;
-                    sync::remove_file_if_exists(&client_req_dir.join(&response_name))?;
-                    sync::remove_file_if_exists(&srv_client_dir.join(&filename))?;
-                    sync::remove_file_if_exists(&srv_client_dir.join(&response_name))?;
-                } else if source_role == "server" {
-                    // F-012: server is source → microservice-project is target.
-                    // Resolve only the SPECIFIC target microservice — earlier
-                    // versions iterated all connected MS, which deleted REQ-NNN
-                    // pairs from sibling MSes when filenames collided across
-                    // independent NNN sequences (v0.27.1 review C1).
-                    let microservice_ids = db
-                        .list_project_microservices(project_id)
-                        .map_err(|e| e.to_string())?;
-
-                    for ms_project_id in &microservice_ids {
-                        let Ok(ms_server_repo) = db.server_repo_of_microservice(*ms_project_id)
-                        else {
-                            continue;
-                        };
-                        // Disambiguation: only the SPECIFIC target. Earlier
-                        // code matched by filename-existence, which deleted
-                        // sibling MS pairs when NNN collided.
-                        if ms_server_repo.id != target_repo_id {
-                            continue;
-                        }
-                        if let Some(ref ms_path) = ms_server_repo.local_path {
-                            let ms_base = Path::new(ms_path);
-                            // F-033: canonical repo names for sync folders.
-                            let ms_canonical = ms_server_repo.canonical_folder_name();
-                            let parent_folder = srv.canonical_folder_name();
-                            let srv_ms_dir = srv_base
-                                .join("docs")
-                                .join("microservice-requirements")
-                                .join(&ms_canonical);
-                            let ms_srv_dir = ms_base
-                                .join("docs")
-                                .join("server-requirements")
-                                .join(&parent_folder);
-
-                            sync::remove_file_if_exists(&srv_ms_dir.join(&filename))?;
-                            sync::remove_file_if_exists(&srv_ms_dir.join(&response_name))?;
-                            sync::remove_file_if_exists(&ms_srv_dir.join(&filename))?;
-                            sync::remove_file_if_exists(&ms_srv_dir.join(&response_name))?;
-                        }
-                    }
-                } else {
-                    // Source role is neither client nor server (e.g. `tool` /
-                    // `landing` / null). REQ flow is not defined for these —
-                    // surface explicitly instead of silently no-op'ing
-                    // (review M8).
-                    return Err(format!(
-                        "Unexpected source repo role for REQ confirm: {:?}",
-                        source_repo.role
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(())
+    sync::confirm_pair(&source_repo, &target_repo, &filename)
 }
 
 // ── Rename log (F-033) ────────────────────────────────────────────────────────

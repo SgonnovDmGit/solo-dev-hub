@@ -1,9 +1,79 @@
-// REQ-pair-specific operations: rename-replay and nested-folder migration
-// helpers. Called from `sync_project` in lib.rs to propagate folder renames
-// across counterparty repos.
+// REQ-pair-specific operations: rename-replay, nested-folder migration,
+// and bilateral pair-deletion (confirm). Called from `sync_project` and
+// `confirm_requirement` in lib.rs.
 
 use std::fs;
 use std::path::Path;
+
+use crate::models::Repository;
+use crate::sync::fs::remove_file_if_exists;
+
+/// B-000021: bilateral delete of a REQ pair across sender and recipient sides.
+/// Resolves filesystem paths from the sender and recipient `Repository`
+/// records directly — no dependency on "current project" — so the confirm
+/// flow works symmetrically from either project's SyncScreen (server's
+/// own view OR microservice's reverse-lookup view).
+///
+/// Path layout per direction (source_repo.role drives selection):
+/// - `client | admin_client | test_client` → sender (client)
+///   `docs/backend-requirements/` + recipient (server)
+///   `docs/client-requirements/<client-canonical>/`.
+/// - `server` → sender (server)
+///   `docs/microservice-requirements/<ms-canonical>/` + recipient (ms-server)
+///   `docs/server-requirements/<server-canonical>/`.
+///
+/// Returns `Err` for unsupported source roles (`tool` / `landing` / null) so
+/// callers don't silently no-op on bad input — same contract as the previous
+/// in-place implementation.
+pub fn confirm_pair(
+    source_repo: &Repository,
+    target_repo: &Repository,
+    filename: &str,
+) -> Result<(), String> {
+    let (Some(source_path), Some(target_path)) =
+        (source_repo.local_path.as_ref(), target_repo.local_path.as_ref())
+    else {
+        return Ok(());
+    };
+    let source_base = Path::new(source_path);
+    let target_base = Path::new(target_path);
+    let response_name = filename.replace(".md", ".response.md");
+    let source_role = source_repo.role.as_deref().unwrap_or("");
+
+    let (sender_dir, recipient_dir) = match source_role {
+        "client" | "admin_client" | "test_client" => {
+            let sender = source_base.join("docs").join("backend-requirements");
+            let recipient = target_base
+                .join("docs")
+                .join("client-requirements")
+                .join(source_repo.canonical_folder_name());
+            (sender, recipient)
+        }
+        "server" => {
+            let sender = source_base
+                .join("docs")
+                .join("microservice-requirements")
+                .join(target_repo.canonical_folder_name());
+            let recipient = target_base
+                .join("docs")
+                .join("server-requirements")
+                .join(source_repo.canonical_folder_name());
+            (sender, recipient)
+        }
+        _ => {
+            return Err(format!(
+                "Unexpected source repo role for REQ confirm: {:?}",
+                source_repo.role
+            ));
+        }
+    };
+
+    remove_file_if_exists(&sender_dir.join(filename))?;
+    remove_file_if_exists(&sender_dir.join(&response_name))?;
+    remove_file_if_exists(&recipient_dir.join(filename))?;
+    remove_file_if_exists(&recipient_dir.join(&response_name))?;
+    Ok(())
+}
 
 /// F-033 Stage 1e: replay a pending repo rename on the recipient side.
 /// Idempotent: returns Ok(false) when there's nothing to do (old dir missing,
@@ -495,5 +565,132 @@ mod tests {
         assert_eq!(migrated, 2);
         assert!(ms_flat.join("parentA/REQ-001.md").exists());
         assert!(ms_flat.join("parentA/REQ-001.response.md").exists());
+    }
+
+    // ── B-000021: confirm_pair bilateral REQ-pair delete ─────────────────────
+
+    fn mk_repo(id: i64, github_name: &str, role: &str, local_path: &Path) -> Repository {
+        Repository {
+            id,
+            project_id: None,
+            github_name: Some(github_name.to_string()),
+            github_url: None,
+            role: Some(role.to_string()),
+            description: None,
+            language: None,
+            last_pushed_at: None,
+            added_at: String::new(),
+            updated_at: String::new(),
+            local_path: Some(local_path.to_string_lossy().to_string()),
+            github_id: None,
+            deploy_target: None,
+        }
+    }
+
+    fn seed_pair(dir: &Path, filename: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let stem = filename.trim_end_matches(".md");
+        fs::write(dir.join(filename), "req body").unwrap();
+        fs::write(dir.join(format!("{stem}.response.md")), "receipt body").unwrap();
+    }
+
+    #[test]
+    fn test_confirm_pair_client_to_server_deletes_both_sides() {
+        let tmp = TempDir::new().unwrap();
+        let client_base = tmp.path().join("client");
+        let server_base = tmp.path().join("server");
+        let client = mk_repo(1, "owner/web-client", "client", &client_base);
+        let server = mk_repo(2, "owner/backend", "server", &server_base);
+
+        let client_dir = client_base.join("docs/backend-requirements");
+        let server_dir = server_base.join("docs/client-requirements/web-client");
+        seed_pair(&client_dir, "REQ-001_login.md");
+        seed_pair(&server_dir, "REQ-001_login.md");
+
+        confirm_pair(&client, &server, "REQ-001_login.md").unwrap();
+
+        assert!(!client_dir.join("REQ-001_login.md").exists());
+        assert!(!client_dir.join("REQ-001_login.response.md").exists());
+        assert!(!server_dir.join("REQ-001_login.md").exists());
+        assert!(!server_dir.join("REQ-001_login.response.md").exists());
+    }
+
+    #[test]
+    fn test_confirm_pair_server_to_microservice_deletes_both_sides() {
+        let tmp = TempDir::new().unwrap();
+        let server_base = tmp.path().join("server");
+        let ms_base = tmp.path().join("ms");
+        let server = mk_repo(1, "owner/backend", "server", &server_base);
+        let ms_server = mk_repo(2, "owner/avatar-ms", "server", &ms_base);
+
+        let server_dir = server_base.join("docs/microservice-requirements/avatar-ms");
+        let ms_dir = ms_base.join("docs/server-requirements/backend");
+        seed_pair(&server_dir, "REQ-007_blobs.md");
+        seed_pair(&ms_dir, "REQ-007_blobs.md");
+
+        confirm_pair(&server, &ms_server, "REQ-007_blobs.md").unwrap();
+
+        assert!(!server_dir.join("REQ-007_blobs.md").exists());
+        assert!(!server_dir.join("REQ-007_blobs.response.md").exists());
+        assert!(!ms_dir.join("REQ-007_blobs.md").exists());
+        assert!(!ms_dir.join("REQ-007_blobs.response.md").exists());
+    }
+
+    #[test]
+    fn test_confirm_pair_only_deletes_target_specific_paths() {
+        // Sibling MS with same NNN should NOT be touched (replicates C1
+        // disambiguation invariant from v0.27.1).
+        let tmp = TempDir::new().unwrap();
+        let server_base = tmp.path().join("server");
+        let ms_a_base = tmp.path().join("ms-a");
+        let ms_b_base = tmp.path().join("ms-b");
+        let server = mk_repo(1, "owner/backend", "server", &server_base);
+        let ms_a = mk_repo(2, "owner/avatar-ms", "server", &ms_a_base);
+        let _ms_b = mk_repo(3, "owner/notify-ms", "server", &ms_b_base);
+
+        let server_dir_a = server_base.join("docs/microservice-requirements/avatar-ms");
+        let server_dir_b = server_base.join("docs/microservice-requirements/notify-ms");
+        let ms_a_dir = ms_a_base.join("docs/server-requirements/backend");
+        let ms_b_dir = ms_b_base.join("docs/server-requirements/backend");
+        seed_pair(&server_dir_a, "REQ-005_x.md");
+        seed_pair(&server_dir_b, "REQ-005_x.md");
+        seed_pair(&ms_a_dir, "REQ-005_x.md");
+        seed_pair(&ms_b_dir, "REQ-005_x.md");
+
+        confirm_pair(&server, &ms_a, "REQ-005_x.md").unwrap();
+
+        // MS-A pair gone
+        assert!(!server_dir_a.join("REQ-005_x.md").exists());
+        assert!(!ms_a_dir.join("REQ-005_x.md").exists());
+        // MS-B pair untouched (sibling NNN collision protected)
+        assert!(server_dir_b.join("REQ-005_x.md").exists());
+        assert!(server_dir_b.join("REQ-005_x.response.md").exists());
+        assert!(ms_b_dir.join("REQ-005_x.md").exists());
+        assert!(ms_b_dir.join("REQ-005_x.response.md").exists());
+    }
+
+    #[test]
+    fn test_confirm_pair_unknown_role_errors() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let source = mk_repo(1, "owner/tool", "tool", &a);
+        let target = mk_repo(2, "owner/other", "server", &b);
+
+        let err = confirm_pair(&source, &target, "REQ-001.md").unwrap_err();
+        assert!(err.contains("Unexpected source repo role"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_confirm_pair_missing_local_path_noop() {
+        let tmp = TempDir::new().unwrap();
+        let a_path = tmp.path().join("a");
+        let mut source = mk_repo(1, "owner/client", "client", &a_path);
+        source.local_path = None;
+        let target = mk_repo(2, "owner/server", "server", tmp.path());
+
+        // Does not error — silent no-op when either side has no local_path,
+        // mirroring previous in-place behavior (paths can't be derived).
+        confirm_pair(&source, &target, "REQ-001.md").unwrap();
     }
 }

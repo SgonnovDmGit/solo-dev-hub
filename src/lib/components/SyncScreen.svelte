@@ -245,11 +245,8 @@
                     <span class="req-repos">{req.source_repo} &rarr; {req.target_repo}</span>
                   </div>
                   <div class="req-actions">
-                    {#if req.is_reverse_lookup}
-                      <span class="reverse-hint" title="Reverse-lookup view — подтверждать должен sender (parent server) из своего SyncScreen.">↩</span>
-                    {/if}
                     <span class="badge {statusClass(req.status)}">{statusLabel(req.status)}</span>
-                    {#if req.status === 'responded' && !req.is_reverse_lookup}
+                    {#if req.status === 'responded'}
                       <button class="action-btn confirm-btn" onclick={() => handleConfirm(req)} title={$tStore('sync.confirm')}>
                         &#10003;
                       </button>
@@ -456,13 +453,6 @@
     font-size: 11px;
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
-  }
-
-  .reverse-hint {
-    font-size: 12px;
-    color: var(--text-muted);
-    opacity: 0.7;
-    cursor: help;
   }
 
   .badge-new {

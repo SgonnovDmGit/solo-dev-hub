@@ -65,8 +65,9 @@ pub struct RequirementInfo {
     pub source_repo: String,
     pub target_repo: String,
     /// B-000018: true когда строка собрана reverse-lookup'ом со стороны ms-проекта
-    /// (sender = parent server, recipient = текущий ms). UI скрывает ✓-кнопку для таких
-    /// строк — confirm должен делать sender из своего собственного SyncScreen.
+    /// (sender = parent server, recipient = текущий ms). После B-000021 confirm-✓
+    /// работает с обеих сторон одинаково — поле осталось informational/audit-flag
+    /// и в UI больше не гейтит кнопку.
     #[serde(default)]
     pub is_reverse_lookup: bool,
 }
