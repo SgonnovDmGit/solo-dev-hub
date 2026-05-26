@@ -159,6 +159,26 @@ impl AppDb {
         Ok(())
     }
 
+    /// T-000130: reopen a confirmed-or-rejected bug back to `testing`.
+    /// Atomically: status → 'testing', confirmed_at → NULL, archived_from_md_at
+    /// → NULL. `fix_attempts` left unchanged (reopen is the undo of a verdict,
+    /// not a new fix attempt — the invariant `COUNT(entered_testing) ==
+    /// fix_attempts` must hold). Caller is responsible for inserting the
+    /// `reopened` bug_event and gating the source status (confirmed/rejected
+    /// only); see `reopen_bug` Tauri command in `lib.rs`.
+    pub fn reopen_bug(&self, bug_id: i64) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE bugs
+             SET status = 'testing',
+                 confirmed_at = NULL,
+                 archived_from_md_at = NULL
+             WHERE id = ?1",
+            rusqlite::params![bug_id],
+        )?;
+        Ok(())
+    }
+
     /// Hard-delete a bug row. Used only for "accidental creation" cleanup
     /// (UI gates to `status='created'`). Normal close flow is resolve_bug
     /// (→ status='confirmed', row stays for history).
@@ -650,6 +670,121 @@ mod tests {
         assert_eq!(
             refreshed.confirmed_at.as_deref(),
             Some("2026-04-24T10:00:00Z")
+        );
+    }
+
+    // T-000130: reopen_bug — undo a confirmed/rejected verdict back to testing.
+    #[test]
+    fn test_reopen_bug_from_confirmed_clears_confirmed_at_keeps_attempts() {
+        let db = make_db();
+        let rid = make_repo(&db);
+        let b = seed_bug(&db, rid, "2026-05-10", "major", "logic", 2, "testing");
+        db.update_bug_status(b.id, "confirmed", None, Some("2026-05-20T10:00:00Z"))
+            .unwrap();
+        let pre = db.get_bug_by_id(b.id).unwrap().unwrap();
+        assert_eq!(pre.status, "confirmed");
+        assert_eq!(pre.confirmed_at.as_deref(), Some("2026-05-20T10:00:00Z"));
+        assert_eq!(pre.fix_attempts, 2);
+
+        db.reopen_bug(b.id).unwrap();
+        let post = db.get_bug_by_id(b.id).unwrap().unwrap();
+        assert_eq!(post.status, "testing", "status → testing");
+        assert!(post.confirmed_at.is_none(), "confirmed_at cleared");
+        assert_eq!(post.fix_attempts, 2, "fix_attempts unchanged");
+    }
+
+    #[test]
+    fn test_reopen_bug_from_rejected_keeps_attempts() {
+        let db = make_db();
+        let rid = make_repo(&db);
+        let b = seed_bug(&db, rid, "2026-05-10", "minor", "ui_ux", 1, "rejected");
+        db.reopen_bug(b.id).unwrap();
+        let post = db.get_bug_by_id(b.id).unwrap().unwrap();
+        assert_eq!(post.status, "testing");
+        assert!(post.confirmed_at.is_none());
+        assert_eq!(post.fix_attempts, 1, "fix_attempts unchanged from rejected");
+    }
+
+    #[test]
+    fn test_reopen_preserves_entered_testing_invariant() {
+        // The bug_events invariant is `COUNT(entered_testing) ==
+        // bugs.fix_attempts`. Reopen logs a `reopened` event (NOT
+        // `entered_testing`) and leaves fix_attempts unchanged — so both
+        // sides of the equality stay in sync.
+        let db = make_db();
+        let rid = make_repo(&db);
+        let b = seed_bug(&db, rid, "2026-05-10", "major", "logic", 0, "created");
+        // 2 testing transitions = 2 attempts.
+        db.update_bug_status(b.id, "in-progress", None, None).unwrap();
+        db.update_bug_status(b.id, "testing", Some(1), None).unwrap();
+        db.insert_bug_event(
+            b.id, "entered_testing",
+            Some("in-progress"), Some("testing"), "2026-05-12T10:00:00Z",
+        ).unwrap();
+        db.update_bug_status(b.id, "rejected", None, None).unwrap();
+        db.update_bug_status(b.id, "testing", Some(2), None).unwrap();
+        db.insert_bug_event(
+            b.id, "entered_testing",
+            Some("rejected"), Some("testing"), "2026-05-14T10:00:00Z",
+        ).unwrap();
+        db.update_bug_status(b.id, "confirmed", None, Some("2026-05-20T10:00:00Z")).unwrap();
+
+        // Reopen: status → testing, fix_attempts UNCHANGED at 2.
+        db.reopen_bug(b.id).unwrap();
+        db.insert_bug_event(b.id, "reopened", Some("confirmed"), Some("testing"), "2026-05-21T10:00:00Z").unwrap();
+
+        // Invariant: COUNT(entered_testing) == fix_attempts.
+        let bug = db.get_bug_by_id(b.id).unwrap().unwrap();
+        let count: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM bug_events WHERE bug_id = ?1 AND event_type = 'entered_testing'",
+                rusqlite::params![b.id],
+                |r| r.get(0),
+            ).unwrap()
+        };
+        assert_eq!(count, 2, "two entered_testing events");
+        assert_eq!(bug.fix_attempts, 2, "fix_attempts matches");
+        assert_eq!(count, bug.fix_attempts as i64, "invariant holds after reopen");
+
+        // The reopened event exists but doesn't count toward attempts.
+        let reopened_count: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM bug_events WHERE bug_id = ?1 AND event_type = 'reopened'",
+                rusqlite::params![b.id],
+                |r| r.get(0),
+            ).unwrap()
+        };
+        assert_eq!(reopened_count, 1, "one reopened event logged");
+    }
+
+    #[test]
+    fn test_reopen_bug_clears_archived_from_md_at() {
+        // Confirmed bug after LLM acknowledgement cleanup has archived_from_md_at
+        // set. Reopen must clear it so the bug reappears in MD on next regen.
+        let db = make_db();
+        let rid = make_repo(&db);
+        let b = seed_bug(&db, rid, "2026-05-10", "minor", "ui_ux", 1, "testing");
+        db.update_bug_status(b.id, "confirmed", None, Some("2026-05-20T10:00:00Z"))
+            .unwrap();
+        // Simulate LLM cleanup having archived this bug from MD.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE bugs SET archived_from_md_at = '2026-05-21T11:00:00Z' WHERE id = ?1",
+                rusqlite::params![b.id],
+            )
+            .unwrap();
+        }
+
+        db.reopen_bug(b.id).unwrap();
+        let post = db.get_bug_by_id(b.id).unwrap().unwrap();
+        assert_eq!(post.status, "testing");
+        assert!(post.confirmed_at.is_none());
+        assert!(
+            post.archived_from_md_at.is_none(),
+            "archived_from_md_at cleared so bug reappears in MD"
         );
     }
 

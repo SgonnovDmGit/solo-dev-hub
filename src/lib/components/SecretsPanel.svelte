@@ -527,6 +527,13 @@
     min-height: 0;
   }
 
+  /* T-000129 follow-up: keep existing-secrets at natural height so
+     .new-secrets gets the remaining flex space. Without flex-shrink:0
+     the existing-list gets compressed when many secrets are present. */
+  .secrets-section.flat .existing-secrets {
+    flex-shrink: 0;
+  }
+
   .secrets-section.flat .new-secrets {
     flex: 1;
     min-height: 0;

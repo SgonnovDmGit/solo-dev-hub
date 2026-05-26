@@ -287,6 +287,11 @@ export async function rejectBug(repoId: number, displayId: string): Promise<BugV
   return invoke<BugView>('reject_bug', { repoId, displayId });
 }
 
+// T-000130: reopen a confirmed-or-rejected bug back to testing (undo verdict).
+export async function reopenBug(repoId: number, displayId: string): Promise<BugView> {
+  return invoke<BugView>('reopen_bug', { repoId, displayId });
+}
+
 // ── Stats / Graph summaries (v0.22.0 lifetime-only API; live-computed) ───────
 
 export async function getRepoStatsSummary(repositoryId: number): Promise<StatsSummary> {
