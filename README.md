@@ -129,8 +129,10 @@ The full release runbook (key rotation, CI troubleshooting, hotfix flow) — [do
 
 ## Roadmap
 
-- **v1.0.0** *(current — 2026-05-18)* — public launch, MIT-licensed open source, frozen-contract era begins.
-- **v1.0.x** — post-launch polish: internal refactors (`lib.rs` / `tauri-commands.ts` splits, decomposing the 570-line `sync_project` handler), `docs/ARCHITECTURE.md` for contributors, SQLite ER-graph, in-app multilingual help screen.
+- **v1.1.0** *(current — 2026-05-25)* — verdict-rollback for bugs (↩ reopen button on confirmed/rejected), full-height secrets bulk-paste, unified dialog button labels.
+- **v1.0.0** — public launch (2026-05-18), MIT-licensed open source, frozen-contract era begins.
+- **v1.1.x** — internal refactors (`lib.rs` / `tauri-commands.ts` splits, decomposing the 570-line `sync_project` handler, UI component splits) + contributor docs (`docs/ARCHITECTURE.md`, SQLite ER-graph).
+- **v1.2.0** — in-app multilingual help screen documenting the LLM operating contract.
 - **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix, REQ auto-accept with `## Status:` frontmatter.
 
 Full backlog and per-version task lists — [`docs/roadmap.md`](docs/roadmap.md).

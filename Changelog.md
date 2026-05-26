@@ -4,28 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
-## [1.0.6] — 2026-05-25
+## [1.1.0] — 2026-05-25
 
-Adds a verdict-rollback path for bugs. Until now ✓ and ✗ on a `testing` bug were one-way — clicking either by accident or on second thought left the user with no way back. New ↩ button on `confirmed` and `rejected` rows reopens the bug to `testing` so the verdict can be retaken without losing the fix history.
+First MINOR after the v1.0.0 public launch. Adds a verdict-rollback path for bugs and ships two dogfood-surfaced UX fixes that emerged the same week. The MINOR bump is driven by T-000130 — a new user-facing capability (↩ reopen button) — not by the polish fixes that came along with it.
 
 ### Added
-- **T-000130 — Reopen bug action (↩ button).** Replaces the read-only ✓ mark on `confirmed` rows and fills the previously-empty action slot on `rejected` rows. Click ↩ → bug transitions back to `testing`. No confirm dialog — the whole point of the button is fast rollback. New Tauri command `reopen_bug(repo_id, display_id)` + DB method `reopen_bug(bug_id)` that atomically: sets `status='testing'`, clears `confirmed_at = NULL`, clears `archived_from_md_at = NULL`. `fix_attempts` deliberately left unchanged — reopen is the undo of a verdict, not a new fix attempt. A `reopened` event is logged to `bug_events` (with `from_status` = original) so Dashboard activity feed sees the action, but it does NOT contribute to KPI5 (avg attempts per closed in period — that query filters by `event_type='entered_testing'`). The bug_events invariant `COUNT(entered_testing) == bugs.fix_attempts` is preserved through reopen. Amber `#f59e0b` colour for the button distinguishes "rollback" from finalising ✓ (green) and rejecting ✗ (red).
-
-### Tests
-- 380 cargo (+4 for `reopen_bug`: confirmed → testing clears confirmed_at + keeps attempts; rejected → testing keeps attempts; archived_from_md_at cleared so bug reappears in MD; bug_events invariant `COUNT(entered_testing) == fix_attempts` holds across reopen) / 72 vitest / 0 svelte issues.
-
-## [1.0.5] — 2026-05-25
-
-UX polish patch — two small dogfood-surfaced annoyances. Reject-bug dialog button label was semantically off ("Подтвердить" / "Confirm" on a dialog whose header literally says "Отклонить баг" / "Reject bug" — the verb on the button didn't match the action). SecretsPanel bulk-paste textarea was pinned at `rows="4"` (~70px) regardless of viewport — on a 1337px-tall window the input occupied 5% of vertical real estate, the rest sat empty. Both are CSS / i18n-only — no Rust touched.
+- **T-000130 — Reopen bug action (↩ button).** Until now ✓ and ✗ on a `testing` bug were one-way: clicking either by accident or on second thought left the user with no way back. The new ↩ button on `confirmed` and `rejected` rows reopens the bug to `testing` so the verdict can be retaken without losing fix history. Replaces the read-only ✓ mark on `confirmed` rows (the status badge already names the state) and fills the previously-empty action slot on `rejected`. No confirm dialog — the whole point of the button is fast rollback. New Tauri command `reopen_bug(repo_id, display_id)` + DB method `reopen_bug(bug_id)` atomically: `status='testing'`, `confirmed_at = NULL`, `archived_from_md_at = NULL`. `fix_attempts` deliberately preserved — reopen is the undo of a verdict, not a new fix attempt. A `reopened` event is logged to `bug_events` (with `from_status` = original) so the Dashboard activity feed sees the action, but it does NOT contribute to KPI5 (avg attempts per closed in period filters by `event_type='entered_testing'`). The bug_events invariant `COUNT(entered_testing) == bugs.fix_attempts` is preserved through reopen. Amber `#f59e0b` for the button distinguishes "rollback" from finalising ✓ (green) and rejecting ✗ (red).
 
 ### Changed
 - **`dialog.confirm` i18n key** — `Подтвердить` / `Confirm` → `ОК` / `OK`. Affects every `ConfirmDialog` site (13 usages: bug delete, bug reject, deploy env delete, GlobalClaudeEditor discard, project type change, project delete, repo delete, secrets bulk delete, project secrets push, sidebar project delete, template revert). The header of each dialog already names the action — the button just needs to be a confirmation primitive. Closes B-000022.
 
 ### Fixed
-- **T-000129** — SecretsPanel bulk-paste textarea now grows vertically to fill the Секреты tab. `.secrets-section.flat` cascades `flex: 1 / min-height: 0 / display: flex column` through `.secrets-body` → `.new-secrets` → `.secrets-textarea`, so the textarea absorbs whatever vertical space is left after the existing-secrets list. Minimum height kept at 70px for short windows; resize-vertical handle preserved. On a 1080p+ window with a handful of existing secrets the bulk-paste field now spans the rest of the viewport. *Initial fix (commit `21a1ba7`) missed the parent: `.secrets-wrapper` in RepoDetail was a plain block container, so the `flex: 1` on `.secrets-section.flat` had no flex parent to grow into — the cascade silently no-op'd and the textarea stayed at rows="4". Follow-up adds `display: flex / flex-direction: column` to `.secrets-wrapper` and `flex-shrink: 0` to `.existing-secrets` (so the existing-secrets list keeps natural height when many secrets are present and the wrapper scrolls instead of compressing the list).*
+- **T-000129 — SecretsPanel bulk-paste textarea now grows vertically** to fill the Секреты tab. Previously pinned at `rows="4"` (~70px) regardless of viewport — on a 1337px-tall window the input occupied 5% of vertical real estate, the rest sat empty. `.secrets-wrapper` in RepoDetail now lays out as `display: flex; flex-direction: column`, and `.secrets-section.flat` cascades `flex: 1 / min-height: 0` through `.secrets-body` → `.new-secrets` → `.secrets-textarea`. `.existing-secrets` carries `flex-shrink: 0` so a long list keeps natural height and the wrapper scrolls instead of compressing it. Minimum height 70px kept as a floor; resize-vertical handle preserved.
 
 ### Tests
-- 376 cargo / 72 vitest / 0 svelte issues (unchanged — CSS/i18n only).
+- 380 cargo (+4 for `reopen_bug`: confirmed → testing clears confirmed_at + keeps attempts; rejected → testing keeps attempts; archived_from_md_at cleared so the bug reappears in MD; bug_events invariant `COUNT(entered_testing) == fix_attempts` holds across reopen) / 72 vitest / 0 svelte issues.
 
 ## [1.0.4] — 2026-05-25
 

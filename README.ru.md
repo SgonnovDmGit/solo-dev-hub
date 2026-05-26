@@ -129,8 +129,10 @@ git push origin master vX.Y.Z
 
 ## Roadmap
 
-- **v1.0.0** *(текущий — 2026-05-18)* — public launch, MIT open source, начало эры frozen contract.
-- **v1.0.x** — post-launch polish: внутренние рефакторы (split `lib.rs` / `tauri-commands.ts`, декомпозиция 570-строчного `sync_project` handler'а), `docs/ARCHITECTURE.md` для контрибьюторов, SQLite ER-граф, in-app мультиязычный help-экран.
+- **v1.1.0** *(текущий — 2026-05-25)* — verdict-rollback для багов (↩ reopen на confirmed/rejected), полноразмерное массовое поле секретов, унифицированные подписи кнопок диалогов.
+- **v1.0.0** — public launch (2026-05-18), MIT open source, начало эры frozen contract.
+- **v1.1.x** — внутренние рефакторы (`lib.rs` / `tauri-commands.ts` splits, декомпозиция 570-строчного `sync_project`, UI component splits) + контрибьютор-доки (`docs/ARCHITECTURE.md`, SQLite ER-граф).
+- **v1.2.0** — in-app мультиязычный help-экран документирующий LLM operating contract.
 - **v2.0.0** — Windows Authenticode code signing (убирает SmartScreen warning), read-only API viewer + матрица совместимости клиент/сервер, REQ auto-accept через `## Status:` frontmatter.
 
 Полный backlog и per-version задачи — [`docs/roadmap.md`](docs/roadmap.md).
