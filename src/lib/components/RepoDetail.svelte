@@ -754,6 +754,12 @@
     min-height: 0;
     overflow-y: auto;
     padding: 0 24px;
+    /* T-000129 follow-up: flex column so SecretsPanel's `flex: 1` cascade
+       reaches the bulk-paste textarea. Without this the .secrets-section.flat
+       child has no flex parent, so its `flex: 1` is silently ignored and the
+       textarea stays at rows="4". */
+    display: flex;
+    flex-direction: column;
   }
 
   /* B-000008: same overflow-scroll pattern as .secrets-wrapper / .stats-section.
