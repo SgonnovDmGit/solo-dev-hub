@@ -843,6 +843,48 @@ fn reject_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<BugV
     Ok(refreshed.to_view())
 }
 
+/// T-000130: reopen a `confirmed` or `rejected` bug back to `testing` so the
+/// user can undo an accidental ✓ or ✗ verdict. Reopen is a user-initiated
+/// rollback — not a new fix attempt — so `fix_attempts` is preserved and the
+/// `entered_testing` invariant (`COUNT(bug_events.entered_testing) ==
+/// bugs.fix_attempts`) holds. A `reopened` bug_event is logged so Dashboard /
+/// activity feed see the action, but it does NOT contribute to KPI5
+/// (avg attempts per closed in period) which filters by `entered_testing`.
+/// `confirmed_at` and `archived_from_md_at` are cleared so the bug rejoins the
+/// "active" set and reappears in MD on next regen.
+#[tauri::command]
+fn reopen_bug(db: State<AppDb>, repo_id: i64, display_id: String) -> Result<BugView, String> {
+    // T-000128: reconcile LLM MD edits before mutating.
+    let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
+    let bug = db
+        .get_bug_by_display_id(repo_id, &display_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("bug {} not found", display_id))?;
+    if bug.status != "confirmed" && bug.status != "rejected" {
+        return Err(format!(
+            "cannot reopen from status '{}' — must be 'confirmed' or 'rejected'",
+            bug.status
+        ));
+    }
+    let from_status = bug.status.clone();
+    let now = db::utc_now_rfc3339();
+    db.reopen_bug(bug.id).map_err(|e| e.to_string())?;
+    db.insert_bug_event(
+        bug.id,
+        "reopened",
+        Some(from_status.as_str()),
+        Some("testing"),
+        &now,
+    )
+    .map_err(|e| e.to_string())?;
+    let refreshed = db
+        .get_bug_by_id(bug.id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "bug vanished after update".to_string())?;
+    let _ = sync::regenerate_bugs_md(&db, repo_id);
+    Ok(refreshed.to_view())
+}
+
 // ── Stats / Graph summaries ──────────────────────────────────────────────────
 // Stats are live-computed from the `bugs` and `bug_events` tables — no
 // persisted counters, no recalc commands. The legacy `*_stat` write-stubs
@@ -3087,6 +3129,7 @@ pub fn run() {
             delete_bug,
             resolve_bug,
             reject_bug,
+            reopen_bug,
             // Microservice connections
             connect_microservice,
             disconnect_microservice,

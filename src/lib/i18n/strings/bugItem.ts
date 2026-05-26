@@ -25,6 +25,9 @@ export const ru = {
   'bugItem.rejectConfirmMessage': 'Что нужно доделать?',
   'bugItem.addComment': 'комментарий',
   'bugItem.commentPlaceholder': 'Комментарий...',
+  // T-000130: reopen verdict (confirm ✓ or reject ✗) — undo back to testing.
+  'bugItem.reopenFromConfirmedTooltip': 'Переоткрыть: вернуть из «подтверждён» обратно в тестирование',
+  'bugItem.reopenFromRejectedTooltip': 'Переоткрыть: вернуть из «отклонён» обратно в тестирование',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -54,4 +57,6 @@ export const en: Record<keyof typeof ru, string> = {
   'bugItem.rejectConfirmMessage': 'What still needs doing?',
   'bugItem.addComment': 'comment',
   'bugItem.commentPlaceholder': 'Comment...',
+  'bugItem.reopenFromConfirmedTooltip': 'Reopen: return from "confirmed" back to testing',
+  'bugItem.reopenFromRejectedTooltip': 'Reopen: return from "rejected" back to testing',
 };

@@ -10,6 +10,7 @@ import {
   deleteBug,
   resolveBug,
   rejectBug,
+  reopenBug,
 } from '$lib/api/tauri-commands';
 import { addToast } from './ui';
 import { tf, t } from '$lib/i18n';
@@ -166,6 +167,21 @@ export async function rejectBugWithComment(displayId: string, comment?: string):
       await updateBugFields(currentRepoId, displayId, { comment: comment.trim() });
     }
     await rejectBug(currentRepoId, displayId);
+    await reloadBugsList();
+  } catch (err) {
+    addToast(String(err), 'error');
+  }
+}
+
+/** T-000130: reopen a confirmed-or-rejected bug back to `testing` so the user
+ *  can undo an accidental ✓/✗ verdict. `fix_attempts` preserved on backend —
+ *  reopen is a verdict rollback, not a new fix attempt. Refreshes the list
+ *  from DB so the bug rejoins the active set (or stays visible if the
+ *  "Показать закрытые" toggle is on). */
+export async function reopenBugAction(displayId: string): Promise<void> {
+  if (currentRepoId === null) return;
+  try {
+    await reopenBug(currentRepoId, displayId);
     await reloadBugsList();
   } catch (err) {
     addToast(String(err), 'error');

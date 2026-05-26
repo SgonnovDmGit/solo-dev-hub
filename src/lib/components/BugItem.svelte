@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { confirmBug, editBug, removeBug, rejectBugWithComment } from '$lib/stores/bugs';
+  import { confirmBug, editBug, removeBug, rejectBugWithComment, reopenBugAction } from '$lib/stores/bugs';
   import { type BugView } from '$lib/types';
   import { tStore } from '$lib/i18n';
   import ConfirmDialog from './ConfirmDialog.svelte';
@@ -59,6 +59,16 @@
   const statusColor = $derived(statusColors[bug.status] ?? '#6b7280');
   const isTesting = $derived(bug.status === 'testing');
   const isConfirmed = $derived(bug.status === 'confirmed');
+  const isRejected = $derived(bug.status === 'rejected');
+  // T-000130: confirmed and rejected bugs get an ↩ reopen button to undo
+  // the verdict back to `testing`. Backend preserves fix_attempts and clears
+  // confirmed_at — see `reopen_bug` in lib.rs.
+  const canReopen = $derived(isConfirmed || isRejected);
+  const reopenTooltipKey = $derived(
+    isConfirmed
+      ? 'bugItem.reopenFromConfirmedTooltip'
+      : 'bugItem.reopenFromRejectedTooltip',
+  );
   // Hard-delete only allowed for accidental creations (status 'created').
   // Beyond that, confirmed-status is the archive path.
   const canDelete = $derived(bug.status === 'created');
@@ -150,8 +160,8 @@
     <div class="action-slot">
       {#if isTesting}
         <button class="action-btn confirm-btn" onclick={handleConfirm} title={$tStore('bugItem.confirmTooltip' as any)} type="button">✓</button>
-      {:else if isConfirmed}
-        <span class="confirmed-mark" title={$tStore('bugItem.confirmedBadge' as any)}>✓</span>
+      {:else if canReopen}
+        <button class="action-btn reopen-btn" onclick={() => reopenBugAction(bug.id)} title={$tStore(reopenTooltipKey as any)} type="button">↩</button>
       {/if}
     </div>
 
@@ -322,11 +332,11 @@
   .reject-btn { color: #ef4444; border-color: #ef4444; }
   .reject-btn:hover { background: rgba(239,68,68,0.15); }
 
-  .confirmed-mark {
-    color: #22c55e;
-    font-size: 12px;
-    font-weight: bold;
-  }
+  /* T-000130: ↩ reopen — amber distinguishes "rollback" semantics from
+     finalising ✓ (green) and rejecting ✗ (red). Shown on confirmed +
+     rejected to undo a verdict back to testing. */
+  .reopen-btn { color: #f59e0b; border-color: #f59e0b; }
+  .reopen-btn:hover { background: rgba(245,158,11,0.15); }
 
   .num {
     font-size: 10px;

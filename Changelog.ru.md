@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [1.0.6] — 2026-05-25
+
+Добавляет verdict-rollback путь для багов. До этого ✓ и ✗ на `testing`-баге были one-way — клик по неосторожности или на второй взгляд оставлял user'а без обратного пути. Новая кнопка ↩ на `confirmed` и `rejected` строках переоткрывает баг в `testing` чтобы verdict можно было пересдать без потери fix-истории.
+
+### Added
+- **T-000130 — Reopen bug action (↩ кнопка).** Заменяет non-interactive ✓ mark на `confirmed`-строках и заполняет ранее-пустой action-слот на `rejected`. Клик ↩ → баг откатывается в `testing`. Никакого confirm-диалога — вся точка кнопки в быстром rollback'е. Новый Tauri command `reopen_bug(repo_id, display_id)` + DB method `reopen_bug(bug_id)` атомарно: ставит `status='testing'`, чистит `confirmed_at = NULL`, чистит `archived_from_md_at = NULL`. `fix_attempts` намеренно оставлен без изменений — reopen это undo verdict'а, не новая fix-попытка. Event `reopened` пишется в `bug_events` (с `from_status` = original) чтобы Dashboard activity feed увидел action, но он НЕ контрибутит в KPI5 (avg attempts per closed in period — этот query фильтрует по `event_type='entered_testing'`). Invariant `COUNT(entered_testing) == bugs.fix_attempts` сохраняется через reopen. Amber `#f59e0b` цвет кнопки отличает "rollback"-семантику от завершающего ✓ (зелёный) и rejecting ✗ (красный).
+
+### Tests
+- 380 cargo (+4 для `reopen_bug`: confirmed → testing чистит confirmed_at + сохраняет attempts; rejected → testing сохраняет attempts; archived_from_md_at очищается чтобы баг вернулся в MD; bug_events invariant `COUNT(entered_testing) == fix_attempts` держится через reopen) / 72 vitest / 0 svelte issues.
+
 ## [1.0.5] — 2026-05-25
 
 UX-polish патч — две dogfood-всплывшие мелочи. Кнопка confirm в reject-bug диалоге была семантически кривая («Подтвердить» / «Confirm» на диалоге чей заголовок буквально «Отклонить баг» / «Reject bug» — глагол на кнопке не матчил действие). SecretsPanel массовое поле пасты залочено на `rows="4"` (~70px) независимо от viewport'а — на 1337px-высоком окне инпут занимал 5% vertical real estate, остальное стояло пустым. Оба фикса — CSS / i18n only, Rust не трогали.

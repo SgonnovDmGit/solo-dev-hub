@@ -4,6 +4,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.0.6] — 2026-05-25
+
+Adds a verdict-rollback path for bugs. Until now ✓ and ✗ on a `testing` bug were one-way — clicking either by accident or on second thought left the user with no way back. New ↩ button on `confirmed` and `rejected` rows reopens the bug to `testing` so the verdict can be retaken without losing the fix history.
+
+### Added
+- **T-000130 — Reopen bug action (↩ button).** Replaces the read-only ✓ mark on `confirmed` rows and fills the previously-empty action slot on `rejected` rows. Click ↩ → bug transitions back to `testing`. No confirm dialog — the whole point of the button is fast rollback. New Tauri command `reopen_bug(repo_id, display_id)` + DB method `reopen_bug(bug_id)` that atomically: sets `status='testing'`, clears `confirmed_at = NULL`, clears `archived_from_md_at = NULL`. `fix_attempts` deliberately left unchanged — reopen is the undo of a verdict, not a new fix attempt. A `reopened` event is logged to `bug_events` (with `from_status` = original) so Dashboard activity feed sees the action, but it does NOT contribute to KPI5 (avg attempts per closed in period — that query filters by `event_type='entered_testing'`). The bug_events invariant `COUNT(entered_testing) == bugs.fix_attempts` is preserved through reopen. Amber `#f59e0b` colour for the button distinguishes "rollback" from finalising ✓ (green) and rejecting ✗ (red).
+
+### Tests
+- 380 cargo (+4 for `reopen_bug`: confirmed → testing clears confirmed_at + keeps attempts; rejected → testing keeps attempts; archived_from_md_at cleared so bug reappears in MD; bug_events invariant `COUNT(entered_testing) == fix_attempts` holds across reopen) / 72 vitest / 0 svelte issues.
+
 ## [1.0.5] — 2026-05-25
 
 UX polish patch — two small dogfood-surfaced annoyances. Reject-bug dialog button label was semantically off ("Подтвердить" / "Confirm" on a dialog whose header literally says "Отклонить баг" / "Reject bug" — the verb on the button didn't match the action). SecretsPanel bulk-paste textarea was pinned at `rows="4"` (~70px) regardless of viewport — on a 1337px-tall window the input occupied 5% of vertical real estate, the rest sat empty. Both are CSS / i18n-only — no Rust touched.
