@@ -18,7 +18,6 @@ pub use claude_md::*;
 pub use fs::*;
 pub use gitattributes::*;
 pub use gitignore::*;
-pub use managed_block::*;
 pub use project_md::*;
 pub use requirements::*;
 pub use tasks::*;
