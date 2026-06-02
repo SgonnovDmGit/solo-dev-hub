@@ -1,94 +1,14 @@
-// .gitignore managed-block sync (dedup-aware). Manages content between
-// `# --- solo-dev-hub:begin ---` / `# --- solo-dev-hub:end ---` markers.
+// .gitignore managed-block sync. Thin wrapper over the shared dedup-aware
+// section-merge in `managed_block` — targets `<repo_root>/.gitignore`.
 
-use regex::Regex;
-use std::fs;
+use super::managed_block::sync_managed_block;
 use std::path::Path;
 
-/// Sync a managed section in .gitignore between markers — with **dedup logic**.
-/// Приципы:
-/// - Из template берём только rule-строки (не комментарии и не пустые).
-/// - Отфильтровываем те, которые **уже есть** в user-контенте (exact-match trimmed).
-/// - Оставшиеся правила (если есть) → блок между маркерами.
-/// - Если новых правил нет — блок удаляется (или не создаётся).
-///
-/// Returns true if file was modified.
+/// Sync the managed `.gitignore` section between markers (dedup-aware).
+/// Returns true if the file was modified. See `sync_managed_block` for the
+/// full merge semantics.
 pub fn sync_gitignore_section(template: &str, repo_root: &Path) -> Result<bool, String> {
-    if template.trim().is_empty() {
-        return Ok(false);
-    }
-    let target = repo_root.join(".gitignore");
-
-    let existing = if target.exists() {
-        fs::read_to_string(&target).map_err(|e| e.to_string())?
-    } else {
-        String::new()
-    };
-
-    let has_begin = existing.contains("solo-dev-hub:begin");
-    let has_end = existing.contains("solo-dev-hub:end");
-
-    // User content = everything outside any existing managed block.
-    // Self-heal orphan markers: if only one marker present, just strip that line
-    // and treat rest as user content — block will be rebuilt below.
-    let block_re =
-        Regex::new(r"(?s)\n*# --- solo-dev-hub:begin.*?# --- solo-dev-hub:end ---\n*").unwrap();
-    let user_content = if has_begin && has_end {
-        block_re.replace(&existing, "\n").to_string()
-    } else if has_begin || has_end {
-        // Orphan: strip any line containing either marker string, keep rest as user content.
-        existing
-            .lines()
-            .filter(|line| {
-                !line.contains("solo-dev-hub:begin") && !line.contains("solo-dev-hub:end")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        existing.clone()
-    };
-
-    // Collect user's actual rules (trimmed, non-comment, non-empty).
-    use std::collections::HashSet;
-    let user_rules: HashSet<&str> = user_content
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
-
-    // Extract rules from template only (drop comments) and keep those NOT already in user_rules.
-    let new_rules: Vec<&str> = template
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter(|l| !user_rules.contains(l))
-        .collect();
-
-    // Decide desired final content.
-    let user_trimmed = user_content.trim_end();
-    let desired = if new_rules.is_empty() {
-        if user_trimmed.is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", user_trimmed)
-        }
-    } else {
-        let block = format!(
-            "# --- solo-dev-hub:begin ---\n{}\n# --- solo-dev-hub:end ---",
-            new_rules.join("\n")
-        );
-        if user_trimmed.is_empty() {
-            format!("{}\n", block)
-        } else {
-            format!("{}\n\n{}\n", user_trimmed, block)
-        }
-    };
-
-    if desired == existing {
-        return Ok(false);
-    }
-    fs::write(&target, desired).map_err(|e| e.to_string())?;
-    Ok(true)
+    sync_managed_block(template, &repo_root.join(".gitignore"))
 }
 
 #[cfg(test)]
