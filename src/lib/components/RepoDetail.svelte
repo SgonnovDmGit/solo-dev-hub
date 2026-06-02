@@ -426,15 +426,10 @@
       <!-- Secrets panel — renamed from "Overview" (tab held only this). -->
       {#if repo.github_name && $pat}
         <div class="secrets-wrapper">
-          <!-- B-000025: SecretsPanel holds component-local state (bulk-paste
-               textarea `secretsText`, selections). Without a key on repo.id the
-               instance is reused on repo switch, so the previous repo's draft
-               bleeds into the new one. Force remount, symmetric with the Deploy
-               tab's B-000006 key below. {#key} adds no DOM node, so the
-               .secrets-wrapper flex parent (T-000129) is preserved. -->
-          {#key repo.id}
-            <SecretsPanel mode="repo" repoFullName={repo.github_name} collapsible={false} />
-          {/key}
+          <!-- B-000025: SecretsPanel keeps per-repo bulk-paste drafts internally
+               (module-level map keyed by repoFullName), so no remount is needed —
+               switching repos restores the previous draft instead of wiping it. -->
+          <SecretsPanel mode="repo" repoFullName={repo.github_name} collapsible={false} />
         </div>
       {/if}
     {:else if activeTab === 'bugs'}

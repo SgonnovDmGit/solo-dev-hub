@@ -1,3 +1,11 @@
+<script module lang="ts">
+  // B-000025: per-repo bulk-paste drafts, shared across SecretsPanel instances
+  // so the textarea content survives repo switches and is restored on return
+  // (the user wants per-repo memory, not a wipe). Keyed by repoFullName;
+  // module-level so it persists for the app session, across repo switches.
+  const bulkDrafts: Record<string, string> = {};
+</script>
+
 <script lang="ts">
   import { pat } from '$lib/stores/settings';
   import { addToast } from '$lib/stores/ui';
@@ -70,6 +78,21 @@
   $effect(() => {
     if (bodyOpen && mode === 'repo' && repoFullName && $pat) {
       loadSecrets();
+    }
+  });
+
+  // B-000025: per-repo bulk-paste draft memory. On repo switch, stash the
+  // outgoing repo's draft and restore the incoming one, so going back shows what
+  // was typed before (and the post-push clear to '' persists). `lastDraftRepo`
+  // is a plain non-reactive marker — this effect re-runs on every keystroke
+  // (it reads secretsText) but those are cheap no-ops since current === last.
+  let lastDraftRepo = '';
+  $effect(() => {
+    const current = repoFullName ?? '';
+    if (current !== lastDraftRepo) {
+      if (lastDraftRepo) bulkDrafts[lastDraftRepo] = secretsText;
+      lastDraftRepo = current;
+      secretsText = current ? (bulkDrafts[current] ?? '') : '';
     }
   });
 
