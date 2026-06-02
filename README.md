@@ -29,9 +29,10 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 - **Cross-repo requirements** — `REQ-NNN.md` exchange between client ↔ server ↔ microservice. Sender writes the ask, recipient writes the receipt, the app handles file movement between repos. No GitHub Issues, no email threads.
 - **Project graph** — visualize a project as a 1-hop graph: server in the center, repos and connected microservices around it. Click any node to navigate. Built on Cytoscape.
 - **Multi-environment deploy** — generate Docker + GitHub Actions deploy pipelines per environment (prod / staging / test / any custom name) with native GitHub Environments integration and per-secret role/scope flags.
+- **Deploy report** — portfolio-wide view of every deploy environment across all repos in one screen (domains, branches, image tags, secret counts), grouped by project. Click any row to jump straight to that environment's setup.
 - **Tasks (todo.md / done.md)** — each repo has an append-only completion log auto-tagged with versions. Universal data grid: filter, sort, persist preferences per tab.
 - **Activity timeline** — multi-source events (bugs, tasks, syncs, deploys, repo renames) across the entire portfolio. Date-range / kind / repo / search filters.
-- **Templates** — per-language seeds for `.gitignore`, deploy YAML, CLAUDE.md sections. Customize once in the app, sync into every project.
+- **Templates** — per-language seeds for `.gitignore`, `.gitattributes`, deploy YAML, CLAUDE.md sections. Customize once in the app, sync into every project.
 - **PAT in OS keyring** — your GitHub token goes into Windows Credential Manager (OS-level), never SQLite, never `.env`, never a plaintext file.
 - **Single .exe, ~11 MB** — Tauri v2 + WebView2. No Electron bloat. No daemon. No telemetry. The only background network call is the update-checker pinging GitHub Releases once on startup; everything else is on your explicit action.
 
@@ -129,10 +130,11 @@ The full release runbook (key rotation, CI troubleshooting, hotfix flow) — [do
 
 ## Roadmap
 
-- **v1.1.0** *(current — 2026-05-25)* — verdict-rollback for bugs (↩ reopen button on confirmed/rejected), full-height secrets bulk-paste, unified dialog button labels.
+- **v1.2.0** *(current — 2026-06-02)* — portfolio deploy report (all deploy environments in one screen, grouped by project, with drill-down to each), `.gitattributes` managed template, plus dashboard custom date-range and per-repo secrets-draft fixes.
+- **v1.1.0** — verdict-rollback for bugs (↩ reopen button on confirmed/rejected), full-height secrets bulk-paste, unified dialog button labels (2026-05-25).
 - **v1.0.0** — public launch (2026-05-18), MIT-licensed open source, frozen-contract era begins.
-- **v1.1.x** — internal refactors (`lib.rs` / `tauri-commands.ts` splits, decomposing the 570-line `sync_project` handler, UI component splits) + contributor docs (`docs/ARCHITECTURE.md`, SQLite ER-graph).
-- **v1.2.0** — in-app multilingual help screen documenting the LLM operating contract.
+- **v1.2.x** — internal refactors (`lib.rs` / `tauri-commands.ts` splits, decomposing the 570-line `sync_project` handler, UI component splits) + contributor docs (`docs/ARCHITECTURE.md`, SQLite ER-graph).
+- **v1.3.0** — in-app multilingual help screen documenting the LLM operating contract.
 - **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix, REQ auto-accept with `## Status:` frontmatter.
 
 Full backlog and per-version task lists — [`docs/roadmap.md`](docs/roadmap.md).
