@@ -23,6 +23,7 @@
   import AppDefaultsScreen from '$lib/components/AppDefaultsScreen.svelte';
   import About from '$lib/components/About.svelte';
   import Timeline from '$lib/components/Timeline.svelte';
+  import DeployReport from '$lib/components/DeployReport.svelte';
   import GlobalClaudeEditor from '$lib/components/GlobalClaudeEditor.svelte';
   import InputContextMenu from '$lib/components/InputContextMenu.svelte';
   import logo from '$lib/assets/logo.png';
@@ -174,6 +175,14 @@
       </button>
       <button
         class="ghost titlebar-btn"
+        class:active={$currentScreen.name === 'deploy_report'}
+        onclick={() => $currentScreen.name === 'deploy_report' ? goBack() : navigateTo('deploy_report')}
+        title={$tStore('deploy.report.title' as any)}
+      >
+        🚀 {$tStore('deploy.report.title' as any)}
+      </button>
+      <button
+        class="ghost titlebar-btn"
         class:active={$currentScreen.name === 'settings'}
         onclick={() => $currentScreen.name === 'settings' ? goBack() : navigateTo('settings')}
         title={$tStore('app.openSettings')}
@@ -256,6 +265,8 @@
         <About />
       {:else if $currentScreen.name === 'timeline'}
         <Timeline />
+      {:else if $currentScreen.name === 'deploy_report'}
+        <DeployReport />
       {:else if $currentScreen.name === 'global_claude_editor'}
         <GlobalClaudeEditor />
       {/if}

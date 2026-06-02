@@ -13,11 +13,11 @@ use chrono;
 use db::AppDb;
 use models::{
     BugView, CreateDeployEnvironmentArgs, DailyFlowDay, DashboardData, DashboardFilter,
-    DeployEnvironment, DeploySecret, FileBugNote, GitignoredListing, KpiCard, MetaSecretHint,
-    MigrationReport, Project, ProjectGraph, ReadBugsResult, ReadDoneResult, ReadTodoResult,
-    RenderedFile, RepoRename, Repository, RequirementInfo, StatsSummary, SyncResult, TemplateFile,
-    TemplateLanguage, UntrackReport, UpdateDeployEnvironmentArgs, UpsertRepoOutcome, WriteError,
-    WriteResult,
+    DeployEnvironment, DeployReportRow, DeploySecret, FileBugNote, GitignoredListing, KpiCard,
+    MetaSecretHint, MigrationReport, Project, ProjectGraph, ReadBugsResult, ReadDoneResult,
+    ReadTodoResult, RenderedFile, RepoRename, Repository, RequirementInfo, StatsSummary,
+    SyncResult, TemplateFile, TemplateLanguage, UntrackReport, UpdateDeployEnvironmentArgs,
+    UpsertRepoOutcome, WriteError, WriteResult,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1152,7 +1152,7 @@ fn sync_global_claude_md(db: State<AppDb>) -> Result<SyncGlobalClaudeResult, Str
 }
 
 /// Init skeletons for a single repo — F-016 manual trigger.
-/// Copies-if-missing: docs/todo.md, docs/bug-reports.md, .gitignore.
+/// Copies-if-missing: docs/todo.md, docs/bug-reports.md; section-merges .gitignore + .gitattributes.
 /// Returns list of filenames actually created (empty list = all already exist).
 #[tauri::command]
 fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>, String> {
@@ -1179,6 +1179,11 @@ fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>, Str
         .map_err(|e| e.to_string())?
         .map(|t| t.content)
         .unwrap_or_default();
+    let gitattributes_template = db
+        .get_template_file("_global", ".gitattributes.tmpl")
+        .map_err(|e| e.to_string())?
+        .map(|t| t.content)
+        .unwrap_or_default();
 
     let mut updated = Vec::new();
     if sync::copy_doc_skeleton_if_missing(&todo_template, base, "todo.md")? {
@@ -1189,6 +1194,9 @@ fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>, Str
     }
     if sync::sync_gitignore_section(&gitignore_template, base)? {
         updated.push(".gitignore (section)".to_string());
+    }
+    if sync::sync_gitattributes_section(&gitattributes_template, base)? {
+        updated.push(".gitattributes (section)".to_string());
     }
     // App-owned files (project.md + CLAUDE.md section) — always overwritten when
     // the repo is attached to a project. Orphan repos (project_id=None) skip this
@@ -1241,10 +1249,16 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
     let mut migrated = 0usize;
     let mut errors: Vec<String> = vec![];
 
-    // 0.10.0 pre-phase: write project.md + CLAUDE.md section + .gitignore to all repos.
+    // 0.10.0 pre-phase: write project.md + CLAUDE.md section + .gitignore + .gitattributes to all repos.
     // 0.11.0 extends with todo.md + bug-reports.md skeletons.
     let gitignore_template = db
         .get_template_file("_global", ".gitignore.tmpl")
+        .ok()
+        .flatten()
+        .map(|t| t.content)
+        .unwrap_or_default();
+    let gitattributes_template = db
+        .get_template_file("_global", ".gitattributes.tmpl")
         .ok()
         .flatten()
         .map(|t| t.content)
@@ -1295,6 +1309,9 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
         if let Err(e) = sync::sync_gitignore_section(&gitignore_template, base) {
             errors.push(format!(".gitignore for {}: {}", label, e));
         }
+        if let Err(e) = sync::sync_gitattributes_section(&gitattributes_template, base) {
+            errors.push(format!(".gitattributes for {}: {}", label, e));
+        }
         if let Err(e) = sync::copy_doc_skeleton_if_missing(&todo_template, base, "todo.md") {
             errors.push(format!("todo.md for {}: {}", label, e));
         }
@@ -1341,6 +1358,9 @@ fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String>
         }
         if let Err(e) = sync::sync_gitignore_section(&gitignore_template, base) {
             errors.push(format!(".gitignore for {}: {}", label, e));
+        }
+        if let Err(e) = sync::sync_gitattributes_section(&gitattributes_template, base) {
+            errors.push(format!(".gitattributes for {}: {}", label, e));
         }
         if let Err(e) = sync::copy_doc_skeleton_if_missing(&todo_template, base, "todo.md") {
             errors.push(format!("todo.md for {}: {}", label, e));
@@ -2614,6 +2634,11 @@ fn list_deploy_environments(
 }
 
 #[tauri::command]
+fn list_deploy_report(db: State<AppDb>) -> Result<Vec<DeployReportRow>, String> {
+    db.list_deploy_report().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn get_deploy_environment(db: State<AppDb>, id: i64) -> Result<Option<DeployEnvironment>, String> {
     db.get_deploy_environment(id).map_err(|e| e.to_string())
 }
@@ -3172,6 +3197,7 @@ pub fn run() {
             set_repo_deploy_config,
             render_deploy_files_for_env,
             list_deploy_environments,
+            list_deploy_report,
             get_deploy_environment,
             create_deploy_environment,
             clone_deploy_environment,

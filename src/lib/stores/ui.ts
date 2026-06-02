@@ -1,6 +1,6 @@
 import { writable } from 'svelte/store';
 
-export type ScreenName = 'repo-detail' | 'settings' | 'project' | 'dashboard' | 'sync' | 'templates' | 'app_defaults' | 'about' | 'timeline' | 'global_claude_editor';
+export type ScreenName = 'repo-detail' | 'settings' | 'project' | 'dashboard' | 'sync' | 'templates' | 'app_defaults' | 'about' | 'timeline' | 'deploy_report' | 'global_claude_editor';
 
 export interface ScreenState {
   name: ScreenName;
@@ -60,3 +60,11 @@ export function dismissToast(id: number): void {
  * Используется как "one-shot" сигнал — не наблюдаемый long-living state.
  */
 export const timelineInitialRepoIds = writable<number[] | null>(null);
+
+/**
+ * v1.2.0 (deploy report): one-shot drill-down signal. Set by DeployReport on
+ * row click; consumed by RepoDetail (→ activeTab='deploy') then DeployScreen
+ * (→ open that env's detail in viewMode='detail'), then cleared. Same one-shot
+ * pattern as `timelineInitialRepoIds` above.
+ */
+export const deployDrillTarget = writable<{ repoId: number; deployEnvId: number } | null>(null);

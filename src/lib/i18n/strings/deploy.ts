@@ -76,6 +76,29 @@ export const ru = {
   // T-000103 Task 5: empty-required warning for repo-scope placeholders.
   // {0} is the comma-separated list of missing keys (e.g. "GO_VERSION, BINARY_NAME").
   'deploy.missingRequiredRepoScope': 'Не заполнены общие настройки образа — задайте их в разделе «Общие настройки образа» выше: {0}',
+  // v1.2.0: portfolio deploy report (top-level "Деплои" screen).
+  'deploy.report.title': 'Деплои',
+  'deploy.report.subtitle': 'все деплой-окружения портфеля в одном месте',
+  'deploy.report.filterProject': 'Проект',
+  'deploy.report.filterEnv': 'Окружение',
+  'deploy.report.allProjects': 'Все проекты',
+  'deploy.report.allEnvs': 'Все env',
+  'deploy.report.search': 'Поиск',
+  'deploy.report.searchPlaceholder': 'репо, домен, ветка…',
+  'deploy.report.summaryFmt': '{0} деплоев · {1} проектов',
+  'deploy.report.sectionMetaFmt': '{0} деплоев · {1} репо',
+  'deploy.report.colRepo': 'Репозиторий',
+  'deploy.report.colEnv': 'Env',
+  'deploy.report.colDomain': 'Домен',
+  'deploy.report.colBranch': 'Ветка',
+  'deploy.report.colImageTag': 'Image tag',
+  'deploy.report.colSecrets': 'Секреты',
+  'deploy.report.colUpdated': 'Конфиг обновлён',
+  'deploy.report.noProject': 'Без проекта',
+  'deploy.report.internalDomain': '— внутренний',
+  'deploy.report.loading': 'Загрузка…',
+  'deploy.report.empty': 'Деплой-окружений пока нет. Создайте их во вкладке «Деплой» репозитория.',
+  'deploy.report.noMatch': 'Под фильтры ничего не подходит.',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -156,4 +179,27 @@ export const en: Record<keyof typeof ru, string> = {
   // T-000103 Task 5: empty-required warning for repo-scope placeholders.
   // {0} is the comma-separated list of missing keys (e.g. "GO_VERSION, BINARY_NAME").
   'deploy.missingRequiredRepoScope': 'Shared image config is empty — set it in the "Shared image config" section above: {0}',
+  // v1.2.0: portfolio deploy report (top-level "Deploys" screen).
+  'deploy.report.title': 'Deploys',
+  'deploy.report.subtitle': 'all deploy environments in your portfolio, in one place',
+  'deploy.report.filterProject': 'Project',
+  'deploy.report.filterEnv': 'Environment',
+  'deploy.report.allProjects': 'All projects',
+  'deploy.report.allEnvs': 'All envs',
+  'deploy.report.search': 'Search',
+  'deploy.report.searchPlaceholder': 'repo, domain, branch…',
+  'deploy.report.summaryFmt': '{0} deploys · {1} projects',
+  'deploy.report.sectionMetaFmt': '{0} deploys · {1} repos',
+  'deploy.report.colRepo': 'Repository',
+  'deploy.report.colEnv': 'Env',
+  'deploy.report.colDomain': 'Domain',
+  'deploy.report.colBranch': 'Branch',
+  'deploy.report.colImageTag': 'Image tag',
+  'deploy.report.colSecrets': 'Secrets',
+  'deploy.report.colUpdated': 'Config updated',
+  'deploy.report.noProject': 'No project',
+  'deploy.report.internalDomain': '— internal',
+  'deploy.report.loading': 'Loading…',
+  'deploy.report.empty': "No deploy environments yet. Create them in a repository's Deploy tab.",
+  'deploy.report.noMatch': 'Nothing matches the filters.',
 };

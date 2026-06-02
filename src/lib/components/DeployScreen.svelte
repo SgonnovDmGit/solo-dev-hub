@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { selectedRepoId, addToast } from '$lib/stores/ui';
+  import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
+  import { selectedRepoId, addToast, deployDrillTarget } from '$lib/stores/ui';
   import { allRepos } from '$lib/stores/repos';
   import { pat } from '$lib/stores/settings';
   import { tStore, locale } from '$lib/i18n';
@@ -206,6 +208,17 @@
     viewMode = 'list';
     loadEnvironments();
   }
+
+  // v1.2.0 deploy-report drill-down: if DeployReport armed a target for this
+  // repo, open that env's detail directly. One-shot — cleared after consuming.
+  // DeployScreen is keyed by repo.id in RepoDetail, so this fires per repo open.
+  onMount(() => {
+    const target = get(deployDrillTarget);
+    if (target && repo && target.repoId === repo.id) {
+      openDetail(target.deployEnvId);
+      deployDrillTarget.set(null);
+    }
+  });
 
   function startNewForm() {
     showNewForm = true;

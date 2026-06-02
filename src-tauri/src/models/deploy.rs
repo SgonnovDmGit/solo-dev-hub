@@ -114,6 +114,26 @@ pub struct DeployEvent {
     pub details: Option<String>,
 }
 
+/// v1.2.0 (deploy report): one row of the portfolio-wide deploy inventory.
+/// Joins a deploy environment with its repo (display = last segment of
+/// github_name) + project (NULL for orphan repos) + count of included secrets.
+/// snake_case JSON, no serde rename — matches `DeployEnvironment` and the TS
+/// `src/lib/types/deploy.ts` convention (Tauri tool, not a server).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeployReportRow {
+    pub deploy_env_id: i64,
+    pub repository_id: i64,
+    pub repo_name: String,
+    pub project_id: Option<i64>,
+    pub project_name: Option<String>,
+    pub env_name: String,
+    pub domain: String,
+    pub deploy_branch: String,
+    pub image_tag: String,
+    pub secrets_count: i64,
+    pub updated_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

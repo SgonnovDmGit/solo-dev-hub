@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Project, Repository, FileBugNote, ReadBugsResult, BugView, MigrationReport, StatsSummary, SyncResult, RequirementInfo, RepoRename, TemplateFile, TemplateLanguage, RenderedFile, WriteResult, DashboardFilter, DashboardData, DeployEnvironment, DeploySecret, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, ActivityEvent, Task, SyncTasksReport, TimelineFilter, ProjectGraph, UntrackReport, GitignoredListing } from '$lib/types';
+import type { Project, Repository, FileBugNote, ReadBugsResult, BugView, MigrationReport, StatsSummary, SyncResult, RequirementInfo, RepoRename, TemplateFile, TemplateLanguage, RenderedFile, WriteResult, DashboardFilter, DashboardData, DeployEnvironment, DeployReportRow, DeploySecret, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, ActivityEvent, Task, SyncTasksReport, TimelineFilter, ProjectGraph, UntrackReport, GitignoredListing } from '$lib/types';
 
 // ── Project commands ──────────────────────────────────────────────────────────
 
@@ -512,6 +512,9 @@ export async function recordDeploySecretEvent(deployEnvId: number, repoId: numbe
 
 export const listDeployEnvironments = (repoId: number) =>
   invoke<DeployEnvironment[]>('list_deploy_environments', { repoId });
+
+export const listDeployReport = () =>
+  invoke<DeployReportRow[]>('list_deploy_report', {});
 
 export const getDeployEnvironment = (id: number) =>
   invoke<DeployEnvironment | null>('get_deploy_environment', { id });

@@ -360,6 +360,53 @@ impl AppDb {
         tx.commit()?;
         Ok(())
     }
+
+    /// v1.2.0 deploy report: portfolio-wide inventory of every deploy env,
+    /// joined with its repo + project (NULL for orphan repos) and the count of
+    /// included secrets. Read-only; the frontend filters/groups client-side.
+    /// `repo_name` mirrors `Repository::display_name()`: last segment of
+    /// github_name, else `description` (local-only repos have NULL github_name),
+    /// else `<local>`.
+    pub fn list_deploy_report(&self) -> SqlResult<Vec<DeployReportRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT de.id, de.repository_id, r.github_name, r.description, r.project_id, p.name, \
+                    de.name, de.domain, de.deploy_branch, de.image_tag, de.updated_at, \
+                    (SELECT COUNT(*) FROM deploy_secrets ds \
+                       WHERE ds.deploy_env_id = de.id AND ds.included = 1) \
+             FROM deploy_environments de \
+             JOIN repositories r ON r.id = de.repository_id \
+             LEFT JOIN projects p ON p.id = r.project_id \
+             ORDER BY (p.name IS NULL), p.name COLLATE NOCASE, \
+                      COALESCE(r.github_name, r.description, '') COLLATE NOCASE, de.sort_order",
+        )?;
+        let rows: Vec<DeployReportRow> = stmt
+            .query_map([], |row| {
+                let github_name: Option<String> = row.get(2)?;
+                let description: Option<String> = row.get(3)?;
+                // Mirror Repository::display_name() exactly.
+                let repo_name = match github_name {
+                    Some(gh) => gh.rsplit('/').next().unwrap_or("").to_string(),
+                    None => description.unwrap_or_else(|| "<local>".to_string()),
+                };
+                Ok(DeployReportRow {
+                    deploy_env_id: row.get(0)?,
+                    repository_id: row.get(1)?,
+                    repo_name,
+                    project_id: row.get(4)?,
+                    project_name: row.get(5)?,
+                    env_name: row.get(6)?,
+                    domain: row.get(7)?,
+                    deploy_branch: row.get(8)?,
+                    image_tag: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    secrets_count: row.get(11)?,
+                })
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -993,6 +1040,72 @@ mod tests {
             "existing role preserved"
         );
         assert!(s[0].override_enabled, "existing override preserved");
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn test_list_deploy_report_aggregates_across_projects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = AppDb::new(tmp.path().join("test.db")).unwrap();
+        let pa = db.create_project("Alpha", None, "tool").unwrap();
+        // insert_local_repository stores the name arg in `description`
+        // (github_name stays NULL), so repo_name resolves via the description
+        // branch of display_name(). github_name's last-segment split is the
+        // same logic, covered by display_name()'s own tests.
+        let ra = db
+            .insert_local_repository("/tmp/ra", "alpha-svc", Some(pa.id), None)
+            .unwrap();
+        let orphan = db
+            .insert_local_repository("/tmp/orph", "orphan-cli", None, None)
+            .unwrap();
+
+        let mk = |repo_id: i64, name: &str, domain: &str, branch: &str, tag: &str| {
+            CreateDeployEnvironmentArgs {
+                repository_id: repo_id,
+                name: name.to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: tag.to_string(),
+                compose_service: "s".to_string(),
+                domain: domain.to_string(),
+                deploy_branch: branch.to_string(),
+                extras: Default::default(),
+            }
+        };
+        let e1 = db
+            .insert_deploy_environment(&mk(ra.id, "prod", "a.com", "master", "prod"))
+            .unwrap();
+        db.insert_deploy_environment(&mk(ra.id, "test", "", "dev", "test"))
+            .unwrap();
+        db.insert_deploy_environment(&mk(orphan.id, "prod", "o.com", "main", "latest"))
+            .unwrap();
+        // e1: 2 included secrets + 1 excluded → secrets_count must be 2.
+        db.upsert_deploy_secret(e1.id, "A", Some("deploy"), true, false)
+            .unwrap();
+        db.upsert_deploy_secret(e1.id, "B", Some("deploy"), true, false)
+            .unwrap();
+        db.upsert_deploy_secret(e1.id, "C", None, false, false)
+            .unwrap();
+
+        let report = db.list_deploy_report().unwrap();
+        assert_eq!(report.len(), 3, "all deploy envs across all repos");
+
+        let r1 = report.iter().find(|r| r.deploy_env_id == e1.id).unwrap();
+        assert_eq!(
+            r1.repo_name, "alpha-svc",
+            "repo_name mirrors display_name() (description for local-only repos)"
+        );
+        assert_eq!(r1.project_name.as_deref(), Some("Alpha"));
+        assert_eq!(r1.project_id, Some(pa.id));
+        assert_eq!(r1.secrets_count, 2, "only included secrets counted");
+        assert_eq!(r1.domain, "a.com");
+
+        let orow = report
+            .iter()
+            .find(|r| r.repository_id == orphan.id)
+            .unwrap();
+        assert!(orow.project_id.is_none(), "orphan repo → no project");
+        assert!(orow.project_name.is_none());
+        assert_eq!(orow.repo_name, "orphan-cli");
         std::mem::forget(tmp);
     }
 }

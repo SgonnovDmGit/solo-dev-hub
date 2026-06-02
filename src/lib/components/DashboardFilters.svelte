@@ -5,6 +5,7 @@
     currentPeriod,
     selectedProjectIds,
     setPreset,
+    setCustomPeriod,
     setProjectFilter,
   } from '$lib/stores/dashboard';
   import type { PeriodPreset } from '$lib/types';
@@ -19,8 +20,26 @@
     return $tStore(key as any);
   }
 
+  // B-000026: custom-range date inputs. The store already exposes
+  // `setCustomPeriod` for this, but no component rendered date pickers — the
+  // "Кастом" preset only flipped the highlight and left the period unchanged.
+  // Seed the inputs from the current window when custom is activated, then
+  // apply on edit (guarding start <= end; ISO yyyy-mm-dd compares lexically).
+  let customFrom = $state('');
+  let customTo = $state('');
+
   async function handlePreset(p: PeriodPreset) {
+    if (p === 'custom') {
+      customFrom = $currentPeriod.start;
+      customTo = $currentPeriod.end;
+    }
     await setPreset(p);
+  }
+
+  async function applyCustom() {
+    if (!customFrom || !customTo) return;
+    if (customFrom > customTo) return;
+    await setCustomPeriod({ start: customFrom, end: customTo });
   }
 
   async function toggleProject(projId: number) {
@@ -62,6 +81,31 @@
       {/each}
     </span>
   </div>
+
+  {#if $currentPreset === 'custom'}
+    <div class="filter-block">
+      <span class="filter-label">{$tStore('dashboard.customRangeLabel' as any)}</span>
+      <span class="date-range">
+        <input
+          type="date"
+          class="date-input"
+          aria-label={$tStore('dashboard.customFrom' as any)}
+          bind:value={customFrom}
+          max={customTo || undefined}
+          onchange={applyCustom}
+        />
+        <span class="date-dash">—</span>
+        <input
+          type="date"
+          class="date-input"
+          aria-label={$tStore('dashboard.customTo' as any)}
+          bind:value={customTo}
+          min={customFrom || undefined}
+          onchange={applyCustom}
+        />
+      </span>
+    </div>
+  {/if}
 
   <div class="filter-block">
     <span class="filter-label">{$tStore('dashboard.projectsLabel' as any)}</span>
@@ -105,6 +149,18 @@
     font-size: 11px; padding: 4px 9px; border-radius: 3px; cursor: pointer;
   }
   .period-picker button.active { background: var(--accent, #7c3aed); color: white; }
+
+  .date-range { display: inline-flex; align-items: center; gap: 6px; }
+  .date-input {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    color: var(--text);
+    color-scheme: dark;
+  }
+  .date-dash { color: var(--text-muted); font-size: 11px; }
 
   .project-filter-wrap { position: relative; }
   .project-filter {

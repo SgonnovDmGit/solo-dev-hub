@@ -6,7 +6,9 @@
 pub mod bugs;
 pub mod claude_md;
 pub mod fs;
+pub mod gitattributes;
 pub mod gitignore;
+pub mod managed_block;
 pub mod project_md;
 pub mod requirements;
 pub mod tasks;
@@ -14,6 +16,7 @@ pub mod tasks;
 pub use bugs::*;
 pub use claude_md::*;
 pub use fs::*;
+pub use gitattributes::*;
 pub use gitignore::*;
 pub use project_md::*;
 pub use requirements::*;

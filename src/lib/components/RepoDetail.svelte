@@ -2,7 +2,7 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import { allRepos, assignRepo, loadAllRepos } from '$lib/stores/repos';
   import { projects } from '$lib/stores/projects';
-  import { currentScreen, selectedRepoId } from '$lib/stores/ui';
+  import { currentScreen, selectedRepoId, deployDrillTarget } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
   import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo } from '$lib/api/tauri-commands';
   import type { RepoRename } from '$lib/types';
@@ -176,6 +176,17 @@
   // F-021: tabs in RepoDetail. T-000080: Deploy moved from separate screen to tab.
   type Tab = 'bugs' | 'tasks' | 'done' | 'changelog' | 'deploy' | 'secrets' | 'stats';
   let activeTab = $state<Tab>('bugs');
+
+  // v1.2.0 deploy-report drill-down: when DeployReport arms deployDrillTarget
+  // for this repo, jump to the Deploy tab. DeployScreen (keyed by repo.id) then
+  // consumes the target to open that env's detail and clears it. We only switch
+  // the tab here — clearing is DeployScreen's job so it sees the target on mount.
+  $effect(() => {
+    const target = $deployDrillTarget;
+    if (target && repo && target.repoId === repo.id) {
+      activeTab = 'deploy';
+    }
+  });
 
   $effect(() => {
     listTemplateLanguages()
@@ -415,6 +426,9 @@
       <!-- Secrets panel — renamed from "Overview" (tab held only this). -->
       {#if repo.github_name && $pat}
         <div class="secrets-wrapper">
+          <!-- B-000025: SecretsPanel keeps per-repo bulk-paste drafts internally
+               (module-level map keyed by repoFullName), so no remount is needed —
+               switching repos restores the previous draft instead of wiping it. -->
           <SecretsPanel mode="repo" repoFullName={repo.github_name} collapsible={false} />
         </div>
       {/if}

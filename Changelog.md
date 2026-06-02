@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-06-02
+
+Adds a portfolio-wide deploy report and a `.gitattributes` managed template, alongside two dashboard/secrets fixes from continued dogfooding. The MINOR bump is driven by the new top-level Deploys screen — a new user-facing capability.
+
+### Added
+- **Deploy report — new "Деплои" titlebar screen.** Portfolio-wide inventory of every deploy environment across all repos, grouped by project (orphan repos under "Без проекта"). Columns: repository, environment (color badge), domain (click → open in browser), branch, image tag, included-secrets count, config-updated date. Project / environment / free-text filters; columns aligned across sections via a fixed table layout. Clicking a row drills into that repo's Deploy tab with the environment opened in detail, via a one-shot `deployDrillTarget` signal (mirrors the Timeline deep-link). Read-only — live GitHub Actions run status is deferred to a later release. New `list_deploy_report` query (JOIN `deploy_environments` × `repositories` × `projects` + included-secrets count, repo display via `display_name()`) + Tauri command + `DeployReport.svelte`.
+- **`.gitattributes` managed template (B-000024).** New `_global/.gitattributes.tmpl` synced into managed repos: `* text=auto eol=lf` line-ending normalization for sources, CRLF for Windows scripts (`*.bat`/`*.cmd`/`*.ps1`), binary markers. Shares the dedup-aware section-merge logic with `.gitignore` — extracted to `sync/managed_block`, with `sync_gitignore_section` now a thin wrapper. Wired into `init_docs_for_repo` + `sync_project`; appears in Settings → default templates automatically (seeder + editor are zero-touch via `include_dir!` + dynamic listing).
+
+### Fixed
+- **B-000026 (regression, major).** Dashboard custom date period was unusable — selecting the "Custom" preset only highlighted the button and rendered no date inputs, so no range could be chosen. Added start/end `<input type="date">` (seeded from the current window) wired to the already-present but previously-orphaned `setCustomPeriod` store action, guarding `start ≤ end`.
+- **B-000025.** The bulk-paste secrets field now remembers its content per repository and restores it when switching back, instead of wiping on every repo switch. Implemented with a module-level per-repo draft map in `SecretsPanel` (load/save on repo change); the post-push clear is preserved per-repo. (First attempt — a `{#key}` remount that wiped the field — was rejected; this is the rework.)
+
+### Tests
+- 386 cargo (+6: deploy-report aggregation query; `.gitattributes` section-merge ×4; bundled-dotfile embed guard) / 72 vitest / 0 svelte issues.
+
 ## [1.1.0] — 2026-05-25
 
 First MINOR after the v1.0.0 public launch. Adds a verdict-rollback path for bugs and ships two dogfood-surfaced UX fixes that emerged the same week. The MINOR bump is driven by T-000130 — a new user-facing capability (↩ reopen button) — not by the polish fixes that came along with it.

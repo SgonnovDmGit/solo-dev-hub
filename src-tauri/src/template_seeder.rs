@@ -207,4 +207,15 @@ mod tests {
     fn test_bundled_file_content_missing() {
         assert!(bundled_file_content("nonexistent_lang", "foo.txt").is_none());
     }
+
+    #[test]
+    fn test_bundled_global_gitattributes_is_embedded() {
+        // B-000024: guard that include_dir! actually embeds the dotfile
+        // .gitattributes.tmpl (a silently-skipped dotfile would make the
+        // managed-block sync no-op on an empty template).
+        let content = bundled_file_content("_global", ".gitattributes.tmpl")
+            .expect(".gitattributes.tmpl must be bundled");
+        assert!(content.contains("text=auto eol=lf"));
+        assert!(content.contains("*.exe binary"));
+    }
 }
