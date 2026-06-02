@@ -166,6 +166,19 @@
           </span>
         </div>
         <table>
+          <!-- Shared fixed widths so columns line up across every project
+               section (each section is its own table — without this they
+               auto-size per-section and drift). -->
+          <colgroup>
+            <col style="width: 24%" />
+            <col style="width: 9%" />
+            <col style="width: 23%" />
+            <col style="width: 9%" />
+            <col style="width: 12%" />
+            <col style="width: 8%" />
+            <col style="width: 11%" />
+            <col style="width: 4%" />
+          </colgroup>
           <thead>
             <tr>
               <th>{$tStore('deploy.report.colRepo' as any)}</th>
@@ -238,14 +251,14 @@
   .sec-head h2 { font-size: 14px; margin: 0; font-weight: 650; }
   .sec-head .meta { color: var(--text-muted); font-size: 11.5px; }
 
-  table { width: 100%; border-collapse: collapse; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
   thead th {
     text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
     color: var(--text-muted); font-weight: 600; padding: 7px 12px; border-bottom: 1px solid var(--border);
     white-space: nowrap;
   }
   thead th:first-child, tbody td:first-child { padding-left: 14px; }
-  tbody td { padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; font-size: 12px; }
+  tbody td { padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   tbody tr:last-child td { border-bottom: none; }
   tbody tr { cursor: pointer; transition: background 0.08s; }
   tbody tr:hover { background: rgba(124, 58, 237, 0.08); }
