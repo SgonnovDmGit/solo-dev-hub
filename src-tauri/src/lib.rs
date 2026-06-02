@@ -13,11 +13,11 @@ use chrono;
 use db::AppDb;
 use models::{
     BugView, CreateDeployEnvironmentArgs, DailyFlowDay, DashboardData, DashboardFilter,
-    DeployEnvironment, DeploySecret, FileBugNote, GitignoredListing, KpiCard, MetaSecretHint,
-    MigrationReport, Project, ProjectGraph, ReadBugsResult, ReadDoneResult, ReadTodoResult,
-    RenderedFile, RepoRename, Repository, RequirementInfo, StatsSummary, SyncResult, TemplateFile,
-    TemplateLanguage, UntrackReport, UpdateDeployEnvironmentArgs, UpsertRepoOutcome, WriteError,
-    WriteResult,
+    DeployEnvironment, DeployReportRow, DeploySecret, FileBugNote, GitignoredListing, KpiCard,
+    MetaSecretHint, MigrationReport, Project, ProjectGraph, ReadBugsResult, ReadDoneResult,
+    ReadTodoResult, RenderedFile, RepoRename, Repository, RequirementInfo, StatsSummary,
+    SyncResult, TemplateFile, TemplateLanguage, UntrackReport, UpdateDeployEnvironmentArgs,
+    UpsertRepoOutcome, WriteError, WriteResult,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -2634,6 +2634,11 @@ fn list_deploy_environments(
 }
 
 #[tauri::command]
+fn list_deploy_report(db: State<AppDb>) -> Result<Vec<DeployReportRow>, String> {
+    db.list_deploy_report().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn get_deploy_environment(db: State<AppDb>, id: i64) -> Result<Option<DeployEnvironment>, String> {
     db.get_deploy_environment(id).map_err(|e| e.to_string())
 }
@@ -3192,6 +3197,7 @@ pub fn run() {
             set_repo_deploy_config,
             render_deploy_files_for_env,
             list_deploy_environments,
+            list_deploy_report,
             get_deploy_environment,
             create_deploy_environment,
             clone_deploy_environment,
