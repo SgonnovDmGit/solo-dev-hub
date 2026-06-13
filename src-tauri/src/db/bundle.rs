@@ -13,7 +13,13 @@ impl AppDb {
         )?;
         let metas: Vec<(i64, String, String, String, String)> = stmt
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })?
             .filter_map(Result::ok)
             .collect();
@@ -62,12 +68,20 @@ impl AppDb {
 
     pub fn delete_secret_bundle(&self, id: i64) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM secret_bundles WHERE id = ?1", rusqlite::params![id])?;
+        conn.execute(
+            "DELETE FROM secret_bundles WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
         Ok(())
     }
 
     /// Encrypt `value` and upsert the item (insert or replace by UNIQUE name).
-    pub fn upsert_bundle_item(&self, bundle_id: i64, secret_name: &str, value: &str) -> SqlResult<()> {
+    pub fn upsert_bundle_item(
+        &self,
+        bundle_id: i64,
+        secret_name: &str,
+        value: &str,
+    ) -> SqlResult<()> {
         let key = keyring_store::get_or_create_bundle_key()
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(StringError(e))))?;
         let (ciphertext, nonce) = bundle_cipher::encrypt(&key, value.as_bytes())
@@ -151,7 +165,9 @@ mod tests {
     #[test]
     fn create_list_roundtrip_no_values() {
         let db = db();
-        let id = db.create_secret_bundle("prod-server-1", "main app server").unwrap();
+        let id = db
+            .create_secret_bundle("prod-server-1", "main app server")
+            .unwrap();
         db.upsert_bundle_item(id, "SSH_HOST", "1.2.3.4").unwrap();
         db.upsert_bundle_item(id, "DB_PASSWORD", "p@ss").unwrap();
 
