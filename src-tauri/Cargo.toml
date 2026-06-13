@@ -33,7 +33,6 @@ uuid = { version = "1", features = ["v4"] }
 regex = "1"
 include_dir = "0.7"
 aes-gcm = "0.10"
-zeroize = "1"
 base64 = "0.22"
 
 [dev-dependencies]

@@ -3975,7 +3975,6 @@ dependencies = [
  "tauri-plugin-updater",
  "tempfile",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
