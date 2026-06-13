@@ -7,6 +7,7 @@
     listSecretBundles, createSecretBundle, renameSecretBundle,
     deleteSecretBundle, upsertBundleItem, getBundleDecrypted, deleteBundleItem,
   } from '$lib/api/tauri-commands';
+  import { parseEnvText } from '$lib/api/secrets-parser';
   import ConfirmDialog from './ConfirmDialog.svelte';
 
   // ── Master state ────────────────────────────────────────────────────────────
@@ -28,14 +29,11 @@
   let editName = $state('');
   let editDescription = $state('');
 
-  // ── Add-secret form ─────────────────────────────────────────────────────────
-  let secretName = $state('');
-  let secretValue = $state('');
+  // ── Add-secret form (bulk KEY=VALUE) ────────────────────────────────────────
+  let bulkText = $state('');
 
   // ── Delete-bundle confirm ───────────────────────────────────────────────────
   let bundleToDelete = $state<SecretBundle | null>(null);
-
-  const SECRET_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 
   onMount(async () => {
     await reloadBundles();
@@ -52,8 +50,7 @@
   async function selectBundle(id: number) {
     selectedId = id;
     revealed = {};
-    secretName = '';
-    secretValue = '';
+    bulkText = '';
     const b = bundles.find((x) => x.id === id) ?? null;
     editName = b?.name ?? '';
     editDescription = b?.description ?? '';
@@ -151,17 +148,20 @@
     }
   }
 
-  async function handleAddSecret() {
+  async function handleAddSecrets() {
     if (selectedId == null) return;
-    const name = secretName.trim();
-    if (!SECRET_NAME_RE.test(name)) {
-      addToast($tStore('bundles.invalidSecretName' as any), 'error');
+    const text = bulkText.trim();
+    if (!text) return;
+    const { secrets, errors } = parseEnvText(text);
+    if (errors.length > 0) {
+      addToast(errors.join('\n'), 'error');
       return;
     }
     try {
-      await upsertBundleItem(selectedId, name, secretValue);
-      secretName = '';
-      secretValue = '';
+      for (const s of secrets) {
+        await upsertBundleItem(selectedId, s.name, s.value);
+      }
+      bulkText = '';
       items = await getBundleDecrypted(selectedId);
       await reloadBundles();
       addToast($tStore('bundles.savedToast' as any), 'success');
@@ -247,7 +247,7 @@
         </div>
 
         {#if items.length === 0}
-          <p class="empty-note">{$tStore('bundles.empty' as any)}</p>
+          <p class="empty-note">{$tStore('bundles.noSecrets' as any)}</p>
         {:else}
           <table class="items">
             <tbody>
@@ -282,19 +282,15 @@
         {/if}
 
         <div class="add-secret">
-          <span class="form-prompt">{$tStore('bundles.addSecret' as any)}</span>
-          <input
-            type="text"
-            bind:value={secretName}
-            placeholder={$tStore('bundles.secretNamePlaceholder' as any)}
-          />
-          <input
-            type="text"
-            bind:value={secretValue}
-            placeholder={$tStore('bundles.secretValuePlaceholder' as any)}
-          />
-          <button class="primary" onclick={handleAddSecret} disabled={!secretName.trim()}>
-            {$tStore('bundles.addSecret' as any)}
+          <span class="form-prompt">{$tStore('bundles.addSecretsBulk' as any)}</span>
+          <textarea
+            class="bulk-input"
+            bind:value={bulkText}
+            rows="4"
+            placeholder={$tStore('bundles.bulkPlaceholder' as any)}
+          ></textarea>
+          <button class="primary" onclick={handleAddSecrets} disabled={!bulkText.trim()}>
+            {$tStore('bundles.addSecretsBulk' as any)}
           </button>
         </div>
       {/if}
@@ -400,14 +396,22 @@
 
   .add-secret {
     display: flex;
+    flex-direction: column;
+    align-items: stretch;
     gap: 0.6rem;
-    align-items: center;
-    flex-wrap: wrap;
     padding: 0.6rem 0.5rem;
     background: var(--hover-bg);
     border-radius: 4px;
   }
-  .add-secret input { padding: 0.4rem 0.6rem; flex: 1; min-width: 10rem; }
+  .bulk-input {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 5rem;
+    font-family: var(--mono, monospace);
+    font-size: 0.85em;
+    padding: 0.5rem;
+    resize: vertical;
+  }
 
   .form-prompt { color: var(--text-muted); font-size: 0.9em; }
   .empty-note { color: var(--text-muted); padding: 0.5rem; }
