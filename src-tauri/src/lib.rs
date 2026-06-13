@@ -1,3 +1,4 @@
+mod crypto;
 mod db;
 mod export;
 mod git_ops;
