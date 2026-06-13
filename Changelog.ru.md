@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-06-14
+
+Добавляет переиспользуемые, локально-зашифрованные наборы секретов — вводишь одни и те же SSH / DB / npm значения один раз и применяешь к секретам любого репо или deploy-окружения, вместо повторного ввода в каждом репо. Заодно фиксит протекание repo deploy-config между репо, всплывшее на dogfood'е. MINOR-бамп обоснован новым экраном 🔐 «Наборы секретов» — новой user-facing capability.
+
+### Added
+- **Наборы секретов — новый экран 🔐 «Наборы секретов» в титлбаре.** Переиспользуемые именованные наборы значений GitHub-секретов, **зашифрованные at-rest** (AES-256-GCM, 32-байт data-key в OS keyring — без мастер-пароля; та же модель доверия, что у PAT). Master-detail редактор: создание / переименование / удаление наборов, добавление секретов через **bulk-поле `KEY=VALUE`** (тот же dotenv-формат + per-line валидация, что в панели секретов репо), маскированные значения с per-row reveal-toggle, удаление отдельных секретов. **Применение набора с двух поверхностей** — SecretsPanel (→ секреты уровня репо) и DeploySecretsTable (→ секреты deploy-окружения) — мёрж расшифрованных значений в существующую форму пуша (набор побеждает при конфликте имён); существующие пути пуша в GitHub не тронуты. Новые таблицы `secret_bundles` + `secret_bundle_items` (миграция v26 — значения только как зашифрованный BLOB + nonce, никогда не plaintext), модуль `crypto/bundle_cipher`, keyring data-key helper, 7 Tauri-команд и pure-хелпер `bundle-apply` с round-trip-безопасной сериализацией (triple-quote / escaped-double-quote fallback — значение с `"""` или переносами строк переживает повторный парсинг перед пушем).
+
+### Fixed
+- **Протекание repo deploy-config между репо.** Фокус поля «Shared image config» в репо A с последующим переключением на репо B записывал shared-конфиг A в B — save на blur резолвил целевой репо из живого глобального выбора (`$selectedRepoId`), а не из репо, которому принадлежала правка. Теперь save захватывает id своего репо при маунте (снимок через `untrack` — deploy-блок keyed по репо, один репо на инстанс) и гардит запись по текущему выбору, так что blur во время teardown'а переключения отбрасывается, а не утекает. Обычные save в том же репо не затронуты.
+
+### Tests
+- 400 cargo (+14: AES-GCM cipher roundtrip / tamper / wrong-key / nonce-length ×7; migration v26 ×1; bundle db CRUD + CASCADE + UNIQUE + decrypt ×6) / 86 vitest (+14: apply-merge map overlay + dotenv-text merge по 8 round-trip классам значений вкл. triple-quote-в-multiline и literal-backslash edge-кейсы) / 0 svelte.
+
 ## [1.2.0] — 2026-06-02
 
 Добавляет портфельный отчёт по деплоям и managed-шаблон `.gitattributes`, плюс два dogfood-фикса (Дашборд / секреты). MINOR-бамп обоснован новым top-level экраном «Деплои» — новая user-facing capability.

@@ -4,6 +4,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-06-14
+
+Adds reusable, locally-encrypted secret bundles — input the same SSH / DB / npm values once and apply them to any repo's or deploy environment's GitHub secrets, instead of re-typing them per repo. Folds in a deploy repo-config leak fix surfaced during dogfooding. The MINOR bump is driven by the new 🔐 Secrets screen — a new user-facing capability.
+
+### Added
+- **Secret bundles — new 🔐 "Secrets" titlebar screen** (ru locale: «Наборы секретов»). Reusable named bundles of GitHub secret values, **encrypted at rest** (AES-256-GCM, 32-byte data-key in the OS keyring — no master password; same trust model as the PAT). Master-detail editor: create / rename / delete bundles, add secrets via a **bulk `KEY=VALUE` textarea** (same dotenv format + per-line validation as the repo-secrets panel), masked values with per-row reveal toggle, per-secret delete. **Apply a bundle from two surfaces** — SecretsPanel (→ repo-level secrets) and DeploySecretsTable (→ a deploy environment's secrets) — merging decrypted values into the existing push form (bundle wins on name conflict); existing GitHub push paths unchanged. New `secret_bundles` + `secret_bundle_items` tables (migration v26 — values stored only as encrypted BLOB + nonce, never plaintext), `crypto/bundle_cipher` module, keyring data-key helper, 7 Tauri commands, and a pure `bundle-apply` merge helper with round-trip-safe value serialization (triple-quote / escaped-double-quote fallback so a value containing `"""` or newlines survives re-parsing before push).
+
+### Fixed
+- **Deploy repo-config leak between repos.** Focusing a "Shared image config" field in repo A and then switching to repo B wrote A's shared config into B — the on-blur save resolved the target repo from the live global selection (`$selectedRepoId`) rather than the repo the edit belonged to. The save now captures the owning repo id at mount (an `untrack` snapshot — the deploy block is keyed by repo, so one repo per instance) and guards the write against the current selection, so a blur firing during the repo-switch teardown is dropped instead of leaked. Normal same-repo saves are unaffected.
+
+### Tests
+- 400 cargo (+14: AES-GCM cipher roundtrip / tamper / wrong-key / nonce-length ×7; migration v26 table-presence ×1; bundle db CRUD + CASCADE + UNIQUE + decrypt ×6) / 86 vitest (+14: apply-merge map overlay + dotenv-text merge across 8 round-trip value classes incl. triple-quote-in-multiline and literal-backslash edge cases) / 0 svelte issues.
+
 ## [1.2.0] — 2026-06-02
 
 Adds a portfolio-wide deploy report and a `.gitattributes` managed template, alongside two dashboard/secrets fixes from continued dogfooding. The MINOR bump is driven by the new top-level Deploys screen — a new user-facing capability.
