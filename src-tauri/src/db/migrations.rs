@@ -60,6 +60,7 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
     (23, "drop_bug_stats_view", mig_v23_drop_bug_stats_view),
     (24, "project_renames_log", mig_v24_project_renames),
     (25, "deploy_repo_config", mig_v25_deploy_repo_config),
+    (26, "secret_bundles", mig_v26_secret_bundles),
 ];
 
 impl AppDb {
@@ -851,6 +852,29 @@ fn mig_v25_data_move(conn: &Connection) -> SqlResult<()> {
     Ok(())
 }
 
+fn mig_v26_secret_bundles(conn: &Connection) -> SqlResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS secret_bundles (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL UNIQUE,
+            description TEXT NOT NULL DEFAULT '',
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS secret_bundle_items (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            bundle_id   INTEGER NOT NULL REFERENCES secret_bundles(id) ON DELETE CASCADE,
+            secret_name TEXT NOT NULL,
+            ciphertext  BLOB NOT NULL,
+            nonce       BLOB NOT NULL,
+            UNIQUE(bundle_id, secret_name)
+        );
+
+        PRAGMA user_version = 26;",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,11 +1144,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v25 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v26 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
 
         drop(conn);
         let _ = repo;
@@ -1191,7 +1215,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
     }
 
     #[test]
@@ -1708,5 +1732,23 @@ mod tests {
             .insert_local_repository("/tmp/r-col", "r-col", None, None)
             .unwrap();
         assert_eq!(get_repo_config(&db, repo.id), "{}");
+    }
+
+    #[test]
+    fn test_v26_adds_secret_bundle_tables() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let v: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert!(v >= 26);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('secret_bundles','secret_bundle_items')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }
