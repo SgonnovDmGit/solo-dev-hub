@@ -1,3 +1,4 @@
+mod crypto;
 mod db;
 mod export;
 mod git_ops;
@@ -15,9 +16,9 @@ use models::{
     BugView, CreateDeployEnvironmentArgs, DailyFlowDay, DashboardData, DashboardFilter,
     DeployEnvironment, DeployReportRow, DeploySecret, FileBugNote, GitignoredListing, KpiCard,
     MetaSecretHint, MigrationReport, Project, ProjectGraph, ReadBugsResult, ReadDoneResult,
-    ReadTodoResult, RenderedFile, RepoRename, Repository, RequirementInfo, StatsSummary,
-    SyncResult, TemplateFile, TemplateLanguage, UntrackReport, UpdateDeployEnvironmentArgs,
-    UpsertRepoOutcome, WriteError, WriteResult,
+    ReadTodoResult, RenderedFile, RepoRename, Repository, RequirementInfo, SecretBundle,
+    SecretBundleItemValue, StatsSummary, SyncResult, TemplateFile, TemplateLanguage, UntrackReport,
+    UpdateDeployEnvironmentArgs, UpsertRepoOutcome, WriteError, WriteResult,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -2454,6 +2455,63 @@ fn set_repo_deploy_config(
         .map_err(|e| e.to_string())
 }
 
+// ── Secret bundles (v1.3.0) ───────────────────────────────────────────────────
+#[tauri::command]
+fn list_secret_bundles(db: State<AppDb>) -> Result<Vec<SecretBundle>, String> {
+    db.list_secret_bundles().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_secret_bundle(
+    db: State<AppDb>,
+    name: String,
+    description: String,
+) -> Result<i64, String> {
+    db.create_secret_bundle(&name, &description)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rename_secret_bundle(
+    db: State<AppDb>,
+    id: i64,
+    name: String,
+    description: String,
+) -> Result<(), String> {
+    db.rename_secret_bundle(id, &name, &description)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_secret_bundle(db: State<AppDb>, id: i64) -> Result<(), String> {
+    db.delete_secret_bundle(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn upsert_bundle_item(
+    db: State<AppDb>,
+    bundle_id: i64,
+    secret_name: String,
+    value: String,
+) -> Result<(), String> {
+    db.upsert_bundle_item(bundle_id, &secret_name, &value)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_bundle_item(db: State<AppDb>, item_id: i64) -> Result<(), String> {
+    db.delete_bundle_item(item_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_bundle_decrypted(
+    db: State<AppDb>,
+    bundle_id: i64,
+) -> Result<Vec<SecretBundleItemValue>, String> {
+    db.get_bundle_decrypted(bundle_id)
+        .map_err(|e| e.to_string())
+}
+
 // ── Deploy render (v0.18.0, multi-env) ────────────────────────────────────────
 
 /// v0.18.0: render workflow/Dockerfile files for a single deploy_env.
@@ -3220,6 +3278,14 @@ pub fn run() {
             read_done_from_db,
             record_secret_event,
             record_deploy_secret_event,
+            // Secret bundles (v1.3.0)
+            list_secret_bundles,
+            create_secret_bundle,
+            rename_secret_bundle,
+            delete_secret_bundle,
+            upsert_bundle_item,
+            delete_bundle_item,
+            get_bundle_decrypted,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

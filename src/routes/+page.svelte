@@ -24,6 +24,7 @@
   import About from '$lib/components/About.svelte';
   import Timeline from '$lib/components/Timeline.svelte';
   import DeployReport from '$lib/components/DeployReport.svelte';
+  import SecretBundles from '$lib/components/SecretBundles.svelte';
   import GlobalClaudeEditor from '$lib/components/GlobalClaudeEditor.svelte';
   import InputContextMenu from '$lib/components/InputContextMenu.svelte';
   import logo from '$lib/assets/logo.png';
@@ -183,6 +184,14 @@
       </button>
       <button
         class="ghost titlebar-btn"
+        class:active={$currentScreen.name === 'secret_bundles'}
+        onclick={() => $currentScreen.name === 'secret_bundles' ? goBack() : navigateTo('secret_bundles')}
+        title={$tStore('bundles.title' as any)}
+      >
+        🔐 {$tStore('bundles.title' as any)}
+      </button>
+      <button
+        class="ghost titlebar-btn"
         class:active={$currentScreen.name === 'settings'}
         onclick={() => $currentScreen.name === 'settings' ? goBack() : navigateTo('settings')}
         title={$tStore('app.openSettings')}
@@ -267,6 +276,8 @@
         <Timeline />
       {:else if $currentScreen.name === 'deploy_report'}
         <DeployReport />
+      {:else if $currentScreen.name === 'secret_bundles'}
+        <SecretBundles />
       {:else if $currentScreen.name === 'global_claude_editor'}
         <GlobalClaudeEditor />
       {/if}

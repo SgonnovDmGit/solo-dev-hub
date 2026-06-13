@@ -1,6 +1,6 @@
 import { writable } from 'svelte/store';
 
-export type ScreenName = 'repo-detail' | 'settings' | 'project' | 'dashboard' | 'sync' | 'templates' | 'app_defaults' | 'about' | 'timeline' | 'deploy_report' | 'global_claude_editor';
+export type ScreenName = 'repo-detail' | 'settings' | 'project' | 'dashboard' | 'sync' | 'templates' | 'app_defaults' | 'about' | 'timeline' | 'deploy_report' | 'secret_bundles' | 'global_claude_editor';
 
 export interface ScreenState {
   name: ScreenName;

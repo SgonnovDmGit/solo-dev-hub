@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 pub mod bugs;
+pub mod bundle;
 pub mod dashboard;
 pub mod deploy;
 pub mod graph;

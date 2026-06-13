@@ -4,6 +4,7 @@
 
 export * from './types/core';
 export * from './types/bugs';
+export * from './types/bundle';
 export * from './types/dashboard';
 export * from './types/deploy';
 export * from './types/graph';
