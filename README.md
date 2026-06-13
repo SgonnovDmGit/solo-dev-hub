@@ -135,8 +135,9 @@ The full release runbook (key rotation, CI troubleshooting, hotfix flow) — [do
 - **v1.2.0** — portfolio deploy report (all deploy environments in one screen, grouped by project, with drill-down to each), `.gitattributes` managed template, plus dashboard custom date-range and per-repo secrets-draft fixes (2026-06-02).
 - **v1.1.0** — verdict-rollback for bugs (↩ reopen button on confirmed/rejected), full-height secrets bulk-paste, unified dialog button labels (2026-05-25).
 - **v1.0.0** — public launch (2026-05-18), MIT-licensed open source, frozen-contract era begins.
-- **v1.2.x** — internal refactors (`lib.rs` / `tauri-commands.ts` splits, decomposing the 570-line `sync_project` handler, UI component splits) + contributor docs (`docs/ARCHITECTURE.md`, SQLite ER-graph).
-- **v1.5.0** — in-app multilingual help screen documenting the LLM operating contract.
+- **v1.4–v1.6** — internal refactors (`lib.rs` / `tauri-commands.ts` splits, decomposing the 570-line `sync_project` handler, UI component splits) + contributor docs (`docs/ARCHITECTURE.md`, SQLite ER-graph).
+- **v1.7.0** — in-app multilingual help screen documenting the LLM operating contract.
+- **v1.8.0** — cross-platform builds (macOS / Linux).
 - **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix, REQ auto-accept with `## Status:` frontmatter.
 
 Full backlog and per-version task lists — [`docs/roadmap.md`](docs/roadmap.md).
