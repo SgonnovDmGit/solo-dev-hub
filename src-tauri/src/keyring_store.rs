@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use keyring::Entry;
 
 const SERVICE_NAME: &str = "solo-dev-hub";
@@ -58,4 +59,30 @@ pub fn migrate_legacy_pat() {
         return;
     }
     let _ = legacy_entry.delete_credential();
+}
+
+const BUNDLE_KEY: &str = "secret-bundle-key";
+
+/// v1.3.0: get the 32-byte data key used to encrypt secret-bundle values,
+/// generating + persisting it on first use. Stored base64 in the OS keyring
+/// under the same service as the PAT — trust model identical to the PAT.
+pub fn get_or_create_bundle_key() -> Result<[u8; 32], String> {
+    let entry = Entry::new(SERVICE_NAME, BUNDLE_KEY).map_err(|e| e.to_string())?;
+    match entry.get_password() {
+        Ok(b64) => {
+            let bytes = STANDARD.decode(b64).map_err(|e| e.to_string())?;
+            let arr: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| "stored bundle key has wrong length".to_string())?;
+            Ok(arr)
+        }
+        Err(keyring::Error::NoEntry) => {
+            let key = crate::crypto::bundle_cipher::generate_data_key();
+            entry
+                .set_password(&STANDARD.encode(key))
+                .map_err(|e| e.to_string())?;
+            Ok(key)
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
