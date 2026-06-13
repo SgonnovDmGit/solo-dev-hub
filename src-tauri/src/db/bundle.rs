@@ -102,22 +102,23 @@ impl AppDb {
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(StringError(e))))?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT secret_name, ciphertext, nonce FROM secret_bundle_items
+            "SELECT id, secret_name, ciphertext, nonce FROM secret_bundle_items
              WHERE bundle_id = ?1 ORDER BY secret_name COLLATE NOCASE",
         )?;
-        let rows: Vec<(String, Vec<u8>, Vec<u8>)> = stmt
+        let rows: Vec<(i64, String, Vec<u8>, Vec<u8>)> = stmt
             .query_map(rusqlite::params![bundle_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?
             .filter_map(Result::ok)
             .collect();
         drop(stmt);
 
         let mut out = Vec::with_capacity(rows.len());
-        for (secret_name, ct, nonce) in rows {
+        for (id, secret_name, ct, nonce) in rows {
             let plain = bundle_cipher::decrypt(&key, &ct, &nonce)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(StringError(e))))?;
             out.push(SecretBundleItemValue {
+                id,
                 secret_name,
                 value: String::from_utf8(plain)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,

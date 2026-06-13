@@ -16,6 +16,7 @@ pub struct SecretBundle {
 /// consumed transiently by the frontend for the GitHub push.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SecretBundleItemValue {
+    pub id: i64,
     pub secret_name: String,
     pub value: String,
 }

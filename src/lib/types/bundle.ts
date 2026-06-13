@@ -11,6 +11,7 @@ export interface SecretBundle {
 }
 
 export interface SecretBundleItemValue {
+  id: number;
   secret_name: string;
   value: string;
 }

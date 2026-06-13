@@ -5,7 +5,7 @@
   import type { SecretBundle, SecretBundleItemValue } from '$lib/types';
   import {
     listSecretBundles, createSecretBundle, renameSecretBundle,
-    deleteSecretBundle, upsertBundleItem, getBundleDecrypted,
+    deleteSecretBundle, upsertBundleItem, getBundleDecrypted, deleteBundleItem,
   } from '$lib/api/tauri-commands';
   import ConfirmDialog from './ConfirmDialog.svelte';
 
@@ -140,6 +140,17 @@
     }
   }
 
+  async function handleDeleteSecret(item: SecretBundleItemValue) {
+    if (selectedId == null) return;
+    try {
+      await deleteBundleItem(item.id);
+      items = await getBundleDecrypted(selectedId);
+      await reloadBundles();
+    } catch (err) {
+      addToast(String(err), 'error');
+    }
+  }
+
   async function handleAddSecret() {
     if (selectedId == null) return;
     const name = secretName.trim();
@@ -257,10 +268,12 @@
                       title={revealed[item.secret_name] ? $tStore('bundles.hide' as any) : $tStore('bundles.reveal' as any)}
                       aria-label={revealed[item.secret_name] ? $tStore('bundles.hide' as any) : $tStore('bundles.reveal' as any)}
                     >👁</button>
-                    <!-- NEEDS_CONTEXT: per-secret delete omitted — getBundleDecrypted
-                         returns { secret_name, value } with no item id, so
-                         deleteBundleItem(itemId) cannot be wired from this screen.
-                         See report / proposed backend addition. -->
+                    <button
+                      class="icon"
+                      onclick={() => handleDeleteSecret(item)}
+                      title={$tStore('bundles.deleteSecret' as any)}
+                      aria-label={$tStore('bundles.deleteSecret' as any)}
+                    >🗑</button>
                   </td>
                 </tr>
               {/each}

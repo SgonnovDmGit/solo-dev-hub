@@ -7,7 +7,7 @@ import type { SecretBundleItemValue } from '$lib/types';
 
 export function mergeBundleValues(
   current: Record<string, string>,
-  bundleItems: SecretBundleItemValue[],
+  bundleItems: Pick<SecretBundleItemValue, 'secret_name' | 'value'>[],
 ): Record<string, string> {
   const out = { ...current };
   for (const item of bundleItems) out[item.secret_name] = item.value;
@@ -36,7 +36,7 @@ function serializeEnvValue(v: string): string {
 
 export function mergeBundleIntoEnvText(
   currentText: string,
-  bundleItems: SecretBundleItemValue[],
+  bundleItems: Pick<SecretBundleItemValue, 'secret_name' | 'value'>[],
 ): string {
   // Parse existing entries into a map (later wins, matching parseEnvText order),
   // overlay the bundle, then re-serialize. Comments/formatting are not preserved
