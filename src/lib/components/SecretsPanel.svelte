@@ -16,13 +16,14 @@
   } from '$lib/api/github';
   import { encryptSecret } from '$lib/api/secrets-crypto';
   import { parseEnvText } from '$lib/api/secrets-parser';
-  import { getDisplayName, type Repository } from '$lib/types';
+  import { getDisplayName, type Repository, type SecretBundle } from '$lib/types';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import { allRepos } from '$lib/stores/repos';
   import {
     registerRepoSecretInDeploys, listDeployEnvironments, deleteDeploySecret,
-    recordSecretEvent,
+    recordSecretEvent, listSecretBundles, getBundleDecrypted,
   } from '$lib/api/tauri-commands';
+  import { mergeBundleIntoEnvText } from '$lib/api/bundle-apply';
 
   interface Props {
     mode: 'repo' | 'project';
@@ -46,6 +47,7 @@
 
   // State
   let secretsText = $state('');
+  let bundles = $state<SecretBundle[]>([]);
   let existingSecrets = $state<RepoSecret[]>([]);
   let loading = $state(false);
   let pushing = $state(false);
@@ -100,6 +102,10 @@
     if (!repoFullName || !$pat) return;
     loading = true;
     try {
+      // Bundles are repo-independent — fetch once, reuse across repo switches.
+      if (bundles.length === 0) {
+        try { bundles = await listSecretBundles(); } catch { bundles = []; }
+      }
       const { owner, repo } = splitRepoFullName(repoFullName);
       existingSecrets = await listRepoSecrets($pat, owner, repo);
       selectedSecrets = new Set();
@@ -233,6 +239,17 @@
     }
     const result = parseEnvText(secretsText);
     parseErrors = result.errors;
+  }
+
+  // Merge a bundle's values into the bulk textarea (bundle wins on name clash).
+  // Only fills the input — the user still reviews and pushes via the existing button.
+  async function applyBundle(bundleId: number) {
+    const bundle = bundles.find((b) => b.id === bundleId);
+    if (!bundle) return;
+    const items = await getBundleDecrypted(bundleId);
+    secretsText = mergeBundleIntoEnvText(secretsText, items);
+    handleTextInput();
+    addToast($tStore('bundles.appliedToast' as any).replace('{0}', bundle.name), 'success');
   }
 
   async function pushSecretsToRepo(token: string, owner: string, repo: string, secrets: { name: string; value: string }[]): Promise<void> {
@@ -449,7 +466,27 @@
 
       <!-- Input textarea for new secrets -->
       <div class="new-secrets">
-        <div class="sub-label">{$tStore('secrets.addNew' as any)}</div>
+        <div class="new-secrets-label-row">
+          <div class="sub-label">{$tStore('secrets.addNew' as any)}</div>
+          {#if bundles.length > 0}
+            <select
+              class="bundle-apply-select"
+              value=""
+              onchange={(e) => {
+                const t = e.target as HTMLSelectElement;
+                const id = Number(t.value);
+                t.value = '';
+                if (id) applyBundle(id);
+              }}
+              disabled={pushing}
+            >
+              <option value="" disabled>{$tStore('bundles.applyPrompt' as any)}</option>
+              {#each bundles as b (b.id)}
+                <option value={b.id}>{b.name}</option>
+              {/each}
+            </select>
+          {/if}
+        </div>
         <textarea
           class="secrets-textarea"
           bind:value={secretsText}
@@ -750,6 +787,33 @@
   .new-secrets {
     border-top: 1px solid var(--border);
     padding-top: 8px;
+  }
+
+  .new-secrets-label-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+
+  .new-secrets-label-row .sub-label {
+    margin-bottom: 0;
+  }
+
+  .bundle-apply-select {
+    margin-left: auto;
+    font-size: 11px;
+    padding: 2px 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .bundle-apply-select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
   .secrets-textarea {

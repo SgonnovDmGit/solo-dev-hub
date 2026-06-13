@@ -7,14 +7,16 @@
   import {
     listDeploySecrets, upsertDeploySecret,
     ensureDeploySecretsPopulated, recordDeploySecretEvent,
+    listSecretBundles, getBundleDecrypted,
   } from '$lib/api/tauri-commands';
+  import { mergeBundleValues } from '$lib/api/bundle-apply';
   import {
     listRepoSecrets, listEnvironmentSecrets, getEnvironmentPublicKey,
     createOrUpdateEnvironmentSecret, deleteEnvironmentSecret,
     splitRepoFullName, type RepoSecret, type EnvironmentSecret,
   } from '$lib/api/github';
   import { encryptSecret } from '$lib/api/secrets-crypto';
-  import type { DeploySecret, DeploySecretRole } from '$lib/types';
+  import type { DeploySecret, DeploySecretRole, SecretBundle } from '$lib/types';
 
   interface Props {
     deployEnvId: number;
@@ -30,6 +32,7 @@
   let repoSecretsFromGitHub = $state<RepoSecret[]>([]);
   let envSecretsFromGitHub = $state<EnvironmentSecret[]>([]);
   let values = $state<Record<string, string>>({});
+  let bundles = $state<SecretBundle[]>([]);
   let loading = $state(true);
 
   const repo = $derived($allRepos.find((r) => r.id === repoId) ?? null);
@@ -61,6 +64,8 @@
       }
       // Step 4: list deploy_secrets from DB (after seed)
       dbSecrets = await listDeploySecrets(deployEnvId);
+      // Step 5: load bundles for the apply control (best-effort)
+      try { bundles = await listSecretBundles(); } catch { bundles = []; }
     } catch (err) {
       addToast(String(err), 'error');
     } finally {
@@ -171,6 +176,19 @@
     }
   }
 
+  // Fill the per-secret value inputs from a bundle (bundle wins on name clash),
+  // but only for declared rows — unmatched bundle names have no row/push path.
+  // Only fills inputs; the user still reviews and pushes via the existing controls.
+  async function applyBundle(bundleId: number) {
+    const bundle = bundles.find((b) => b.id === bundleId);
+    if (!bundle) return;
+    const items = await getBundleDecrypted(bundleId);
+    const known = new Set(dbSecrets.map((s) => s.secret_name));
+    const filtered = items.filter((i) => known.has(i.secret_name));
+    values = mergeBundleValues(values, filtered);
+    addToast($tStore('bundles.appliedToast' as any).replace('{0}', bundle.name), 'success');
+  }
+
   function repoSecretMeta(name: string): RepoSecret | null {
     return repoSecretsFromGitHub.find((r) => r.name === name) ?? null;
   }
@@ -183,6 +201,23 @@
 
 <div class="deploy-secrets-table">
   <div class="header-row">
+    {#if !loading && bundles.length > 0 && dbSecrets.length > 0}
+      <select
+        class="bundle-apply-select"
+        value=""
+        onchange={(e) => {
+          const t = e.target as HTMLSelectElement;
+          const id = Number(t.value);
+          t.value = '';
+          if (id) applyBundle(id);
+        }}
+      >
+        <option value="" disabled>{$tStore('bundles.applyPrompt' as any)}</option>
+        {#each bundles as b (b.id)}
+          <option value={b.id}>{b.name}</option>
+        {/each}
+      </select>
+    {/if}
     <button class="ghost mini refresh-btn"
             onclick={load}
             disabled={loading}
@@ -304,8 +339,19 @@
   }
   .header-row {
     display: flex;
+    align-items: center;
     justify-content: flex-end;
+    gap: 0.5rem;
     margin-bottom: 0.4rem;
+  }
+  .bundle-apply-select {
+    font-size: 11px;
+    padding: 2px 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    cursor: pointer;
   }
   .refresh-btn {
     font-size: 14px;
