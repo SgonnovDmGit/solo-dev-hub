@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Project, Repository, FileBugNote, ReadBugsResult, BugView, MigrationReport, StatsSummary, SyncResult, RequirementInfo, RepoRename, TemplateFile, TemplateLanguage, RenderedFile, WriteResult, DashboardFilter, DashboardData, DeployEnvironment, DeployReportRow, DeploySecret, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, ActivityEvent, Task, SyncTasksReport, TimelineFilter, ProjectGraph, UntrackReport, GitignoredListing } from '$lib/types';
+import type { Project, Repository, FileBugNote, ReadBugsResult, BugView, MigrationReport, StatsSummary, SyncResult, RequirementInfo, RepoRename, TemplateFile, TemplateLanguage, RenderedFile, WriteResult, DashboardFilter, DashboardData, DeployEnvironment, DeployReportRow, DeploySecret, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, ActivityEvent, Task, SyncTasksReport, TimelineFilter, ProjectGraph, UntrackReport, GitignoredListing, SecretBundle, SecretBundleItemValue } from '$lib/types';
 
 // ── Project commands ──────────────────────────────────────────────────────────
 
@@ -555,3 +555,26 @@ export const registerRepoSecretInDeploys = (repoId: number, secretName: string) 
 
 export const renderDeployFilesForEnv = (deployEnvId: number) =>
   invoke<RenderedFile[]>('render_deploy_files_for_env', { deployEnvId });
+
+// ── v1.3.0: Secret bundles ────────────────────────────────────────────────────
+
+export const listSecretBundles = () =>
+  invoke<SecretBundle[]>('list_secret_bundles', {});
+
+export const createSecretBundle = (name: string, description: string) =>
+  invoke<number>('create_secret_bundle', { name, description });
+
+export const renameSecretBundle = (id: number, name: string, description: string) =>
+  invoke<void>('rename_secret_bundle', { id, name, description });
+
+export const deleteSecretBundle = (id: number) =>
+  invoke<void>('delete_secret_bundle', { id });
+
+export const upsertBundleItem = (bundleId: number, secretName: string, value: string) =>
+  invoke<void>('upsert_bundle_item', { bundleId, secretName, value });
+
+export const deleteBundleItem = (itemId: number) =>
+  invoke<void>('delete_bundle_item', { itemId });
+
+export const getBundleDecrypted = (bundleId: number) =>
+  invoke<SecretBundleItemValue[]>('get_bundle_decrypted', { bundleId });
