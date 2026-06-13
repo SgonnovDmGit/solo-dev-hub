@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import { selectedRepoId, addToast, deployDrillTarget } from '$lib/stores/ui';
   import { allRepos } from '$lib/stores/repos';
@@ -22,6 +22,14 @@
   import ConfirmDialog from './ConfirmDialog.svelte';
 
   const repo = $derived($allRepos.find((r) => r.id === $selectedRepoId) ?? null);
+
+  // B-fix (v1.3.0): snapshot this instance's repo id ONCE at mount. The block is
+  // wrapped in {#key repo.id} (one repo per instance), so the id is stable for the
+  // instance's lifetime. Must NOT be reactive — `repo` derives from the global
+  // $selectedRepoId, so a reactive ownRepoId would re-track the selection and
+  // defeat the leak guard. `untrack` reads it once without establishing a dep
+  // (also silences the state_referenced_locally false-positive).
+  const ownRepoId = untrack(() => repo?.id ?? null);
 
   type ViewMode = 'list' | 'detail';
   let viewMode = $state<ViewMode>('list');
@@ -167,11 +175,13 @@
   });
 
   async function saveRepoConfigKey(_key: string) {
-    if (!repo) return;
+    if (ownRepoId == null) return;
+    // Guard: if the global selection has already moved to another repo (blur
+    // firing during teardown of a repo switch), do NOT write this repo's config
+    // — it would leak into the now-selected repo.
+    if (get(selectedRepoId) !== ownRepoId) return;
     try {
-      // Persist the full current map — per-key blur trigger, full-map write.
-      // Backend overwrites the JSON blob; the call is idempotent.
-      await setRepoDeployConfig(repo.id, { ...repoConfig });
+      await setRepoDeployConfig(ownRepoId, { ...repoConfig });
     } catch (err) {
       addToast(String(err), 'error');
     }
