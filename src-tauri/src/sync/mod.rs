@@ -10,6 +10,7 @@ pub mod gitattributes;
 pub mod gitignore;
 pub mod managed_block;
 pub mod project_md;
+pub mod project_sync;
 pub mod requirements;
 pub mod tasks;
 
@@ -19,5 +20,6 @@ pub use fs::*;
 pub use gitattributes::*;
 pub use gitignore::*;
 pub use project_md::*;
+pub use project_sync::*;
 pub use requirements::*;
 pub use tasks::*;
