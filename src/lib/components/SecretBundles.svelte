@@ -20,7 +20,8 @@
     selectedId == null ? null : (bundles.find((b) => b.id === selectedId) ?? null),
   );
 
-  // ── New-bundle form ─────────────────────────────────────────────────────────
+  // ── New-bundle form (collapsed disclosure — button until opened) ─────────────
+  let showNewForm = $state(false);
   let newName = $state('');
   let newDescription = $state('');
   let creating = $state(false);
@@ -73,6 +74,7 @@
       const id = await createSecretBundle(name, newDescription.trim());
       newName = '';
       newDescription = '';
+      showNewForm = false;
       await reloadBundles();
       await selectBundle(id);
     } catch (err) {
@@ -80,6 +82,12 @@
     } finally {
       creating = false;
     }
+  }
+
+  function cancelNewForm() {
+    newName = '';
+    newDescription = '';
+    showNewForm = false;
   }
 
   async function saveBundleMeta() {
@@ -201,21 +209,35 @@
         </ul>
       {/if}
 
-      <div class="new-bundle">
-        <span class="form-prompt">{$tStore('bundles.newBundle' as any)}</span>
-        <input
-          type="text"
-          bind:value={newName}
-          placeholder={$tStore('bundles.namePlaceholder' as any)}
-        />
-        <input
-          type="text"
-          bind:value={newDescription}
-          placeholder={$tStore('bundles.descriptionPlaceholder' as any)}
-        />
-        <button class="primary" onclick={handleCreate} disabled={creating || !newName.trim()}>
-          {$tStore('bundles.newBundle' as any)}
-        </button>
+      <div class="new-bundle-wrap">
+        {#if !showNewForm}
+          <button class="new-bundle-btn" onclick={() => (showNewForm = true)}>
+            {$tStore('bundles.newBundle' as any)}
+          </button>
+        {:else}
+          <div class="new-bundle-form">
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              type="text"
+              bind:value={newName}
+              placeholder={$tStore('bundles.namePlaceholder' as any)}
+              autofocus
+            />
+            <input
+              type="text"
+              bind:value={newDescription}
+              placeholder={$tStore('bundles.descriptionPlaceholder' as any)}
+            />
+            <div class="new-bundle-actions">
+              <button class="primary" onclick={handleCreate} disabled={creating || !newName.trim()}>
+                {$tStore('bundles.create' as any)}
+              </button>
+              <button class="ghost" onclick={cancelNewForm} disabled={creating}>
+                {$tStore('bundles.cancel' as any)}
+              </button>
+            </div>
+          </div>
+        {/if}
       </div>
     </aside>
 
@@ -249,47 +271,46 @@
         {#if items.length === 0}
           <p class="empty-note">{$tStore('bundles.noSecrets' as any)}</p>
         {:else}
-          <table class="items">
-            <tbody>
-              {#each items as item (item.secret_name)}
-                <tr>
-                  <td class="item-name">{item.secret_name}</td>
-                  <td class="item-value">
-                    <input
-                      type={revealed[item.secret_name] ? 'text' : 'password'}
-                      value={item.value}
-                      onblur={(e) => saveItemValue(item, (e.currentTarget as HTMLInputElement).value)}
-                    />
-                  </td>
-                  <td class="item-actions">
-                    <button
-                      class="icon"
-                      onclick={() => toggleReveal(item.secret_name)}
-                      title={revealed[item.secret_name] ? $tStore('bundles.hide' as any) : $tStore('bundles.reveal' as any)}
-                      aria-label={revealed[item.secret_name] ? $tStore('bundles.hide' as any) : $tStore('bundles.reveal' as any)}
-                    >👁</button>
-                    <button
-                      class="icon"
-                      onclick={() => handleDeleteSecret(item)}
-                      title={$tStore('bundles.deleteSecret' as any)}
-                      aria-label={$tStore('bundles.deleteSecret' as any)}
-                    >🗑</button>
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
+          <div class="items">
+            {#each items as item (item.secret_name)}
+              <div class="secret-row">
+                <span class="item-name">{item.secret_name}</span>
+                <textarea
+                  class="item-value"
+                  class:revealed={revealed[item.secret_name]}
+                  rows="1"
+                  spellcheck="false"
+                  autocomplete="off"
+                  value={item.value}
+                  onblur={(e) => saveItemValue(item, (e.currentTarget as HTMLTextAreaElement).value)}
+                ></textarea>
+                <div class="item-actions">
+                  <button
+                    class="icon"
+                    onclick={() => toggleReveal(item.secret_name)}
+                    title={revealed[item.secret_name] ? $tStore('bundles.hide' as any) : $tStore('bundles.reveal' as any)}
+                    aria-label={revealed[item.secret_name] ? $tStore('bundles.hide' as any) : $tStore('bundles.reveal' as any)}
+                  >👁</button>
+                  <button
+                    class="icon"
+                    onclick={() => handleDeleteSecret(item)}
+                    title={$tStore('bundles.deleteSecret' as any)}
+                    aria-label={$tStore('bundles.deleteSecret' as any)}
+                  >🗑</button>
+                </div>
+              </div>
+            {/each}
+          </div>
         {/if}
 
         <div class="add-secret">
-          <span class="form-prompt">{$tStore('bundles.addSecretsBulk' as any)}</span>
           <textarea
             class="bulk-input"
             bind:value={bulkText}
             rows="4"
             placeholder={$tStore('bundles.bulkPlaceholder' as any)}
           ></textarea>
-          <button class="primary" onclick={handleAddSecrets} disabled={!bulkText.trim()}>
+          <button class="primary add-secret-btn" onclick={handleAddSecrets} disabled={!bulkText.trim()}>
             {$tStore('bundles.addSecretsBulk' as any)}
           </button>
         </div>
@@ -315,7 +336,7 @@
 
   .layout {
     display: grid;
-    grid-template-columns: 18rem 1fr;
+    grid-template-columns: 19rem 1fr;
     gap: 1rem;
     align-items: start;
   }
@@ -323,107 +344,183 @@
   /* ── Master ──────────────────────────────────────────────────────────────── */
   .master {
     border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--hover-bg);
+    border-radius: 6px;
+    background: var(--surface);
     padding: 0.5rem;
   }
-  .bundle-list { list-style: none; margin: 0 0 0.5rem 0; padding: 0; }
+  .bundle-list { list-style: none; margin: 0; padding: 0; }
+  .bundle-list li + li .bundle-row { border-top: 1px solid var(--border); }
   .bundle-row {
     width: 100%;
     display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.6rem;
     text-align: left;
-    padding: 0.5rem 0.6rem;
+    padding: 0.55rem 0.6rem;
     background: transparent;
     border: 0;
-    border-radius: 3px;
     cursor: pointer;
     color: var(--text);
     font-family: inherit;
+    font-size: 0.95rem;
   }
-  .bundle-row:hover { background: var(--border-light); }
-  .bundle-row.active { background: var(--border-light); font-weight: 600; }
-  .bundle-name { font-weight: 600; }
-  .bundle-count { color: var(--text-muted); font-size: 0.82em; }
+  .bundle-row:hover { background: var(--surface-hover); }
+  .bundle-row.active { background: var(--surface-hover); }
+  .bundle-row.active .bundle-name { color: var(--accent); }
+  .bundle-name {
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .bundle-count { color: var(--text-muted); font-size: 0.8em; white-space: nowrap; flex-shrink: 0; }
 
-  .new-bundle {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-    padding: 0.6rem 0.5rem 0.3rem 0.5rem;
+  .new-bundle-wrap {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
     border-top: 1px solid var(--border);
   }
-  .new-bundle input { padding: 0.4rem 0.5rem; box-sizing: border-box; }
+  .new-bundle-btn {
+    width: 100%;
+    padding: 0.5rem;
+    background: transparent;
+    color: var(--accent);
+    border: 1px dashed var(--border);
+    border-radius: 5px;
+    cursor: pointer;
+    font-weight: 500;
+    font-family: inherit;
+  }
+  .new-bundle-btn:hover { background: var(--surface-hover); border-color: var(--accent); }
+  .new-bundle-form { display: flex; flex-direction: column; gap: 0.45rem; }
+  .new-bundle-form input { padding: 0.4rem 0.55rem; box-sizing: border-box; }
+  .new-bundle-actions { display: flex; gap: 0.4rem; }
+  .new-bundle-actions .primary { flex: 1; }
 
   /* ── Detail ──────────────────────────────────────────────────────────────── */
   .detail {
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 0.75rem;
-    min-height: 12rem;
+    border-radius: 6px;
+    padding: 0.9rem;
+    min-height: 14rem;
+    background: var(--surface);
   }
   .detail-head {
     display: flex;
     align-items: flex-start;
     gap: 1rem;
-    margin-bottom: 0.75rem;
+    margin-bottom: 0.9rem;
   }
   .meta-edit {
     display: flex;
     flex-direction: column;
-    gap: 0.35rem;
+    gap: 0.4rem;
     flex: 1;
   }
-  .name-edit { padding: 0.4rem 0.6rem; font-weight: 600; box-sizing: border-box; }
-  .desc-edit { padding: 0.4rem 0.6rem; color: var(--text-muted); box-sizing: border-box; }
+  .name-edit { padding: 0.45rem 0.6rem; font-weight: 600; box-sizing: border-box; }
+  .desc-edit { padding: 0.45rem 0.6rem; color: var(--text-muted); box-sizing: border-box; }
 
-  .items { width: 100%; border-collapse: collapse; margin-bottom: 0.75rem; }
-  .items td { padding: 0.35rem 0.4rem; border-bottom: 1px solid var(--border-light); }
-  .item-name { font-weight: 600; font-family: var(--mono, monospace); white-space: nowrap; }
-  .item-value { width: 100%; }
-  .item-value input { width: 100%; padding: 0.35rem 0.5rem; box-sizing: border-box; }
-  .item-actions { text-align: right; white-space: nowrap; }
+  .items { display: flex; flex-direction: column; gap: 0.3rem; margin-bottom: 0.9rem; }
+  .secret-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    padding: 0.3rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+  }
+  .secret-row:hover { background: var(--surface); }
+  .item-name {
+    font-weight: 600;
+    font-family: monospace;
+    font-size: 0.8rem;
+    min-width: 8.5rem;
+    flex-shrink: 0;
+    padding-top: 0.4rem;
+    word-break: break-word;
+  }
+  .item-value {
+    flex: 1;
+    min-width: 0;
+    font-family: monospace;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    padding: 0.25rem 0.45rem;
+    box-sizing: border-box;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text);
+    resize: vertical;
+    white-space: pre;
+    overflow: auto;
+    min-height: 1.6rem;
+    max-height: 12rem;
+    /* Mask like a password — textarea still accepts multi-line keys (SSH_KEY). */
+    -webkit-text-security: disc;
+  }
+  .item-value:focus { outline: none; border-color: var(--accent); min-height: 5rem; }
+  .item-value.revealed { -webkit-text-security: none; }
+  .item-actions { display: flex; gap: 0.1rem; flex-shrink: 0; padding-top: 0.15rem; }
   .item-actions .icon {
     background: transparent;
     border: 0;
     cursor: pointer;
     font-size: 1rem;
-    padding: 0.2rem 0.4rem;
+    padding: 0.25rem 0.4rem;
     color: var(--text-muted);
+    border-radius: 3px;
   }
-  .item-actions .icon:hover { color: var(--text); }
+  .item-actions .icon:hover { color: var(--text); background: var(--surface-hover); }
 
   .add-secret {
     display: flex;
     flex-direction: column;
     align-items: stretch;
     gap: 0.6rem;
-    padding: 0.6rem 0.5rem;
-    background: var(--hover-bg);
-    border-radius: 4px;
+    padding: 0.6rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
   }
   .bulk-input {
     width: 100%;
     box-sizing: border-box;
     min-height: 5rem;
-    font-family: var(--mono, monospace);
-    font-size: 0.85em;
+    font-family: monospace;
+    font-size: 0.8rem;
     padding: 0.5rem;
     resize: vertical;
   }
+  .add-secret-btn { align-self: flex-end; }
 
-  .form-prompt { color: var(--text-muted); font-size: 0.9em; }
   .empty-note { color: var(--text-muted); padding: 0.5rem; }
 
   .primary {
     padding: 0.45rem 1rem;
-    border: 0;
-    border-radius: 4px;
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    border-radius: 5px;
     cursor: pointer;
     font-weight: 500;
   }
+  .primary:hover:not(:disabled) { background: var(--accent); color: #fff; }
   .primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .ghost {
+    padding: 0.45rem 0.9rem;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    border-radius: 5px;
+    cursor: pointer;
+    font-weight: 500;
+  }
+  .ghost:hover:not(:disabled) { background: var(--surface-hover); }
+  .ghost:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .danger-btn {
     padding: 0.45rem 0.9rem;
@@ -431,9 +528,9 @@
     background: transparent;
     color: var(--text);
     cursor: pointer;
-    border-radius: 4px;
+    border-radius: 5px;
     font-weight: 500;
     flex-shrink: 0;
   }
-  .danger-btn:hover { background: var(--hover-bg); border-color: var(--text-muted); }
+  .danger-btn:hover { background: var(--surface-hover); border-color: var(--danger); color: var(--danger); }
 </style>
