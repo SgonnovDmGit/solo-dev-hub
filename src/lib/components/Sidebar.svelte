@@ -13,6 +13,7 @@
   } from '$lib/api/tauri-commands';
   import EmptyState from './EmptyState.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
+  import SidebarResizer from './SidebarResizer.svelte';
 
   // Collapsible state per project id. Default: all collapsed on first launch; persisted in settings.
   let collapsed = $state<Record<number, boolean>>({});
@@ -78,12 +79,10 @@
 
   // F-025: Rust ORDER BY sort_order ASC, (name|github_name) ASC — no frontend sort needed.
   const sortedProjects = $derived($projects);
-  // v0.19.0: drag-resize state
+  // v0.19.0: drag-resize state. The drag mechanics live in SidebarResizer;
+  // these are the bound values it writes back, plus the live preview width.
   let isResizing = $state(false);
-  let resizeStartX = 0;
-  let resizeStartWidth = 0;
   let resizePreviewWidth = $state(320);
-  let rafId: number | null = null;
 
   const effectiveWidth = $derived(
     isResizing
@@ -91,48 +90,12 @@
       : (sidebarCollapsed ? 52 : sidebarWidth)
   );
 
-  function onResizePointerDown(e: PointerEvent) {
-    if (e.button !== 0) return;
-    if (draggedRepoId !== null) return; // don't start resize while a repo drag is in flight
-    e.preventDefault();
-    isResizing = true;
-    resizeStartX = e.clientX;
-    resizeStartWidth = sidebarCollapsed ? 52 : sidebarWidth;
-    resizePreviewWidth = resizeStartWidth;
-    // Add window-level listeners — pointer may travel outside handle
-    window.addEventListener('pointermove', onResizePointerMove);
-    window.addEventListener('pointerup', onResizePointerUp);
-    window.addEventListener('pointercancel', onResizePointerUp);
-  }
-
-  function onResizePointerMove(e: PointerEvent) {
-    if (!isResizing) return;
-    if (rafId !== null) cancelAnimationFrame(rafId);
-    rafId = requestAnimationFrame(() => {
-      const delta = e.clientX - resizeStartX;
-      const raw = resizeStartWidth + delta;
-      resizePreviewWidth = Math.max(0, Math.min(500, raw));
-      rafId = null;
-    });
-  }
-
-  function onResizePointerUp() {
-    if (!isResizing) return;
-    isResizing = false;
-    window.removeEventListener('pointermove', onResizePointerMove);
-    window.removeEventListener('pointerup', onResizePointerUp);
-    window.removeEventListener('pointercancel', onResizePointerUp);
-    if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
-
-    // Commit decision based on final preview width
-    if (resizePreviewWidth < 160) {
-      // Snap to collapsed; sidebarWidth retains last non-collapsed value
+  // Called by SidebarResizer after a drag commits (sidebarCollapsed/sidebarWidth
+  // binds are already updated). Snap-to-collapsed closes any open inline forms.
+  function handleResizeCommit() {
+    if (sidebarCollapsed) {
       if (showNewProjectForm) cancelNewProject();
       if (showLocalFolderForm) cancelLocalFolder();
-      sidebarCollapsed = true;
-    } else {
-      sidebarCollapsed = false;
-      sidebarWidth = clampWidth(resizePreviewWidth);
     }
     persistLayoutDebounced();
   }
@@ -513,7 +476,6 @@
 <aside
   class="sidebar"
   class:collapsed={sidebarCollapsed}
-  class:resizing={isResizing}
   class:no-select={isDragging}
   style="width: {effectiveWidth}px; min-width: {effectiveWidth}px;"
   onpointermove={handlePointerMove}
@@ -844,12 +806,14 @@
     </div>
   {/if}
   {/if}
-  <div
-    class="resize-handle"
-    onpointerdown={onResizePointerDown}
-    role="separator"
-    aria-orientation="vertical"
-  ></div>
+  <SidebarResizer
+    bind:width={sidebarWidth}
+    bind:collapsed={sidebarCollapsed}
+    bind:isResizing
+    bind:previewWidth={resizePreviewWidth}
+    disabled={draggedRepoId !== null}
+    onCommit={handleResizeCommit}
+  />
 </aside>
 
 {#if showAutoSortConfirm}
@@ -1237,20 +1201,4 @@
     cursor: pointer;
   }
   .unassigned-badge:hover { color: var(--text); background: var(--surface-hover); }
-
-  .resize-handle {
-    position: absolute;
-    top: 0;
-    right: 0;
-    width: 4px;
-    height: 100%;
-    cursor: col-resize;
-    z-index: 10;
-    user-select: none;
-  }
-  .resize-handle:hover,
-  .sidebar.resizing .resize-handle {
-    background: var(--accent);
-    opacity: 0.5;
-  }
 </style>
