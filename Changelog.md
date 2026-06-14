@@ -4,6 +4,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+### Changed
+- **Secret-bundles screen polish (dogfood).** Secret value fields are now masked textareas (mirroring the repo-secrets panel): collapsed to one line, growing on focus, with a reveal toggle and a resizable corner — multi-line keys like `SSH_KEY` are finally readable and editable, where the old single-line input mangled them. The bundle list now puts the name on the left and the secret count on the right of the same row, with per-row dividers and an accent on the active bundle. "New bundle" collapsed into a single button that discloses the create-form inline (Create enabled only with a name, plus Cancel), dropping the duplicate label. The "Add secrets" button is right-aligned.
+
+### Fixed
+- **Broken theme on the Secrets and Deploy screens.** `SecretBundles`, `DeploySecretsTable` and `DeployScreen` referenced CSS variables (`--hover-bg`, `--border-light`) that are not defined in the theme and have no fallback, so panel backgrounds, row hovers and borders rendered transparent/invalid. Remapped to the real tokens (`--surface` / `--surface-hover` / `--border`).
+
 ## [1.3.0] — 2026-06-14
 
 Adds reusable, locally-encrypted secret bundles — input the same SSH / DB / npm values once and apply them to any repo's or deploy environment's GitHub secrets, instead of re-typing them per repo. Folds in a deploy repo-config leak fix surfaced during dogfooding. The MINOR bump is driven by the new 🔐 Secrets screen — a new user-facing capability.
