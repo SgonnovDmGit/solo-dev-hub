@@ -131,11 +131,12 @@ git push origin master vX.Y.Z
 
 ## Roadmap
 
-- **v1.3.0** *(текущий — 2026-06-14)* — переиспользуемые зашифрованные наборы секретов (вводишь SSH / DB / npm значения один раз, применяешь к секретам любого репо или deploy-окружения), плюс фикс протекания repo deploy-config между репо.
+- **v1.4.0** *(текущий — 2026-06-14)* — веха внутреннего рефакторинга: разбили слой Rust-команд (`lib.rs` → `commands/`) и TS-биндинги (`tauri-commands.ts` → каталог), вынесли ресайзер сайдбара в отдельный компонент; заодно полиш экрана наборов (читаемое multiline-редактирование `SSH_KEY`) и фикс сломанной темы.
+- **v1.3.0** — переиспользуемые зашифрованные наборы секретов (вводишь SSH / DB / npm значения один раз, применяешь к секретам любого репо или deploy-окружения), плюс фикс протекания repo deploy-config между репо (2026-06-14).
 - **v1.2.0** — портфельный отчёт по деплоям (все deploy-окружения в одном экране, по проектам, с drill-down), managed-шаблон `.gitattributes`, плюс фиксы кастомного периода Дашборда и per-repo черновика секретов (2026-06-02).
 - **v1.1.0** — verdict-rollback для багов (↩ reopen на confirmed/rejected), полноразмерное массовое поле секретов, унифицированные подписи кнопок диалогов (2026-05-25).
 - **v1.0.0** — public launch (2026-05-18), MIT open source, начало эры frozen contract.
-- **v1.4–v1.6** — внутренние рефакторы (`lib.rs` / `tauri-commands.ts` splits, декомпозиция 570-строчного `sync_project`, UI component splits) + контрибьютор-доки (`docs/ARCHITECTURE.md`, SQLite ER-граф).
+- **v1.4.1–v1.6** — дальнейшие внутренние рефакторы (декомпозиция 570-строчного `sync_project`, UI component splits) + контрибьютор-доки (`docs/ARCHITECTURE.md`, SQLite ER-граф).
 - **v1.7.0** — in-app мультиязычный help-экран документирующий LLM operating contract.
 - **v1.8.0** — cross-platform сборки (macOS / Linux).
 - **v2.0.0** — Windows Authenticode code signing (убирает SmartScreen warning), read-only API viewer + матрица совместимости клиент/сервер, REQ auto-accept через `## Status:` frontmatter.

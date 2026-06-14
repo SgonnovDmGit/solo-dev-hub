@@ -4,6 +4,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-06-14
+
+Internal refactor milestone. The monolithic command layer is split into domain modules on both sides — Rust `lib.rs` (103 Tauri commands, 3346 lines) into `commands/*.rs`, and the TypeScript binding file `tauri-commands.ts` into a `tauri-commands/` directory — and the sidebar resize handle is extracted into its own component. No new user-facing capability; the MINOR bump marks the refactor milestone per the roadmap (v1.4–v1.6). Ships alongside a polish pass on the secret-bundles screen and a broken-theme fix surfaced during dogfooding.
+
+### Changed
+- **Internal module refactor (no behavior change).** `lib.rs` split into `commands/{project,repo,bug,dashboard,sync,templates,deploy,timeline,misc}.rs` (handlers registered by defining-module path, `lib.rs` down to 223 lines); `tauri-commands.ts` split into a `tauri-commands/` directory re-exported through an index — the `$lib/api/tauri-commands` specifier resolves to the directory, so no consumer imports changed; the sidebar drag-resize handle extracted into `SidebarResizer.svelte` with a bindable `width` / `collapsed` / `isResizing` / `previewWidth` interface plus an `onCommit` callback.
+- **Secret-bundles screen polish (dogfood).** Secret value fields are now masked textareas (mirroring the repo-secrets panel): collapsed to one line, growing on focus, with a reveal toggle and a resizable corner — multi-line keys like `SSH_KEY` are finally readable and editable, where the old single-line input mangled them. The bundle list now puts the name on the left and the secret count on the right of the same row, with per-row dividers and an accent on the active bundle. "New bundle" collapsed into a single button that discloses the create-form inline (Create enabled only with a name, plus Cancel), dropping the duplicate label. The "Add secrets" button is right-aligned.
+
+### Fixed
+- **Broken theme on the Secrets and Deploy screens.** `SecretBundles`, `DeploySecretsTable` and `DeployScreen` referenced CSS variables (`--hover-bg`, `--border-light`) that are not defined in the theme and have no fallback, so panel backgrounds, row hovers and borders rendered transparent/invalid. Remapped to the real tokens (`--surface` / `--surface-hover` / `--border`).
+
+### Tests
+- 400 cargo / 86 vitest / 0 svelte issues (unchanged — the refactor moved code without altering behavior; `cargo check` clean after gating the test-only event-log read helpers behind `#[cfg(test)]`).
+
 ## [1.3.0] — 2026-06-14
 
 Adds reusable, locally-encrypted secret bundles — input the same SSH / DB / npm values once and apply them to any repo's or deploy environment's GitHub secrets, instead of re-typing them per repo. Folds in a deploy repo-config leak fix surfaced during dogfooding. The MINOR bump is driven by the new 🔐 Secrets screen — a new user-facing capability.

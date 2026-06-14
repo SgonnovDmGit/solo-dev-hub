@@ -149,6 +149,7 @@ impl AppDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn list_task_events_by_task(
         &self,
         task_id: i64,
@@ -208,6 +209,7 @@ impl AppDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn list_sync_events(
         &self,
         limit: u32,
@@ -250,6 +252,7 @@ impl AppDb {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn list_deploy_events(
         &self,
         limit: u32,

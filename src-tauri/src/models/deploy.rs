@@ -104,6 +104,9 @@ pub struct MetaPlaceholder {
     pub scope: Option<String>,
 }
 
+// Read-side DTO for deploy_events — currently consumed only by tests that
+// verify the event log; gated so it doesn't read as dead code in release builds.
+#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeployEvent {
     pub id: i64,

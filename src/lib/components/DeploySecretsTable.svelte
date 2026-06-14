@@ -274,7 +274,7 @@
     align-items: center;
     gap: 0.6rem;
     padding: 0.4rem 0;
-    border-bottom: 1px solid var(--border-light);
+    border-bottom: 1px solid var(--border);
   }
   .secret-row.disabled .secret-name { opacity: 0.55; }
   .secret-row.disabled .role-chip { opacity: 0.4; pointer-events: none; }
@@ -331,7 +331,7 @@
   }
   .value-input:disabled {
     opacity: 0.6;
-    background: var(--hover-bg);
+    background: var(--surface-hover);
   }
   .empty-hint {
     color: var(--text-muted);
