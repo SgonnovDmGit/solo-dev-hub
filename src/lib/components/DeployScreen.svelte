@@ -423,8 +423,8 @@
   .env-list { width: 100%; border-collapse: collapse; margin: 1rem 0; }
   .env-list th { text-align: left; padding: 0.5rem; font-weight: 600; border-bottom: 1px solid var(--border); }
   .env-row { cursor: pointer; }
-  .env-row:hover { background: var(--hover-bg); }
-  .env-row td { padding: 0.5rem; border-bottom: 1px solid var(--border-light); }
+  .env-row:hover { background: var(--surface-hover); }
+  .env-row td { padding: 0.5rem; border-bottom: 1px solid var(--border); }
   .env-row .name { font-weight: 600; }
   .env-row .updated { color: var(--text-muted); font-size: 0.85em; }
   .env-row .actions { text-align: right; }
@@ -446,7 +446,7 @@
     gap: 0.6rem;
     align-items: center;
     padding: 0.6rem 0.75rem;
-    background: var(--hover-bg);
+    background: var(--surface);
     border-radius: 4px;
     flex-wrap: wrap;
     margin-top: 0.5rem;
@@ -465,7 +465,7 @@
     border-radius: 4px;
     font-weight: 500;
   }
-  .cancel-btn:hover:not(:disabled) { background: var(--hover-bg); border-color: var(--text-muted); }
+  .cancel-btn:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--text-muted); }
   .cancel-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
   /* T-000103 Task 4: shared (repo-wide) image config section above env list */
@@ -473,7 +473,7 @@
     margin-bottom: 1rem;
     border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--hover-bg);
+    background: var(--surface);
   }
   .shared-config-header {
     width: 100%;
@@ -489,7 +489,7 @@
     font-family: inherit;
   }
   .shared-config-header:hover {
-    background: var(--border-light);
+    background: var(--surface-hover);
   }
   .shared-config.collapsed .shared-config-header {
     border-bottom: 0;
