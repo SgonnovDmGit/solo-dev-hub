@@ -63,6 +63,9 @@ pub struct Task {
     pub updated_at: String,
 }
 
+// Read-side DTO for task_events — currently consumed only by tests that
+// verify the event log; gated so it doesn't read as dead code in release builds.
+#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TaskEvent {
     pub id: i64,

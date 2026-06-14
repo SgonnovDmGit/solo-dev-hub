@@ -47,6 +47,9 @@ pub struct GitignoredListing {
     pub other_staged_count: usize,
 }
 
+// Read-side DTO for sync_events — currently consumed only by tests that
+// verify the event log; gated so it doesn't read as dead code in release builds.
+#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SyncEvent {
     pub id: i64,
