@@ -131,7 +131,8 @@ The full release runbook (key rotation, CI troubleshooting, hotfix flow) — [do
 
 ## Roadmap
 
-- **v1.4.0** *(current — 2026-06-14)* — internal refactor milestone: split the Rust command layer (`lib.rs` → `commands/`) and the TypeScript bindings (`tauri-commands.ts` → directory), extracted the sidebar resizer into its own component; ships with a secret-bundles screen polish (readable multi-line `SSH_KEY` editing) and a broken-theme fix.
+- **v1.4.1** *(current — 2026-06-15)* — patch: decomposed the `sync_project` handler out of the command layer into a `sync/project_sync.rs` domain module (zero behavior change), plus a dev-workflow self-heal that auto-frees port 1420 before `tauri dev`.
+- **v1.4.0** — internal refactor milestone: split the Rust command layer (`lib.rs` → `commands/`) and the TypeScript bindings (`tauri-commands.ts` → directory), extracted the sidebar resizer into its own component; ships with a secret-bundles screen polish (readable multi-line `SSH_KEY` editing) and a broken-theme fix (2026-06-14).
 - **v1.3.0** — reusable encrypted secret bundles (enter SSH / DB / npm values once, apply to any repo's or deploy environment's GitHub secrets), plus a deploy repo-config cross-repo leak fix (2026-06-14).
 - **v1.2.0** — portfolio deploy report (all deploy environments in one screen, grouped by project, with drill-down to each), `.gitattributes` managed template, plus dashboard custom date-range and per-repo secrets-draft fixes (2026-06-02).
 - **v1.1.0** — verdict-rollback for bugs (↩ reopen button on confirmed/rejected), full-height secrets bulk-paste, unified dialog button labels (2026-05-25).

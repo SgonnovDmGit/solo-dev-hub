@@ -4,6 +4,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-06-15
+
+Patch release. Continues the v1.4.0 internal-refactor work by decomposing the largest remaining command handler, and adds a developer-workflow self-heal for the local dev server. No user-facing behavior change.
+
+### Changed
+- **`sync_project` decomposed out of the command layer (no behavior change).** The ~712-line `sync_project` handler is extracted from `commands/sync.rs` into a new `sync/project_sync.rs` domain module (`run_project_sync`), leaving the Tauri command a 3-line wrapper. The body is split into focused helpers — a `SyncCounters` accumulator, `load_skeleton_templates`, `write_repo_skeletons` (collapsing the two duplicated Phase-0 skeleton loops), and `sync_client_to_server` / `sync_server_to_microservice` / `sync_microservice_to_parents` — preserving every load-bearing edge (B-001 early bail on a moved server folder, rename-replay idempotency, the standard-project "no server / no clients" warning gating, single up-front `project_type` read).
+- **dev: auto-free port 1420 before `tauri dev`.** An aborted `tauri dev` orphans its vite child, which keeps listening on port 1420; because vite's `strictPort` is intentional (the Tauri `devUrl` is pinned to that port), the next launch hard-failed with "Port 1420 already in use". A new `predev` step (`scripts/free-port.mjs` — dependency-free, cross-platform, IPv6-aware) clears any stale listener so `npm run dev` / `tauri dev` starts clean every time.
+
+### Tests
+- 400 cargo / 86 vitest / 0 svelte issues (unchanged — the decomposition moved code without altering behavior).
+
 ## [1.4.0] — 2026-06-14
 
 Internal refactor milestone. The monolithic command layer is split into domain modules on both sides — Rust `lib.rs` (103 Tauri commands, 3346 lines) into `commands/*.rs`, and the TypeScript binding file `tauri-commands.ts` into a `tauri-commands/` directory — and the sidebar resize handle is extracted into its own component. No new user-facing capability; the MINOR bump marks the refactor milestone per the roadmap (v1.4–v1.6). Ships alongside a polish pass on the secret-bundles screen and a broken-theme fix surfaced during dogfooding.
