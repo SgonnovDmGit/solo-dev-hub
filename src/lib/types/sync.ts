@@ -5,6 +5,8 @@ export interface SyncResult {
   errors: string[];
   /** F-000039: base REQ filenames whose pair was auto-closed via a sender `.impl.md` drop. */
   auto_closed: string[];
+  /** T-000137: display names of repos that received an SDH auto-commit of synced cross-repo files. */
+  committed: string[];
 }
 
 export interface RequirementInfo {

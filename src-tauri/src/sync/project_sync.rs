@@ -29,6 +29,9 @@ struct SyncCounters {
     errors: Vec<String>,
     /// F-000039: base REQ filenames whose pair was auto-closed via `.impl.md`.
     auto_closed: Vec<String>,
+    /// T-000137: display names of repos that received an SDH auto-commit of
+    /// synced cross-repo files this pass.
+    committed: Vec<String>,
 }
 
 impl SyncCounters {
@@ -39,6 +42,7 @@ impl SyncCounters {
             migrated: 0,
             errors: Vec::new(),
             auto_closed: Vec::new(),
+            committed: Vec::new(),
         }
     }
 
@@ -49,6 +53,7 @@ impl SyncCounters {
             migrated: self.migrated,
             errors: self.errors,
             auto_closed: self.auto_closed,
+            committed: self.committed,
         }
     }
 }
@@ -847,6 +852,45 @@ pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, Strin
     if project_type == "microservice" {
         if let Some(ms_server) = server {
             sync_microservice_to_parents(db, project_id, ms_server, &mut c);
+        }
+    }
+
+    // T-000137: auto-commit synced cross-repo files in opted-in repos (portfolio-wide;
+    // pathspec-scoped, so untouched repos and the dev's own WIP are no-ops).
+    if let Some(git) = crate::git_ops::check_git_available() {
+        match db.list_autocommit_repos() {
+            Ok(repos) => {
+                for (repo, branch) in repos {
+                    let Some(ref lp) = repo.local_path else {
+                        continue;
+                    };
+                    let path = std::path::Path::new(lp);
+                    if !crate::git_ops::is_git_repo(path) {
+                        continue;
+                    }
+                    match crate::sync::autocommit_repo(&git, path, &branch) {
+                        Ok(crate::git_ops::CommitOutcome::Committed { .. }) => {
+                            c.committed.push(repo.display_name());
+                        }
+                        Ok(crate::git_ops::CommitOutcome::WrongBranch { current, expected }) => {
+                            c.errors.push(format!(
+                                "Auto-commit skipped for {}: on branch {:?}, expected {}",
+                                repo.display_name(),
+                                current,
+                                expected
+                            ));
+                        }
+                        Ok(crate::git_ops::CommitOutcome::NothingToCommit) => {}
+                        Err(e) => {
+                            c.errors
+                                .push(format!("Auto-commit {}: {}", repo.display_name(), e))
+                        }
+                    }
+                }
+            }
+            Err(e) => c
+                .errors
+                .push(format!("Auto-commit: failed to list repos: {}", e)),
         }
     }
 

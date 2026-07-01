@@ -691,6 +691,37 @@ impl AppDb {
         )?;
         Ok(())
     }
+
+    /// T-000137: repos opted into auto-commit (non-empty autocommit_branch), each
+    /// paired with its target branch. Used by the post-sync auto-commit pass.
+    pub fn list_autocommit_repos(&self) -> SqlResult<Vec<(Repository, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, github_name, github_url, role, description, language, last_pushed_at, added_at, updated_at, local_path, github_id, deploy_target, autocommit_branch
+             FROM repositories
+             WHERE autocommit_branch IS NOT NULL AND TRIM(autocommit_branch) != ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let repo = Repository {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                github_name: row.get(2)?,
+                github_url: row.get(3)?,
+                role: row.get(4)?,
+                description: row.get(5)?,
+                language: row.get(6)?,
+                last_pushed_at: row.get(7)?,
+                added_at: row.get(8)?,
+                updated_at: row.get(9)?,
+                local_path: row.get(10)?,
+                github_id: row.get(11)?,
+                deploy_target: row.get(12)?,
+            };
+            let branch: String = row.get(13)?;
+            Ok((repo, branch))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
 }
 
 #[cfg(test)]

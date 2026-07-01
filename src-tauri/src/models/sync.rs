@@ -30,6 +30,11 @@ pub struct SyncResult {
     /// acknowledged via a `.impl.md` drop and was auto-torn-down this sync.
     #[serde(default)]
     pub auto_closed: Vec<String>,
+    /// T-000137: display names of repos that received an SDH auto-commit of
+    /// synced cross-repo files this sync (opted-in repos with a set
+    /// `autocommit_branch`, on the correct branch, with actual changes).
+    #[serde(default)]
+    pub committed: Vec<String>,
 }
 
 /// F-000041: report from `untrack_files`. `untracked` = total file count

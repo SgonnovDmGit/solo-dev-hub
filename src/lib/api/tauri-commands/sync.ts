@@ -43,3 +43,13 @@ export async function listRepoRenames(): Promise<RepoRename[]> {
 export async function listRenamesForRepo(repoId: number): Promise<RepoRename[]> {
   return invoke<RepoRename[]>('list_renames_for_repo', { repoId });
 }
+
+// ── T-000137: per-repo auto-commit branch selector ─────────────────────────────
+
+export async function getAutocommitBranch(repoId: number): Promise<string | null> {
+  return invoke<string | null>('get_autocommit_branch', { repoId });
+}
+
+export async function setAutocommitBranch(repoId: number, branch: string | null): Promise<void> {
+  return invoke<void>('set_autocommit_branch', { repoId, branch });
+}

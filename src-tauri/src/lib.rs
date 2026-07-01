@@ -174,6 +174,9 @@ pub fn run() {
             // Rename log (F-033)
             commands::sync::list_rename_history,
             commands::sync::list_renames_for_repo,
+            // T-000137: per-repo auto-commit branch selector
+            commands::sync::get_autocommit_branch,
+            commands::sync::set_autocommit_branch,
             // Templates (0.6.0)
             commands::templates::list_template_languages,
             commands::templates::list_template_files,

@@ -3,6 +3,7 @@
 // so existing `use crate::sync::*` and `crate::sync::foo()` call-sites in
 // lib.rs and db/*.rs compile unchanged.
 
+pub mod autocommit;
 pub mod bugs;
 pub mod claude_md;
 pub mod fs;
@@ -14,6 +15,7 @@ pub mod project_sync;
 pub mod requirements;
 pub mod tasks;
 
+pub use autocommit::*;
 pub use bugs::*;
 pub use claude_md::*;
 pub use fs::*;

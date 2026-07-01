@@ -544,6 +544,23 @@ pub fn list_renames_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<RepoR
     db.list_renames_for_repo(repo_id).map_err(|e| e.to_string())
 }
 
+// ── T-000137: per-repo auto-commit branch selector ────────────────────────────
+
+#[tauri::command]
+pub fn get_autocommit_branch(db: State<AppDb>, repo_id: i64) -> Result<Option<String>, String> {
+    db.get_autocommit_branch(repo_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_autocommit_branch(
+    db: State<AppDb>,
+    repo_id: i64,
+    branch: Option<String>,
+) -> Result<(), String> {
+    db.set_autocommit_branch(repo_id, branch.as_deref())
+        .map_err(|e| e.to_string())
+}
+
 // ── v0.20.0: Task sync commands ───────────────────────────────────────────────
 
 #[tauri::command]
