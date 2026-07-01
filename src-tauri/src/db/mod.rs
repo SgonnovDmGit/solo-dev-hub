@@ -15,6 +15,7 @@ pub mod bugs;
 pub mod bundle;
 pub mod dashboard;
 pub mod deploy;
+pub mod deploy_secret_values;
 pub mod graph;
 pub mod migrations;
 pub mod projects;

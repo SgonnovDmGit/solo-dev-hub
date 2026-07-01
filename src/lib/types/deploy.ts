@@ -26,6 +26,13 @@ export interface DeploySecret {
   sort_order: number;
 }
 
+// v1.6.0 (F-000043): one decrypted deploy secret name+value. Persisted
+// encrypted-at-rest server-side (mirrors Rust DeploySecretValue, snake_case).
+export interface DeploySecretValue {
+  secret_name: string;
+  value: string;
+}
+
 export interface CreateDeployEnvironmentArgs {
   repository_id: number;
   name: string;
@@ -62,4 +69,19 @@ export interface DeployReportRow {
   image_tag: string;
   secrets_count: number;
   updated_at: string;
+  // v1.6.0 (T-000134): DB/SSH connection inventory per deploy env, assembled
+  // from local data. Sensitive values are withheld (value === null). Both
+  // default to [] (never null). Mirrors Rust DeployInventoryField.
+  db_fields: DeployInventoryField[];
+  ssh_fields: DeployInventoryField[];
+}
+
+// v1.6.0 (T-000134): one DB- or SSH-related inventory field. value is null when
+// the field is sensitive (withheld) or github-only (no local value). origin is
+// where the name was sourced. Mirrors Rust DeployInventoryField (snake_case).
+export interface DeployInventoryField {
+  name: string;
+  value: string | null;
+  origin: 'persisted' | 'placeholder' | 'github_only';
+  sensitive: boolean;
 }

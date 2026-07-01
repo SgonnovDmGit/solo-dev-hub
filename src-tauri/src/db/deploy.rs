@@ -2,6 +2,19 @@
 // Moved from db.rs.
 
 use super::*;
+use std::collections::HashMap;
+
+/// Minimal error wrapper so crypto/keyring `String` errors can ride inside
+/// `rusqlite::Error` without a new error enum. (Local copy — the identical
+/// helper in `db/deploy_secret_values.rs` is private to that module.)
+#[derive(Debug)]
+struct StringError(String);
+impl std::fmt::Display for StringError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for StringError {}
 
 impl AppDb {
     // ── set_deploy_target (repositories.deploy_target column) ─────────────────
@@ -368,45 +381,253 @@ impl AppDb {
     /// github_name, else `description` (local-only repos have NULL github_name),
     /// else `<local>`.
     pub fn list_deploy_report(&self) -> SqlResult<Vec<DeployReportRow>> {
+        // Phase 1: build the base rows under the connection lock. We also carry
+        // per-env `extras` (plaintext placeholder JSON) forward so phase 2 can
+        // assemble inventory without re-querying it.
+        let base: Vec<(DeployReportRow, String)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT de.id, de.repository_id, r.github_name, r.description, r.project_id, p.name, \
+                        de.name, de.domain, de.deploy_branch, de.image_tag, de.updated_at, \
+                        (SELECT COUNT(*) FROM deploy_secrets ds \
+                           WHERE ds.deploy_env_id = de.id AND ds.included = 1), \
+                        de.extras \
+                 FROM deploy_environments de \
+                 JOIN repositories r ON r.id = de.repository_id \
+                 LEFT JOIN projects p ON p.id = r.project_id \
+                 ORDER BY (p.name IS NULL), p.name COLLATE NOCASE, \
+                          COALESCE(r.github_name, r.description, '') COLLATE NOCASE, de.sort_order",
+            )?;
+            let collected: Vec<(DeployReportRow, String)> = stmt
+                .query_map([], |row| {
+                    let github_name: Option<String> = row.get(2)?;
+                    let description: Option<String> = row.get(3)?;
+                    // Mirror Repository::display_name() exactly.
+                    let repo_name = match github_name {
+                        Some(gh) => gh.rsplit('/').next().unwrap_or("").to_string(),
+                        None => description.unwrap_or_else(|| "<local>".to_string()),
+                    };
+                    let extras_json: String = row
+                        .get::<_, String>(12)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    Ok((
+                        DeployReportRow {
+                            deploy_env_id: row.get(0)?,
+                            repository_id: row.get(1)?,
+                            repo_name,
+                            project_id: row.get(4)?,
+                            project_name: row.get(5)?,
+                            env_name: row.get(6)?,
+                            domain: row.get(7)?,
+                            deploy_branch: row.get(8)?,
+                            image_tag: row.get(9)?,
+                            updated_at: row.get(10)?,
+                            secrets_count: row.get(11)?,
+                            db_fields: Vec::new(),
+                            ssh_fields: Vec::new(),
+                        },
+                        extras_json,
+                    ))
+                })?
+                .filter_map(Result::ok)
+                .collect();
+            collected
+        }; // lock released here — phase 2 re-locks via the helpers it calls.
+
+        // Fetch the keyring bundle key ONCE for the whole report, not per env.
+        let key = crate::keyring_store::get_or_create_bundle_key()
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(StringError(e))))?;
+
+        let mut out = Vec::with_capacity(base.len());
+        for (mut r, extras_json) in base {
+            let env_id = r.deploy_env_id;
+            let repo_id = r.repository_id;
+
+            // Source 1: persisted (decrypted with the once-fetched key).
+            let persisted = self.decrypt_deploy_secret_values_with_key(env_id, &key)?;
+            // Source 2: placeholders — per-env `extras` + repo-wide config (plaintext).
+            let extras: HashMap<String, String> =
+                serde_json::from_str(&extras_json).unwrap_or_default();
+            let repo_config = self.get_repo_deploy_config(repo_id)?;
+            // Source 3: github-only secret names (no local value).
+            let secret_names: Vec<String> = self
+                .list_deploy_secrets(env_id)?
+                .into_iter()
+                .map(|s| s.secret_name)
+                .collect();
+
+            let (db_fields, ssh_fields) =
+                assemble_inventory_fields(&persisted, &extras, &repo_config, &secret_names);
+            r.db_fields = db_fields;
+            r.ssh_fields = ssh_fields;
+            out.push(r);
+        }
+        Ok(out)
+    }
+
+    /// Decrypt all persisted values for a deploy env using an already-fetched
+    /// bundle key (avoids a keyring round-trip per env in the report).
+    fn decrypt_deploy_secret_values_with_key(
+        &self,
+        deploy_env_id: i64,
+        key: &[u8; 32],
+    ) -> SqlResult<Vec<DeploySecretValue>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT de.id, de.repository_id, r.github_name, r.description, r.project_id, p.name, \
-                    de.name, de.domain, de.deploy_branch, de.image_tag, de.updated_at, \
-                    (SELECT COUNT(*) FROM deploy_secrets ds \
-                       WHERE ds.deploy_env_id = de.id AND ds.included = 1) \
-             FROM deploy_environments de \
-             JOIN repositories r ON r.id = de.repository_id \
-             LEFT JOIN projects p ON p.id = r.project_id \
-             ORDER BY (p.name IS NULL), p.name COLLATE NOCASE, \
-                      COALESCE(r.github_name, r.description, '') COLLATE NOCASE, de.sort_order",
+            "SELECT secret_name, ciphertext, nonce FROM deploy_secret_values
+             WHERE deploy_env_id = ?1 ORDER BY secret_name COLLATE NOCASE",
         )?;
-        let rows: Vec<DeployReportRow> = stmt
-            .query_map([], |row| {
-                let github_name: Option<String> = row.get(2)?;
-                let description: Option<String> = row.get(3)?;
-                // Mirror Repository::display_name() exactly.
-                let repo_name = match github_name {
-                    Some(gh) => gh.rsplit('/').next().unwrap_or("").to_string(),
-                    None => description.unwrap_or_else(|| "<local>".to_string()),
-                };
-                Ok(DeployReportRow {
-                    deploy_env_id: row.get(0)?,
-                    repository_id: row.get(1)?,
-                    repo_name,
-                    project_id: row.get(4)?,
-                    project_name: row.get(5)?,
-                    env_name: row.get(6)?,
-                    domain: row.get(7)?,
-                    deploy_branch: row.get(8)?,
-                    image_tag: row.get(9)?,
-                    updated_at: row.get(10)?,
-                    secrets_count: row.get(11)?,
-                })
+        let rows: Vec<(String, Vec<u8>, Vec<u8>)> = stmt
+            .query_map(rusqlite::params![deploy_env_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?
             .filter_map(Result::ok)
             .collect();
-        Ok(rows)
+        drop(stmt);
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (secret_name, ct, nonce) in rows {
+            let plain = crate::crypto::bundle_cipher::decrypt(key, &ct, &nonce)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(StringError(e))))?;
+            out.push(DeploySecretValue {
+                secret_name,
+                value: String::from_utf8(plain)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+            });
+        }
+        Ok(out)
     }
+}
+
+// ── v1.6.0 (T-000134): deploy report inventory assembly ──────────────────────
+
+/// Classification of an inventory field by name (case-insensitive on the
+/// uppercased name). `None` = ignored (neither DB nor SSH).
+enum InventoryKind {
+    Db,
+    Ssh,
+}
+
+/// DB field if name starts with `DB_` / `DATABASE` / `PG`. SSH field if it
+/// starts with `SSH_`. Everything else is ignored.
+fn classify_inventory_name(upper: &str) -> Option<InventoryKind> {
+    if upper.starts_with("DB_") || upper.starts_with("DATABASE") || upper.starts_with("PG") {
+        Some(InventoryKind::Db)
+    } else if upper.starts_with("SSH_") {
+        Some(InventoryKind::Ssh)
+    } else {
+        None
+    }
+}
+
+/// A name is sensitive (value withheld) if the uppercased name contains any of
+/// `PASSWORD` / `SECRET` / `TOKEN` / `PRIVATE` / `PASS` / `KEY`, or ends with
+/// `_KEY`. Identifying names (`*HOST*`, `*NAME*`, `*USER*`, `*PORT*`) are not
+/// sensitive by this rule. `DATABASE_URL` is handled separately by the caller.
+fn is_sensitive_name(upper: &str) -> bool {
+    upper.contains("PASSWORD")
+        || upper.contains("SECRET")
+        || upper.contains("TOKEN")
+        || upper.contains("PRIVATE")
+        || upper.contains("PASS")
+        || upper.ends_with("_KEY")
+        || upper.contains("KEY")
+}
+
+/// Strip the `user:password@` userinfo from a database URL, keeping scheme,
+/// host, port, and path. E.g. `postgres://u:p@h:5432/db` → `postgres://h:5432/db`.
+/// Returns `None` if the string doesn't parse as a `scheme://…` URL — the
+/// caller then withholds the value entirely.
+fn redact_database_url(url: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    let scheme = &url[..scheme_end];
+    let rest = &url[scheme_end + 3..];
+    // Userinfo, if present, is everything before the first '@' in the authority.
+    // The authority ends at the first '/', '?' or '#'.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let tail = &rest[authority_end..];
+    let host_port = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    Some(format!("{}://{}{}", scheme, host_port, tail))
+}
+
+/// Assemble the DB and SSH inventory field vecs from the three local sources,
+/// applying dedup precedence (persisted > placeholder > github_only),
+/// classification, and the sensitive guard. Each returned vec is sorted by name.
+fn assemble_inventory_fields(
+    persisted: &[DeploySecretValue],
+    extras: &HashMap<String, String>,
+    repo_config: &HashMap<String, String>,
+    github_secret_names: &[String],
+) -> (Vec<DeployInventoryField>, Vec<DeployInventoryField>) {
+    // Dedup by name with precedence persisted > placeholder > github_only.
+    // Store (Option<value>, origin) keyed by the original name.
+    let mut merged: HashMap<String, (Option<String>, &'static str)> = HashMap::new();
+
+    // github_only first (lowest precedence) so later inserts overwrite it.
+    for name in github_secret_names {
+        merged.entry(name.clone()).or_insert((None, "github_only"));
+    }
+    // placeholders (extras then repo_config) — plaintext values.
+    for (name, value) in extras.iter().chain(repo_config.iter()) {
+        merged.insert(name.clone(), (Some(value.clone()), "placeholder"));
+    }
+    // persisted (highest precedence).
+    for sv in persisted {
+        merged.insert(
+            sv.secret_name.clone(),
+            (Some(sv.value.clone()), "persisted"),
+        );
+    }
+
+    let mut db_fields = Vec::new();
+    let mut ssh_fields = Vec::new();
+
+    for (name, (value, origin)) in merged {
+        let upper = name.to_uppercase();
+        let kind = match classify_inventory_name(&upper) {
+            Some(k) => k,
+            None => continue,
+        };
+
+        let field = if upper == "DATABASE_URL" {
+            // Special case: keep a redacted URL (userinfo stripped), sensitive=true.
+            // If no value or it doesn't parse, withhold entirely.
+            let redacted = value.as_deref().and_then(redact_database_url);
+            DeployInventoryField {
+                name,
+                value: redacted,
+                origin: origin.to_string(),
+                sensitive: true,
+            }
+        } else if is_sensitive_name(&upper) {
+            DeployInventoryField {
+                name,
+                value: None,
+                origin: origin.to_string(),
+                sensitive: true,
+            }
+        } else {
+            DeployInventoryField {
+                name,
+                value,
+                origin: origin.to_string(),
+                sensitive: false,
+            }
+        };
+
+        match kind {
+            InventoryKind::Db => db_fields.push(field),
+            InventoryKind::Ssh => ssh_fields.push(field),
+        }
+    }
+
+    db_fields.sort_by(|a, b| a.name.cmp(&b.name));
+    ssh_fields.sort_by(|a, b| a.name.cmp(&b.name));
+    (db_fields, ssh_fields)
 }
 
 #[cfg(test)]
@@ -1107,5 +1328,188 @@ mod tests {
         assert!(orow.project_name.is_none());
         assert_eq!(orow.repo_name, "orphan-cli");
         std::mem::forget(tmp);
+    }
+
+    // ── v1.6.0 (T-000134): inventory field assembly ──────────────────────────
+
+    #[test]
+    fn test_redact_database_url_strips_userinfo() {
+        assert_eq!(
+            redact_database_url("postgres://u:p@h:5432/db").as_deref(),
+            Some("postgres://h:5432/db")
+        );
+        // No userinfo → unchanged.
+        assert_eq!(
+            redact_database_url("postgres://h:5432/db").as_deref(),
+            Some("postgres://h:5432/db")
+        );
+        // Not a URL → None (caller withholds).
+        assert!(redact_database_url("not-a-url").is_none());
+    }
+
+    /// Seed a repo + one env with the given per-env extras, returning env id.
+    fn seed_env_with_extras(db: &AppDb, extras: HashMap<String, String>) -> i64 {
+        let (_p, r) = seed_repo_for_deploy_tests(db);
+        let env = db
+            .insert_deploy_environment(&CreateDeployEnvironmentArgs {
+                repository_id: r,
+                name: "prod".to_string(),
+                workflow_name: "W".to_string(),
+                image_tag: "l".to_string(),
+                compose_service: "s".to_string(),
+                domain: "d".to_string(),
+                deploy_branch: "m".to_string(),
+                extras,
+            })
+            .unwrap();
+        env.id
+    }
+
+    fn row_for<'a>(report: &'a [DeployReportRow], env_id: i64) -> &'a DeployReportRow {
+        report.iter().find(|r| r.deploy_env_id == env_id).unwrap()
+    }
+
+    #[test]
+    fn test_inventory_classification_db_ssh_neither() {
+        let db = make_db();
+        let mut extras = HashMap::new();
+        extras.insert("DB_HOST".to_string(), "h".to_string());
+        extras.insert(
+            "DATABASE_URL".to_string(),
+            "postgres://u:p@h:5432/db".to_string(),
+        );
+        extras.insert("PGDATABASE".to_string(), "mydb".to_string());
+        extras.insert("SSH_HOST".to_string(), "1.2.3.4".to_string());
+        extras.insert("API_ENDPOINT".to_string(), "https://x".to_string());
+        let env = seed_env_with_extras(&db, extras);
+
+        let report = db.list_deploy_report().unwrap();
+        let r = row_for(&report, env);
+
+        let db_names: Vec<&str> = r.db_fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(db_names, vec!["DATABASE_URL", "DB_HOST", "PGDATABASE"]);
+        let ssh_names: Vec<&str> = r.ssh_fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(ssh_names, vec!["SSH_HOST"]);
+        // API_ENDPOINT is ignored (in neither vec).
+        assert!(!r.db_fields.iter().any(|f| f.name == "API_ENDPOINT"));
+        assert!(!r.ssh_fields.iter().any(|f| f.name == "API_ENDPOINT"));
+    }
+
+    #[test]
+    fn test_inventory_sensitive_guard_withholds_value_even_when_persisted() {
+        let db = make_db();
+        let env = seed_env_with_extras(&db, HashMap::new());
+        // Persist sensitive values — they must NOT appear in the report.
+        db.set_deploy_secret_value(env, "DB_PASSWORD", "hunter2")
+            .unwrap();
+        db.set_deploy_secret_value(env, "DB_SECRET", "s3cr3t")
+            .unwrap();
+        db.set_deploy_secret_value(env, "SSH_PRIVATE_KEY", "----KEY----")
+            .unwrap();
+        db.set_deploy_secret_value(env, "DB_TOKEN", "tok").unwrap();
+
+        let report = db.list_deploy_report().unwrap();
+        let r = row_for(&report, env);
+
+        for name in ["DB_PASSWORD", "DB_SECRET", "DB_TOKEN"] {
+            let f = r.db_fields.iter().find(|f| f.name == name).unwrap();
+            assert!(f.value.is_none(), "{name} value must be withheld");
+            assert!(f.sensitive, "{name} must be flagged sensitive");
+        }
+        let ssh = r
+            .ssh_fields
+            .iter()
+            .find(|f| f.name == "SSH_PRIVATE_KEY")
+            .unwrap();
+        assert!(ssh.value.is_none());
+        assert!(ssh.sensitive);
+        // No plaintext secret leaks into any field value.
+        let all_values: String = r
+            .db_fields
+            .iter()
+            .chain(r.ssh_fields.iter())
+            .filter_map(|f| f.value.clone())
+            .collect();
+        assert!(!all_values.contains("hunter2"));
+        assert!(!all_values.contains("s3cr3t"));
+    }
+
+    #[test]
+    fn test_inventory_identifying_field_keeps_value() {
+        let db = make_db();
+        let env = seed_env_with_extras(&db, HashMap::new());
+        db.set_deploy_secret_value(env, "DB_HOST", "db.internal")
+            .unwrap();
+
+        let report = db.list_deploy_report().unwrap();
+        let r = row_for(&report, env);
+        let f = r.db_fields.iter().find(|f| f.name == "DB_HOST").unwrap();
+        assert_eq!(f.value.as_deref(), Some("db.internal"));
+        assert!(!f.sensitive);
+        assert_eq!(f.origin, "persisted");
+    }
+
+    #[test]
+    fn test_inventory_database_url_redacted_from_persisted() {
+        let db = make_db();
+        let env = seed_env_with_extras(&db, HashMap::new());
+        db.set_deploy_secret_value(env, "DATABASE_URL", "postgres://u:p@h:5432/db")
+            .unwrap();
+
+        let report = db.list_deploy_report().unwrap();
+        let r = row_for(&report, env);
+        let f = r
+            .db_fields
+            .iter()
+            .find(|f| f.name == "DATABASE_URL")
+            .unwrap();
+        assert_eq!(f.value.as_deref(), Some("postgres://h:5432/db"));
+        assert!(f.sensitive, "DATABASE_URL is styled as redacted");
+        assert!(!f.value.as_ref().unwrap().contains("p@"));
+    }
+
+    #[test]
+    fn test_inventory_github_only_name_no_value() {
+        let db = make_db();
+        let env = seed_env_with_extras(&db, HashMap::new());
+        // A secret NAME with no persisted value + not in extras.
+        db.upsert_deploy_secret(env, "DB_NAME", Some("runtime"), true, false)
+            .unwrap();
+
+        let report = db.list_deploy_report().unwrap();
+        let r = row_for(&report, env);
+        let f = r.db_fields.iter().find(|f| f.name == "DB_NAME").unwrap();
+        assert!(f.value.is_none());
+        assert_eq!(f.origin, "github_only");
+        assert!(!f.sensitive, "DB_NAME is identifying, not sensitive");
+    }
+
+    #[test]
+    fn test_inventory_precedence_persisted_over_placeholder() {
+        let db = make_db();
+        let mut extras = HashMap::new();
+        extras.insert("DB_HOST".to_string(), "placeholder-host".to_string());
+        let env = seed_env_with_extras(&db, extras);
+        db.set_deploy_secret_value(env, "DB_HOST", "persisted-host")
+            .unwrap();
+
+        let report = db.list_deploy_report().unwrap();
+        let r = row_for(&report, env);
+        let f = r.db_fields.iter().find(|f| f.name == "DB_HOST").unwrap();
+        assert_eq!(f.value.as_deref(), Some("persisted-host"));
+        assert_eq!(f.origin, "persisted", "persisted wins over placeholder");
+    }
+
+    #[test]
+    fn test_inventory_empty_when_no_relevant_keys() {
+        let db = make_db();
+        let mut extras = HashMap::new();
+        extras.insert("APP_PORT".to_string(), "8080".to_string());
+        let env = seed_env_with_extras(&db, extras);
+
+        let report = db.list_deploy_report().unwrap();
+        let r = row_for(&report, env);
+        assert!(r.db_fields.is_empty());
+        assert!(r.ssh_fields.is_empty());
     }
 }

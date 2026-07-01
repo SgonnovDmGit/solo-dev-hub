@@ -62,6 +62,9 @@ export const ru = {
   'deploy.customSecretName': 'имя секрета',
   'deploy.secretSaved': 'Секрет "{0}" сохранён',
   'deploy.roleTooltip': 'build = запекается в образ при сборке / deploy = доступен в workflow / runtime = docker run --env (клик чтобы сменить)',
+  // v1.6.0 (F-000043 T3): opt-in local persistence of secret values (pre-fill).
+  'deploy.secretPersist.header': 'Сохр.',
+  'deploy.secretPersist.tooltip': 'Хранить значение локально (шифровано) и предзаполнять',
   'deploy.cloneOverrideWarning': 'В новом деплое нужно заново ввести {0} override-значений секретов (GitHub API не отдаёт значения для копирования).',
   'deploy.generateWorkflowFiles': 'Сгенерировать workflow-файлы',
   'deploy.regenerateWorkflowFiles': 'Перегенерировать workflow-файлы',
@@ -99,6 +102,12 @@ export const ru = {
   'deploy.report.loading': 'Загрузка…',
   'deploy.report.empty': 'Деплой-окружений пока нет. Создайте их во вкладке «Деплой» репозитория.',
   'deploy.report.noMatch': 'Под фильтры ничего не подходит.',
+  // v1.6.0 (T-000134 T5): DB/SSH connection inventory sub-row inside the report.
+  'deploy.report.dbColumn': 'БД',
+  'deploy.report.sshColumn': 'SSH',
+  'deploy.report.markerPersisted': 'хранится локально (шифровано)',
+  'deploy.report.markerGithubOnly': 'только в GitHub, локально не сохранено',
+  'deploy.report.valueHidden': 'значение скрыто (чувствительное)',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -165,6 +174,9 @@ export const en: Record<keyof typeof ru, string> = {
   'deploy.customSecretName': 'secret name',
   'deploy.secretSaved': 'Secret "{0}" saved',
   'deploy.roleTooltip': 'build = baked into image at compile time / deploy = workflow context / runtime = docker run --env (click to change)',
+  // v1.6.0 (F-000043 T3): opt-in local persistence of secret values (pre-fill).
+  'deploy.secretPersist.header': 'Save',
+  'deploy.secretPersist.tooltip': 'Keep value locally (encrypted) and pre-fill',
   'deploy.cloneOverrideWarning': '{0} secret override values need to be re-entered in the new deploy (GitHub API does not expose values for copying).',
   'deploy.generateWorkflowFiles': 'Generate workflow files',
   'deploy.regenerateWorkflowFiles': 'Regenerate workflow files',
@@ -202,4 +214,10 @@ export const en: Record<keyof typeof ru, string> = {
   'deploy.report.loading': 'Loading…',
   'deploy.report.empty': "No deploy environments yet. Create them in a repository's Deploy tab.",
   'deploy.report.noMatch': 'Nothing matches the filters.',
+  // v1.6.0 (T-000134 T5): DB/SSH connection inventory sub-row inside the report.
+  'deploy.report.dbColumn': 'DB',
+  'deploy.report.sshColumn': 'SSH',
+  'deploy.report.markerPersisted': 'stored locally (encrypted)',
+  'deploy.report.markerGithubOnly': 'only in GitHub, not stored locally',
+  'deploy.report.valueHidden': 'value hidden (sensitive)',
 };

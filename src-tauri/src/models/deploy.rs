@@ -135,6 +135,38 @@ pub struct DeployReportRow {
     pub image_tag: String,
     pub secrets_count: i64,
     pub updated_at: String,
+    // v1.6.0 (T-000134): DB/SSH connection inventory, assembled from local data
+    // (persisted encrypted values, plaintext placeholders, github-only secret
+    // names). Sensitive values are withheld. Both default to `[]`, never null.
+    #[serde(default)]
+    pub db_fields: Vec<DeployInventoryField>,
+    #[serde(default)]
+    pub ssh_fields: Vec<DeployInventoryField>,
+}
+
+/// v1.6.0 (T-000134): one DB- or SSH-related inventory field surfaced in the
+/// deploy report. `value` is `None` when the field is sensitive (withheld) or
+/// exists only as a GitHub secret name with no local value. `origin` records
+/// where the name was sourced from. snake_case JSON, no serde rename.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeployInventoryField {
+    pub name: String,
+    /// `None` = redacted (sensitive) OR github-only (no local value).
+    pub value: Option<String>,
+    /// `"persisted"` | `"placeholder"` | `"github_only"`.
+    pub origin: String,
+    /// `true` = value withheld because the name is sensitive.
+    pub sensitive: bool,
+}
+
+/// v1.6.0 (F-000043): one decrypted deploy secret name+value. Persisted
+/// encrypted-at-rest in `deploy_secret_values` (mirrors `SecretBundleItemValue`).
+/// snake_case JSON, no serde rename — matches the other deploy structs
+/// (Tauri tool contract, not a server).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeploySecretValue {
+    pub secret_name: String,
+    pub value: String,
 }
 
 #[cfg(test)]

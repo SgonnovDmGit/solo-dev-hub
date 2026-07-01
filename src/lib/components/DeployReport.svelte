@@ -91,6 +91,21 @@
     navigateTo('repo-detail');
   }
 
+  // v1.6.0: the report shows only the database NAME (a DB-classified field
+  // ending in _NAME, or DATABASE / PGDATABASE) — display-only, in the main row.
+  // Host/user and SSH are still returned by the backend for future filters but
+  // not shown here. Github-only names (no local value) are simply omitted.
+  function dbNameOf(r: DeployReportRow): string {
+    return r.db_fields
+      .filter((f) => {
+        const u = f.name.toUpperCase();
+        return u.endsWith('_NAME') || u === 'DATABASE' || u === 'PGDATABASE';
+      })
+      .map((f) => f.value)
+      .filter((v): v is string => !!v)
+      .join(', ');
+  }
+
   async function openDomain(e: MouseEvent, domain: string) {
     e.preventDefault(); // don't let the webview navigate to the href
     e.stopPropagation(); // don't also trigger the row drill
@@ -170,13 +185,14 @@
                section (each section is its own table — without this they
                auto-size per-section and drift). -->
           <colgroup>
-            <col style="width: 24%" />
-            <col style="width: 9%" />
-            <col style="width: 23%" />
-            <col style="width: 9%" />
-            <col style="width: 12%" />
+            <col style="width: 20%" />
+            <col style="width: 8%" />
+            <col style="width: 18%" />
             <col style="width: 8%" />
             <col style="width: 11%" />
+            <col style="width: 12%" />
+            <col style="width: 7%" />
+            <col style="width: 12%" />
             <col style="width: 4%" />
           </colgroup>
           <thead>
@@ -186,6 +202,7 @@
               <th>{$tStore('deploy.report.colDomain' as any)}</th>
               <th>{$tStore('deploy.report.colBranch' as any)}</th>
               <th>{$tStore('deploy.report.colImageTag' as any)}</th>
+              <th>{$tStore('deploy.report.dbColumn' as any)}</th>
               <th class="num">{$tStore('deploy.report.colSecrets' as any)}</th>
               <th>{$tStore('deploy.report.colUpdated' as any)}</th>
               <th></th>
@@ -193,7 +210,7 @@
           </thead>
           <tbody>
             {#each g.rows as r (r.deploy_env_id)}
-              <tr onclick={() => drillTo(r)}>
+              <tr class="main" onclick={() => drillTo(r)}>
                 <td class="repo">{r.repo_name}</td>
                 <td><span class="env {envClass(r.env_name)}">{r.env_name}</span></td>
                 <td>
@@ -205,6 +222,7 @@
                 </td>
                 <td class="mono">{r.deploy_branch}</td>
                 <td class="mono">{r.image_tag}</td>
+                <td class="mono db-name">{#if dbNameOf(r)}{dbNameOf(r)}{:else}<span class="muted">—</span>{/if}</td>
                 <td class="num"><span class="sbadge">{r.secrets_count}</span></td>
                 <td class="muted">{fmtDate(r.updated_at)}</td>
                 <td class="num"><span class="drill">→</span></td>
@@ -282,4 +300,6 @@
   .env.test { color: #2563eb; background: rgba(37, 99, 235, 0.15); }
   .env.stg  { color: #d97706; background: rgba(217, 119, 6, 0.15); }
   .env.cust { color: #9aa0aa; background: rgba(124, 130, 138, 0.18); }
+
+  .db-name { color: var(--text-muted); }
 </style>

@@ -403,6 +403,37 @@ pub fn register_repo_secret_in_deploys(
         .map_err(|e| e.to_string())
 }
 
+// ── Persisted deploy secret values (v1.6.0, F-000043) ─────────────────────────
+#[tauri::command]
+pub fn set_deploy_secret_value(
+    db: State<AppDb>,
+    deploy_env_id: i64,
+    secret_name: String,
+    value: String,
+) -> Result<(), String> {
+    db.set_deploy_secret_value(deploy_env_id, &secret_name, &value)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_deploy_secret_value(
+    db: State<AppDb>,
+    deploy_env_id: i64,
+    secret_name: String,
+) -> Result<(), String> {
+    db.delete_deploy_secret_value(deploy_env_id, &secret_name)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_deploy_secret_values(
+    db: State<AppDb>,
+    deploy_env_id: i64,
+) -> Result<Vec<DeploySecretValue>, String> {
+    db.get_deploy_secret_values(deploy_env_id)
+        .map_err(|e| e.to_string())
+}
+
 fn validate_env_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Environment name is required".to_string());
