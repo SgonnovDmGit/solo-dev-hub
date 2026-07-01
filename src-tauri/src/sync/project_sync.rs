@@ -241,6 +241,17 @@ fn sync_client_to_server(
                     )),
                 }
             }
+
+            // T-000139: blind-copy sender's docs/my_api/*.md into the client's server-api inbox.
+            match sync::copy_my_api_dir(
+                &srv_base.join("docs"),
+                &client_base.join("docs").join("server-api"),
+            ) {
+                Ok(n) => c.copied += n,
+                Err(e) => c
+                    .errors
+                    .push(format!("Copy my_api -> {}: {}", client.display_name(), e)),
+            }
         }
     }
 }
@@ -508,6 +519,22 @@ fn sync_server_to_microservice(
                 )),
             }
         }
+
+        // T-000139: blind-copy the microservice's docs/my_api/*.md into the parent's microservice-api/<ms_name> inbox.
+        match sync::copy_my_api_dir(
+            &ms_base.join("docs"),
+            &srv_base
+                .join("docs")
+                .join("microservice-api")
+                .join(&ms_name),
+        ) {
+            Ok(n) => c.copied += n,
+            Err(e) => c.errors.push(format!(
+                "Copy ms my_api from {}: {}",
+                ms_server_repo.display_name(),
+                e
+            )),
+        }
     }
 }
 
@@ -597,6 +624,18 @@ fn sync_microservice_to_parents(
                             filename, parent_project.name, e
                         )),
                     }
+                }
+
+                // T-000139: blind-copy the ms's docs/my_api/*.md into the parent's microservice-api/<ms_project_name> inbox.
+                match sync::copy_my_api_dir(
+                    &ms_base.join("docs"),
+                    &parent_base
+                        .join("docs")
+                        .join("microservice-api")
+                        .join(&ms_project_name),
+                ) {
+                    Ok(n) => c.copied += n,
+                    Err(e) => c.errors.push(format!("Copy ms my_api -> parent: {}", e)),
                 }
 
                 // parent → MS: REQ-*.md (source of truth on parent side)
