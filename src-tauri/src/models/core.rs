@@ -7,6 +7,7 @@ pub struct Project {
     pub description: Option<String>,
     pub created_at: String,
     pub project_type: String, // "standard" | "microservice"
+    pub auto_sync_enabled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
