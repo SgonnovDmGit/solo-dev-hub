@@ -1,5 +1,8 @@
 export const ru = {
   'toast.clickToDismiss': 'Нажмите, чтобы закрыть',
+  'toast.copy': 'Копировать',
+  'toast.copied': 'Скопировано',
+  'toast.dismiss': 'Закрыть',
   'toast.failedToLoadProjects': 'Не удалось загрузить проекты: {0}',
   'toast.projectCreated': 'Проект "{0}" создан',
   'toast.failedToCreateProject': 'Не удалось создать проект: {0}',
@@ -64,6 +67,9 @@ export const ru = {
 
 export const en: Record<keyof typeof ru, string> = {
   'toast.clickToDismiss': 'Click to dismiss',
+  'toast.copy': 'Copy',
+  'toast.copied': 'Copied',
+  'toast.dismiss': 'Dismiss',
   'toast.failedToLoadProjects': 'Failed to load projects: {0}',
   'toast.projectCreated': 'Project "{0}" created',
   'toast.failedToCreateProject': 'Failed to create project: {0}',
