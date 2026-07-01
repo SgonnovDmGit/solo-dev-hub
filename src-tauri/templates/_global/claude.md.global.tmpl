@@ -251,6 +251,18 @@ If the sender is not satisfied with a **final** receipt (`implemented` / `partia
 
 If the receipt is `clarification-needed`, a different path applies: the sender updates the **original** REQ inline with the clarifications rather than writing `REQ-N+1`. See `## Receipt format` above for the full clarification-needed loop.
 
+## Closing a pair: manual ✓ or `.impl.md` acknowledgement
+
+There are two ways to close (delete) a REQ pair once the sender is satisfied with the receipt:
+
+1. **Manual ✓** — the user clicks ✓ in the app (`confirm_requirement`), deleting the pair on both sides. Available for any responded pair.
+2. **`.impl.md` acknowledgement (LLM-authorable)** — the **sender** drops an (optionally empty) file `REQ-NNN_<slug>.impl.md` next to the REQ in its **own outgoing folder**, signalling "I have integrated the response; close this pair." At the next sync, Solo Dev Hub detects the file and tears down the whole triple (`.md` + `.response.md` + `.impl.md`) on both sides automatically. This lets the sender's LLM close its own loops without waiting for a human ✓.
+
+Rules for `.impl.md`:
+- **Only the sender authors it**, only in the sender's **outgoing** folder (client: `docs/backend-requirements/`; server: `docs/microservice-requirements/<ms>/`). The **recipient must never author an `.impl.md`** — a recipient-side impl file is not deliverable (the recipient's incoming folder is app-managed and overwritten at sync) and must not be used to force a close.
+- **Existence is the signal** — empty is fine; any content is ignored by the app (it may hold integration notes for humans).
+- Drop it **only when you are done integrating and satisfied** with the receipt. If you are NOT satisfied with a final receipt, do not drop `.impl.md` — write a clarified `REQ-N+1` instead (see above).
+
 ## LLM policy
 
 | Action | Who does it |
@@ -259,13 +271,13 @@ If the receipt is `clarification-needed`, a different path applies: the sender u
 | Edit `REQ-*.md` | Sender only (own side) |
 | Create `REQ-*.response.md` | Recipient |
 | Edit `REQ-*.response.md` | Recipient only (own side) |
-| Confirm a pair (delete both files, both sides) | User — via app's ✓ button |
+| Confirm a pair (delete all files, both sides) | User via app's ✓ button, **or** the sender drops `REQ-NNN_<slug>.impl.md` (auto-closed at next sync) |
 
 The LLM must NOT:
 - author a `REQ-*.md` in its **own recipient folder** (server's `docs/client-requirements/<client>/`, microservice's `docs/server-requirements/`) — those folders are populated **by Solo Dev Hub** from the sender's outgoing folder. A REQ written there will not propagate anywhere and will be mistaken for an incoming request the LLM should answer. Server-initiated communication to a client / microservice-initiated communication to its parent goes through **announcements** (`# Cross-repo announcements`), not REQ
 - edit a `REQ-*.md` on the **recipient** side — edits are silently overwritten at next sync
 - edit a `REQ-*.response.md` on the **sender** side — same reason
-- delete a `REQ-*.md` or `.response.md` manually — confirmation is a user-only action through the app's ✓ button
+- delete a `REQ-*.md` or `.response.md` manually — closing a pair happens **only** through the app's ✓ button or the sender's `.impl.md` acknowledgement (never by manually deleting the REQ / response files)
 - rename or renumber `NNN`
 - author a `.response.md` for a requirement it did not receive (receipts are only authored by the recipient)
 - rename the sync folders (`backend-requirements/`, `client-requirements/...`, etc) manually — those are app-managed
@@ -414,9 +426,26 @@ Concretely:
 - Recipient-LLM **deletes** `ANNOUNCE-*.md` from its own repo after integrating.
 - Solo Dev Hub does **not** track, propagate, or surface announcement files — no UI counter, no badge, no confirm-✓.
 
+# Solo Dev Hub auto-commits
+
+Solo Dev Hub syncs cross-repo files (REQ requirements, API contracts, announcements) by copying them into recipient repos' working trees. They land **uncommitted**, and a local AI assistant may treat them as "foreign" and ignore them. To prevent that, the app can **auto-commit** the synced files itself:
+
+- If a repo has an **auto-commit branch** configured (per-repo setting in Solo Dev Hub), then after each sync the app commits changes **only within the cross-repo doc folders** (`docs/backend-requirements/`, `docs/client-requirements/`, `docs/microservice-requirements/`, `docs/server-requirements/`, `docs/server-api/`, `docs/microservice-api/`, `docs/server-announcements/`, `docs/microservice-announcements/`). The commit is **pathspec-scoped**, so your own uncommitted work anywhere else is untouched, and it happens **only when the repo is currently on the configured branch** (otherwise the app skips and reports it).
+- The commit is authored by **`Solo Dev Hub <noreply@solodevhub.app>`** with a **`chore(sdh-sync):`** subject prefix.
+
+**Recipient-LLM contract:** a commit authored by `Solo Dev Hub` / prefixed `chore(sdh-sync)` is a legitimate cross-repo file sync performed by the app — **not** foreign or accidental. Do not revert it, do not treat its files as suspect; build your own work on top of it. If auto-commit is **off** for a repo, the synced files simply stay uncommitted in the working tree — commit them yourself as part of your normal flow (they are real, app-delivered files, not stray edits).
+
 # API contract sync
 
 `docs/api.md` is consumed cross-repo (clients read the synced server's `api.md`; parent-servers read connected microservices' `api.md`). This makes the contract a load-bearing artifact, not project documentation — drift between code and contract becomes drift visible to other repos. Two symmetric rules keep code and contract aligned, one for the read side (client) and one for the write side (server / microservice).
+
+## Multi-file contracts via `docs/my_api/`
+
+A sender may keep its contract as **multiple** markdown files instead of a single `docs/api.md`. Put any number of `*.md` files into a **`docs/my_api/`** folder (e.g. `api.md`, `handlers.md`, `admin-api.md`, `client-api.md`) and Solo Dev Hub blindly copies **every `*.md`** from there into the recipient's existing inbox on each sync:
+- **Server → Client:** `docs/my_api/*.md` → client's `docs/server-api/*.md` (flat).
+- **Microservice → Parent server:** `docs/my_api/*.md` → parent's `docs/microservice-api/<ms-project-name>/*.md` (flat).
+
+Backward-compatible: the legacy single-file copy (`docs/api.md` + `docs/handlers.md` at the `docs/` root) still works exactly as before. Use one convention or the other per repo — if both a root `docs/api.md` and a `docs/my_api/api.md` exist, the `my_api` copy wins (it lands last). Non-`.md` files in `my_api/` are ignored. The read-side pre-flight check and write-side same-commit rule below apply to whichever files carry the contract (root `api.md` or the `my_api/` set).
 
 ## Client read-side: pre-flight server-surface check before phase-level spec
 
