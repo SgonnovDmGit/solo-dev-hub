@@ -54,6 +54,10 @@
       if (result.errors.length > 0) {
         addToast($tStore('sync.errors').replace('{0}', result.errors.join('; ')), 'warning');
       }
+      // F-000039: report REQ pairs auto-closed via .impl.md acknowledgement.
+      if (result.auto_closed.length > 0) {
+        addToast($tStore('sync.autoClosed').replace('{0}', String(result.auto_closed.length)), 'info');
+      }
       await loadRequirements();
     } catch (e) {
       addToast(String(e), 'error');
@@ -189,6 +193,9 @@
                     <span class="req-repos">{req.source_repo} &rarr; {req.target_repo}</span>
                   </div>
                   <div class="req-actions">
+                    {#if req.has_impl}
+                      <span class="badge badge-impl" title={$tStore('sync.willAutoClose')}>&#8987; impl</span>
+                    {/if}
                     <span class="badge {statusClass(req.status)}">{statusLabel(req.status)}</span>
                     {#if req.status === 'responded'}
                       <button class="action-btn confirm-btn" onclick={() => handleConfirm(req)} title={$tStore('sync.confirm')}>
@@ -245,6 +252,9 @@
                     <span class="req-repos">{req.source_repo} &rarr; {req.target_repo}</span>
                   </div>
                   <div class="req-actions">
+                    {#if req.has_impl}
+                      <span class="badge badge-impl" title={$tStore('sync.willAutoClose')}>&#8987; impl</span>
+                    {/if}
                     <span class="badge {statusClass(req.status)}">{statusLabel(req.status)}</span>
                     {#if req.status === 'responded'}
                       <button class="action-btn confirm-btn" onclick={() => handleConfirm(req)} title={$tStore('sync.confirm')}>
@@ -471,6 +481,14 @@
     background-color: rgba(34, 197, 94, 0.15);
     border-color: rgba(34, 197, 94, 0.5);
     color: rgb(34, 197, 94);
+  }
+
+  /* F-000039: .impl.md present → pair will auto-close on next sync. */
+  .badge-impl {
+    background-color: rgba(168, 85, 247, 0.15);
+    border-color: rgba(168, 85, 247, 0.5);
+    color: rgb(168, 85, 247);
+    font-variant-numeric: tabular-nums;
   }
 
   .action-btn {
