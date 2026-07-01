@@ -16,7 +16,7 @@
   } from '$lib/api/github';
   import { encryptSecret } from '$lib/api/secrets-crypto';
   import { parseEnvText } from '$lib/api/secrets-parser';
-  import { getDisplayName, type Repository, type SecretBundle } from '$lib/types';
+  import { type SecretBundle } from '$lib/types';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import { allRepos } from '$lib/stores/repos';
   import {
@@ -26,9 +26,7 @@
   import { mergeBundleIntoEnvText } from '$lib/api/bundle-apply';
 
   interface Props {
-    mode: 'repo' | 'project';
     repoFullName?: string;
-    projectRepos?: Repository[];
     /**
      * Show the header-toggle that collapses the body. Default `true` (legacy behaviour in
      * ProjectDetail where SecretsPanel sits alongside other collapsible sections).
@@ -39,9 +37,7 @@
   }
 
   let {
-    mode,
     repoFullName,
-    projectRepos = [],
     collapsible = true,
   }: Props = $props();
 
@@ -68,17 +64,12 @@
   // Confirm dialogs
   let showDeleteConfirm = $state(false);
 
-  // Project mode state
-  let showPushConfirm = $state(false);
-  let selectedRepoIds = $state<Set<number>>(new Set());
-  let pushProgress = $state('');
-
   const hasSelectedSecrets = $derived(selectedSecrets.size > 0);
 
-  // Load existing secrets when the body is open (repo mode only).
+  // Load existing secrets when the body is open.
   // `bodyOpen` covers both cases: collapsible-expanded and non-collapsible (always open).
   $effect(() => {
-    if (bodyOpen && mode === 'repo' && repoFullName && $pat) {
+    if (bodyOpen && repoFullName && $pat) {
       loadSecrets();
     }
   });
@@ -315,81 +306,6 @@
     }
   }
 
-  function handlePushProject() {
-    const result = parseEnvText(secretsText);
-    if (result.errors.length > 0) {
-      parseErrors = result.errors;
-      return;
-    }
-    if (result.secrets.length === 0) {
-      addToast($tStore('secrets.emptyInput' as any), 'error');
-      return;
-    }
-    selectedRepoIds = new Set(projectRepos.filter(r => r.github_name).map(r => r.id));
-    showPushConfirm = true;
-  }
-
-  function toggleRepo(id: number) {
-    const next = new Set(selectedRepoIds);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    selectedRepoIds = next;
-  }
-
-  function selectAllRepos() {
-    selectedRepoIds = new Set(projectRepos.filter(r => r.github_name).map(r => r.id));
-  }
-
-  function deselectAllRepos() {
-    selectedRepoIds = new Set();
-  }
-
-  async function confirmProjectPush() {
-    if (!$pat) return;
-    if (selectedRepoIds.size === 0) {
-      addToast($tStore('secrets.noReposSelected' as any), 'error');
-      return;
-    }
-
-    const result = parseEnvText(secretsText);
-    const selectedRepos = projectRepos.filter(r => selectedRepoIds.has(r.id) && r.github_name);
-    showPushConfirm = false;
-    pushing = true;
-
-    let failures = 0;
-    const total = selectedRepos.length;
-
-    for (let i = 0; i < selectedRepos.length; i++) {
-      const repo = selectedRepos[i];
-      pushProgress = $tStore('secrets.progressPushing' as any)
-        .replace('{0}', String(i + 1))
-        .replace('{1}', String(total));
-      try {
-        const { owner, repo: repoName } = splitRepoFullName(repo.github_name ?? '');
-        await pushSecretsToRepo($pat, owner, repoName, result.secrets);
-        // v0.20.0: record secret event per secret for timeline
-        for (const s of result.secrets) {
-          await recordSecretEvent(repo.id, 'set', s.name).catch((e) => console.warn('record_secret_event failed:', e));
-        }
-      } catch {
-        failures++;
-      }
-    }
-
-    pushing = false;
-    pushProgress = '';
-
-    if (failures === 0) {
-      addToast($tStore('secrets.pushSuccess' as any).replace('{0}', `${total} repos`), 'success');
-      secretsText = '';
-      parseErrors = [];
-    } else {
-      addToast(
-        $tStore('secrets.pushPartialFail' as any).replace('{0}', String(failures)).replace('{1}', String(total)),
-        'error'
-      );
-    }
-  }
 </script>
 
 <div class="secrets-section" class:flat={!collapsible}>
@@ -401,9 +317,8 @@
 
   {#if bodyOpen}
     <div class="secrets-body">
-      <!-- Existing secrets list (repo mode only) -->
-      {#if mode === 'repo'}
-        <div class="existing-secrets">
+      <!-- Existing secrets list -->
+      <div class="existing-secrets">
           <div class="sub-label-row">
             <span class="sub-label">{$tStore('secrets.existingSecrets' as any)}</span>
             {#if !loading && existingSecrets.length > 0}
@@ -462,7 +377,6 @@
             {/if}
           {/if}
         </div>
-      {/if}
 
       <!-- Input textarea for new secrets -->
       <div class="new-secrets">
@@ -507,12 +421,12 @@
         <div class="push-row">
           <button
             class="push-btn"
-            onclick={mode === 'repo' ? handlePushRepo : handlePushProject}
+            onclick={handlePushRepo}
             disabled={pushing || parseErrors.length > 0 || secretsText.trim() === ''}
             type="button"
           >
             {#if pushing}
-              {pushProgress || $tStore('secrets.pushing' as any)}
+              {$tStore('secrets.pushing' as any)}
             {:else}
               {$tStore('secrets.push' as any)}
             {/if}
@@ -531,34 +445,6 @@
     onConfirm={handleDeleteSelected}
     onCancel={() => (showDeleteConfirm = false)}
   />
-{/if}
-
-<!-- Project push confirmation -->
-{#if showPushConfirm}
-  <ConfirmDialog
-    title={$tStore('secrets.confirmPushTitle' as any)}
-    message={$tStore('secrets.confirmPushMessage' as any)}
-    onConfirm={confirmProjectPush}
-    onCancel={() => (showPushConfirm = false)}
-  >
-    <div class="repo-checkboxes">
-      <div class="select-actions">
-        <button class="ghost mini" onclick={selectAllRepos} type="button">{$tStore('secrets.selectAll' as any)}</button>
-        <button class="ghost mini" onclick={deselectAllRepos} type="button">{$tStore('secrets.deselectAll' as any)}</button>
-      </div>
-      {#each projectRepos.filter(r => r.github_name) as repo (repo.id)}
-        <label class="repo-checkbox">
-          <input
-            type="checkbox"
-            checked={selectedRepoIds.has(repo.id)}
-            onchange={() => toggleRepo(repo.id)}
-          />
-          {getDisplayName(repo)}
-          <span class="repo-full-name">{repo.github_name}</span>
-        </label>
-      {/each}
-    </div>
-  </ConfirmDialog>
 {/if}
 
 <style>
@@ -875,46 +761,5 @@
   .push-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
-  }
-
-  .repo-checkboxes {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    max-height: 250px;
-    overflow-y: auto;
-    margin: 8px 0;
-  }
-
-  .select-actions {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 4px;
-  }
-
-  .select-actions .mini {
-    font-size: 11px;
-    color: var(--accent);
-    padding: 0;
-  }
-
-  .repo-checkbox {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    cursor: pointer;
-    padding: 3px 0;
-  }
-
-  .repo-checkbox input[type="checkbox"] {
-    cursor: pointer;
-  }
-
-  .repo-full-name {
-    font-size: 11px;
-    color: var(--text-muted);
-    margin-left: auto;
-    font-family: monospace;
   }
 </style>
