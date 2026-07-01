@@ -4,6 +4,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-07-01
+
+Deploy value persistence (pain №1). Selected deploy secret values can now be kept locally (encrypted at rest) so they pre-fill instead of being retyped every session, and the deploy report gained a database-name line per environment. Originally scoped as a standalone typed secrets vault; corrected during design to a deploy-integrated feature — the DB belongs to deploy.
+
+### Added
+- **Opt-in local persistence of deploy secret values.** A per-secret 💾 "save" toggle (placed before the Include column) in the deploy secrets table keeps the value in a new encrypted-at-rest store (`deploy_secret_values`, AES-256-GCM, key in the OS keyring — reuses the secret-bundles crypto, no master password). Persisted values pre-fill the textarea on load instead of being blank; toggling off deletes the stored value. Available only for included + override secrets. Migration v27.
+- **Database name in the deploy report.** Each deploy environment row can carry a sub-row showing its database name, drawn from persisted values and plaintext placeholders, with a 💾 (stored locally) / ☁ (only in GitHub) marker. Sensitive values (passwords, keys, tokens) are never displayed; `DATABASE_URL` is redacted to host/db. Host/user and SSH fields are captured by the query but hidden in the UI for now (future filters).
+
+### Tests
+- 413 cargo / 86 vitest / 0 svelte issues.
+
 ## [1.5.0] — 2026-07-01
 
 Internal refactor milestone. Decomposes the two largest Svelte components into focused sub-components ahead of the typed-secrets-vault work (v1.6.0). No user-facing behavior change; the MINOR bump marks the refactor milestone per the roadmap.
