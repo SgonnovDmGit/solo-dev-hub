@@ -27,6 +27,8 @@ struct SyncCounters {
     responses: usize,
     migrated: usize,
     errors: Vec<String>,
+    /// F-000039: base REQ filenames whose pair was auto-closed via `.impl.md`.
+    auto_closed: Vec<String>,
 }
 
 impl SyncCounters {
@@ -36,6 +38,7 @@ impl SyncCounters {
             responses: 0,
             migrated: 0,
             errors: Vec::new(),
+            auto_closed: Vec::new(),
         }
     }
 
@@ -45,6 +48,7 @@ impl SyncCounters {
             responses: self.responses,
             migrated: self.migrated,
             errors: self.errors,
+            auto_closed: self.auto_closed,
         }
     }
 }
@@ -161,6 +165,16 @@ fn sync_client_to_server(
                     .push(format!("List renames for client {}: {}", client.id, e)),
             }
             let srv_client_dir = client_requirements_parent.join(&client_name);
+
+            // F-000039: auto-close pairs the client (sender) acknowledged via .impl.md.
+            match sync::auto_close_impl_pairs(&client_req_dir, &srv_client_dir) {
+                Ok(closed) => c.auto_closed.extend(closed),
+                Err(e) => c.errors.push(format!(
+                    "Auto-close impl -> {}: {}",
+                    client.display_name(),
+                    e
+                )),
+            }
 
             // Copy REQ-*.md from client (source of truth) to server.
             // Overwrite on change so sender edits propagate to the recipient.
@@ -455,6 +469,14 @@ fn sync_server_to_microservice(
         // F-033: nested per parent-server so multi-parent microservices don't collide.
         let ms_srv_dir = ms_srv_parent.join(&parent_folder);
 
+        // F-000039: auto-close pairs the server (sender) acknowledged via .impl.md.
+        match sync::auto_close_impl_pairs(&srv_ms_dir, &ms_srv_dir) {
+            Ok(closed) => c.auto_closed.extend(closed),
+            Err(e) => c
+                .errors
+                .push(format!("Auto-close impl (server->ms): {}", e)),
+        }
+
         // Copy REQ-*.md from server (source of truth) to microservice server-repo.
         // Overwrite on change so sender edits propagate to the recipient.
         for req_file in sync::scan_requirements(&srv_ms_dir) {
@@ -647,6 +669,15 @@ fn sync_microservice_to_parents(
                     .join("docs")
                     .join("server-requirements")
                     .join(&parent_canonical);
+
+                // F-000039: auto-close pairs the parent server (sender) acknowledged via .impl.md.
+                match sync::auto_close_impl_pairs(&parent_ms_dir, &ms_parent_dir) {
+                    Ok(closed) => c.auto_closed.extend(closed),
+                    Err(e) => c
+                        .errors
+                        .push(format!("Auto-close impl (parent->ms): {}", e)),
+                }
+
                 for req_file in sync::scan_requirements(&parent_ms_dir) {
                     let src = parent_ms_dir.join(&req_file);
                     let dst = ms_parent_dir.join(&req_file);

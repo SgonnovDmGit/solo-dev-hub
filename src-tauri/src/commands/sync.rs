@@ -161,6 +161,9 @@ pub fn list_project_requirements(
                         let response_name = req_file.replace(".md", ".response.md");
                         let has_response = srv_client_dir.join(&response_name).exists()
                             || client_req_dir.join(&response_name).exists();
+                        // F-000039: impl-ack lives in the sender's (client) outgoing dir.
+                        let impl_name = req_file.replace(".md", ".impl.md");
+                        let has_impl = client_req_dir.join(&impl_name).exists();
 
                         let status = if has_response {
                             "responded".to_string()
@@ -177,6 +180,7 @@ pub fn list_project_requirements(
                             source_repo: client.display_name().clone(),
                             target_repo: srv.display_name().clone(),
                             is_reverse_lookup: false,
+                            has_impl,
                         });
                     }
 
@@ -210,6 +214,7 @@ pub fn list_project_requirements(
                             source_repo: srv.display_name().clone(),
                             target_repo: client.display_name().clone(),
                             is_reverse_lookup: false,
+                            has_impl: false,
                         });
                     }
 
@@ -223,6 +228,9 @@ pub fn list_project_requirements(
                         let response_name = req_file.replace(".md", ".response.md");
                         let has_response = srv_client_dir.join(&response_name).exists()
                             || client_req_dir.join(&response_name).exists();
+                        // F-000039: impl-ack lives in the sender's (client) outgoing dir.
+                        let impl_name = req_file.replace(".md", ".impl.md");
+                        let has_impl = client_req_dir.join(&impl_name).exists();
 
                         let status = if has_response {
                             "responded".to_string()
@@ -237,6 +245,7 @@ pub fn list_project_requirements(
                             source_repo: client.display_name().clone(),
                             target_repo: srv.display_name().clone(),
                             is_reverse_lookup: false,
+                            has_impl,
                         });
                     }
                 }
@@ -263,6 +272,9 @@ pub fn list_project_requirements(
                         let response_name = req_file.replace(".md", ".response.md");
                         let has_response = ms_srv_dir.join(&response_name).exists()
                             || srv_ms_dir.join(&response_name).exists();
+                        // F-000039: impl-ack lives in the sender's (server) outgoing dir.
+                        let impl_name = req_file.replace(".md", ".impl.md");
+                        let has_impl = srv_ms_dir.join(&impl_name).exists();
 
                         let status = if has_response {
                             "responded".to_string()
@@ -279,6 +291,7 @@ pub fn list_project_requirements(
                             source_repo: srv.display_name().clone(),
                             target_repo: ms_server_repo.display_name().clone(),
                             is_reverse_lookup: false,
+                            has_impl,
                         });
                     }
 
@@ -292,6 +305,9 @@ pub fn list_project_requirements(
                         let response_name = req_file.replace(".md", ".response.md");
                         let has_response = ms_srv_dir.join(&response_name).exists()
                             || srv_ms_dir.join(&response_name).exists();
+                        // F-000039: impl-ack lives in the sender's (server) outgoing dir.
+                        let impl_name = req_file.replace(".md", ".impl.md");
+                        let has_impl = srv_ms_dir.join(&impl_name).exists();
 
                         let status = if has_response {
                             "responded".to_string()
@@ -306,6 +322,7 @@ pub fn list_project_requirements(
                             source_repo: srv.display_name().clone(),
                             target_repo: ms_server_repo.display_name().clone(),
                             is_reverse_lookup: false,
+                            has_impl,
                         });
                     }
 
@@ -341,6 +358,7 @@ pub fn list_project_requirements(
                             source_repo: ms_server_repo.display_name().clone(),
                             target_repo: srv.display_name().clone(),
                             is_reverse_lookup: false,
+                            has_impl: false,
                         });
                     }
                 }
@@ -392,6 +410,9 @@ pub fn list_project_requirements(
                         let on_ms = ms_parent_dir.join(&req_file).exists();
                         let has_response = ms_parent_dir.join(&response_name).exists()
                             || parent_ms_dir.join(&response_name).exists();
+                        // F-000039: impl-ack lives in the sender's (parent server) outgoing dir.
+                        let impl_name = req_file.replace(".md", ".impl.md");
+                        let has_impl = parent_ms_dir.join(&impl_name).exists();
 
                         let status = if has_response {
                             "responded".to_string()
@@ -408,6 +429,7 @@ pub fn list_project_requirements(
                             source_repo: parent_server.display_name().clone(),
                             target_repo: ms_server.display_name().clone(),
                             is_reverse_lookup: true,
+                            has_impl,
                         });
                     }
 
@@ -424,6 +446,9 @@ pub fn list_project_requirements(
                         let response_name = req_file.replace(".md", ".response.md");
                         let has_response = ms_parent_dir.join(&response_name).exists()
                             || parent_ms_dir.join(&response_name).exists();
+                        // F-000039: impl-ack lives in the sender's (parent server) outgoing dir.
+                        let impl_name = req_file.replace(".md", ".impl.md");
+                        let has_impl = parent_ms_dir.join(&impl_name).exists();
 
                         let status = if has_response {
                             "responded".to_string()
@@ -438,6 +463,7 @@ pub fn list_project_requirements(
                             source_repo: parent_server.display_name().clone(),
                             target_repo: ms_server.display_name().clone(),
                             is_reverse_lookup: true,
+                            has_impl,
                         });
                     }
 
@@ -473,6 +499,7 @@ pub fn list_project_requirements(
                             source_repo: ms_server.display_name().clone(),
                             target_repo: parent_server.display_name().clone(),
                             is_reverse_lookup: true,
+                            has_impl: false,
                         });
                     }
                 }

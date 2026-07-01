@@ -85,6 +85,23 @@ pub fn scan_responses(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// F-000039: scan directory for REQ-*.impl.md acknowledgement files.
+pub fn scan_impl_files(dir: &Path) -> Vec<String> {
+    if !dir.exists() {
+        return vec![];
+    }
+    fs::read_dir(dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| name.starts_with("REQ-") && name.ends_with(".impl.md"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Remove a file
 pub fn remove_file_if_exists(path: &Path) -> Result<(), String> {
     if path.exists() {
@@ -282,6 +299,24 @@ mod tests {
     #[test]
     fn test_scan_responses_nonexistent_dir() {
         let result = scan_responses(Path::new("/nonexistent/path/abc123"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_scan_impl_files() {
+        // F-000039: only REQ-*.impl.md files are picked up.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("REQ-001_x.impl.md"), "ack").unwrap();
+        fs::write(tmp.path().join("REQ-002.md"), "req").unwrap();
+        fs::write(tmp.path().join("foo.impl.md"), "not a REQ").unwrap();
+
+        let result = scan_impl_files(tmp.path());
+        assert_eq!(result, vec!["REQ-001_x.impl.md".to_string()]);
+    }
+
+    #[test]
+    fn test_scan_impl_files_nonexistent_dir() {
+        let result = scan_impl_files(Path::new("/nonexistent/path/abc123"));
         assert!(result.is_empty());
     }
 

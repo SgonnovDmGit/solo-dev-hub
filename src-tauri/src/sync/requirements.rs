@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::models::Repository;
-use crate::sync::fs::remove_file_if_exists;
+use crate::sync::fs::{remove_file_if_exists, scan_impl_files};
 
 /// B-000021: bilateral delete of a REQ pair across sender and recipient sides.
 /// Resolves filesystem paths from the sender and recipient `Repository`
@@ -25,6 +25,10 @@ use crate::sync::fs::remove_file_if_exists;
 /// Returns `Err` for unsupported source roles (`tool` / `landing` / null) so
 /// callers don't silently no-op on bad input — same contract as the previous
 /// in-place implementation.
+///
+/// F-000039: the pair may have a third member — a `REQ-NNN_slug.impl.md`
+/// sender acknowledgement — which is removed on both sides too, so the manual
+/// ✓ path tears down the whole triple just like the auto-close path.
 pub fn confirm_pair(
     source_repo: &Repository,
     target_repo: &Repository,
@@ -39,6 +43,7 @@ pub fn confirm_pair(
     let source_base = Path::new(source_path);
     let target_base = Path::new(target_path);
     let response_name = filename.replace(".md", ".response.md");
+    let impl_name = filename.replace(".md", ".impl.md");
     let source_role = source_repo.role.as_deref().unwrap_or("");
 
     let (sender_dir, recipient_dir) = match source_role {
@@ -73,7 +78,38 @@ pub fn confirm_pair(
     remove_file_if_exists(&sender_dir.join(&response_name))?;
     remove_file_if_exists(&recipient_dir.join(filename))?;
     remove_file_if_exists(&recipient_dir.join(&response_name))?;
+    // F-000039: tear down the sender's `.impl.md` acknowledgement too.
+    remove_file_if_exists(&sender_dir.join(&impl_name))?;
+    remove_file_if_exists(&recipient_dir.join(&impl_name))?;
     Ok(())
+}
+
+/// F-000039: auto-close REQ pairs whose sender dropped a `.impl.md`. Scans
+/// `sender_dir` for `REQ-*.impl.md`; for each, removes the whole triple
+/// (`REQ-NNN_slug.md`, `.response.md`, `.impl.md`) in BOTH `sender_dir` and
+/// `recipient_dir`. Idempotent (remove_file_if_exists is a no-op when absent),
+/// so a pair visible from two sync directions closing twice is harmless.
+/// Returns the base REQ filenames (`REQ-NNN_slug.md`) that were closed.
+pub fn auto_close_impl_pairs(
+    sender_dir: &Path,
+    recipient_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let mut closed = Vec::new();
+    for impl_name in scan_impl_files(sender_dir) {
+        let Some(stem) = impl_name.strip_suffix(".impl.md") else {
+            continue;
+        };
+        let base = format!("{stem}.md");
+        let response = format!("{stem}.response.md");
+        remove_file_if_exists(&sender_dir.join(&base))?;
+        remove_file_if_exists(&sender_dir.join(&response))?;
+        remove_file_if_exists(&sender_dir.join(&impl_name))?;
+        remove_file_if_exists(&recipient_dir.join(&base))?;
+        remove_file_if_exists(&recipient_dir.join(&response))?;
+        remove_file_if_exists(&recipient_dir.join(&impl_name))?;
+        closed.push(base);
+    }
+    Ok(closed)
 }
 
 /// F-033 Stage 1e: replay a pending repo rename on the recipient side.
@@ -595,6 +631,13 @@ mod tests {
         fs::write(dir.join(format!("{stem}.response.md")), "receipt body").unwrap();
     }
 
+    /// F-000039: seed the full triple (req + response + impl-ack) in a dir.
+    fn seed_triple(dir: &Path, filename: &str) {
+        seed_pair(dir, filename);
+        let stem = filename.trim_end_matches(".md");
+        fs::write(dir.join(format!("{stem}.impl.md")), "").unwrap();
+    }
+
     #[test]
     fn test_confirm_pair_client_to_server_deletes_both_sides() {
         let tmp = TempDir::new().unwrap();
@@ -605,15 +648,18 @@ mod tests {
 
         let client_dir = client_base.join("docs/backend-requirements");
         let server_dir = server_base.join("docs/client-requirements/web-client");
-        seed_pair(&client_dir, "REQ-001_login.md");
-        seed_pair(&server_dir, "REQ-001_login.md");
+        // F-000039: seed the full triple to confirm .impl.md is torn down too.
+        seed_triple(&client_dir, "REQ-001_login.md");
+        seed_triple(&server_dir, "REQ-001_login.md");
 
         confirm_pair(&client, &server, "REQ-001_login.md").unwrap();
 
         assert!(!client_dir.join("REQ-001_login.md").exists());
         assert!(!client_dir.join("REQ-001_login.response.md").exists());
+        assert!(!client_dir.join("REQ-001_login.impl.md").exists());
         assert!(!server_dir.join("REQ-001_login.md").exists());
         assert!(!server_dir.join("REQ-001_login.response.md").exists());
+        assert!(!server_dir.join("REQ-001_login.impl.md").exists());
     }
 
     #[test]
@@ -693,5 +739,53 @@ mod tests {
         // Does not error — silent no-op when either side has no local_path,
         // mirroring previous in-place behavior (paths can't be derived).
         confirm_pair(&source, &target, "REQ-001.md").unwrap();
+    }
+
+    // ── F-000039: auto_close_impl_pairs ──────────────────────────────────────
+
+    #[test]
+    fn test_auto_close_impl_pairs_tears_down_triple_both_sides() {
+        let tmp = TempDir::new().unwrap();
+        let sender_dir = tmp.path().join("sender");
+        let recipient_dir = tmp.path().join("recipient");
+        fs::create_dir_all(&sender_dir).unwrap();
+        fs::create_dir_all(&recipient_dir).unwrap();
+        // Sender (acknowledged): base + impl-ack. Recipient: base + response.
+        fs::write(sender_dir.join("REQ-001_x.md"), "req").unwrap();
+        fs::write(sender_dir.join("REQ-001_x.impl.md"), "").unwrap();
+        fs::write(recipient_dir.join("REQ-001_x.md"), "req").unwrap();
+        fs::write(recipient_dir.join("REQ-001_x.response.md"), "receipt").unwrap();
+
+        let closed = auto_close_impl_pairs(&sender_dir, &recipient_dir).unwrap();
+        assert_eq!(closed, vec!["REQ-001_x.md".to_string()]);
+
+        // Everything gone in both dirs.
+        assert!(!sender_dir.join("REQ-001_x.md").exists());
+        assert!(!sender_dir.join("REQ-001_x.impl.md").exists());
+        assert!(!recipient_dir.join("REQ-001_x.md").exists());
+        assert!(!recipient_dir.join("REQ-001_x.response.md").exists());
+
+        // Second call is a no-op (idempotent) — impl file already gone.
+        let closed_again = auto_close_impl_pairs(&sender_dir, &recipient_dir).unwrap();
+        assert!(closed_again.is_empty());
+    }
+
+    #[test]
+    fn test_auto_close_impl_pairs_untouched_without_impl() {
+        let tmp = TempDir::new().unwrap();
+        let sender_dir = tmp.path().join("sender");
+        let recipient_dir = tmp.path().join("recipient");
+        fs::create_dir_all(&sender_dir).unwrap();
+        fs::create_dir_all(&recipient_dir).unwrap();
+        // A live pair with NO impl-ack — must be left alone.
+        fs::write(sender_dir.join("REQ-002_y.md"), "req").unwrap();
+        fs::write(recipient_dir.join("REQ-002_y.md"), "req").unwrap();
+        fs::write(recipient_dir.join("REQ-002_y.response.md"), "receipt").unwrap();
+
+        let closed = auto_close_impl_pairs(&sender_dir, &recipient_dir).unwrap();
+        assert!(closed.is_empty());
+        assert!(sender_dir.join("REQ-002_y.md").exists());
+        assert!(recipient_dir.join("REQ-002_y.md").exists());
+        assert!(recipient_dir.join("REQ-002_y.response.md").exists());
     }
 }
