@@ -5,7 +5,7 @@
   import { listDeployReport } from '$lib/api/tauri-commands';
   import { projects } from '$lib/stores/projects';
   import { selectedRepoId, deployDrillTarget, navigateTo, addToast } from '$lib/stores/ui';
-  import type { DeployReportRow, DeployInventoryField } from '$lib/types';
+  import type { DeployReportRow } from '$lib/types';
 
   let rows = $state<DeployReportRow[]>([]);
   let loading = $state(true);
@@ -91,20 +91,19 @@
     navigateTo('repo-detail');
   }
 
-  // v1.6.0: the report shows only the database NAME for now — host/user and the
-  // whole SSH group are still returned by the backend (for future filters) but
-  // hidden here. A DB-classified field is a "name" if it ends with _NAME or is
-  // DATABASE / PGDATABASE.
-  function dbNameFields(r: DeployReportRow): DeployInventoryField[] {
-    return r.db_fields.filter((f) => {
-      const u = f.name.toUpperCase();
-      return u.endsWith('_NAME') || u === 'DATABASE' || u === 'PGDATABASE';
-    });
-  }
-
-  // Whether a row carries a database name worth a sub-row.
-  function hasInventory(r: DeployReportRow): boolean {
-    return dbNameFields(r).length > 0;
+  // v1.6.0: the report shows only the database NAME (a DB-classified field
+  // ending in _NAME, or DATABASE / PGDATABASE) — display-only, in the main row.
+  // Host/user and SSH are still returned by the backend for future filters but
+  // not shown here. Github-only names (no local value) are simply omitted.
+  function dbNameOf(r: DeployReportRow): string {
+    return r.db_fields
+      .filter((f) => {
+        const u = f.name.toUpperCase();
+        return u.endsWith('_NAME') || u === 'DATABASE' || u === 'PGDATABASE';
+      })
+      .map((f) => f.value)
+      .filter((v): v is string => !!v)
+      .join(', ');
   }
 
   async function openDomain(e: MouseEvent, domain: string) {
@@ -186,13 +185,14 @@
                section (each section is its own table — without this they
                auto-size per-section and drift). -->
           <colgroup>
-            <col style="width: 24%" />
-            <col style="width: 9%" />
-            <col style="width: 23%" />
-            <col style="width: 9%" />
-            <col style="width: 12%" />
+            <col style="width: 20%" />
+            <col style="width: 8%" />
+            <col style="width: 18%" />
             <col style="width: 8%" />
             <col style="width: 11%" />
+            <col style="width: 12%" />
+            <col style="width: 7%" />
+            <col style="width: 12%" />
             <col style="width: 4%" />
           </colgroup>
           <thead>
@@ -202,6 +202,7 @@
               <th>{$tStore('deploy.report.colDomain' as any)}</th>
               <th>{$tStore('deploy.report.colBranch' as any)}</th>
               <th>{$tStore('deploy.report.colImageTag' as any)}</th>
+              <th>{$tStore('deploy.report.dbColumn' as any)}</th>
               <th class="num">{$tStore('deploy.report.colSecrets' as any)}</th>
               <th>{$tStore('deploy.report.colUpdated' as any)}</th>
               <th></th>
@@ -209,7 +210,7 @@
           </thead>
           <tbody>
             {#each g.rows as r (r.deploy_env_id)}
-              <tr class="main" class:has-inv={hasInventory(r)} onclick={() => drillTo(r)}>
+              <tr class="main" onclick={() => drillTo(r)}>
                 <td class="repo">{r.repo_name}</td>
                 <td><span class="env {envClass(r.env_name)}">{r.env_name}</span></td>
                 <td>
@@ -221,22 +222,11 @@
                 </td>
                 <td class="mono">{r.deploy_branch}</td>
                 <td class="mono">{r.image_tag}</td>
+                <td class="mono db-name">{#if dbNameOf(r)}{dbNameOf(r)}{:else}<span class="muted">—</span>{/if}</td>
                 <td class="num"><span class="sbadge">{r.secrets_count}</span></td>
                 <td class="muted">{fmtDate(r.updated_at)}</td>
                 <td class="num"><span class="drill">→</span></td>
               </tr>
-              {#if hasInventory(r)}
-                <!-- Inventory sub-row: database name only (v1.6.0). colspan spans
-                     the full 8-column table so the entry has room without cramping
-                     the main columns. Click still bubbles to drillTo. -->
-                <tr class="inv" onclick={() => drillTo(r)}>
-                  <td colspan="8">
-                    <div class="inv-wrap">
-                      {@render invGroup($tStore('deploy.report.dbColumn' as any), dbNameFields(r))}
-                    </div>
-                  </td>
-                </tr>
-              {/if}
             {/each}
           </tbody>
         </table>
@@ -244,41 +234,6 @@
     {/each}
   {/if}
 </div>
-
-<!-- Renders one labeled group (DB or SSH) of inventory fields as a compact
-     vertical stack. Marker + tooltip vary by origin/sensitive per T-000134 T5. -->
-{#snippet invGroup(label: string, fields: DeployInventoryField[])}
-  <div class="inv-group">
-    <span class="inv-label">{label}</span>
-    <div class="inv-fields">
-      {#each fields as f (f.name)}
-        {#if f.sensitive}
-          <!-- Sensitive: value is either null (withheld) or a pre-redacted
-               DATABASE_URL string that is already safe to show. -->
-          <span class="inv-field sensitive" title={$tStore('deploy.report.valueHidden' as any)}>
-            <span class="inv-name">{f.name}</span>{#if f.value}<span class="inv-sep">:</span><span class="inv-val muted">{f.value}</span>{/if}
-            <span class="inv-lock">•••</span>
-          </span>
-        {:else if f.value === null && f.origin === 'github_only'}
-          <span class="inv-field" title={$tStore('deploy.report.markerGithubOnly' as any)}>
-            <span class="inv-name">{f.name}</span>
-            <span class="inv-marker">☁</span>
-          </span>
-        {:else if f.origin === 'persisted'}
-          <span class="inv-field" title={$tStore('deploy.report.markerPersisted' as any)}>
-            <span class="inv-name">{f.name}</span><span class="inv-sep">:</span><span class="inv-val">{f.value}</span>
-            <span class="inv-marker">💾</span>
-          </span>
-        {:else}
-          <!-- placeholder: plaintext value, no marker. -->
-          <span class="inv-field">
-            <span class="inv-name">{f.name}</span><span class="inv-sep">:</span><span class="inv-val">{f.value}</span>
-          </span>
-        {/if}
-      {/each}
-    </div>
-  </div>
-{/snippet}
 
 <style>
   .wrap {
@@ -346,40 +301,5 @@
   .env.stg  { color: #d97706; background: rgba(217, 119, 6, 0.15); }
   .env.cust { color: #9aa0aa; background: rgba(124, 130, 138, 0.18); }
 
-  /* DB/SSH inventory sub-row (T-000134 T5). A main row with inventory keeps its
-     bottom border off so it visually joins its sub-row; the sub-row carries the
-     divider instead. */
-  tbody tr.main.has-inv td { border-bottom: none; }
-  tbody tr.inv { cursor: pointer; }
-  tbody tr.inv:hover { background: rgba(124, 58, 237, 0.08); }
-  tbody tr.inv td {
-    padding: 2px 14px 9px;
-    border-bottom: 1px solid var(--border);
-    white-space: normal;
-    overflow: visible;
-  }
-  tbody tr:last-child.inv td { border-bottom: none; }
-  .inv-wrap { display: flex; flex-wrap: wrap; gap: 6px 20px; }
-  .inv-group { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-  .inv-label {
-    font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--text-muted); font-weight: 700; flex: none;
-    padding: 1px 5px; border: 1px solid var(--border); border-radius: 5px;
-    background: rgba(0, 0, 0, 0.1);
-  }
-  .inv-fields { display: flex; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
-  .inv-field {
-    display: inline-flex; align-items: baseline; gap: 2px;
-    font-size: 10.5px; line-height: 1.5;
-    font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
-    background: rgba(0, 0, 0, 0.12); border: 1px solid var(--border);
-    border-radius: var(--radius, 5px); padding: 1px 6px;
-  }
-  .inv-field.sensitive { opacity: 0.85; }
-  .inv-name { color: var(--text); }
-  .inv-sep { color: var(--text-muted); }
-  .inv-val { color: var(--accent, #7c3aed); }
-  .inv-val.muted { color: var(--text-muted); }
-  .inv-marker { font-size: 9px; opacity: 0.8; }
-  .inv-lock { color: var(--text-muted); font-size: 9px; letter-spacing: 0.05em; }
+  .db-name { color: var(--text-muted); }
 </style>
