@@ -4,7 +4,7 @@
   import { projects } from '$lib/stores/projects';
   import { currentScreen, selectedRepoId, deployDrillTarget } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
-  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo } from '$lib/api/tauri-commands';
+  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch } from '$lib/api/tauri-commands';
   import type { RepoRename } from '$lib/types';
   import { deleteRepoOnGitHub, splitRepoFullName } from '$lib/api/github';
   import { addToast } from '$lib/stores/ui';
@@ -35,6 +35,8 @@
   let editingName = $state(false);
   let editNameValue = $state('');
   let renames = $state<RepoRename[]>([]);
+  // T-000137: per-repo auto-commit target branch for synced cross-repo files (empty = disabled).
+  let autocommitBranch = $state('');
 
   async function loadRenames() {
     if (!repo) { renames = []; return; }
@@ -49,9 +51,19 @@
     }
   }
 
+  async function loadAutocommitBranch() {
+    if (!repo) { autocommitBranch = ''; return; }
+    try {
+      autocommitBranch = (await getAutocommitBranch(repo.id)) ?? '';
+    } catch {
+      autocommitBranch = '';
+    }
+  }
+
   $effect(() => {
     void $selectedRepoId;
     loadRenames();
+    loadAutocommitBranch();
   });
 
   function startEditName() {
@@ -98,6 +110,18 @@
       (e.target as HTMLSelectElement).value = repo.role ?? 'other';
     }
     await loadAllRepos();
+  }
+
+  // T-000137: save the auto-commit branch (empty → null disables auto-commit for this repo).
+  async function handleAutocommitBranchChange(e: Event) {
+    if (!repo) return;
+    const val = (e.target as HTMLInputElement).value.trim();
+    autocommitBranch = val;
+    try {
+      await setAutocommitBranch(repo.id, val === '' ? null : val);
+    } catch (err) {
+      addToast(String(err), 'error');
+    }
   }
 
   async function handleSetLocalPath() {
@@ -367,6 +391,18 @@
               <option value={lang}>{lang}</option>
             {/each}
           </select>
+        </div>
+
+        <div class="chip">
+          <span class="chip-label">{$tStore('repoDetail.labelAutocommit' as any)}:</span>
+          <input
+            class="chip-input"
+            type="text"
+            value={autocommitBranch}
+            onchange={handleAutocommitBranchChange}
+            placeholder={$tStore('repoDetail.autocommitPlaceholder' as any)}
+            title={$tStore('repoDetail.autocommitHint' as any)}
+          />
         </div>
 
         <button class="delete-repo-btn row-action" onclick={openDeleteDialog} type="button" disabled={deleting} title={$tStore('repo.deleteButton' as any)}>
@@ -709,6 +745,22 @@
     padding: 2px 0;
     font-family: inherit;
     outline: none;
+  }
+  /* T-000137: auto-commit branch text input, styled to sit inside a chip. */
+  .chip-input {
+    background: transparent;
+    color: var(--text);
+    border: 0;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 2px 0;
+    font-family: inherit;
+    outline: none;
+    width: 96px;
+  }
+  .chip-input::placeholder {
+    color: var(--text-muted);
+    font-weight: 400;
   }
 
   .row-action {

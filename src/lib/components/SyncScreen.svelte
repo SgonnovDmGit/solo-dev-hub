@@ -58,6 +58,10 @@
       if (result.auto_closed.length > 0) {
         addToast($tStore('sync.autoClosed').replace('{0}', String(result.auto_closed.length)), 'info');
       }
+      // T-000137: report repos where synced cross-repo files were auto-committed.
+      if (result.committed.length > 0) {
+        addToast($tStore('sync.committed').replace('{0}', String(result.committed.length)), 'info');
+      }
       await loadRequirements();
     } catch (e) {
       addToast(String(e), 'error');
