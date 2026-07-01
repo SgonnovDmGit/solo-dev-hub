@@ -30,9 +30,10 @@ pub fn confirm_pair(
     target_repo: &Repository,
     filename: &str,
 ) -> Result<(), String> {
-    let (Some(source_path), Some(target_path)) =
-        (source_repo.local_path.as_ref(), target_repo.local_path.as_ref())
-    else {
+    let (Some(source_path), Some(target_path)) = (
+        source_repo.local_path.as_ref(),
+        target_repo.local_path.as_ref(),
+    ) else {
         return Ok(());
     };
     let source_base = Path::new(source_path);
