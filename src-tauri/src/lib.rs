@@ -99,6 +99,7 @@ pub fn run() {
             commands::project::list_projects,
             commands::project::update_project,
             commands::project::delete_project,
+            commands::project::set_project_auto_sync,
             // Repositories
             commands::repo::create_local_repository,
             commands::repo::upsert_repository,

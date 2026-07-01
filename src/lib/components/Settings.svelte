@@ -11,6 +11,11 @@
     saveUiScaleMode,
     saveUiScaleManual,
     aiRulesLastSyncAt,
+    autoSyncEnabled,
+    autoSyncIntervalMin,
+    autoSyncLastAt,
+    saveAutoSyncEnabled,
+    saveAutoSyncInterval,
   } from "$lib/stores/settings";
   import { uiScaleMode, uiScaleManual, uiScaleAutoComputed, SCALE_PRESETS } from "$lib/ui-scale";
   import { allRepos, loadAllRepos } from "$lib/stores/repos";
@@ -228,6 +233,51 @@
       </div>
     </div>
   </section>
+
+  <!-- 6. Авто-синхронизация -->
+  <section class="card-new">
+    <div class="card-title-tab">{$tStore("settings.autoSyncCard" as any)}</div>
+    <div class="row">
+      <div class="row-label">{$tStore("settings.autoSyncEnabled" as any)}</div>
+      <div class="row-control" style="grid-column: 2 / -1; justify-content:flex-start;">
+        <input
+          type="checkbox"
+          class="autosync-check"
+          checked={$autoSyncEnabled}
+          onchange={(e) => saveAutoSyncEnabled(e.currentTarget.checked)}
+        />
+      </div>
+    </div>
+    <div class="row">
+      <div class="row-label">{$tStore("settings.autoSyncInterval" as any)}</div>
+      <div class="row-control" style="grid-column: 2 / -1; justify-content:flex-start;">
+        <input
+          type="number"
+          class="autosync-interval"
+          min="5"
+          max="120"
+          step="1"
+          value={$autoSyncIntervalMin}
+          onchange={(e) => saveAutoSyncInterval(parseInt(e.currentTarget.value, 10))}
+        />
+      </div>
+    </div>
+    <div class="row">
+      <div class="row-label">{$tStore("settings.autoSyncLast" as any)}</div>
+      <div class="row-control" style="grid-column: 2 / -1; justify-content:flex-start;">
+        <span class="sync-status">
+          {$autoSyncLastAt
+            ? formatRelativeTime($autoSyncLastAt, $nowTick)
+            : $tStore("settings.autoSyncNever" as any)}
+        </span>
+      </div>
+    </div>
+    <div class="row">
+      <div class="row-control" style="grid-column: 1 / -1; justify-content:flex-start;">
+        <span class="autosync-hint">{$tStore("settings.autoSyncHint" as any)}</span>
+      </div>
+    </div>
+  </section>
 </div>
 
 <style>
@@ -303,4 +353,8 @@
   .row-control button[type="button"]:not(.primary):not(.icon-only):hover { background: var(--surface); }
 
   .sync-status { font-size: 11px; color: var(--text-muted); font-style: italic; }
+
+  .autosync-check { width: 16px; height: 16px; cursor: pointer; flex: none; }
+  .autosync-interval { flex: none !important; width: 80px; }
+  .autosync-hint { font-size: 11px; color: var(--text-muted); }
 </style>

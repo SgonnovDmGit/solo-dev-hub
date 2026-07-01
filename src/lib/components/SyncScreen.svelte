@@ -5,6 +5,7 @@
   import { projects } from '$lib/stores/projects';
   import { tStore } from '$lib/i18n';
   import { syncProject, listProjectRequirements, confirmRequirement } from '$lib/api/tauri-commands';
+  import { noteManualSync } from '$lib/stores/autosync';
   import { getDisplayName, type RequirementInfo } from '$lib/types';
 
   let requirements = $state<RequirementInfo[]>([]);
@@ -41,6 +42,9 @@
   async function handleSync() {
     if (!projectId) return;
     syncing = true;
+    // T-000136: reset the auto-sync elapsed clock so the next timed run waits a
+    // full interval after this manual sync.
+    noteManualSync();
     try {
       const result = await syncProject(projectId);
       const msgKey = result.migrated > 0 ? 'sync.syncCompleteFull' : 'sync.syncComplete';

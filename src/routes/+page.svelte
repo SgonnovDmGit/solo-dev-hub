@@ -5,6 +5,7 @@
   import { loadSettings } from '$lib/stores/settings';
   import { initUiScale } from '$lib/ui-scale';
   import { loadProjects } from '$lib/stores/projects';
+  import { startAutoSyncTimer } from '$lib/stores/autosync';
   import { loadAllRepos, pendingMergeCases, type AmbiguousMergeCase } from '$lib/stores/repos';
   import { addToast } from '$lib/stores/ui';
   import { resolveMergeWithLocal, forceInsertGithubRepo } from '$lib/api/tauri-commands';
@@ -58,6 +59,8 @@
     await loadSettings();
     await initUiScale();
     await Promise.all([loadProjects(), loadAllRepos()]);
+    // T-000136: settings + projects are loaded → safe to arm the auto-sync timer.
+    startAutoSyncTimer();
     checkForUpdate(true);
 
     // B-000007: suppress WebView2's default right-click menu in release builds

@@ -130,8 +130,6 @@ impl AppDb {
 
     /// T-000136: toggle the per-project auto-sync opt-in flag. Read back via
     /// `get_project` / `list_projects` (the flag lives on the `Project` struct).
-    // Foundation for v1.7.0 auto-sync; command wiring lands in a later task.
-    #[allow(dead_code)]
     pub fn set_project_auto_sync(&self, project_id: i64, enabled: bool) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

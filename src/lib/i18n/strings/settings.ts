@@ -61,6 +61,12 @@ export const ru = {
   'settings.renameLog.columns.from': 'Старое имя',
   'settings.renameLog.columns.to': 'Новое имя',
   'settings.renameLog.columns.at': 'Когда',
+  'settings.autoSyncCard': 'Авто-синхронизация',
+  'settings.autoSyncEnabled': 'Включить авто-синк по таймеру',
+  'settings.autoSyncInterval': 'Интервал (мин)',
+  'settings.autoSyncLast': 'Последний авто-синк',
+  'settings.autoSyncNever': 'ещё не выполнялся',
+  'settings.autoSyncHint': 'Синхронизирует проекты с включённым флагом по расписанию',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -126,4 +132,10 @@ export const en: Record<keyof typeof ru, string> = {
   'settings.renameLog.columns.from': 'From',
   'settings.renameLog.columns.to': 'To',
   'settings.renameLog.columns.at': 'At',
+  'settings.autoSyncCard': 'Auto-sync',
+  'settings.autoSyncEnabled': 'Enable timed auto-sync',
+  'settings.autoSyncInterval': 'Interval (min)',
+  'settings.autoSyncLast': 'Last auto-sync',
+  'settings.autoSyncNever': 'never run',
+  'settings.autoSyncHint': 'Syncs projects with the per-project flag on a schedule',
 };
