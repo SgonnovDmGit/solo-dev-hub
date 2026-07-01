@@ -5,10 +5,6 @@ use super::*;
 use crate::crypto::bundle_cipher;
 use crate::keyring_store;
 
-// F-000043 task T1 lands the store; the Tauri commands / UI that call these
-// methods arrive in later tasks. Until wired, they read as dead code — drop
-// this allow when the commands land.
-#[allow(dead_code)]
 impl AppDb {
     /// Encrypt `value` and upsert it for `(deploy_env_id, secret_name)`.
     pub fn set_deploy_secret_value(

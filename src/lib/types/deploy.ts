@@ -26,6 +26,13 @@ export interface DeploySecret {
   sort_order: number;
 }
 
+// v1.6.0 (F-000043): one decrypted deploy secret name+value. Persisted
+// encrypted-at-rest server-side (mirrors Rust DeploySecretValue, snake_case).
+export interface DeploySecretValue {
+  secret_name: string;
+  value: string;
+}
+
 export interface CreateDeployEnvironmentArgs {
   repository_id: number;
   name: string;

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Repository, RenderedFile, WriteResult, DeployEnvironment, DeployReportRow, DeploySecret, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, Task, SecretBundle, SecretBundleItemValue } from '$lib/types';
+import type { Repository, RenderedFile, WriteResult, DeployEnvironment, DeployReportRow, DeploySecret, DeploySecretValue, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, Task, SecretBundle, SecretBundleItemValue } from '$lib/types';
 
 
 // ── Deploy (0.7.0) ────────────────────────────────────────────────────────────
@@ -69,6 +69,17 @@ export const ensureDeploySecretsPopulated = (deployEnvId: number, repoSecretName
 
 export const registerRepoSecretInDeploys = (repoId: number, secretName: string) =>
   invoke<void>('register_repo_secret_in_deploys', { repoId, secretName });
+
+// ── v1.6.0 (F-000043): persisted deploy secret values ─────────────────────────
+
+export const setDeploySecretValue = (deployEnvId: number, secretName: string, value: string) =>
+  invoke<void>('set_deploy_secret_value', { deployEnvId, secretName, value });
+
+export const deleteDeploySecretValue = (deployEnvId: number, secretName: string) =>
+  invoke<void>('delete_deploy_secret_value', { deployEnvId, secretName });
+
+export const getDeploySecretValues = (deployEnvId: number) =>
+  invoke<DeploySecretValue[]>('get_deploy_secret_values', { deployEnvId });
 
 export const renderDeployFilesForEnv = (deployEnvId: number) =>
   invoke<RenderedFile[]>('render_deploy_files_for_env', { deployEnvId });
