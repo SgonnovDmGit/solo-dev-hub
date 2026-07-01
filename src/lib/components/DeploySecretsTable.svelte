@@ -8,6 +8,7 @@
     listDeploySecrets, upsertDeploySecret,
     ensureDeploySecretsPopulated, recordDeploySecretEvent,
     listSecretBundles, getBundleDecrypted,
+    setDeploySecretValue, deleteDeploySecretValue, getDeploySecretValues,
   } from '$lib/api/tauri-commands';
   import { mergeBundleValues } from '$lib/api/bundle-apply';
   import {
@@ -32,6 +33,9 @@
   let repoSecretsFromGitHub = $state<RepoSecret[]>([]);
   let envSecretsFromGitHub = $state<EnvironmentSecret[]>([]);
   let values = $state<Record<string, string>>({});
+  // v1.6.0 (F-000043 T3): which secret names have their value persisted locally
+  // (encrypted-at-rest) for pre-fill. Seeded from getDeploySecretValues in load().
+  let persisted = $state<Record<string, boolean>>({});
   let bundles = $state<SecretBundle[]>([]);
   let loading = $state(true);
 
@@ -64,7 +68,20 @@
       }
       // Step 4: list deploy_secrets from DB (after seed)
       dbSecrets = await listDeploySecrets(deployEnvId);
-      // Step 5: load bundles for the apply control (best-effort)
+      // Step 5: seed persisted local values (F-000043 T3). Reset first so a
+      // reload for a different env never carries stale persisted flags. Runs
+      // after dbSecrets so pre-fill lands on the freshly-loaded rows.
+      persisted = {};
+      try {
+        const stored = await getDeploySecretValues(deployEnvId);
+        for (const { secret_name, value } of stored) {
+          values[secret_name] = value;
+          persisted[secret_name] = true;
+        }
+      } catch (e) {
+        console.warn(e);
+      }
+      // Step 6: load bundles for the apply control (best-effort)
       try { bundles = await listSecretBundles(); } catch { bundles = []; }
     } catch (err) {
       addToast(String(err), 'error');
@@ -135,6 +152,30 @@
     }
   }
 
+  // v1.6.0 (F-000043 T3): opt-in local persistence of a secret's value.
+  // On: remember + (if a non-empty value is already typed) store it now.
+  // Off: forget + delete the stored value + clear the visible field.
+  async function togglePersist(s: DeploySecret, checked: boolean) {
+    try {
+      if (checked) {
+        persisted[s.secret_name] = true;
+        const value = (values[s.secret_name] ?? '').trim();
+        if (value) {
+          await setDeploySecretValue(deployEnvId, s.secret_name, value);
+        }
+        // If empty, it will persist on the next saveValue (blur) push.
+      } else {
+        persisted[s.secret_name] = false;
+        await deleteDeploySecretValue(deployEnvId, s.secret_name);
+        values[s.secret_name] = '';
+      }
+    } catch (e) {
+      // Roll back the optimistic flag so UI stays consistent with storage.
+      persisted[s.secret_name] = !checked;
+      addToast(String(e), 'error');
+    }
+  }
+
   async function saveValue(s: DeploySecret) {
     const value = (values[s.secret_name] ?? '').trim();
     if (!value) return;
@@ -154,7 +195,18 @@
       // v0.20.0: record deploy secret event for timeline
       await recordDeploySecretEvent(deployEnvId, repoId, 'env_secret_set', s.secret_name).catch((e) => console.warn(e));
       addToast(($tStore('deploy.secretSaved' as any) || 'Secret "{0}" saved').replace('{0}', s.secret_name), 'success');
-      values[s.secret_name] = '';
+      // v1.6.0 (F-000043 T3): if the user opted into local persistence for this
+      // secret, mirror the value into encrypted-at-rest storage and KEEP it
+      // visible (pre-filled). Otherwise fall back to the original clear-on-save.
+      if (persisted[s.secret_name]) {
+        try {
+          await setDeploySecretValue(deployEnvId, s.secret_name, value);
+        } catch (e) {
+          addToast(String(e), 'error');
+        }
+      } else {
+        values[s.secret_name] = '';
+      }
       // B-000009: optimistic update of envSecretsFromGitHub instead of `await load()`.
       // A full reload replaces dbSecrets/envSecretsFromGitHub arrays → keyed each
       // block re-renders → focus is lost from the next textarea the user tabs to.
@@ -258,6 +310,14 @@
                           ? ($tStore('deploy.overrideSavedHint' as any) || 'saved {0}').replace('{0}', envSecretMeta(s.secret_name)!.updated_at.slice(0, 10))
                           : ($tStore('deploy.enterOverrideValue' as any) || 'Enter value'))}
                   onblur={() => saveValue(s)}></textarea>
+        <label class="persist-toggle" class:muted={!s.included || !s.override_enabled}
+               title={$tStore('deploy.secretPersist.tooltip' as any) || 'Keep value locally (encrypted) and pre-fill'}>
+          <input type="checkbox"
+                 checked={persisted[s.secret_name] === true}
+                 disabled={!s.included || !s.override_enabled}
+                 onchange={(e) => togglePersist(s, (e.currentTarget as HTMLInputElement).checked)} />
+          {$tStore('deploy.secretPersist.header' as any) || 'Save'}
+        </label>
         <label class="include-toggle">
           <input type="checkbox" checked={s.included} onchange={() => toggleIncluded(s)} />
           {$tStore('deploy.includeCheckbox' as any) || 'Include'}
@@ -301,7 +361,7 @@
   .role-chip.role-runtime { background: #f59e0b; }    /* amber */
   .role-chip:disabled { cursor: not-allowed; }
   .spacer { flex: 1; }
-  .include-toggle, .override-toggle {
+  .include-toggle, .override-toggle, .persist-toggle {
     display: flex;
     align-items: center;
     gap: 0.3rem;
@@ -309,7 +369,7 @@
     cursor: pointer;
     user-select: none;
   }
-  .override-toggle.muted {
+  .override-toggle.muted, .persist-toggle.muted {
     opacity: 0.5;
   }
   .value-input {
