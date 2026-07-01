@@ -1,21 +1,20 @@
 <script lang="ts">
-  import { projects, editProject, removeProject } from '$lib/stores/projects';
+  import { projects } from '$lib/stores/projects';
   import { allRepos, assignRepo, loadAllRepos } from '$lib/stores/repos';
   import { selectedProjectId, selectedRepoId, currentScreen } from '$lib/stores/ui';
   import { tStore } from '$lib/i18n';
   import { getRoleLabel, getDisplayName, ROLE_ICONS, type Role } from '$lib/types';
   import type { StatsSummary as StatsSummaryData } from '$lib/types';
-  import ConfirmDialog from './ConfirmDialog.svelte';
+  import ProjectHeader from './ProjectHeader.svelte';
   import StatsSummary from './StatsSummary.svelte';
   import RecentActivityFeed from './RecentActivityFeed.svelte';
   import ProjectGraph from './ProjectGraph.svelte';
   import {
     connectMicroservice, disconnectMicroservice, listProjectMicroservices, getProjectStatsSummary,
-    listMicroserviceProjects, listParentsOfMicroservice, updateProjectType, serverRepoOfMicroservice,
+    listMicroserviceProjects, listParentsOfMicroservice, serverRepoOfMicroservice,
   } from '$lib/api/tauri-commands';
   import type { Project, Repository } from '$lib/types';
   import { addToast } from '$lib/stores/ui';
-  import { loadProjects } from '$lib/stores/projects';
 
   const roleKeys: Role[] = ['server', 'admin_client', 'client', 'test_client', 'landing', 'tool', 'other'];
   const roles = roleKeys.map((key) => [key, getRoleLabel(key)] as [Role, string]);
@@ -132,52 +131,9 @@
     }
   }
 
-  // F-012: type-change is blocked ONLY when this project is a microservice connected
-  // to parents (standard projects referencing it). Repos and own-connected microservices
-  // don't matter — user can freely reshape a project.
-  const canChangeType = $derived(
-    project !== null && parentsOfMicroservice.length === 0
-  );
-  let showTypeChangeConfirm = $state(false);
-  let pendingNewType = $state<'standard' | 'microservice'>('standard');
-
-  // B-003: select-based type change — open ConfirmDialog with chosen value
-  function handleTypeSelectChange(e: Event) {
-    if (!project) return;
-    const newType = (e.target as HTMLSelectElement).value as 'standard' | 'microservice';
-    if (newType === project.project_type) return;
-    pendingNewType = newType;
-    showTypeChangeConfirm = true;
-    // Revert select immediately; will re-render to new value after confirm
-    (e.target as HTMLSelectElement).value = project.project_type;
-  }
-
-  async function confirmTypeChange() {
-    if (!project) return;
-    try {
-      await updateProjectType(project.id, pendingNewType);
-      addToast($tStore('toast.projectTypeChanged' as any), 'success');
-      await loadProjects();
-    } catch (err) {
-      addToast(String(err), 'error');
-    } finally {
-      showTypeChangeConfirm = false;
-    }
-  }
-
   function openParentProject(parentId: number) {
     selectedProjectId.set(parentId);
     currentScreen.set({ name: 'project' });
-  }
-
-  // B-002: same pattern as BugItem — autoFocus + Enter-save, Shift+Enter for newline
-  function autoFocus(node: HTMLElement) {
-    node.focus();
-  }
-
-  function handleDescKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') { cancelEditDesc(); return; }
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveEditDesc(); }
   }
 
   // F-013/T-055: tabs (mirror RepoDetail pattern)
@@ -189,51 +145,6 @@
     void $selectedProjectId;
     activeTab = 'repos';
   });
-
-  // Inline edit state for name
-  let editingName = $state(false);
-  let editNameValue = $state('');
-
-  // Inline edit state for description
-  let editingDesc = $state(false);
-  let editDescValue = $state('');
-
-  // Delete confirm
-  let showDeleteConfirm = $state(false);
-
-  function startEditName() {
-    if (!project) return;
-    editNameValue = project.name;
-    editingName = true;
-  }
-
-  function cancelEditName() {
-    editingName = false;
-    editNameValue = '';
-  }
-
-  async function saveEditName() {
-    if (!project || !editNameValue.trim()) return;
-    await editProject(project.id, editNameValue.trim(), project.description ?? undefined);
-    editingName = false;
-  }
-
-  function startEditDesc() {
-    if (!project) return;
-    editDescValue = project.description ?? '';
-    editingDesc = true;
-  }
-
-  function cancelEditDesc() {
-    editingDesc = false;
-    editDescValue = '';
-  }
-
-  async function saveEditDesc() {
-    if (!project) return;
-    await editProject(project.id, project.name, editDescValue.trim() || undefined);
-    editingDesc = false;
-  }
 
   async function handleUnassignRepo(repoId: number) {
     await assignRepo(repoId, null, null);
@@ -247,16 +158,6 @@
     await loadAllRepos();
   }
 
-  async function handleDeleteProject() {
-    if (!project) return;
-    const success = await removeProject(project.id);
-    if (success) {
-      selectedProjectId.set(null);
-      currentScreen.set({ name: 'dashboard' });
-    }
-    showDeleteConfirm = false;
-  }
-
   function openSync() {
     currentScreen.set({ name: 'sync' });
   }
@@ -264,15 +165,6 @@
   function openRepo(id: number) {
     selectedRepoId.set(id);
     currentScreen.set({ name: 'repo-detail' });
-  }
-
-  function formatDate(iso: string | null | undefined): string {
-    if (!iso) return '—';
-    return new Date(iso).toLocaleDateString(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-    });
   }
 
   function getRoleIcon(role: string | null): string {
@@ -287,87 +179,7 @@
       <p>{$tStore('project.notFound')}</p>
     </div>
   {:else}
-    <div class="header">
-      <div class="title-row">
-        {#if editingName}
-          <input
-            class="name-input"
-            type="text"
-            bind:value={editNameValue}
-            onkeydown={(e) => {
-              if (e.key === 'Enter') saveEditName();
-              if (e.key === 'Escape') cancelEditName();
-            }}
-            onblur={saveEditName}
-          />
-        {:else}
-          <button class="ghost project-title" onclick={startEditName} title={$tStore('project.editName')}>
-            {project.name}
-          </button>
-        {/if}
-        <div class="header-actions">
-          <button class="icon-btn" onclick={startEditName} title={$tStore('project.editName')} aria-label="edit">✏</button>
-          <button
-            class="icon-btn danger"
-            onclick={() => (showDeleteConfirm = true)}
-            disabled={project.project_type === 'microservice' && parentsOfMicroservice.length > 0}
-            title={project.project_type === 'microservice' && parentsOfMicroservice.length > 0 ? $tStore('project.deleteBlockedHasParents' as any) : $tStore('project.deleteProject')}
-            aria-label="delete"
-          >⌫</button>
-        </div>
-      </div>
-
-      <div class="meta">
-        <span class="type-label">{$tStore('project.typeLabel' as any)}:</span>
-        <!-- Обёртка span с title: browsers не показывают title на disabled-элементах надёжно -->
-        <span
-          class="type-select-wrapper"
-          title={canChangeType ? '' : $tStore('project.changeTypeDisabled' as any)}
-        >
-          <select
-            class="type-select"
-            value={project.project_type}
-            onchange={handleTypeSelectChange}
-            disabled={!canChangeType}
-          >
-            <option value="standard">📁 {$tStore('project.typeStandard' as any)}</option>
-            <option value="microservice">⚙ {$tStore('project.typeMicroservice' as any)}</option>
-          </select>
-          {#if !canChangeType}
-            <span class="type-lock-icon" aria-hidden="true">🔒</span>
-          {/if}
-        </span>
-        <span class="meta-sep">•</span>
-        {$tStore('project.created')}: {formatDate(project.created_at)}
-      </div>
-    </div>
-
-    <div class="description-section">
-      <div class="section-label">{$tStore('project.description')}</div>
-      {#if editingDesc}
-        <textarea
-          class="desc-input"
-          bind:value={editDescValue}
-          placeholder={$tStore('project.descriptionPlaceholder')}
-          onkeydown={handleDescKeydown}
-          onblur={saveEditDesc}
-          rows="2"
-          use:autoFocus
-        ></textarea>
-      {:else}
-        <div
-          class="description-text"
-          class:placeholder={!project.description}
-          onclick={startEditDesc}
-          role="button"
-          tabindex="0"
-          title={$tStore('project.editName')}
-          onkeydown={(e) => e.key === 'Enter' && startEditDesc()}
-        >
-          {project.description || $tStore('project.descriptionPlaceholder')}
-        </div>
-      {/if}
-    </div>
+    <ProjectHeader {project} hasParents={parentsOfMicroservice.length > 0} />
 
     <div class="project-tabs">
       <button class="tab-btn" class:active={activeTab === 'repos'} onclick={() => (activeTab = 'repos')}>
@@ -540,24 +352,6 @@
   {/if}
 </div>
 
-{#if showDeleteConfirm && project}
-  <ConfirmDialog
-    title={$tStore('project.deleteConfirmTitle')}
-    message={$tStore('project.deleteConfirmMessage').replace('{0}', project.name)}
-    onConfirm={handleDeleteProject}
-    onCancel={() => (showDeleteConfirm = false)}
-  />
-{/if}
-
-{#if showTypeChangeConfirm && project}
-  <ConfirmDialog
-    title={$tStore('project.changeType' as any)}
-    message={$tStore('project.changeTypeConfirm' as any).replace('{0}', pendingNewType === 'microservice' ? $tStore('project.typeMicroservice' as any) : $tStore('project.typeStandard' as any))}
-    onConfirm={confirmTypeChange}
-    onCancel={() => (showTypeChangeConfirm = false)}
-  />
-{/if}
-
 <style>
   .project-detail {
     padding: 24px 28px;
@@ -578,13 +372,6 @@
     color: var(--text-muted);
   }
 
-  .header {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    flex-shrink: 0;
-  }
-
   .sync-nav-btn {
     font-size: 12px;
     padding: 4px 12px;
@@ -601,85 +388,6 @@
     color: white;
   }
 
-  .title-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .project-title {
-    font-size: 22px;
-    font-weight: 700;
-    color: var(--text);
-    cursor: pointer;
-    border-radius: 4px;
-    padding: 2px 6px;
-    margin: 0 -6px;
-    transition: background-color 0.1s;
-  }
-
-  .project-title:hover {
-    background-color: var(--surface);
-  }
-
-  .name-input {
-    font-size: 22px;
-    font-weight: 700;
-    background-color: var(--surface);
-    border: 1px solid var(--accent);
-    border-radius: 4px;
-    padding: 2px 6px;
-    color: var(--text);
-    width: 100%;
-    max-width: 500px;
-  }
-
-  .meta {
-    font-size: 12px;
-    color: var(--text-muted);
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-
-  .type-label {
-    font-size: 11px;
-    color: var(--text-muted);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-
-  /* Match the style of role select in repo-table — minimal, use system defaults */
-  .type-select {
-    font-size: 12px;
-    padding: 3px 6px;
-    min-width: 140px;
-  }
-
-  .type-select:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-
-  /* Wrapper needed because browsers don't always show title on disabled elements */
-  .type-select-wrapper {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-  }
-
-  .type-lock-icon {
-    font-size: 11px;
-    opacity: 0.7;
-    cursor: help;
-  }
-
-  .meta-sep {
-    color: var(--border);
-  }
-
   .ms-server-info {
     font-size: 11px;
     color: var(--text-muted);
@@ -688,55 +396,12 @@
     text-align: center;
   }
 
-  .description-section {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    flex-shrink: 0;
-  }
-
   .section-label {
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: var(--text-muted);
-  }
-
-  .description-text {
-    font-size: 13px;
-    color: var(--text);
-    cursor: pointer;
-    border-radius: 4px;
-    padding: 6px 8px;
-    border: 1px solid transparent;
-    transition: border-color 0.1s, background-color 0.1s;
-    min-height: 32px;
-    line-height: 1.5;
-  }
-
-  .description-text:hover {
-    background-color: var(--surface);
-    border-color: var(--border);
-  }
-
-  .description-text.placeholder {
-    color: var(--text-muted);
-    font-style: italic;
-  }
-
-  .desc-input {
-    font-size: 13px;
-    padding: 6px 8px;
-    resize: vertical;
-    border: 1px solid var(--accent);
-    border-radius: 4px;
-    background-color: var(--surface);
-    color: var(--text);
-    width: 100%;
-    font-family: inherit;
-    line-height: 1.5;
-    min-height: 60px;
   }
 
   .repos-section {
@@ -959,22 +624,4 @@
     background-color: rgba(34, 197, 94, 0.25);
     border-color: rgb(34, 197, 94);
   }
-
-  .header-actions {
-    margin-left: auto;
-    display: flex;
-    gap: 4px;
-  }
-  .icon-btn {
-    background: none;
-    border: none;
-    padding: 4px 8px;
-    cursor: pointer;
-    font-size: 14px;
-    color: var(--text-muted);
-    border-radius: 4px;
-  }
-  .icon-btn:hover { color: var(--accent); background: var(--surface-hover); }
-  .icon-btn.danger:hover { color: #f87171; background: rgba(248, 113, 113, 0.1); }
-  .icon-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
 </style>
