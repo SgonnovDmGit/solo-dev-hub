@@ -137,6 +137,16 @@ pub struct DeployReportRow {
     pub updated_at: String,
 }
 
+/// v1.6.0 (F-000043): one decrypted deploy secret name+value. Persisted
+/// encrypted-at-rest in `deploy_secret_values` (mirrors `SecretBundleItemValue`).
+/// snake_case JSON, no serde rename — matches the other deploy structs
+/// (Tauri tool contract, not a server).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeploySecretValue {
+    pub secret_name: String,
+    pub value: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

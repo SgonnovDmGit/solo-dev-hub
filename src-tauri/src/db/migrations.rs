@@ -61,6 +61,7 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
     (24, "project_renames_log", mig_v24_project_renames),
     (25, "deploy_repo_config", mig_v25_deploy_repo_config),
     (26, "secret_bundles", mig_v26_secret_bundles),
+    (27, "deploy_secret_values", mig_v27_deploy_secret_values),
 ];
 
 impl AppDb {
@@ -875,6 +876,27 @@ fn mig_v26_secret_bundles(conn: &Connection) -> SqlResult<()> {
     )
 }
 
+fn mig_v27_deploy_secret_values(conn: &Connection) -> SqlResult<()> {
+    // v1.6.0 (F-000043): encrypted-at-rest persisted deploy secret values.
+    // Reuses the same keyring data key + AES-256-GCM cipher as secret bundles
+    // (v26). `ciphertext`/`nonce` mirror the `secret_bundle_items` layout —
+    // values are NEVER stored in plaintext. UNIQUE(deploy_env_id, secret_name)
+    // makes each per-env secret upsertable by name.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS deploy_secret_values (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            deploy_env_id INTEGER NOT NULL REFERENCES deploy_environments(id) ON DELETE CASCADE,
+            secret_name   TEXT NOT NULL,
+            ciphertext    BLOB NOT NULL,
+            nonce         BLOB NOT NULL,
+            updated_at    TEXT NOT NULL,
+            UNIQUE(deploy_env_id, secret_name)
+        );
+
+        PRAGMA user_version = 27;",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,7 +927,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         // Update this when a new migration is added.
-        assert!(version >= 25);
+        assert!(version >= 27);
     }
 
     #[test]
@@ -1144,11 +1166,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v26 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v27 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 26);
+        assert_eq!(version, 27);
 
         drop(conn);
         let _ = repo;
@@ -1215,7 +1237,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 26);
+        assert_eq!(version, 27);
     }
 
     #[test]
