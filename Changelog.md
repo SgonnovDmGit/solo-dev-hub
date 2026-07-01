@@ -4,6 +4,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-07-01
+
+Internal refactor milestone. Decomposes the two largest Svelte components into focused sub-components ahead of the typed-secrets-vault work (v1.6.0). No user-facing behavior change; the MINOR bump marks the refactor milestone per the roadmap.
+
+### Changed
+- **ProjectDetail and SecretsPanel split into focused components (no behavior change).** `ProjectDetail.svelte` (980 lines) extracts `ProjectHeader.svelte` (title, inline name/description edit, project-type select, edit/delete actions + confirm dialogs) and `ProjectMicroservicesTab.svelte` (connect/disconnect other microservice-projects + connected-parents list, owning its connection state and lazy-loading on mount); `parentsOfMicroservice` stays in the parent and flows to both children as props. `SecretsPanel.svelte` (920 lines) extracts `SecretsList.svelte` (existing-secrets list: checkboxes, per-row autosave, bulk delete) with an exported `reload()` the parent calls after a push for one-fetch refresh-and-verify. The flat flex-shrink cascade (T-000129) is preserved via a self-owned rule on the new list root.
+
+### Removed
+- **Dead project-mode in SecretsPanel.** The `mode='project'` project-wide secrets-push flow (prop, state, functions, confirm dialog) had no call site — SecretsPanel was only ever used in repo mode by RepoDetail. Removed along with 4 orphaned i18n keys. Recoverable from git if a project-wide push feature is ever planned.
+
+### Tests
+- 400 cargo / 86 vitest / 0 svelte issues (unchanged — pure code movement).
+
 ## [1.4.1] — 2026-06-15
 
 Patch release. Continues the v1.4.0 internal-refactor work by decomposing the largest remaining command handler, and adds a developer-workflow self-heal for the local dev server. No user-facing behavior change.

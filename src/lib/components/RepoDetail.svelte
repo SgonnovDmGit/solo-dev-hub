@@ -429,7 +429,7 @@
           <!-- B-000025: SecretsPanel keeps per-repo bulk-paste drafts internally
                (module-level map keyed by repoFullName), so no remount is needed —
                switching repos restores the previous draft instead of wiping it. -->
-          <SecretsPanel mode="repo" repoFullName={repo.github_name} collapsible={false} />
+          <SecretsPanel repoFullName={repo.github_name} collapsible={false} />
         </div>
       {/if}
     {:else if activeTab === 'bugs'}
