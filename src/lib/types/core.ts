@@ -6,6 +6,7 @@ export interface Project {
   description: string | null;
   created_at: string;
   project_type: string; // "standard" | "microservice"
+  auto_sync_enabled: boolean; // T-000136: per-project background auto-sync opt-in
 }
 
 export type ProjectType = 'standard' | 'microservice';

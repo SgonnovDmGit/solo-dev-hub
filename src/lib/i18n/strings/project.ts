@@ -36,6 +36,7 @@ export const ru = {
   'project.deleteBlockedHasParents': 'Отключите проект от parent\'ов перед удалением',
   'project.microserviceNoServer': '⚠ нет server-репо',
   'project.microserviceMultipleServers': '⚠ несколько server-репо',
+  'project.autoSync': 'Авто-синк',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -76,4 +77,5 @@ export const en: Record<keyof typeof ru, string> = {
   'project.deleteBlockedHasParents': 'Disconnect project from parents before deleting',
   'project.microserviceNoServer': '⚠ no server-repo',
   'project.microserviceMultipleServers': '⚠ multiple server-repos',
+  'project.autoSync': 'Auto-sync',
 };

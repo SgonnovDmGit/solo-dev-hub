@@ -20,6 +20,10 @@ export const pat = writable<string | null>(null);
 export const workspaceRoot = writable<string | null>(null);
 export const theme = writable<string>('dark');
 export const aiRulesLastSyncAt = writable<string | null>(null);
+// T-000136: background auto-sync master switch + interval (min) + last-run stamp.
+export const autoSyncEnabled = writable<boolean>(false);
+export const autoSyncIntervalMin = writable<number>(15);
+export const autoSyncLastAt = writable<string | null>(null);
 export const hasPat = derived(pat, ($pat) => $pat !== null && $pat.length > 0);
 
 export async function loadSettings(): Promise<void> {
@@ -49,6 +53,14 @@ export async function loadSettings(): Promise<void> {
     }
     const storedAiRulesLastSyncAt = await getSetting('ai_rules_last_sync_at');
     aiRulesLastSyncAt.set(storedAiRulesLastSyncAt || null);
+    const storedAutoSyncEnabled = await getSetting('auto_sync_enabled');
+    autoSyncEnabled.set(storedAutoSyncEnabled === 'true');
+    const storedAutoSyncInterval = await getSetting('auto_sync_interval_min');
+    if (storedAutoSyncInterval) {
+      const n = parseInt(storedAutoSyncInterval, 10);
+      if (Number.isFinite(n) && n >= 5 && n <= 120) autoSyncIntervalMin.set(n);
+    }
+    autoSyncLastAt.set((await getSetting('auto_sync_last_at')) || null);
   } catch (err) {
     addToast(tf('toast.failedToLoadSettings', String(err)), 'error');
   }
@@ -118,5 +130,36 @@ export async function saveTheme(newTheme: string): Promise<void> {
     document.documentElement.dataset.theme = newTheme;
   } catch (err) {
     addToast(tf('toast.failedToSaveSetting', String(err)), 'error');
+  }
+}
+
+// T-000136: persist the auto-sync master switch.
+export async function saveAutoSyncEnabled(enabled: boolean): Promise<void> {
+  try {
+    await setSetting('auto_sync_enabled', enabled ? 'true' : 'false');
+    autoSyncEnabled.set(enabled);
+  } catch (err) {
+    addToast(tf('toast.failedToSaveSetting', String(err)), 'error');
+  }
+}
+
+// T-000136: persist the auto-sync interval, clamped to 5..120 minutes.
+export async function saveAutoSyncInterval(min: number): Promise<void> {
+  const clamped = Math.min(120, Math.max(5, Math.round(min)));
+  try {
+    await setSetting('auto_sync_interval_min', String(clamped));
+    autoSyncIntervalMin.set(clamped);
+  } catch (err) {
+    addToast(tf('toast.failedToSaveSetting', String(err)), 'error');
+  }
+}
+
+// T-000136: persist the last auto-sync run timestamp (display-only; non-fatal).
+export async function saveAutoSyncLastAt(iso: string): Promise<void> {
+  try {
+    await setSetting('auto_sync_last_at', iso);
+    autoSyncLastAt.set(iso);
+  } catch (err) {
+    // non-fatal: timestamp display only
   }
 }

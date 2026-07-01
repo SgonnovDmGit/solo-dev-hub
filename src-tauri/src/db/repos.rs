@@ -661,6 +661,67 @@ impl AppDb {
         )?;
         Ok(())
     }
+
+    // ── T-000137: per-repo auto-commit target branch ──────────────────────────
+    // Foundation for v1.7.0 auto-commit; command wiring lands in a later task.
+
+    /// Read the per-repo auto-commit target branch (T-000137). Empty/None = auto-commit off.
+    #[allow(dead_code)]
+    pub fn get_autocommit_branch(&self, repo_id: i64) -> SqlResult<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT autocommit_branch FROM repositories WHERE id = ?1",
+            rusqlite::params![repo_id],
+            |row| row.get::<_, Option<String>>(0),
+        ) {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Set/clear the per-repo auto-commit target branch. Pass None or "" to disable.
+    #[allow(dead_code)]
+    pub fn set_autocommit_branch(&self, repo_id: i64, branch: Option<&str>) -> SqlResult<()> {
+        let normalized = branch.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE repositories SET autocommit_branch = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            rusqlite::params![normalized, repo_id],
+        )?;
+        Ok(())
+    }
+
+    /// T-000137: repos opted into auto-commit (non-empty autocommit_branch), each
+    /// paired with its target branch. Used by the post-sync auto-commit pass.
+    pub fn list_autocommit_repos(&self) -> SqlResult<Vec<(Repository, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, github_name, github_url, role, description, language, last_pushed_at, added_at, updated_at, local_path, github_id, deploy_target, autocommit_branch
+             FROM repositories
+             WHERE autocommit_branch IS NOT NULL AND TRIM(autocommit_branch) != ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let repo = Repository {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                github_name: row.get(2)?,
+                github_url: row.get(3)?,
+                role: row.get(4)?,
+                description: row.get(5)?,
+                language: row.get(6)?,
+                last_pushed_at: row.get(7)?,
+                added_at: row.get(8)?,
+                updated_at: row.get(9)?,
+                local_path: row.get(10)?,
+                github_id: row.get(11)?,
+                deploy_target: row.get(12)?,
+            };
+            let branch: String = row.get(13)?;
+            Ok((repo, branch))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
 }
 
 #[cfg(test)]
@@ -1451,6 +1512,35 @@ mod tests {
         db.set_repo_deploy_config(repo.id, &empty).unwrap();
         let read_back3 = db.get_repo_deploy_config(repo.id).unwrap();
         assert!(read_back3.is_empty());
+    }
+
+    // ── T-000137: autocommit_branch CRUD ──────────────────────────────────────
+
+    #[test]
+    fn test_set_get_autocommit_branch_roundtrip() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/ac-repo", "ac", None, None)
+            .unwrap();
+
+        // Fresh repo → None (column defaults NULL).
+        assert_eq!(db.get_autocommit_branch(repo.id).unwrap(), None);
+
+        // Set "dev" → get Some("dev").
+        db.set_autocommit_branch(repo.id, Some("dev")).unwrap();
+        assert_eq!(
+            db.get_autocommit_branch(repo.id).unwrap(),
+            Some("dev".to_string())
+        );
+
+        // Set Some("") → normalized to None (disable).
+        db.set_autocommit_branch(repo.id, Some("")).unwrap();
+        assert_eq!(db.get_autocommit_branch(repo.id).unwrap(), None);
+
+        // Set back to "dev", then None → None.
+        db.set_autocommit_branch(repo.id, Some("dev")).unwrap();
+        db.set_autocommit_branch(repo.id, None).unwrap();
+        assert_eq!(db.get_autocommit_branch(repo.id).unwrap(), None);
     }
 
     #[test]

@@ -715,23 +715,42 @@ mod tests {
         let rid = make_repo(&db);
         let b = seed_bug(&db, rid, "2026-05-10", "major", "logic", 0, "created");
         // 2 testing transitions = 2 attempts.
-        db.update_bug_status(b.id, "in-progress", None, None).unwrap();
-        db.update_bug_status(b.id, "testing", Some(1), None).unwrap();
+        db.update_bug_status(b.id, "in-progress", None, None)
+            .unwrap();
+        db.update_bug_status(b.id, "testing", Some(1), None)
+            .unwrap();
         db.insert_bug_event(
-            b.id, "entered_testing",
-            Some("in-progress"), Some("testing"), "2026-05-12T10:00:00Z",
-        ).unwrap();
+            b.id,
+            "entered_testing",
+            Some("in-progress"),
+            Some("testing"),
+            "2026-05-12T10:00:00Z",
+        )
+        .unwrap();
         db.update_bug_status(b.id, "rejected", None, None).unwrap();
-        db.update_bug_status(b.id, "testing", Some(2), None).unwrap();
+        db.update_bug_status(b.id, "testing", Some(2), None)
+            .unwrap();
         db.insert_bug_event(
-            b.id, "entered_testing",
-            Some("rejected"), Some("testing"), "2026-05-14T10:00:00Z",
-        ).unwrap();
-        db.update_bug_status(b.id, "confirmed", None, Some("2026-05-20T10:00:00Z")).unwrap();
+            b.id,
+            "entered_testing",
+            Some("rejected"),
+            Some("testing"),
+            "2026-05-14T10:00:00Z",
+        )
+        .unwrap();
+        db.update_bug_status(b.id, "confirmed", None, Some("2026-05-20T10:00:00Z"))
+            .unwrap();
 
         // Reopen: status → testing, fix_attempts UNCHANGED at 2.
         db.reopen_bug(b.id).unwrap();
-        db.insert_bug_event(b.id, "reopened", Some("confirmed"), Some("testing"), "2026-05-21T10:00:00Z").unwrap();
+        db.insert_bug_event(
+            b.id,
+            "reopened",
+            Some("confirmed"),
+            Some("testing"),
+            "2026-05-21T10:00:00Z",
+        )
+        .unwrap();
 
         // Invariant: COUNT(entered_testing) == fix_attempts.
         let bug = db.get_bug_by_id(b.id).unwrap().unwrap();
@@ -745,7 +764,10 @@ mod tests {
         };
         assert_eq!(count, 2, "two entered_testing events");
         assert_eq!(bug.fix_attempts, 2, "fix_attempts matches");
-        assert_eq!(count, bug.fix_attempts as i64, "invariant holds after reopen");
+        assert_eq!(
+            count, bug.fix_attempts as i64,
+            "invariant holds after reopen"
+        );
 
         // The reopened event exists but doesn't count toward attempts.
         let reopened_count: i64 = {
@@ -754,7 +776,8 @@ mod tests {
                 "SELECT COUNT(*) FROM bug_events WHERE bug_id = ?1 AND event_type = 'reopened'",
                 rusqlite::params![b.id],
                 |r| r.get(0),
-            ).unwrap()
+            )
+            .unwrap()
         };
         assert_eq!(reopened_count, 1, "one reopened event logged");
     }

@@ -27,6 +27,11 @@ struct SyncCounters {
     responses: usize,
     migrated: usize,
     errors: Vec<String>,
+    /// F-000039: base REQ filenames whose pair was auto-closed via `.impl.md`.
+    auto_closed: Vec<String>,
+    /// T-000137: display names of repos that received an SDH auto-commit of
+    /// synced cross-repo files this pass.
+    committed: Vec<String>,
 }
 
 impl SyncCounters {
@@ -36,6 +41,8 @@ impl SyncCounters {
             responses: 0,
             migrated: 0,
             errors: Vec::new(),
+            auto_closed: Vec::new(),
+            committed: Vec::new(),
         }
     }
 
@@ -45,6 +52,8 @@ impl SyncCounters {
             responses: self.responses,
             migrated: self.migrated,
             errors: self.errors,
+            auto_closed: self.auto_closed,
+            committed: self.committed,
         }
     }
 }
@@ -162,6 +171,16 @@ fn sync_client_to_server(
             }
             let srv_client_dir = client_requirements_parent.join(&client_name);
 
+            // F-000039: auto-close pairs the client (sender) acknowledged via .impl.md.
+            match sync::auto_close_impl_pairs(&client_req_dir, &srv_client_dir) {
+                Ok(closed) => c.auto_closed.extend(closed),
+                Err(e) => c.errors.push(format!(
+                    "Auto-close impl -> {}: {}",
+                    client.display_name(),
+                    e
+                )),
+            }
+
             // Copy REQ-*.md from client (source of truth) to server.
             // Overwrite on change so sender edits propagate to the recipient.
             for req_file in sync::scan_requirements(&client_req_dir) {
@@ -240,6 +259,17 @@ fn sync_client_to_server(
                         e
                     )),
                 }
+            }
+
+            // T-000139: blind-copy sender's docs/my_api/*.md into the client's server-api inbox.
+            match sync::copy_my_api_dir(
+                &srv_base.join("docs"),
+                &client_base.join("docs").join("server-api"),
+            ) {
+                Ok(n) => c.copied += n,
+                Err(e) => c
+                    .errors
+                    .push(format!("Copy my_api -> {}: {}", client.display_name(), e)),
             }
         }
     }
@@ -444,6 +474,14 @@ fn sync_server_to_microservice(
         // F-033: nested per parent-server so multi-parent microservices don't collide.
         let ms_srv_dir = ms_srv_parent.join(&parent_folder);
 
+        // F-000039: auto-close pairs the server (sender) acknowledged via .impl.md.
+        match sync::auto_close_impl_pairs(&srv_ms_dir, &ms_srv_dir) {
+            Ok(closed) => c.auto_closed.extend(closed),
+            Err(e) => c
+                .errors
+                .push(format!("Auto-close impl (server->ms): {}", e)),
+        }
+
         // Copy REQ-*.md from server (source of truth) to microservice server-repo.
         // Overwrite on change so sender edits propagate to the recipient.
         for req_file in sync::scan_requirements(&srv_ms_dir) {
@@ -507,6 +545,22 @@ fn sync_server_to_microservice(
                     e
                 )),
             }
+        }
+
+        // T-000139: blind-copy the microservice's docs/my_api/*.md into the parent's microservice-api/<ms_name> inbox.
+        match sync::copy_my_api_dir(
+            &ms_base.join("docs"),
+            &srv_base
+                .join("docs")
+                .join("microservice-api")
+                .join(&ms_name),
+        ) {
+            Ok(n) => c.copied += n,
+            Err(e) => c.errors.push(format!(
+                "Copy ms my_api from {}: {}",
+                ms_server_repo.display_name(),
+                e
+            )),
         }
     }
 }
@@ -599,6 +653,18 @@ fn sync_microservice_to_parents(
                     }
                 }
 
+                // T-000139: blind-copy the ms's docs/my_api/*.md into the parent's microservice-api/<ms_project_name> inbox.
+                match sync::copy_my_api_dir(
+                    &ms_base.join("docs"),
+                    &parent_base
+                        .join("docs")
+                        .join("microservice-api")
+                        .join(&ms_project_name),
+                ) {
+                    Ok(n) => c.copied += n,
+                    Err(e) => c.errors.push(format!("Copy ms my_api -> parent: {}", e)),
+                }
+
                 // parent → MS: REQ-*.md (source of truth on parent side)
                 let parent_ms_dir = parent_base
                     .join("docs")
@@ -608,6 +674,15 @@ fn sync_microservice_to_parents(
                     .join("docs")
                     .join("server-requirements")
                     .join(&parent_canonical);
+
+                // F-000039: auto-close pairs the parent server (sender) acknowledged via .impl.md.
+                match sync::auto_close_impl_pairs(&parent_ms_dir, &ms_parent_dir) {
+                    Ok(closed) => c.auto_closed.extend(closed),
+                    Err(e) => c
+                        .errors
+                        .push(format!("Auto-close impl (parent->ms): {}", e)),
+                }
+
                 for req_file in sync::scan_requirements(&parent_ms_dir) {
                     let src = parent_ms_dir.join(&req_file);
                     let dst = ms_parent_dir.join(&req_file);
@@ -777,6 +852,45 @@ pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, Strin
     if project_type == "microservice" {
         if let Some(ms_server) = server {
             sync_microservice_to_parents(db, project_id, ms_server, &mut c);
+        }
+    }
+
+    // T-000137: auto-commit synced cross-repo files in opted-in repos (portfolio-wide;
+    // pathspec-scoped, so untouched repos and the dev's own WIP are no-ops).
+    if let Some(git) = crate::git_ops::check_git_available() {
+        match db.list_autocommit_repos() {
+            Ok(repos) => {
+                for (repo, branch) in repos {
+                    let Some(ref lp) = repo.local_path else {
+                        continue;
+                    };
+                    let path = std::path::Path::new(lp);
+                    if !crate::git_ops::is_git_repo(path) {
+                        continue;
+                    }
+                    match crate::sync::autocommit_repo(&git, path, &branch) {
+                        Ok(crate::git_ops::CommitOutcome::Committed { .. }) => {
+                            c.committed.push(repo.display_name());
+                        }
+                        Ok(crate::git_ops::CommitOutcome::WrongBranch { current, expected }) => {
+                            c.errors.push(format!(
+                                "Auto-commit skipped for {}: on branch {:?}, expected {}",
+                                repo.display_name(),
+                                current,
+                                expected
+                            ));
+                        }
+                        Ok(crate::git_ops::CommitOutcome::NothingToCommit) => {}
+                        Err(e) => {
+                            c.errors
+                                .push(format!("Auto-commit {}: {}", repo.display_name(), e))
+                        }
+                    }
+                }
+            }
+            Err(e) => c
+                .errors
+                .push(format!("Auto-commit: failed to list repos: {}", e)),
         }
     }
 

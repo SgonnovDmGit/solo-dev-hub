@@ -62,6 +62,11 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
     (25, "deploy_repo_config", mig_v25_deploy_repo_config),
     (26, "secret_bundles", mig_v26_secret_bundles),
     (27, "deploy_secret_values", mig_v27_deploy_secret_values),
+    (
+        28,
+        "autocommit_branch_and_auto_sync",
+        mig_v28_workflow_automation_columns,
+    ),
 ];
 
 impl AppDb {
@@ -897,6 +902,17 @@ fn mig_v27_deploy_secret_values(conn: &Connection) -> SqlResult<()> {
     )
 }
 
+fn mig_v28_workflow_automation_columns(conn: &Connection) -> SqlResult<()> {
+    // v1.7.0: auto-commit target branch per repo (T-000137) + per-project
+    // auto-sync opt-in flag (T-000136). Both nullable/defaulted so existing
+    // rows migrate cleanly.
+    conn.execute_batch(
+        "ALTER TABLE repositories ADD COLUMN autocommit_branch TEXT;
+         ALTER TABLE projects ADD COLUMN auto_sync_enabled INTEGER NOT NULL DEFAULT 0;
+         PRAGMA user_version = 28;",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -927,7 +943,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         // Update this when a new migration is added.
-        assert!(version >= 27);
+        assert!(version >= 28);
     }
 
     #[test]
@@ -1166,11 +1182,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v27 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v28 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 27);
+        assert_eq!(version, 28);
 
         drop(conn);
         let _ = repo;
@@ -1237,7 +1253,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 27);
+        assert_eq!(version, 28);
     }
 
     #[test]
@@ -1251,6 +1267,35 @@ mod tests {
             .filter_map(Result::ok)
             .collect();
         assert!(cols.contains(&"tasks_migrated_at".to_string()));
+    }
+
+    #[test]
+    fn test_v28_adds_workflow_automation_columns() {
+        // T-000141: repositories.autocommit_branch + projects.auto_sync_enabled.
+        let db = make_db();
+        let conn = db.conn.lock().unwrap();
+
+        let mut repo_stmt = conn.prepare("PRAGMA table_info(repositories)").unwrap();
+        let repo_cols: Vec<String> = repo_stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            repo_cols.contains(&"autocommit_branch".to_string()),
+            "repositories must have autocommit_branch column"
+        );
+
+        let mut proj_stmt = conn.prepare("PRAGMA table_info(projects)").unwrap();
+        let proj_cols: Vec<String> = proj_stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            proj_cols.contains(&"auto_sync_enabled".to_string()),
+            "projects must have auto_sync_enabled column"
+        );
     }
 
     #[test]

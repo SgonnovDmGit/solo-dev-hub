@@ -95,6 +95,145 @@ pub fn detect_repo_state(local_path: &Path) -> RepoState {
     RepoState::Clean
 }
 
+/// Current checked-out branch name, or None if detached HEAD (or unborn).
+// T-000141 foundation: consumed by the v1.7.0 auto-commit wiring (T-000137+).
+#[allow(dead_code)]
+pub fn current_branch(git: &GitBinary, local_path: &Path) -> Result<Option<String>, String> {
+    let out = spawn_cmd(&git.0)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git rev-parse failed to start: {}", e))?;
+    if !out.status.success() {
+        // Unborn branch (no commits yet) — treat as no resolvable branch.
+        return Ok(None);
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() || name == "HEAD" {
+        Ok(None) // detached HEAD
+    } else {
+        Ok(Some(name))
+    }
+}
+
+/// Outcome of a scoped (pathspec) commit attempt.
+// T-000141 foundation: consumed by the v1.7.0 auto-commit wiring (T-000137+).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutcome {
+    Committed {
+        files: usize,
+    },
+    NothingToCommit,
+    WrongBranch {
+        current: Option<String>,
+        expected: String,
+    },
+}
+
+/// Commit ONLY `paths` (adds/mods/deletes) on top of HEAD using a pathspec
+/// commit, so any other staged or unstaged work in the tree is left untouched.
+///
+/// Guard: commits only if the current branch == `expected_branch`; otherwise
+/// returns `WrongBranch` without modifying the repo (never checks out a branch).
+///
+/// Identity (author + committer) is set via `-c user.name=/-c user.email=`,
+/// which does NOT mutate the repo's git config.
+///
+/// `paths` are repo-relative. New/modified/deleted are all handled: we
+/// `git add -A -- <paths>` first (so brand-new untracked synced files are staged),
+/// then `git commit -- <paths>` (pathspec scopes the commit to just these files).
+// T-000141 foundation: consumed by the v1.7.0 auto-commit wiring (T-000137+).
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn commit_paths(
+    git: &GitBinary,
+    local_path: &Path,
+    expected_branch: &str,
+    paths: &[PathBuf],
+    subject: &str,
+    body: Option<&str>,
+    author_name: &str,
+    author_email: &str,
+) -> Result<CommitOutcome, String> {
+    if paths.is_empty() {
+        return Ok(CommitOutcome::NothingToCommit);
+    }
+    // Branch guard.
+    let current = current_branch(git, local_path)?;
+    if current.as_deref() != Some(expected_branch) {
+        return Ok(CommitOutcome::WrongBranch {
+            current,
+            expected: expected_branch.to_string(),
+        });
+    }
+    // Stage our paths (adds/mods/deletes), scoped by pathspec.
+    let add = spawn_cmd(&git.0)
+        .arg("add")
+        .arg("-A")
+        .arg("--")
+        .args(paths)
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git add failed to start: {}", e))?;
+    if !add.status.success() {
+        return Err(format!(
+            "git add exit {}: {}",
+            add.status,
+            String::from_utf8_lossy(&add.stderr)
+        ));
+    }
+    // Anything actually staged for these paths vs HEAD?
+    let staged = spawn_cmd(&git.0)
+        .args(["diff", "--cached", "--name-only", "-z", "--"])
+        .args(paths)
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git diff --cached failed to start: {}", e))?;
+    if !staged.status.success() {
+        return Err(format!(
+            "git diff --cached exit {}: {}",
+            staged.status,
+            String::from_utf8_lossy(&staged.stderr)
+        ));
+    }
+    let staged_names: Vec<&[u8]> = staged
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if staged_names.is_empty() {
+        return Ok(CommitOutcome::NothingToCommit);
+    }
+    // Pathspec commit — scopes the commit to just these paths, leaving other
+    // staged/unstaged work in the index untouched.
+    let mut cmd = spawn_cmd(&git.0);
+    cmd.arg("-c")
+        .arg(format!("user.name={}", author_name))
+        .arg("-c")
+        .arg(format!("user.email={}", author_email))
+        .arg("commit")
+        .arg("-m")
+        .arg(subject);
+    if let Some(b) = body {
+        cmd.arg("-m").arg(b);
+    }
+    cmd.arg("--").args(paths).current_dir(local_path);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("git commit failed to start: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Defensive: race where nothing remained to commit.
+        if stderr.contains("nothing to commit") || stderr.contains("no changes added") {
+            return Ok(CommitOutcome::NothingToCommit);
+        }
+        return Err(format!("git commit exit {}: {}", out.status, stderr));
+    }
+    Ok(CommitOutcome::Committed {
+        files: staged_names.len(),
+    })
+}
+
 /// List tracked files that match `.gitignore` rules. Uses `-z` so the parser
 /// is whitespace-safe (filenames with spaces, newlines, quotes all survive).
 /// Git writes UTF-8 to stdout regardless of platform.
@@ -373,5 +512,245 @@ mod tests {
         let git = check_git_available().expect("git available");
         let n = count_other_staged_changes(&git, tmp.path(), &[PathBuf::from("a.txt")]).unwrap();
         assert_eq!(n, 2, "expected b.txt + c.txt = 2 other staged");
+    }
+
+    // ── T-000141: current_branch / commit_paths ───────────────────────────────
+
+    /// Count commits reachable from HEAD (0 if unborn).
+    fn commit_count(dir: &Path) -> usize {
+        let out = Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        if !out.status.success() {
+            return 0; // unborn branch
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    /// Files in HEAD's tree commit (`git log -1 --name-only`, filtered to paths).
+    fn head_files(dir: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["log", "-1", "--name-only", "--format="])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    fn staged_files(dir: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_current_branch_returns_master() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        // `git rev-parse --abbrev-ref HEAD` only resolves once the branch has a
+        // commit (an unborn branch reports None) — seed one first.
+        fs::write(tmp.path().join("README.md"), "# r\n").unwrap();
+        run_git(tmp.path(), &["add", "README.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "init"]);
+        let git = check_git_available().expect("git available");
+        assert_eq!(
+            current_branch(&git, tmp.path()).unwrap(),
+            Some("master".to_string())
+        );
+    }
+
+    #[test]
+    fn test_commit_paths_new_file_committed() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        // Baseline commit so the branch is born (commit_paths' branch guard needs
+        // a resolvable branch); synced.md is a brand-new file added on top.
+        fs::write(tmp.path().join("README.md"), "# r\n").unwrap();
+        run_git(tmp.path(), &["add", "README.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "init"]);
+        fs::write(tmp.path().join("synced.md"), "# hi\n").unwrap();
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths(
+            &git,
+            tmp.path(),
+            "master",
+            &[PathBuf::from("synced.md")],
+            "sync: add synced.md",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 1 });
+
+        // File is in HEAD.
+        assert!(
+            head_files(tmp.path()).contains(&"synced.md".to_string()),
+            "synced.md must be in HEAD tree"
+        );
+
+        // Author identity applied without touching repo config.
+        let an = Command::new("git")
+            .args(["log", "-1", "--format=%an"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&an.stdout).trim(), "Solo Dev Hub");
+    }
+
+    #[test]
+    fn test_commit_paths_wrong_branch_no_commit() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        // Seed a commit so we have a non-zero baseline count.
+        fs::write(tmp.path().join("README.md"), "# r\n").unwrap();
+        run_git(tmp.path(), &["add", "README.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "init"]);
+        let before = commit_count(tmp.path());
+
+        fs::write(tmp.path().join("synced.md"), "# hi\n").unwrap();
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths(
+            &git,
+            tmp.path(),
+            "dev", // repo is on master
+            &[PathBuf::from("synced.md")],
+            "sync: add synced.md",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            CommitOutcome::WrongBranch {
+                current: Some("master".to_string()),
+                expected: "dev".to_string(),
+            }
+        );
+        assert_eq!(commit_count(tmp.path()), before, "no commit must be made");
+    }
+
+    #[test]
+    fn test_commit_paths_preserves_other_staged_work() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        fs::write(tmp.path().join("README.md"), "# r\n").unwrap();
+        run_git(tmp.path(), &["add", "README.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "init"]);
+
+        // Unrelated staged work.
+        fs::write(tmp.path().join("wip.txt"), "work in progress\n").unwrap();
+        run_git(tmp.path(), &["add", "wip.txt"]);
+
+        // Our synced file.
+        fs::write(tmp.path().join("synced.md"), "# hi\n").unwrap();
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths(
+            &git,
+            tmp.path(),
+            "master",
+            &[PathBuf::from("synced.md")],
+            "sync: add synced.md",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 1 });
+
+        // synced.md is in HEAD, wip.txt is NOT committed.
+        let hf = head_files(tmp.path());
+        assert!(hf.contains(&"synced.md".to_string()));
+        assert!(
+            !hf.contains(&"wip.txt".to_string()),
+            "wip.txt must not be in the commit"
+        );
+
+        // wip.txt still staged.
+        assert!(
+            staged_files(tmp.path()).contains(&"wip.txt".to_string()),
+            "wip.txt must remain staged after scoped commit"
+        );
+    }
+
+    #[test]
+    fn test_commit_paths_handles_deletion() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        fs::write(tmp.path().join("gone.md"), "bye\n").unwrap();
+        run_git(tmp.path(), &["add", "gone.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "add gone"]);
+
+        // Delete from disk, then commit that path.
+        fs::remove_file(tmp.path().join("gone.md")).unwrap();
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths(
+            &git,
+            tmp.path(),
+            "master",
+            &[PathBuf::from("gone.md")],
+            "sync: remove gone.md",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 1 });
+
+        // Deletion recorded: file no longer tracked in HEAD tree.
+        let ls = Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let tree = String::from_utf8_lossy(&ls.stdout).to_string();
+        assert!(
+            !tree.lines().any(|l| l == "gone.md"),
+            "gone.md must be removed from the tree: {}",
+            tree
+        );
+    }
+
+    #[test]
+    fn test_commit_paths_nothing_to_commit() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        fs::write(tmp.path().join("stable.md"), "unchanged\n").unwrap();
+        run_git(tmp.path(), &["add", "stable.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "add stable"]);
+
+        // No changes to stable.md since HEAD.
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths(
+            &git,
+            tmp.path(),
+            "master",
+            &[PathBuf::from("stable.md")],
+            "sync: noop",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
     }
 }

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { editProject, removeProject, loadProjects } from '$lib/stores/projects';
-  import { updateProjectType } from '$lib/api/tauri-commands';
+  import { updateProjectType, setProjectAutoSync } from '$lib/api/tauri-commands';
   import { selectedProjectId, currentScreen, addToast } from '$lib/stores/ui';
   import { tStore } from '$lib/i18n';
   import type { Project } from '$lib/types';
@@ -95,6 +95,18 @@
     }
   }
 
+  // T-000136: toggle background auto-sync opt-in for this project. Reload the
+  // projects store so the flag on `project.auto_sync_enabled` reflects the DB.
+  async function handleAutoSyncToggle(e: Event) {
+    const enabled = (e.currentTarget as HTMLInputElement).checked;
+    try {
+      await setProjectAutoSync(project.id, enabled);
+      await loadProjects();
+    } catch (err) {
+      addToast(String(err), 'error');
+    }
+  }
+
   async function handleDeleteProject() {
     const success = await removeProject(project.id);
     if (success) {
@@ -166,6 +178,15 @@
     </span>
     <span class="meta-sep">•</span>
     {$tStore('project.created')}: {formatDate(project.created_at)}
+    <span class="meta-sep">•</span>
+    <label class="autosync-toggle" title={$tStore('project.autoSync' as any)}>
+      <input
+        type="checkbox"
+        checked={project.auto_sync_enabled}
+        onchange={handleAutoSyncToggle}
+      />
+      {$tStore('project.autoSync' as any)}
+    </label>
   </div>
 </div>
 
@@ -299,6 +320,20 @@
 
   .meta-sep {
     color: var(--border);
+  }
+
+  .autosync-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .autosync-toggle input {
+    cursor: pointer;
+    margin: 0;
   }
 
   .description-section {

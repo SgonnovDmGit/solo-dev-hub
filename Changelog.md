@@ -4,6 +4,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-07-02
+
+Workflow automation for cross-repo sync (pains №2b/2c/3). Sync can now run on a background timer, auto-commit the files it copies into recipient repos so a local AI stops treating them as foreign, and auto-close REQ pairs the sender acknowledges — plus a multi-file API-contract folder and a copyable error-toast fix. All app-side; the global cross-repo rules template documents the three new contracts.
+
+### Added
+- **Background auto-sync on a timer (T-000136).** A per-project "Auto-sync" toggle (project header) plus a global master switch + interval (5–120 min, default 15) in Settings run the sync for opted-in projects on a fixed 60-second check cadence, gated on the configured interval elapsing and debounced against manual syncs. The last auto-sync time is shown in Settings. Runs only while the app window is open.
+- **Auto-commit of synced cross-repo files (T-000137).** A per-repo "Auto-commit" branch field (empty = off) in the repo detail header. After a sync, repos with a configured branch get a marker commit — author `Solo Dev Hub <noreply@solodevhub.app>`, `chore(sdh-sync):` subject — of changes within the cross-repo doc folders only, pathspec-scoped so other working-tree changes are untouched, and only when the repo is on the configured branch (otherwise skipped and reported). Stops recipient assistants from treating synced files as foreign uncommitted changes.
+- **REQ auto-close via `.impl.md` acknowledgement (F-000039).** The sender drops an (optionally empty) `REQ-NNN_<slug>.impl.md` in its outgoing folder to signal integration is done; the next sync tears down the whole triple (`.md`/`.response.md`/`.impl.md`) on both sides automatically. A "⏳ impl" badge marks pending-auto-close pairs in the sync screen and the run reports how many pairs closed; the manual ✓ button stays for repos not using the file.
+- **Multi-file API contracts via `docs/my_api/` (T-000139).** A sender may split its contract across multiple markdown files placed in a `docs/my_api/` folder; sync blindly copies every `*.md` into the recipient's existing inbox (`docs/server-api/` or `docs/microservice-api/<name>/`). The legacy single-file `docs/api.md` / `docs/handlers.md` copy still works (backward-compatible).
+
+### Fixed
+- **Error and warning toasts are readable and copyable (B-000027).** They no longer auto-dismiss after 5 seconds, render as a selectable, scrollable panel (max-height 40vh) with a copy button and an explicit × dismiss, and the container is wider (460px). Success/info toasts keep the 5-second click-to-dismiss behavior.
+
+### Tests
+- 433 cargo / 86 vitest / 0 svelte issues. Schema migration v28 (`repositories.autocommit_branch`, `projects.auto_sync_enabled`).
+
 ## [1.6.0] — 2026-07-01
 
 Deploy value persistence (pain №1). Selected deploy secret values can now be kept locally (encrypted at rest) so they pre-fill instead of being retyped every session, and the deploy report gained a database-name line per environment. Originally scoped as a standalone typed secrets vault; corrected during design to a deploy-integrated feature — the DB belongs to deploy.

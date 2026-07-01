@@ -30,7 +30,7 @@ impl AppDb {
         )?;
         let id = conn.last_insert_rowid();
         conn.query_row(
-            "SELECT id, name, description, created_at, project_type FROM projects WHERE id = ?1",
+            "SELECT id, name, description, created_at, project_type, auto_sync_enabled FROM projects WHERE id = ?1",
             rusqlite::params![id],
             |row| {
                 Ok(Project {
@@ -39,6 +39,7 @@ impl AppDb {
                     description: row.get(2)?,
                     created_at: row.get(3)?,
                     project_type: row.get(4)?,
+                    auto_sync_enabled: row.get::<_, bool>(5)?,
                 })
             },
         )
@@ -48,7 +49,7 @@ impl AppDb {
         let conn = self.conn.lock().unwrap();
         // F-025: ORDER BY sort_order first (manual user order), name as tie-breaker.
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at, project_type FROM projects ORDER BY sort_order ASC, name ASC",
+            "SELECT id, name, description, created_at, project_type, auto_sync_enabled FROM projects ORDER BY sort_order ASC, name ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Project {
@@ -57,6 +58,7 @@ impl AppDb {
                 description: row.get(2)?,
                 created_at: row.get(3)?,
                 project_type: row.get(4)?,
+                auto_sync_enabled: row.get::<_, bool>(5)?,
             })
         })?;
         rows.collect()
@@ -92,7 +94,7 @@ impl AppDb {
             }
         }
         conn.query_row(
-            "SELECT id, name, description, created_at, project_type FROM projects WHERE id = ?1",
+            "SELECT id, name, description, created_at, project_type, auto_sync_enabled FROM projects WHERE id = ?1",
             rusqlite::params![id],
             |row| {
                 Ok(Project {
@@ -101,6 +103,7 @@ impl AppDb {
                     description: row.get(2)?,
                     created_at: row.get(3)?,
                     project_type: row.get(4)?,
+                    auto_sync_enabled: row.get::<_, bool>(5)?,
                 })
             },
         )
@@ -110,7 +113,7 @@ impl AppDb {
     pub fn get_project(&self, id: i64) -> SqlResult<Project> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, name, description, created_at, project_type FROM projects WHERE id = ?1",
+            "SELECT id, name, description, created_at, project_type, auto_sync_enabled FROM projects WHERE id = ?1",
             rusqlite::params![id],
             |row| {
                 Ok(Project {
@@ -119,9 +122,21 @@ impl AppDb {
                     description: row.get(2)?,
                     created_at: row.get(3)?,
                     project_type: row.get(4)?,
+                    auto_sync_enabled: row.get::<_, bool>(5)?,
                 })
             },
         )
+    }
+
+    /// T-000136: toggle the per-project auto-sync opt-in flag. Read back via
+    /// `get_project` / `list_projects` (the flag lives on the `Project` struct).
+    pub fn set_project_auto_sync(&self, project_id: i64, enabled: bool) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE projects SET auto_sync_enabled = ?1 WHERE id = ?2",
+            rusqlite::params![enabled as i64, project_id],
+        )?;
+        Ok(())
     }
 
     /// Delete project. If project is microservice type AND has parents, returns Err.
@@ -433,7 +448,7 @@ impl AppDb {
     pub fn list_microservice_projects(&self) -> SqlResult<Vec<Project>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at, project_type FROM projects WHERE project_type = 'microservice' ORDER BY name",
+            "SELECT id, name, description, created_at, project_type, auto_sync_enabled FROM projects WHERE project_type = 'microservice' ORDER BY name",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Project {
@@ -442,6 +457,7 @@ impl AppDb {
                 description: row.get(2)?,
                 created_at: row.get(3)?,
                 project_type: row.get(4)?,
+                auto_sync_enabled: row.get::<_, bool>(5)?,
             })
         })?;
         rows.collect()
@@ -451,7 +467,7 @@ impl AppDb {
     pub fn list_parents_of_microservice(&self, ms_project_id: i64) -> SqlResult<Vec<Project>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT p.id, p.name, p.description, p.created_at, p.project_type
+            "SELECT p.id, p.name, p.description, p.created_at, p.project_type, p.auto_sync_enabled
              FROM projects p
              INNER JOIN project_microservices pm ON pm.project_id = p.id
              WHERE pm.microservice_project_id = ?1
@@ -464,6 +480,7 @@ impl AppDb {
                 description: row.get(2)?,
                 created_at: row.get(3)?,
                 project_type: row.get(4)?,
+                auto_sync_enabled: row.get::<_, bool>(5)?,
             })
         })?;
         rows.collect()
@@ -531,7 +548,7 @@ impl AppDb {
         // Return the updated project
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, name, description, created_at, project_type FROM projects WHERE id = ?1",
+            "SELECT id, name, description, created_at, project_type, auto_sync_enabled FROM projects WHERE id = ?1",
             rusqlite::params![id],
             |row| {
                 Ok(Project {
@@ -540,6 +557,7 @@ impl AppDb {
                     description: row.get(2)?,
                     created_at: row.get(3)?,
                     project_type: row.get(4)?,
+                    auto_sync_enabled: row.get::<_, bool>(5)?,
                 })
             },
         )
@@ -706,6 +724,25 @@ mod tests {
         assert_eq!(p.name, "My App");
         assert_eq!(p.description.as_deref(), Some("A great app"));
         assert!(p.id > 0);
+    }
+
+    #[test]
+    fn test_set_project_auto_sync_roundtrip() {
+        // T-000136: auto_sync_enabled defaults false, toggles to true, reads back.
+        let db = make_db();
+        let p = db.create_project("Sync App", None, "standard").unwrap();
+        assert!(!p.auto_sync_enabled, "new project must default to false");
+
+        db.set_project_auto_sync(p.id, true).unwrap();
+        let reread = db.get_project(p.id).unwrap();
+        assert!(reread.auto_sync_enabled, "flag must be true after enable");
+
+        db.set_project_auto_sync(p.id, false).unwrap();
+        let reread2 = db.get_project(p.id).unwrap();
+        assert!(
+            !reread2.auto_sync_enabled,
+            "flag must be false after disable"
+        );
     }
 
     #[test]

@@ -3,6 +3,10 @@ export interface SyncResult {
   responses: number;
   migrated: number;
   errors: string[];
+  /** F-000039: base REQ filenames whose pair was auto-closed via a sender `.impl.md` drop. */
+  auto_closed: string[];
+  /** T-000137: display names of repos that received an SDH auto-commit of synced cross-repo files. */
+  committed: string[];
 }
 
 export interface RequirementInfo {
@@ -14,6 +18,9 @@ export interface RequirementInfo {
   /** B-000018: true для reverse-lookup строк со стороны ms-проекта (sender — parent server,
    * recipient — текущий ms). UI скрывает ✓-кнопку для них. */
   is_reverse_lookup?: boolean;
+  /** F-000039: true когда sender положил рядом `REQ-NNN_slug.impl.md` (пара будет
+   * авто-закрыта на следующем sync). */
+  has_impl?: boolean;
 }
 
 /** F-033: rename-log entry. */

@@ -44,9 +44,13 @@ export function addToast(message: string, type: ToastType = 'info'): void {
   const id = ++toastCounter;
   toasts.update((list) => [...list, { id, message, type }]);
 
-  setTimeout(() => {
-    toasts.update((list) => list.filter((t) => t.id !== id));
-  }, 5000);
+  // B-000027: errors/warnings persist until the user dismisses them (they may be
+  // long and need reading/copying). Transient success/info auto-dismiss after 5s.
+  if (type !== 'error' && type !== 'warning') {
+    setTimeout(() => {
+      toasts.update((list) => list.filter((t) => t.id !== id));
+    }, 5000);
+  }
 }
 
 export function dismissToast(id: number): void {

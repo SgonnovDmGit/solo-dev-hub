@@ -39,6 +39,17 @@ pub fn delete_project(db: State<AppDb>, id: i64) -> Result<(), String> {
     db.delete_project(id).map_err(|e| e.to_string())
 }
 
+// T-000136: toggle the per-project auto-sync opt-in flag from the UI.
+#[tauri::command]
+pub fn set_project_auto_sync(
+    db: State<AppDb>,
+    project_id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    db.set_project_auto_sync(project_id, enabled)
+        .map_err(|e| e.to_string())
+}
+
 // ── Microservice connection commands (F-012) ─────────────────────────────────
 
 #[tauri::command]

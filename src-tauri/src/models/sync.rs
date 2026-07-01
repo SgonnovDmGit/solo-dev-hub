@@ -26,6 +26,15 @@ pub struct SyncResult {
     pub responses: usize,
     pub migrated: usize,
     pub errors: Vec<String>,
+    /// F-000039: base REQ filenames (`REQ-NNN_slug.md`) whose pair the sender
+    /// acknowledged via a `.impl.md` drop and was auto-torn-down this sync.
+    #[serde(default)]
+    pub auto_closed: Vec<String>,
+    /// T-000137: display names of repos that received an SDH auto-commit of
+    /// synced cross-repo files this sync (opted-in repos with a set
+    /// `autocommit_branch`, on the correct branch, with actual changes).
+    #[serde(default)]
+    pub committed: Vec<String>,
 }
 
 /// F-000041: report from `untrack_files`. `untracked` = total file count
@@ -73,6 +82,11 @@ pub struct RequirementInfo {
     /// и в UI больше не гейтит кнопку.
     #[serde(default)]
     pub is_reverse_lookup: bool,
+    /// F-000039: true when the sender dropped a `REQ-NNN_slug.impl.md`
+    /// acknowledgement alongside this REQ — signals the pair is about to be
+    /// auto-closed on next sync.
+    #[serde(default)]
+    pub has_impl: bool,
 }
 
 /// F-033: history record of a repository rename.

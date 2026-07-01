@@ -85,6 +85,23 @@ pub fn scan_responses(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// F-000039: scan directory for REQ-*.impl.md acknowledgement files.
+pub fn scan_impl_files(dir: &Path) -> Vec<String> {
+    if !dir.exists() {
+        return vec![];
+    }
+    fs::read_dir(dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| name.starts_with("REQ-") && name.ends_with(".impl.md"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Remove a file
 pub fn remove_file_if_exists(path: &Path) -> Result<(), String> {
     if path.exists() {
@@ -110,6 +127,40 @@ pub fn copy_file_if_changed(source: &Path, target: &Path) -> Result<bool, String
     }
     fs::copy(source, target).map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// T-000139: copy every `*.md` from `<sender_docs>/my_api/` into `recipient_inbox`
+/// (flat). Returns the count of files actually written (content changed). A
+/// missing `my_api` folder → Ok(0). Non-`.md` files and subdirectories are
+/// ignored. Reuses `copy_file_if_changed` (which creates the inbox dir + skips
+/// unchanged files).
+pub fn copy_my_api_dir(sender_docs: &Path, recipient_inbox: &Path) -> Result<usize, String> {
+    let my_api = sender_docs.join("my_api");
+    if !my_api.is_dir() {
+        return Ok(0);
+    }
+    let mut copied = 0usize;
+    let entries = fs::read_dir(&my_api).map_err(|e| e.to_string())?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_md = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+        if !is_md {
+            continue;
+        }
+        let name = entry.file_name();
+        let target = recipient_inbox.join(&name);
+        if copy_file_if_changed(&path, &target)? {
+            copied += 1;
+        }
+    }
+    Ok(copied)
 }
 
 /// Move a file atomically: write to target first, then delete source.
@@ -252,6 +303,24 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_impl_files() {
+        // F-000039: only REQ-*.impl.md files are picked up.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("REQ-001_x.impl.md"), "ack").unwrap();
+        fs::write(tmp.path().join("REQ-002.md"), "req").unwrap();
+        fs::write(tmp.path().join("foo.impl.md"), "not a REQ").unwrap();
+
+        let result = scan_impl_files(tmp.path());
+        assert_eq!(result, vec!["REQ-001_x.impl.md".to_string()]);
+    }
+
+    #[test]
+    fn test_scan_impl_files_nonexistent_dir() {
+        let result = scan_impl_files(Path::new("/nonexistent/path/abc123"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn test_remove_file_if_exists() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("test.md");
@@ -330,5 +399,58 @@ mod tests {
 
         assert!(!old_api.exists());
         assert_eq!(fs::read_to_string(&new_api).unwrap(), "content B");
+    }
+
+    #[test]
+    fn test_copy_my_api_dir_copies_only_md_flat() {
+        // T-000139: copies every *.md flat into the inbox, ignoring non-.md files.
+        let tmp = TempDir::new().unwrap();
+        let sender_docs = tmp.path().join("sender/docs");
+        let my_api = sender_docs.join("my_api");
+        fs::create_dir_all(&my_api).unwrap();
+        fs::write(my_api.join("api.md"), "api content").unwrap();
+        fs::write(my_api.join("admin-api.md"), "admin content").unwrap();
+        fs::write(my_api.join("notes.txt"), "not a contract").unwrap();
+        let inbox = tmp.path().join("recipient/docs/server-api");
+
+        let copied = copy_my_api_dir(&sender_docs, &inbox).unwrap();
+
+        assert_eq!(copied, 2, "only the two .md files should be copied");
+        assert!(inbox.join("api.md").exists());
+        assert!(inbox.join("admin-api.md").exists());
+        assert!(
+            !inbox.join("notes.txt").exists(),
+            "non-.md files must be ignored"
+        );
+    }
+
+    #[test]
+    fn test_copy_my_api_dir_missing_folder_is_noop() {
+        // T-000139: missing my_api folder → Ok(0), no error.
+        let tmp = TempDir::new().unwrap();
+        let sender_docs = tmp.path().join("sender/docs");
+        fs::create_dir_all(&sender_docs).unwrap();
+        let inbox = tmp.path().join("recipient/docs/server-api");
+
+        let result = copy_my_api_dir(&sender_docs, &inbox);
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_copy_my_api_dir_idempotent() {
+        // T-000139: second call with unchanged content copies nothing.
+        let tmp = TempDir::new().unwrap();
+        let sender_docs = tmp.path().join("sender/docs");
+        let my_api = sender_docs.join("my_api");
+        fs::create_dir_all(&my_api).unwrap();
+        fs::write(my_api.join("api.md"), "api content").unwrap();
+        let inbox = tmp.path().join("recipient/docs/server-api");
+
+        assert_eq!(copy_my_api_dir(&sender_docs, &inbox).unwrap(), 1);
+        assert_eq!(
+            copy_my_api_dir(&sender_docs, &inbox).unwrap(),
+            0,
+            "unchanged content must be skipped on the second call"
+        );
     }
 }

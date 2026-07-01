@@ -109,8 +109,8 @@ npm run tauri dev          # local dev with hot reload
 ### Tests
 
 ```bash
-cd src-tauri && cargo test --lib   # ~400 Rust tests
-npm test                            # vitest frontend (~85 tests)
+cd src-tauri && cargo test --lib   # ~433 Rust tests
+npm test                            # vitest frontend (~86 tests)
 npm run check                       # svelte-check
 ```
 

@@ -18,6 +18,9 @@ export const ru = {
   'sync.errors': 'Ошибки: {0}',
   'sync.openSync': 'Синхронизация',
   'sync.microserviceSkipped': 'Микросервис {0} пропущен: {1}',
+  'sync.autoClosed': 'Авто-закрыто пар: {0}',
+  'sync.committed': 'Авто-коммит в репозиториях: {0}',
+  'sync.willAutoClose': 'Будет авто-закрыт при следующей синхронизации (есть .impl.md)',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -40,4 +43,7 @@ export const en: Record<keyof typeof ru, string> = {
   'sync.errors': 'Errors: {0}',
   'sync.openSync': 'Sync',
   'sync.microserviceSkipped': 'Microservice {0} skipped: {1}',
+  'sync.autoClosed': 'Auto-closed pairs: {0}',
+  'sync.committed': 'Auto-committed in repos: {0}',
+  'sync.willAutoClose': 'Will auto-close on next sync (.impl.md present)',
 };
