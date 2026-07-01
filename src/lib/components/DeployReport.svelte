@@ -91,9 +91,20 @@
     navigateTo('repo-detail');
   }
 
-  // Whether a row carries any DB/SSH inventory worth a sub-row.
+  // v1.6.0: the report shows only the database NAME for now — host/user and the
+  // whole SSH group are still returned by the backend (for future filters) but
+  // hidden here. A DB-classified field is a "name" if it ends with _NAME or is
+  // DATABASE / PGDATABASE.
+  function dbNameFields(r: DeployReportRow): DeployInventoryField[] {
+    return r.db_fields.filter((f) => {
+      const u = f.name.toUpperCase();
+      return u.endsWith('_NAME') || u === 'DATABASE' || u === 'PGDATABASE';
+    });
+  }
+
+  // Whether a row carries a database name worth a sub-row.
   function hasInventory(r: DeployReportRow): boolean {
-    return r.db_fields.length > 0 || r.ssh_fields.length > 0;
+    return dbNameFields(r).length > 0;
   }
 
   async function openDomain(e: MouseEvent, domain: string) {
@@ -215,19 +226,13 @@
                 <td class="num"><span class="drill">→</span></td>
               </tr>
               {#if hasInventory(r)}
-                <!-- Inventory sub-row: DB/SSH connection fields. colspan spans
-                     the full 8-column table so the entries get real width for
-                     their vertical stacks without cramping the main columns.
-                     Click still bubbles to drillTo (values are static text). -->
+                <!-- Inventory sub-row: database name only (v1.6.0). colspan spans
+                     the full 8-column table so the entry has room without cramping
+                     the main columns. Click still bubbles to drillTo. -->
                 <tr class="inv" onclick={() => drillTo(r)}>
                   <td colspan="8">
                     <div class="inv-wrap">
-                      {#if r.db_fields.length > 0}
-                        {@render invGroup($tStore('deploy.report.dbColumn' as any), r.db_fields)}
-                      {/if}
-                      {#if r.ssh_fields.length > 0}
-                        {@render invGroup($tStore('deploy.report.sshColumn' as any), r.ssh_fields)}
-                      {/if}
+                      {@render invGroup($tStore('deploy.report.dbColumn' as any), dbNameFields(r))}
                     </div>
                   </td>
                 </tr>
