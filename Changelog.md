@@ -4,6 +4,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-07-02
+
+Reports hub + deploy-report CSV export + secret-push audit. The deploy report moves under a new 📋 Reports section (room for future reports without titlebar creep), gains a CSV export, and is joined by a Secrets audit that reconciles what SDH logged pushing against what actually lives in GitHub right now.
+
+### Added
+- **Reports hub (T-000142).** The standalone deploy-report titlebar button is replaced by a 📋 "Reports" entry that opens a hub with drill-in cards — Deployments and Secrets audit — so future reports don't add more titlebar buttons (kept at 6).
+- **Deploy report CSV export (T-000140).** A 📥 "Export CSV" button on the deploy report writes the currently-filtered rows (WYSIWYG: repo, environment, domain, branch, image tag, DB name, secrets count, updated) to a user-chosen path via the OS save dialog. RFC4180-quoted, stable English headers, no new dependency; sensitive values stay masked exactly as in the UI. The frontend flattens the displayed rows and the backend only formats + writes (single-source display logic, cargo-tested escaping).
+- **Secrets audit (T-000135).** A new Secrets audit report: a portfolio-wide journal of logged secret pushes (secret name + target repo/environment + set/delete + time — never values) plus a per-repo reconcile that compares what SDH logged pushing against the secrets actually present in GitHub right now (repo-level and per deploy environment), bucketed into in-both / logged-missing / unlogged. Reconcile needs a GitHub token; the journal works without one. Reuses the existing sync/deploy event log — no new table, no migration.
+
+### Tests
+- 446 cargo / 86 vitest / 0 svelte issues. No schema migration (secret audit reads the existing `sync_events`/`deploy_events` tables).
+
 ## [1.7.0] — 2026-07-02
 
 Workflow automation for cross-repo sync (pains №2b/2c/3). Sync can now run on a background timer, auto-commit the files it copies into recipient repos so a local AI stops treating them as foreign, and auto-close REQ pairs the sender acknowledges — plus a multi-file API-contract folder and a copyable error-toast fix. All app-side; the global cross-repo rules template documents the three new contracts.
