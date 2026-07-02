@@ -120,4 +120,61 @@ mod tests {
         let n = render_skills_to_repo(&db, tmp.path()).unwrap();
         assert_eq!(n, 2);
     }
+
+    /// End-to-end guard: the REAL bundle (via seed_bundled_templates) must carry
+    /// exactly the six sdh-* workflow skills, each with valid frontmatter, and
+    /// they must render to a repo's docs/sdh_skills/. Catches a missing/renamed
+    /// or malformed skill template at test time instead of at app runtime.
+    #[test]
+    fn test_real_bundle_renders_all_six_skills() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.db");
+        std::mem::forget(tmp);
+        let db = AppDb::new(path).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+
+        let skills = list_skill_templates(&db).unwrap();
+        let names: Vec<&str> = skills.iter().map(|(n, _)| n.as_str()).collect();
+        for expected in [
+            "sdh-cross-repo-req",
+            "sdh-cross-repo-announcements",
+            "sdh-api-contract",
+            "sdh-feature-flow-docs",
+            "sdh-phase-workflow",
+            "sdh-release-lifecycle",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "bundle missing skill {}",
+                expected
+            );
+        }
+        assert_eq!(skills.len(), 6, "exactly six sdh-* skills in the bundle");
+
+        for (name, content) in &skills {
+            assert!(
+                content.starts_with("---\n"),
+                "{} lacks YAML frontmatter",
+                name
+            );
+            assert!(
+                content.contains("name:"),
+                "{} frontmatter lacks name:",
+                name
+            );
+            assert!(
+                content.contains("description:"),
+                "{} frontmatter lacks description:",
+                name
+            );
+        }
+
+        let repo = TempDir::new().unwrap();
+        let n = render_skills_to_repo(&db, repo.path()).unwrap();
+        assert_eq!(n, 6);
+        assert!(repo
+            .path()
+            .join("docs/sdh_skills/sdh-cross-repo-req.md")
+            .exists());
+    }
 }
