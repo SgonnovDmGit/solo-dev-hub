@@ -145,7 +145,7 @@ Format: `MAJOR.MINOR.PATCH` (e.g. `2.3.1`). Each component is an independent cou
 | Microservice | Breaking API change (affects all consumers) | New functionality | Bug fix |
 | Tool | Major change | New function | Bug fix |
 
-Release workflow: see **Release closure checklist** below for the full step-by-step procedure (manifest bump, Changelog, done.md, smoke, schema regen, closure commit, tag). The **dev** runs `git tag vX.Y.Z` and `git push origin vX.Y.Z` — LLM does not execute git tag/push autonomously.
+Release workflow: see the `sdh-release-lifecycle` skill for the full step-by-step procedure (manifest bump, Changelog, done.md, smoke, schema regen, closure commit, tag). The **dev** runs `git tag vX.Y.Z` and `git push origin vX.Y.Z` — LLM does not execute git tag/push autonomously.
 
 # `Changelog.md`
 
