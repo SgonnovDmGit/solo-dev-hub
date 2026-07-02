@@ -106,6 +106,9 @@ fn write_repo_skeletons(
     {
         c.errors.push(format!("CLAUDE.md for {}: {}", label, e));
     }
+    if let Err(e) = sync::render_skills_to_repo(db, base) {
+        c.errors.push(format!("sdh_skills for {}: {}", label, e));
+    }
     if let Err(e) = sync::sync_gitignore_section(&tpl.gitignore, base) {
         c.errors.push(format!(".gitignore for {}: {}", label, e));
     }
