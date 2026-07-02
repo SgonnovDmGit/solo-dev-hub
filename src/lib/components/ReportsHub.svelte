@@ -60,7 +60,7 @@
   .report-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   .card-icon { font-size: 1.8rem; line-height: 1; flex-shrink: 0; }
-  .card-text { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; }
-  .card-title { font-weight: 600; font-size: 1.05rem; }
-  .card-desc { color: var(--text-muted); font-size: 0.88em; line-height: 1.4; }
+  .card-text { display: flex; flex-direction: column; gap: 0.3rem; flex: 1; min-width: 0; }
+  .card-title { font-weight: 600; font-size: 1.05rem; overflow-wrap: anywhere; }
+  .card-desc { color: var(--text-muted); font-size: 0.88em; line-height: 1.4; overflow-wrap: anywhere; white-space: normal; }
 </style>
