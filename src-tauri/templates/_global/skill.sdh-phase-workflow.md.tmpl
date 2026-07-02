@@ -1,0 +1,50 @@
+---
+name: sdh-phase-workflow
+description: >
+  Use when scoping any non-trivial request — two or more non-obvious design
+  decisions, cross-boundary changes (DB / contracts / security), or three or
+  more distinct sub-tasks. Covers the fast-lane-vs-phase-workflow choice, the
+  chat → spec → self-review → OK → implementation steps, and the mandatory
+  manual-smoke Verification section every spec must carry.
+---
+
+Use this when scoping a user request, before starting implementation. For any request the assistant first **estimates scope** and chooses one of two paths:
+
+| Scope | Path | User involvement |
+|---|---|---|
+| Trivial (single decision, no cross-boundary impact, single task — including mass mechanical changes regardless of file count) | **Fast lane** — proceed directly to implementation | none — the assistant just does it |
+| Non-trivial (any of: ≥2 non-obvious design decisions / cross-boundary changes (DB schema, contracts, security-sensitive code) / ≥3 logically distinct sub-tasks) | **Phase workflow** — chat → spec → self-review → OK → impl | offer the user; default offer is phase workflow; user may override to fast-lane |
+
+**Mechanical mass changes** — rename across N files, format pass, lint auto-fix, codemod — count as a single task regardless of file count. Fast-lane unless they carry a design decision (e.g. choosing the new naming convention itself is a decision).
+
+**What counts as a "decision"** — a point of design judgment, not a code/file edit. A follow-the-pattern feature with one coherent design intent = one decision, however many files it touches. A feature with non-obvious edges (load strategy, error-handling shape, skeleton state, etc.) accrues a decision per edge.
+
+**The user's explicit request always wins.** If the user asks for a spec (or fast-lane), the assistant honors it without arguing the trigger. The criterion guides the assistant's *offer*; the explicit request overrides it.
+
+## Phase workflow steps
+
+1. **Chat** — discuss scope, decisions, trade-offs. One focused question per message. If a single message would carry 3+ decision points — switch from chat to drafting a spec. *Precondition:* if the feature touches a server, run the pre-flight server-surface check first (skill `sdh-api-contract-consume`); block on missing endpoints before entering chat.
+2. **Spec** — a markdown doc with sections: context (why), scope (which tasks), files-to-modify (full paths), decisions (brief rationale each), verification (per `## Verification (manual smoke)` in this skill). The spec file is mandatory when chat saturates (≥3 decisions in one message) or the user asks explicitly. For phase work comfortably spread across messages with few decisions per message, the chat thread itself serves as the spec — the user's explicit "OK, go" in step 4 closes it. *For non-server features with a visual surface — do mockups first, via skill `sdh-visual-mockups`: the accepted mockup carries the design decisions, and the spec text after it can be thin.*
+3. **Self-review** — re-read the spec (or the chat thread acting as spec) and report any ambiguity or internal contradiction: mismatched symbol / state-field names between sections, files in scope but missing from files-to-modify, decisions contradicting each other, missing localisation / i18n cleanup, missing test updates.
+4. **User OK** — the user reviews the spec (or thread), approves or returns corrections. Iterate until approved. Do not start implementation before approval.
+5. **Implementation** — task by task. Each task commits on completion per the project's implementation workflow.
+
+This sequence is one task-level cycle. It runs inside the broader release lifecycle (skill `sdh-release-lifecycle`): that skill's "Implementation" stage is where these five steps execute per task, and its own Spec / Spec-review stages mirror steps 2–4 at the release level.
+
+## Project bindings (per-project `CLAUDE.md` defines)
+
+- **Spec location:** path and naming convention for spec files (e.g. `docs/specs/<YYYY-MM-DD>-<phase-name>.md`). Spec files are gitignored unless the project says otherwise.
+- **Implementation workflow:** how step 5 runs — subagent-driven (a fresh subagent per task, per-task commits) or sequential (tasks in the current session, per-task or batched commits).
+
+## Verification (manual smoke)
+
+Each spec written under `## Phase workflow steps` includes a `## Verification` (or `## Manual smoke`) section — hands-on UI/feature checks, distinct from unit tests.
+
+Required content:
+- **Per changed feature:** open `<route / screen>` → verify `<expected behavior>`.
+- **Parameter combinations:** list combos to try (e.g. *"filter A × filter B, verify intersection"*).
+- **Regression checks:** list adjacent untouched features; open each and confirm nothing broke.
+- **Edge cases:** empty states, error paths, races if any.
+- **Cross-feature integration:** if changing feature A may affect B — list the touchpoint.
+
+List length scales with complexity: 3–5 items for a small fix, 10+ for a multi-screen phase.

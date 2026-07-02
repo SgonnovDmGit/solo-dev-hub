@@ -109,7 +109,7 @@ npm run tauri dev          # local dev with hot reload
 ### Tests
 
 ```bash
-cd src-tauri && cargo test --lib   # ~446 Rust tests
+cd src-tauri && cargo test --lib   # ~452 Rust tests
 npm test                            # vitest frontend (~86 tests)
 npm run check                       # svelte-check
 ```
@@ -127,7 +127,7 @@ The full release runbook (key rotation, CI troubleshooting, hotfix flow) — [do
 
 ### AI rules
 
-`CLAUDE.md` (gitignored) carries the in-project AI rules. The app's "Sync to ~/.claude/CLAUDE.md" feature pushes the global section into your user-level Claude Code config. Per-project CLAUDE.md sits in each repo's root.
+`CLAUDE.md` (gitignored) carries the in-project AI rules. The app's "Sync to ~/.claude/CLAUDE.md" feature installs a thin always-on core (file formats, versioning, commit conventions) into your user-level Claude Code config, plus the workflow-heavy rules (cross-repo requirements, announcements, api.md contract, phase workflow, release lifecycle) as on-demand `sdh-*` skills in `~/.claude/skills/` — they surface only when relevant instead of loading every session. The same skill content syncs into each repo's `docs/sdh_skills/`, so any AI agent (not just Claude Code) can read it. Per-project CLAUDE.md sits in each repo's root.
 
 ## Roadmap
 

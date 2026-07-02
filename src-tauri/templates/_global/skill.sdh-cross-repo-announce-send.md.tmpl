@@ -1,0 +1,112 @@
+---
+name: sdh-cross-repo-announce-send
+description: >
+  Use when YOU proactively push unsolicited information that affects another
+  repo — server → client, or microservice → parent server (ANNOUNCE-NNN.md
+  files). Covers the announcement-vs-REQ-receipt choice, the actionable-impact
+  threshold, finding the recipient's path, picking the number, the file
+  structure, and the carve-out (writing directly into another repo is allowed).
+  To READ an announcement that arrived — skill sdh-cross-repo-announce-read.
+---
+
+You are here if you **want to tell** another repo something on your own initiative, expecting no answer. An announcement is the **proactive** one-way channel: the sender pushes without being asked, there is no reply.
+
+- An announcement **arrived** for you and you must process it → skill `sdh-cross-repo-announce-read`.
+- The other side **asked** you for something and you are answering → that is a REQ, not an announcement → skill `sdh-cross-repo-req-answer`.
+
+**Who writes announcements:** server → client; microservice → parent server. Reverse directions (client → server, server → microservice) **do not exist** as announcements — they go through REQ/receipt.
+
+## Step 0. Announcement or REQ receipt? (the threshold)
+
+Before writing — check it is actually an announcement, not something else:
+
+| Situation | Channel |
+|---|---|
+| The recipient asked for X; you did X and explain integration | **REQ receipt** (`## Comment:` — see `sdh-cross-repo-req-answer`) |
+| You did something on your own initiative that affects the recipient | **Announcement** |
+| You did work for recipient A; a side effect also hit recipient B | **Announcement** to B |
+| You reworked internals (refactor, deprecation) and the recipient's integration must adjust | **Announcement** |
+
+**Threshold: actionable impact required.** An announcement is appropriate **only if the recipient would need to do something** — change code, config, behavior, or acknowledge a deprecation timeline. The mere existence of a related change on your side (a new admin-only endpoint, an internal refactor that does not change the wire format) is **not** enough. Pure surface additions the recipient may or may not adopt go through the normal `docs/api.md` sync — it picks them up on its own schedule.
+
+**Positive criterion:** would the recipient need to change code/config/behavior to keep working correctly → write an announcement. Can keep working unchanged and pick it up later via `docs/api.md` → don't.
+
+Why the threshold matters: excessive announcements train the recipient to ignore the channel and devalue the urgent ones.
+
+## Directions
+
+| Direction | Trigger | Where you write |
+|---|---|---|
+| Server → client | Server-side change affecting the client | `<client-repo-path>/docs/server-announcements/<server-repo-name>/ANNOUNCE-NNN_<slug>.md` |
+| Microservice → parent server | MS-side change affecting the parent | `<parent-server-repo-path>/docs/microservice-announcements/<ms-project-name>/ANNOUNCE-NNN_<slug>.md` |
+
+## Step 1. Find the recipient's path in your own `docs/project.md`
+
+- **Server → client:** `## Repositories` table, column `Path` for each repo with `role` in {`client`, `admin_client`, `test_client`}.
+- **Microservice → parent:** `## Parent projects` table, column `Path` of the row whose `Parent project` = the target server.
+
+If the path is missing (`_no local path configured_`) or the `Server repo` cell shows `⚠ server repo not resolvable` — **do not write the announcement**, it is undeliverable. Surface the gap to the user (own session log, or a `T-NNNNNN` in `docs/todo.md`).
+
+## Step 2. Pick the number `NNN`
+
+In the recipient's announcement folder:
+- Folder absent → create it and use `001`.
+- Folder present with at least one `ANNOUNCE-*.md` → `max(existing NNN) + 1`.
+- **Do not reuse** numbers of deleted (acknowledged) entries — `NNN` is a monotonic counter, not a slot allocator. Numbers always grow, even after acknowledgements remove files (keeps the recipient's git history readable).
+- The counter is per-(sender × recipient) pair, not global.
+
+**Subfolder name** — **last-segment / canonical** form (e.g. `web-app-backend`, not `SgonnovDmGit/web-app-backend`), matching the `client-requirements/<client-repo>/` convention. Take your own canonical name from your `docs/project.md` `## Repositories` row whose `Path` matches the current working directory.
+
+## Step 3. Write the file directly into the recipient's repo
+
+Plain markdown. The sender keeps **no outbox copy** — the git history of the recipient's repo is the audit trail.
+
+```markdown
+# ANNOUNCE-001: <short headline>
+
+## Why this matters to you
+
+<one paragraph: the impact on the recipient's side>
+
+## What changed
+
+<the change on your side>
+
+## What you need to do
+
+<step by step: integration / migration / acknowledgement>
+
+## References
+
+- <commit / PR / endpoint on your side>
+```
+
+### Example
+
+File `../web-app-client/docs/server-announcements/web-app-backend/ANNOUNCE-003_auth-cookie-rename.md`:
+
+```markdown
+# ANNOUNCE-003: Auth cookie renamed sid → session
+
+## Why this matters to you
+After deploy the server sets the cookie `session` instead of `sid`. A client
+reading `sid` directly will lose the session after the release.
+
+## What changed
+Internal session-middleware refactor; the cookie name is unified with the mobile API.
+
+## What you need to do
+- Replace reading `sid` with `session` in the auth store.
+- Check logout: is the new name cleared.
+
+## References
+- backend commit a1b2c3d, docs/api.md → "Access model" section
+```
+
+## Carve-out from the "no cross-repo writes" rule
+
+The Message/Receipt pattern (skill `sdh-cross-repo-req-*`) forbids the LLM/dev from manually copying/moving/deleting files across a repo boundary — Solo Dev Hub owns that. Announcements are the **explicit exception**: the LLM writes directly into the recipient's filesystem, because there is no app-side sync for this channel.
+
+- The sender-LLM **writes** `ANNOUNCE-*.md` into the recipient's repo path.
+- The recipient-LLM **deletes** it after integrating (see `sdh-cross-repo-announce-read`).
+- Solo Dev Hub does **not** track, propagate, or surface announcements — no counter, no badge, no ✓.

@@ -232,6 +232,7 @@
         </span>
       </div>
     </div>
+    <div class="ai-rules-hint">{$tStore("settings.aiRulesSkillsHint" as any)}</div>
   </section>
 
   <!-- 6. Авто-синхронизация -->
@@ -357,4 +358,5 @@
   .autosync-check { width: 16px; height: 16px; cursor: pointer; flex: none; }
   .autosync-interval { flex: none !important; width: 80px; }
   .autosync-hint { font-size: 11px; color: var(--text-muted); }
+  .ai-rules-hint { font-size: 11px; color: var(--text-muted); margin-top: 6px; line-height: 1.4; }
 </style>

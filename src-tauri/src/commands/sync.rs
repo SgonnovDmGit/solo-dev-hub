@@ -18,6 +18,7 @@ pub fn sync_global_claude_md(db: State<AppDb>) -> Result<SyncGlobalClaudeResult,
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
     let claude_path = home.join(".claude").join("CLAUDE.md");
     sync::update_claude_md_global(&db, &claude_path)?;
+    sync::render_skills_global(&db, &home.join(".claude"))?;
     let now = chrono::Utc::now().to_rfc3339();
     db.set_setting("ai_rules_last_sync_at", &now)
         .map_err(|e| e.to_string())?;
@@ -77,6 +78,8 @@ pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>,
     // App-owned files (project.md + CLAUDE.md section) — always overwritten when
     // the repo is attached to a project. Orphan repos (project_id=None) skip this
     // since project-context wouldn't render meaningfully.
+    sync::render_skills_to_repo(&db, base)?;
+    updated.push("docs/sdh_skills/".to_string());
     if let Some(pid) = repo.project_id {
         sync::generate_project_md(&db, pid, base)?;
         updated.push("docs/project.md".to_string());

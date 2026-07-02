@@ -41,3 +41,6 @@ docs/microservice-requirements/
 docs/server-requirements/
 docs/superpowers/
 # --- solo-dev-hub:end ---
+
+# local RU skill drafts (working reference, not shipped)
+docs/skill-drafts-ru/

@@ -1,0 +1,39 @@
+---
+name: sdh-retro
+description: >
+  Use at release closure (or when the user asks for a retro) to run a
+  structured retrospective — 6 mandatory points (what worked / what didn't /
+  readiness / assessment of the LLM / assessment of the user / process-level
+  lessons) and save it to auto-memory as a project memory. Delivered as one
+  block, not point by point.
+---
+
+You are here at the retro stage — the last in the release cycle (skill `sdh-release-lifecycle`), or whenever the user asks for a retro directly. The retro is **expected** at every closure unless the user explicitly skips it. It is **cheap self-improvement** and the highest-leverage stage for tuning how the LLM and user work together — observations evaporate at the session boundary if not captured.
+
+## Storage
+
+The retro is saved to the assistant's auto-memory directory as a `project`-type memory file:
+- Path: `<auto-memory-dir>/retro_v<X_Y_Z>.md` (e.g. `retro_v0_33_0.md`).
+- Index entry in `MEMORY.md`: `- [Retro v0.33.0](retro_v0_33_0.md) — <one-line hook>`.
+
+Not committed to `docs/` or any repo path. Privacy of internal reflections + persistence across sessions = exactly what auto-memory is for. If retros multiply and make `MEMORY.md` noisy — consolidate older ones into a single `feedback` memory *"patterns across N retros"*; defer until it's a real problem.
+
+## Checklist (six points — all mandatory content of the retro file)
+
+1. **What worked well.** Collaboration patterns, working modes, decisions, communications worth keeping for the next release.
+2. **What didn't work.** Friction, scope drift, missed workflow steps, communication misses, planning errors, surprises.
+3. **Readiness.** Two levels:
+   - **Release readiness** — was the closed release coherent, or did sharp corners and workarounds land?
+   - **Project readiness overall** — current state: technical debt, stability, distance to upcoming milestones, known holes.
+4. **Assessment of the LLM's actions this session.** A retrospective judgment of how the assistant performed in this session specifically — not forward-looking advice (that's implicit in point 6). What it did well, where it slipped, where it skipped steps, where it surprised positively.
+5. **Assessment of the user's actions this session.** A retrospective judgment of the user's patterns this session — communication clarity, decision speed, scope discipline, where redirects came in time vs too late.
+6. **Process-level lessons.** Observations worth promoting to durable memory:
+   - New working-style rules → a `feedback` memory (with **Why:** and **How to apply:** lines per the memory format).
+   - New project facts → a `project` memory.
+   - If yes — write the memory file(s) in the same retro pass and link from `MEMORY.md`.
+
+## How to deliver
+
+The retro is delivered **as one block**: the full opinion on all six points in a single message — including the proposed memory-file draft inline, so the user can ack the wording in one pass. The user then comments / overrides / adds context on any point in a follow-up turn; the final file reflects the post-comment state.
+
+**Do not stage the retro point by point.** Six separate turns waiting for "ok" between each drag the cycle's last stage into N+1 round-trips for no information gained — the assistant already has all the observations from the session, the user steers per-point afterward.

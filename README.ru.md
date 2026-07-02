@@ -127,7 +127,7 @@ git push origin master vX.Y.Z
 
 ### AI-правила
 
-`CLAUDE.md` (gitignored) хранит in-project правила для AI. Фича приложения "Sync to ~/.claude/CLAUDE.md" пушит глобальную секцию в твой user-level Claude Code конфиг. Per-project CLAUDE.md лежит в корне каждого репо.
+`CLAUDE.md` (gitignored) хранит in-project правила для AI. Фича приложения "Sync to ~/.claude/CLAUDE.md" ставит тонкое always-on ядро (форматы файлов, версионирование, конвенции коммитов) в твой user-level Claude Code конфиг, плюс воркфлоу-тяжёлые правила (кросс-репо требования, анонсы, api.md-контракт, phase-воркфлоу, release-lifecycle) как on-demand скиллы `sdh-*` в `~/.claude/skills/` — они всплывают только когда релевантны, а не грузятся каждую сессию. Тот же контент скиллов синкается в `docs/sdh_skills/` каждого репо, чтобы его читал любой AI-агент, не только Claude Code. Per-project CLAUDE.md лежит в корне каждого репо.
 
 ## Roadmap
 

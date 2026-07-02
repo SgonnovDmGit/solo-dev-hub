@@ -1,0 +1,56 @@
+---
+name: sdh-release-lifecycle
+description: >
+  Use when running a release of any SemVer bump — the 11-stage lifecycle
+  (request, analysis, spec, spec review, plan, plan review, implementation,
+  test, closure, next-release plan, retro), the light-vs-full track choice,
+  deciding the bump class at Analysis, and the stage-transition announcement
+  rules. The closure checklist itself — skill sdh-release-closure; the
+  retrospective — skill sdh-retro.
+---
+
+Use this when a release of any SemVer bump is starting or in flight — from the first kickoff message up to handing off to closure. The lifecycle orchestrates a release end-to-end and wraps per-task implementation; for how an individual task within the Implementation stage is scoped/specced/executed, use skill `sdh-phase-workflow`. Two self-contained pieces are extracted into their own skills: **closure** (9→10-step checklist + git canon) — `sdh-release-closure`; **retro** — `sdh-retro`.
+
+Stages are **soft** — the assistant does not gate transitions strictly, but it **must announce** transitions in chat. Trivial fast-lane tasks (per skill `sdh-phase-workflow`) bypass the lifecycle entirely.
+
+## Light track vs full
+
+The fork is decided at the **Analysis** stage, by bump class + number of decisions:
+
+- **Light track** — if the bump is **PATCH**, OR **MINOR with no cross-boundary change and <3 non-obvious decisions**. Collapsed path: Request → Analysis → spec-as-chat → Implementation → Test → Closure → Retro. The **Plan and Plan-review stages are folded into Analysis** by default (tasks straight into `docs/todo.md`, no separate plan-review) — **without** per-stage "may I skip?".
+- **Full track** — **MAJOR always**, plus **MINOR with real design / cross-boundary** (DB schema, contracts, security-sensitive code). All 11 stages.
+
+The boundary is a point of design judgment, not file count (see "what counts as a decision" in `sdh-phase-workflow`). Unsure between light and full → take full.
+
+## Autonomous mode (an overlay on either track)
+
+Orthogonal to scope — it overlays both light and full. The essence: **a single front-loaded gate at design acceptance, then an autonomous run with no per-stage approvals.**
+
+- **When to offer:** all the judgment is settled at design/spec — the rest is mechanical follow-through. Typical for client / landing / visual work (the accepted mockup `sdh-visual-mockups` is the gate).
+- **How it turns on:** at spec/mockup acceptance (stage 4c) the assistant offers: *"design accepted, the rest is mechanical — I'll run Implementation → Test → the documentation part of Closure without approvals, only announcing transitions. OK?"* The grant is the user's. A standing "work without stopping" directive = pre-granted.
+- **What runs autonomously:** stages 5–8 + the documentation part of Closure (bump, Changelog, done.md, closure commit on dev).
+- **Always a stop, even in autonomous mode:** the git canon block (tag / master-merge / master-push) is user-only. Show the block and wait.
+- **Exit from the mode (re-engage):** a new non-obvious decision, a blocker, scope grew → re-evaluate the bump class, smoke revealed a problem → announce a loop back; afterward the autonomous mode may be offered again.
+
+## Stages
+
+1. **Request** — the user's kickoff for a release scope, feature batch, or non-trivial task.
+2. **Analysis** — the assistant estimates scope, classifies fast-lane vs phase and light vs full track, surfaces blockers/dependencies, and for features needing server endpoints runs the pre-flight surface check (skill `sdh-api-contract-consume`). **The bump class (PATCH/MINOR/MAJOR) and version number are decided here** — not deferred to closure: the `## vX.Y.Z` header in the Plan must be right from the start. MAJOR/MINOR is confirmed with the user here (the "ask before MAJOR/MINOR" rule fires at Analysis). Output: a one-message scope picture + class + version the user confirms or redirects.
+3. **Spec** — a written spec per the spec step of `sdh-phase-workflow` (or thread-as-spec). Includes context, scope, files-to-modify, decisions, and a `## Verification` section. *(Light track: the chat itself serves as the spec.)* **For non-server features with a visual surface — do mockups first (skill `sdh-visual-mockups`); the accepted mockup carries the design decisions, the spec text can be thin.**
+4. **Spec review** — three-step procedure:
+   - (a) **Assistant self-review** — an explicit pass: ambiguities, contradictions, logical gaps, missing files-to-modify, mismatched symbol names, missing i18n cleanup, missing test updates. Report to chat (or *"no issues"*).
+   - (b) **Clarification questions** — only if real ones emerged from (a); don't invent for show.
+   - (c) **User OK** — explicit approval. At least one full self-review + OK pass is mandatory before any plan or implementation.
+5. **Plan** *(full track)* — task breakdown into `docs/todo.md` (id, effort, priority), under the `## vX.Y.Z — ...` confirmed at Analysis. Each task maps cleanly to a spec decision or verification step. *(Light track: folded into Analysis.)*
+6. **Plan review** *(full track)* — same three-step procedure (4a/4b/4c). Self-review: scope alignment with the spec, missing/over-broad tasks, priority/effort sanity, order/dependencies. *(Light track: folded into Analysis.)*
+7. **Implementation** — task by task per the implementation step of `sdh-phase-workflow`, using the project's implementation workflow. Each completed task moves from `docs/todo.md` to `docs/done.md`.
+8. **Test** — manual smoke per the spec's `## Verification` + automated suites (`cargo test`, `npm test`, `npm run check`). **Test counts and pass/fail go into Changelog only AFTER the real smoke, never from progress notes.** A bug surfacing here or at closure — see the late-catch rule in `sdh-release-closure` (a small confident fix folds into the current release).
+9. **Closure** — full checklist + git canon: skill `sdh-release-closure`. The tag command is the user's action.
+10. **Next-release plan** — review the `docs/todo.md` backlog, identify candidates for the next milestone, agree scope. Output: tasks under the next `## vX.Y.Z — ...`.
+11. **Retro** — a structured retrospective: skill `sdh-retro`.
+
+## Stage transitions
+
+- The assistant announces each transition: **"moving from stage <X> to stage <Y>"**.
+- Skipping a stage (in the full track) requires explicit permission: *"can I go straight to impl?" / "no retro this time?"* — the assistant proposes the skip with a one-line reason; the user acks or declines. Default — **no skipping**. *(The light track already folds Plan/Plan-review by default — that's not a "skip", it's the track.)*
+- **Loops back to an earlier stage are allowed but not default.** The chain runs forward by default. A loop (impl reveals a gap → back to Spec for an amendment → re-run Spec-review → resume Implementation) happens on user request or when circumstances force it (new constraint, missing endpoint surface, broken assumption, **scope grew → re-evaluate bump class**). The assistant announces loops the same way: *"a gap surfaced, moving from stage 7 back to stage 3, ok?"* — the user acks. Without an explicit loop announcement, the lifecycle is strictly forward.
