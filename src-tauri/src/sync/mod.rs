@@ -13,6 +13,7 @@ pub mod managed_block;
 pub mod project_md;
 pub mod project_sync;
 pub mod requirements;
+pub mod skills;
 pub mod tasks;
 
 pub use autocommit::*;
@@ -24,4 +25,5 @@ pub use gitignore::*;
 pub use project_md::*;
 pub use project_sync::*;
 pub use requirements::*;
+pub use skills::*;
 pub use tasks::*;
