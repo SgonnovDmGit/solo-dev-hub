@@ -1,0 +1,99 @@
+---
+name: sdh-cross-repo-announcements
+description: >
+  Use when proactively pushing unsolicited information to a client
+  (server to client) or to a parent server (microservice to server) that the
+  recipient did not request — ANNOUNCE-NNN.md files. Covers when to use an
+  announcement vs a REQ receipt, the actionable-impact threshold, the two
+  push directions, and the write / read / acknowledge-by-delete flow.
+---
+
+Use this skill whenever pushing unsolicited, sender-initiated information across a repo boundary — server to client, or microservice to parent server — via `ANNOUNCE-NNN.md` files. Announcement is the **proactive** channel: the sender pushes without being asked, and there is no reply. This differs from the `sdh-cross-repo-req` skill's REQ/receipt pattern, which is **reactive** — one side asks, the other answers.
+
+Announcements are a one-way push channel for **unsolicited** information that does not fit the request/response (REQ) pattern. Use when the sender has something the recipient needs to know but the recipient never asked for it.
+
+## When to use an announcement vs a REQ receipt
+
+| Situation | Channel |
+|---|---|
+| Recipient asked for X; sender implemented X and explains how to integrate | **REQ receipt** (`## Comment:` in the receipt covers integration notes) |
+| Sender did something on its own initiative that affects the recipient | **Announcement** |
+| Sender did work for recipient A; side-effect also affects recipient B | **Announcement** to recipient B |
+| Sender reworked internals (refactor, MS-review feedback, deprecation) and recipient's integration needs to adjust | **Announcement** |
+
+In short: REQ → receipt is reactive ("you asked, here's the answer"). Announcement is proactive ("you didn't ask, but you need to know this"). They share no machinery — announcements have no recipient response, no app-side sync, no confirmation pair.
+
+### Threshold: actionable impact required
+
+An announcement is appropriate **only when the recipient would need to take action** — change code, configuration, or behavior, or acknowledge a deprecation timeline. The mere existence of a related sender-side change (e.g. a new admin-only endpoint, an internal refactor that does not affect the wire format) is **not** enough. For pure surface additions that the recipient may or may not adopt, use the standard `docs/api.md` contract sync — the recipient discovers them through the synced contract on its own schedule.
+
+**Positive criterion (helper if you're unsure):** if the recipient would need to change code, config, or behavior to keep working correctly — write an announcement. If the recipient can continue working unchanged and pick up the change later through `docs/api.md`, do not.
+
+Why the threshold matters: excessive announcements train recipients to ignore the channel, which devalues the urgent ones.
+
+## Directions
+
+Two directions exist symmetrically:
+
+| Direction | Trigger | Sender writes to |
+|---|---|---|
+| Server → client | Server-initiated change that affects client | `<client-repo-path>/docs/server-announcements/<server-repo-name>/ANNOUNCE-NNN_<slug>.md` |
+| Microservice → parent server | MS-initiated change that affects parent server | `<parent-server-repo-path>/docs/microservice-announcements/<ms-project-name>/ANNOUNCE-NNN_<slug>.md` |
+
+Reverse directions (client → server, server → MS) do not exist as announcements — those flow through the `sdh-cross-repo-req` skill's REQ/receipt pattern.
+
+## How the sender writes an announcement
+
+1. **Read your own `docs/project.md`** to discover the recipient's local filesystem path:
+   - Server → client: `## Repositories` table, column `Path` for each repo with `role` in {`client`, `admin_client`, `test_client`}.
+   - Microservice → parent server: `## Parent projects` table, column `Path` for the row whose `Parent project` matches the target server.
+
+   If the path is missing (rendered as `_no local path configured_`) or the row's `Server repo` cell shows `⚠ server repo not resolvable`, **do not write the announcement** — it is not deliverable. Surface the gap to the user (own session log, or a `T-NNNNNN` in `docs/todo.md`).
+
+2. **Pick the next free `NNN`** in the recipient's announcement folder.
+   - If the folder does not exist, create it and use `001`.
+   - If the folder exists and contains at least one `ANNOUNCE-*.md`, use `max(existing NNN) + 1`. Do **not** reuse numbers from previously deleted (acknowledged) entries — `NNN` is a monotonic counter, not a slot allocator. This keeps git history of the recipient repo readable: numbers always grow, even after acknowledgements remove files.
+   - Number is per-(sender × recipient) pair, not global.
+
+   **Subfolder naming** — use **last-segment / canonical** form (e.g. `web-app-backend`, not `SgonnovDmGit/web-app-backend`), matching the existing convention for `client-requirements/<client-repo>/` and `microservice-requirements/<ms-project>/`. The sender identifies its own canonical name from its `docs/project.md` `## Repositories` row whose `Path` matches the current working directory.
+
+3. **Write the file** directly to the recipient's filesystem. Use plain markdown. Sender does not keep an outbox copy — git history of the recipient's repo is the audit trail.
+
+   File structure:
+
+   ```markdown
+   # ANNOUNCE-001: <short headline>
+
+   ## Why this matters to you
+
+   <one paragraph explaining the impact on the recipient's side>
+
+   ## What changed
+
+   <description of the sender-side change>
+
+   ## What you need to do
+
+   <step-by-step integration / migration / acknowledgement>
+
+   ## References
+
+   - <commit / PR / endpoint references on sender side>
+   ```
+
+## How the recipient reads an announcement
+
+1. **At session start**, scan `docs/server-announcements/` (if you are a client) or `docs/microservice-announcements/` (if you are a parent server). Each subfolder is named after a sender repo / project.
+
+2. **For each `ANNOUNCE-*.md` found**, read the body, integrate or apply as needed, then **delete the file**. Deletion is the implicit acknowledgement — there is no `.response.md`, no confirm action through the app.
+
+3. **Commit the deletion** to your own git history (alongside any code changes triggered by the announcement). This is the audit trail.
+
+## Carve-out from the no-cross-repo-writes rule
+
+The `sdh-cross-repo-req` skill's Message/Receipt pattern forbids the LLM/dev from copying, moving, or deleting files across repo boundaries manually — Solo Dev Hub owns that movement for REQ pairs. Announcements are the **explicit exception**: the LLM writes directly into the recipient's filesystem, because there is no app-side sync mechanism for this channel.
+
+Concretely:
+- Sender-LLM **writes** `ANNOUNCE-*.md` into the recipient's repo path.
+- Recipient-LLM **deletes** `ANNOUNCE-*.md` from its own repo after integrating.
+- Solo Dev Hub does **not** track, propagate, or surface announcement files — no UI counter, no badge, no confirm-✓.
