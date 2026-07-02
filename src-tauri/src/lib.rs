@@ -193,6 +193,7 @@ pub fn run() {
             commands::deploy::render_deploy_files_for_env,
             commands::deploy::list_deploy_environments,
             commands::deploy::list_deploy_report,
+            commands::deploy::export_deploy_report_csv,
             commands::deploy::get_deploy_environment,
             commands::deploy::create_deploy_environment,
             commands::deploy::clone_deploy_environment,

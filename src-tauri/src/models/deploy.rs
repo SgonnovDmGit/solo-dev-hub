@@ -144,6 +144,24 @@ pub struct DeployReportRow {
     pub ssh_fields: Vec<DeployInventoryField>,
 }
 
+/// v1.8.0 (T-000140): CSV-export row for the deploy report. The frontend
+/// flattens each displayed report row into this 8-cell shape and passes it to
+/// the backend, which only CSV-formats + writes the file (display logic stays
+/// single-source in the frontend). Arrives FROM the frontend as a Tauri command
+/// arg, hence must `Deserialize`. snake_case JSON, no serde rename — matches the
+/// other deploy structs (Tauri tool contract, not a server).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeployReportCsvRow {
+    pub repo: String,
+    pub environment: String,
+    pub domain: String,
+    pub branch: String,
+    pub image_tag: String,
+    pub db_name: String,
+    pub secrets_count: i64,
+    pub updated_at: String,
+}
+
 /// v1.6.0 (T-000134): one DB- or SSH-related inventory field surfaced in the
 /// deploy report. `value` is `None` when the field is sensitive (withheld) or
 /// exists only as a GitHub secret name with no local value. `origin` records
