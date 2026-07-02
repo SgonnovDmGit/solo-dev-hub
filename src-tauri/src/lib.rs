@@ -166,6 +166,8 @@ pub fn run() {
             commands::dashboard::read_recent_activity,
             // Timeline v0.20.0
             commands::timeline::read_timeline,
+            // Secret-push audit v1.8.0 (T-000135)
+            commands::timeline::list_secret_push_events,
             // Requirements sync
             commands::sync::sync_global_claude_md,
             commands::sync::sync_project,

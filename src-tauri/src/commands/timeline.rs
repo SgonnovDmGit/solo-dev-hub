@@ -41,6 +41,18 @@ pub fn record_secret_event(
     .map_err(|e| e.to_string())
 }
 
+/// v1.8.0 (T-000135): read-only unified list of already-logged secret pushes.
+/// Delegates to the DB query; no new table, no recording side effects.
+#[tauri::command]
+pub fn list_secret_push_events(
+    db: State<AppDb>,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<crate::models::SecretPushEvent>, String> {
+    db.list_secret_push_events(limit, offset)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn read_timeline(
     db: State<AppDb>,

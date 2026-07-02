@@ -275,6 +275,160 @@ impl AppDb {
         })?;
         rows.collect()
     }
+
+    // ── Secret-push audit (v1.8.0, T-000135) ───────────────────────────────────
+
+    /// Unified read over already-logged GitHub Actions secret pushes.
+    /// Repo-level events live in `sync_events` (sync_type='secret', verb inside
+    /// `details.action`); env-level events live in `deploy_events`
+    /// (`action IN ('env_secret_set','env_secret_delete')`, name inside
+    /// `details.name`). Both `details` blobs are `serde_json::json!`-produced, so
+    /// they're parsed with serde_json (portable + unit-testable), not SQL
+    /// json_extract. Rows with malformed/absent `details` are skipped. Combined,
+    /// sorted by `ts` DESC, then paginated in Rust (secret events are low-volume).
+    pub fn list_secret_push_events(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> SqlResult<Vec<crate::models::SecretPushEvent>> {
+        // Small local shape for parsing the JSON `details` blobs.
+        #[derive(serde::Deserialize)]
+        struct Details {
+            action: Option<String>,
+            name: Option<String>,
+        }
+
+        // Mirror Repository::display_name() exactly (same as list_deploy_report).
+        fn display_name(github_name: Option<String>, description: Option<String>) -> String {
+            match github_name {
+                Some(gh) => gh.rsplit('/').next().unwrap_or("").to_string(),
+                None => description.unwrap_or_else(|| "<local>".to_string()),
+            }
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut out: Vec<crate::models::SecretPushEvent> = Vec::new();
+
+        // Query A — repo-level secret events (sync_events).
+        {
+            let mut stmt = conn.prepare(
+                "SELECT se.repository_id, r.github_name, r.description, se.details, se.ts \
+                 FROM sync_events se \
+                 JOIN repositories r ON r.id = se.repository_id \
+                 WHERE se.sync_type = 'secret'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let repository_id: i64 = row.get(0)?;
+                let github_name: Option<String> = row.get(1)?;
+                let description: Option<String> = row.get(2)?;
+                let details: Option<String> = row.get(3)?;
+                let ts: String = row.get(4)?;
+                Ok((repository_id, github_name, description, details, ts))
+            })?;
+            for row in rows {
+                let (repository_id, github_name, description, details, ts) = row?;
+                let parsed: Option<Details> = details
+                    .as_deref()
+                    .and_then(|d| serde_json::from_str(d).ok());
+                let Some(Details {
+                    action: Some(action),
+                    name: Some(secret_name),
+                }) = parsed
+                else {
+                    continue; // malformed / missing action|name → skip
+                };
+                out.push(crate::models::SecretPushEvent {
+                    source: "repo".to_string(),
+                    repository_id,
+                    repo_name: display_name(github_name, description),
+                    deploy_env_id: None,
+                    env_name: None,
+                    secret_name,
+                    action,
+                    ts,
+                });
+            }
+        }
+
+        // Query B — env-level secret events (deploy_events).
+        {
+            let mut stmt = conn.prepare(
+                "SELECT de.repository_id, r.github_name, r.description, de.deploy_env_id, \
+                        env.name, de.action, de.details, de.ts \
+                 FROM deploy_events de \
+                 JOIN repositories r ON r.id = de.repository_id \
+                 LEFT JOIN deploy_environments env ON env.id = de.deploy_env_id \
+                 WHERE de.action IN ('env_secret_set', 'env_secret_delete')",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let repository_id: i64 = row.get(0)?;
+                let github_name: Option<String> = row.get(1)?;
+                let description: Option<String> = row.get(2)?;
+                let deploy_env_id: Option<i64> = row.get(3)?;
+                let env_name: Option<String> = row.get(4)?;
+                let action: String = row.get(5)?;
+                let details: Option<String> = row.get(6)?;
+                let ts: String = row.get(7)?;
+                Ok((
+                    repository_id,
+                    github_name,
+                    description,
+                    deploy_env_id,
+                    env_name,
+                    action,
+                    details,
+                    ts,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    repository_id,
+                    github_name,
+                    description,
+                    deploy_env_id,
+                    env_name,
+                    action_col,
+                    details,
+                    ts,
+                ) = row?;
+                let parsed: Option<Details> = details
+                    .as_deref()
+                    .and_then(|d| serde_json::from_str(d).ok());
+                let Some(Details {
+                    name: Some(secret_name),
+                    ..
+                }) = parsed
+                else {
+                    continue; // malformed / missing name → skip
+                };
+                let action = match action_col.as_str() {
+                    "env_secret_set" => "set",
+                    "env_secret_delete" => "delete",
+                    _ => continue, // unreachable given WHERE, but stay defensive
+                }
+                .to_string();
+                out.push(crate::models::SecretPushEvent {
+                    source: "env".to_string(),
+                    repository_id,
+                    repo_name: display_name(github_name, description),
+                    deploy_env_id,
+                    env_name,
+                    secret_name,
+                    action,
+                    ts,
+                });
+            }
+        }
+
+        // Sort by ts DESC, then paginate in Rust.
+        out.sort_by(|a, b| b.ts.cmp(&a.ts));
+        let paged = out
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok(paged)
+    }
 }
 
 #[cfg(test)]
@@ -451,5 +605,153 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, "render");
         assert_eq!(events[0].details.as_deref(), Some(r#"{"env":"prod"}"#));
+    }
+
+    // ── Secret-push audit (v1.8.0, T-000135) ───────────────────────────────────
+
+    /// Seed a repo with a real `github_name` (so repo_name derives from its last
+    /// segment) and one deploy environment. Returns (repository_id, deploy_env_id).
+    fn seed_repo_and_env(db: &AppDb) -> (i64, i64) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO repositories (github_name, github_url, project_id, role, description, local_path, sort_order)
+             VALUES ('owner/audit-repo', NULL, NULL, 'server', 'Audit repo', '/tmp/audit', 10)",
+            [],
+        )
+        .unwrap();
+        let repo_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO deploy_environments
+                (repository_id, name, workflow_name, image_tag, compose_service, domain, deploy_branch)
+             VALUES (?1, 'prod', 'Deploy', 'latest', 'backend', 'x.com', 'master')",
+            rusqlite::params![repo_id],
+        )
+        .unwrap();
+        let env_id = conn.last_insert_rowid();
+        (repo_id, env_id)
+    }
+
+    #[test]
+    fn test_list_secret_push_events_normalizes_and_sorts() {
+        let db = make_db();
+        let (repo_id, env_id) = seed_repo_and_env(&db);
+
+        // Repo secret 'set' (verb inside details.action).
+        db.insert_sync_event(
+            Some(repo_id),
+            "secret",
+            "2026-07-01T10:00:00Z",
+            1,
+            Some(&serde_json::json!({ "action": "set", "name": "API_KEY" }).to_string()),
+        )
+        .unwrap();
+        // Repo secret 'delete'.
+        db.insert_sync_event(
+            Some(repo_id),
+            "secret",
+            "2026-07-01T11:00:00Z",
+            1,
+            Some(&serde_json::json!({ "action": "delete", "name": "OLD_KEY" }).to_string()),
+        )
+        .unwrap();
+        // Env secret set (verb inside the action column; name-only details).
+        db.insert_deploy_event(
+            Some(env_id),
+            repo_id,
+            "env_secret_set",
+            "2026-07-01T12:00:00Z",
+            Some(&serde_json::json!({ "name": "DB_PASSWORD" }).to_string()),
+        )
+        .unwrap();
+
+        let events = db.list_secret_push_events(100, 0).unwrap();
+        assert_eq!(events.len(), 3);
+
+        // Sorted by ts DESC → env event first, then delete, then set.
+        assert_eq!(events[0].source, "env");
+        assert_eq!(events[0].action, "set");
+        assert_eq!(events[0].secret_name, "DB_PASSWORD");
+        assert_eq!(events[0].repo_name, "audit-repo");
+        assert_eq!(events[0].deploy_env_id, Some(env_id));
+        assert_eq!(events[0].env_name.as_deref(), Some("prod"));
+
+        assert_eq!(events[1].source, "repo");
+        assert_eq!(events[1].action, "delete");
+        assert_eq!(events[1].secret_name, "OLD_KEY");
+        assert_eq!(events[1].repo_name, "audit-repo");
+        assert!(events[1].deploy_env_id.is_none());
+        assert!(events[1].env_name.is_none());
+
+        assert_eq!(events[2].source, "repo");
+        assert_eq!(events[2].action, "set");
+        assert_eq!(events[2].secret_name, "API_KEY");
+    }
+
+    #[test]
+    fn test_list_secret_push_events_excludes_non_secret_rows() {
+        let db = make_db();
+        let (repo_id, env_id) = seed_repo_and_env(&db);
+
+        // Non-secret sync event must be excluded.
+        db.insert_sync_event(
+            Some(repo_id),
+            "project_sync",
+            "2026-07-01T09:00:00Z",
+            2,
+            None,
+        )
+        .unwrap();
+        // Non-secret deploy event (render) must be excluded.
+        db.insert_deploy_event(
+            Some(env_id),
+            repo_id,
+            "render",
+            "2026-07-01T09:30:00Z",
+            Some(r#"{"env":"prod"}"#),
+        )
+        .unwrap();
+        // One real secret event so we know the query itself works.
+        db.insert_sync_event(
+            Some(repo_id),
+            "secret",
+            "2026-07-01T10:00:00Z",
+            1,
+            Some(&serde_json::json!({ "action": "set", "name": "TOKEN" }).to_string()),
+        )
+        .unwrap();
+
+        let events = db.list_secret_push_events(100, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].secret_name, "TOKEN");
+        assert_eq!(events[0].action, "set");
+    }
+
+    #[test]
+    fn test_list_secret_push_events_pagination() {
+        let db = make_db();
+        let (repo_id, _env_id) = seed_repo_and_env(&db);
+
+        for (i, hour) in ["10", "11", "12"].iter().enumerate() {
+            db.insert_sync_event(
+                Some(repo_id),
+                "secret",
+                &format!("2026-07-01T{hour}:00:00Z"),
+                1,
+                Some(
+                    &serde_json::json!({ "action": "set", "name": format!("KEY_{i}") }).to_string(),
+                ),
+            )
+            .unwrap();
+        }
+
+        // ts DESC → KEY_2 (12h), KEY_1 (11h), KEY_0 (10h).
+        let first = db.list_secret_push_events(2, 0).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].secret_name, "KEY_2");
+        assert_eq!(first[1].secret_name, "KEY_1");
+
+        let second = db.list_secret_push_events(2, 2).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].secret_name, "KEY_0");
     }
 }

@@ -169,6 +169,24 @@ pub struct DeploySecretValue {
     pub value: String,
 }
 
+/// v1.8.0 (T-000135): one normalized secret-push audit event. Unified read over
+/// two already-logged sources: repo-level pushes (`sync_events`, sync_type='secret',
+/// verb inside details.action) and env-level pushes (`deploy_events`, verb inside
+/// the action column via `env_secret_set`/`env_secret_delete`). `action` is
+/// normalized to "set" | "delete" and `source` to "repo" | "env". snake_case JSON,
+/// no serde rename — matches the other deploy structs (Tauri tool contract).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SecretPushEvent {
+    pub source: String,
+    pub repository_id: i64,
+    pub repo_name: String,
+    pub deploy_env_id: Option<i64>,
+    pub env_name: Option<String>,
+    pub secret_name: String,
+    pub action: String,
+    pub ts: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
