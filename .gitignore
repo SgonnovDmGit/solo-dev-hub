@@ -30,17 +30,20 @@ tauri-updater-key*
 superpowers/
 docs/roadmap.md
 docs/icons-preview/
+# local RU skill drafts (working reference, not shipped)
+docs/skill-drafts-ru/
 
 # --- solo-dev-hub:begin ---
 /CLAUDE.*
 .claude/
+docs/project.md
 docs/bug-reports.md
 docs/backend-requirements/
 docs/client-requirements/
 docs/microservice-requirements/
+docs/microservice-announcements/
 docs/server-requirements/
+docs/server-announcements/
 docs/superpowers/
+docs/sdh_skills/
 # --- solo-dev-hub:end ---
-
-# local RU skill drafts (working reference, not shipped)
-docs/skill-drafts-ru/
