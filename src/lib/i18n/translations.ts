@@ -38,6 +38,7 @@ import * as deploy from './strings/deploy';
 import * as untrack from './strings/untrack';
 import * as bundles from './strings/bundles';
 import * as reports from './strings/reports';
+import * as secretAudit from './strings/secretAudit';
 
 const ru = {
   ...common.ru,
@@ -78,6 +79,7 @@ const ru = {
   ...untrack.ru,
   ...bundles.ru,
   ...reports.ru,
+  ...secretAudit.ru,
 } as const;
 
 const en: Record<keyof typeof ru, string> = {
@@ -119,6 +121,7 @@ const en: Record<keyof typeof ru, string> = {
   ...untrack.en,
   ...bundles.en,
   ...reports.en,
+  ...secretAudit.en,
 };
 
 export const translations: Record<Locale, Record<keyof typeof ru, string>> = { ru, en };

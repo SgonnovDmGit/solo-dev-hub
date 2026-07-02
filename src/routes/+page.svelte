@@ -26,6 +26,7 @@
   import Timeline from '$lib/components/Timeline.svelte';
   import DeployReport from '$lib/components/DeployReport.svelte';
   import ReportsHub from '$lib/components/ReportsHub.svelte';
+  import SecretAudit from '$lib/components/SecretAudit.svelte';
   import SecretBundles from '$lib/components/SecretBundles.svelte';
   import GlobalClaudeEditor from '$lib/components/GlobalClaudeEditor.svelte';
   import InputContextMenu from '$lib/components/InputContextMenu.svelte';
@@ -282,6 +283,8 @@
         <ReportsHub />
       {:else if $currentScreen.name === 'deploy_report'}
         <DeployReport />
+      {:else if $currentScreen.name === 'secret_audit'}
+        <SecretAudit />
       {:else if $currentScreen.name === 'secret_bundles'}
         <SecretBundles />
       {:else if $currentScreen.name === 'global_claude_editor'}
