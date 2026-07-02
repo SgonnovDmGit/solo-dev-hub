@@ -63,6 +63,8 @@ export const ru = {
   'toast.cycleDetected': 'Цикл: этот микросервис уже подключён транзитивно',
   'toast.untrackSuccess': 'Очищено из индекса: {0} файлов. Сделай `git commit` для фиксации.',
   'toast.untrackPartial': 'Очищено: {0}, ошибок: {1}. См. диалог.',
+  'toast.deployCsvExported': 'Отчёт сохранён: {0}',
+  'toast.deployCsvExportFailed': 'Ошибка экспорта CSV: {0}',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -130,4 +132,6 @@ export const en: Record<keyof typeof ru, string> = {
   'toast.cycleDetected': 'Cycle: this microservice is already connected transitively',
   'toast.untrackSuccess': 'Untracked {0} files. Run `git commit` to record.',
   'toast.untrackPartial': 'Untracked: {0}, errors: {1}. See dialog.',
+  'toast.deployCsvExported': 'Report saved: {0}',
+  'toast.deployCsvExportFailed': 'CSV export failed: {0}',
 };

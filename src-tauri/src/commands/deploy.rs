@@ -278,6 +278,19 @@ pub fn list_deploy_report(db: State<AppDb>) -> Result<Vec<DeployReportRow>, Stri
     db.list_deploy_report().map_err(|e| e.to_string())
 }
 
+/// v1.8.0 (T-000140): CSV-export the deploy report. The frontend flattens each
+/// displayed row into `DeployReportCsvRow` and passes them here; the backend
+/// only CSV-formats (RFC4180) + writes to a user-chosen path (from an OS save
+/// dialog, so no path guard needed).
+#[tauri::command]
+pub fn export_deploy_report_csv(
+    file_path: String,
+    rows: Vec<crate::models::DeployReportCsvRow>,
+) -> Result<(), String> {
+    let csv = crate::export::deploy_report_to_csv(&rows);
+    std::fs::write(&file_path, csv).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn get_deploy_environment(
     db: State<AppDb>,

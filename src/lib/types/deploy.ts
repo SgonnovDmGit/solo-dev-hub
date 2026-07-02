@@ -85,3 +85,32 @@ export interface DeployInventoryField {
   origin: 'persisted' | 'placeholder' | 'github_only';
   sensitive: boolean;
 }
+
+// v1.8.0 (T-000135): one normalized secret-push audit event. Mirrors Rust
+// SecretPushEvent (snake_case). source is 'repo' (sync_events, sync_type='secret')
+// or 'env' (deploy_events, env_secret_*); action normalized to 'set' | 'delete'.
+// deploy_env_id/env_name are null for repo-level events. Values are never carried.
+export interface SecretPushEvent {
+  source: 'repo' | 'env';
+  repository_id: number;
+  repo_name: string;
+  deploy_env_id: number | null;
+  env_name: string | null;
+  secret_name: string;
+  action: 'set' | 'delete';
+  ts: string;
+}
+
+// v1.8.0 (T-000140): flattened CSV-export row for the deploy report. The frontend
+// builds this from the displayed row (db_name via dbNameOf) and passes it to
+// export_deploy_report_csv. Mirrors Rust DeployReportCsvRow (snake_case).
+export interface DeployReportCsvRow {
+  repo: string;
+  environment: string;
+  domain: string;
+  branch: string;
+  image_tag: string;
+  db_name: string;
+  secrets_count: number;
+  updated_at: string;
+}

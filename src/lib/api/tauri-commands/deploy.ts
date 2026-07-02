@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Repository, RenderedFile, WriteResult, DeployEnvironment, DeployReportRow, DeploySecret, DeploySecretValue, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, Task, SecretBundle, SecretBundleItemValue } from '$lib/types';
+import type { Repository, RenderedFile, WriteResult, DeployEnvironment, DeployReportRow, DeployReportCsvRow, SecretPushEvent, DeploySecret, DeploySecretValue, CreateDeployEnvironmentArgs, UpdateDeployEnvironmentArgs, DeploySecretRole, Task, SecretBundle, SecretBundleItemValue } from '$lib/types';
 
 
 // ── Deploy (0.7.0) ────────────────────────────────────────────────────────────
@@ -32,6 +32,15 @@ export const listDeployEnvironments = (repoId: number) =>
 
 export const listDeployReport = () =>
   invoke<DeployReportRow[]>('list_deploy_report', {});
+
+// v1.8.0 (T-000140): CSV-export the deploy report. Frontend passes the flattened
+// (already-displayed) rows + a user-chosen path from the OS save dialog.
+export const exportDeployReportCsv = (filePath: string, rows: DeployReportCsvRow[]) =>
+  invoke<void>('export_deploy_report_csv', { filePath, rows });
+
+// v1.8.0 (T-000135): read-only unified list of already-logged secret pushes.
+export const listSecretPushEvents = (limit: number, offset: number) =>
+  invoke<SecretPushEvent[]>('list_secret_push_events', { limit, offset });
 
 export const getDeployEnvironment = (id: number) =>
   invoke<DeployEnvironment | null>('get_deploy_environment', { id });

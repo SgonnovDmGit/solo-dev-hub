@@ -144,6 +144,24 @@ pub struct DeployReportRow {
     pub ssh_fields: Vec<DeployInventoryField>,
 }
 
+/// v1.8.0 (T-000140): CSV-export row for the deploy report. The frontend
+/// flattens each displayed report row into this 8-cell shape and passes it to
+/// the backend, which only CSV-formats + writes the file (display logic stays
+/// single-source in the frontend). Arrives FROM the frontend as a Tauri command
+/// arg, hence must `Deserialize`. snake_case JSON, no serde rename — matches the
+/// other deploy structs (Tauri tool contract, not a server).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeployReportCsvRow {
+    pub repo: String,
+    pub environment: String,
+    pub domain: String,
+    pub branch: String,
+    pub image_tag: String,
+    pub db_name: String,
+    pub secrets_count: i64,
+    pub updated_at: String,
+}
+
 /// v1.6.0 (T-000134): one DB- or SSH-related inventory field surfaced in the
 /// deploy report. `value` is `None` when the field is sensitive (withheld) or
 /// exists only as a GitHub secret name with no local value. `origin` records
@@ -167,6 +185,24 @@ pub struct DeployInventoryField {
 pub struct DeploySecretValue {
     pub secret_name: String,
     pub value: String,
+}
+
+/// v1.8.0 (T-000135): one normalized secret-push audit event. Unified read over
+/// two already-logged sources: repo-level pushes (`sync_events`, sync_type='secret',
+/// verb inside details.action) and env-level pushes (`deploy_events`, verb inside
+/// the action column via `env_secret_set`/`env_secret_delete`). `action` is
+/// normalized to "set" | "delete" and `source` to "repo" | "env". snake_case JSON,
+/// no serde rename — matches the other deploy structs (Tauri tool contract).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SecretPushEvent {
+    pub source: String,
+    pub repository_id: i64,
+    pub repo_name: String,
+    pub deploy_env_id: Option<i64>,
+    pub env_name: Option<String>,
+    pub secret_name: String,
+    pub action: String,
+    pub ts: String,
 }
 
 #[cfg(test)]
