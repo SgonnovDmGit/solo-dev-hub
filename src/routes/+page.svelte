@@ -25,6 +25,7 @@
   import About from '$lib/components/About.svelte';
   import Timeline from '$lib/components/Timeline.svelte';
   import DeployReport from '$lib/components/DeployReport.svelte';
+  import ReportsHub from '$lib/components/ReportsHub.svelte';
   import SecretBundles from '$lib/components/SecretBundles.svelte';
   import GlobalClaudeEditor from '$lib/components/GlobalClaudeEditor.svelte';
   import InputContextMenu from '$lib/components/InputContextMenu.svelte';
@@ -179,11 +180,11 @@
       </button>
       <button
         class="ghost titlebar-btn"
-        class:active={$currentScreen.name === 'deploy_report'}
-        onclick={() => $currentScreen.name === 'deploy_report' ? goBack() : navigateTo('deploy_report')}
-        title={$tStore('deploy.report.title' as any)}
+        class:active={$currentScreen.name === 'reports' || $currentScreen.name === 'deploy_report' || $currentScreen.name === 'secret_audit'}
+        onclick={() => $currentScreen.name === 'reports' ? goBack() : navigateTo('reports')}
+        title={$tStore('reports.tooltip' as any)}
       >
-        🚀 {$tStore('deploy.report.title' as any)}
+        📋 {$tStore('reports.title' as any)}
       </button>
       <button
         class="ghost titlebar-btn"
@@ -277,6 +278,8 @@
         <About />
       {:else if $currentScreen.name === 'timeline'}
         <Timeline />
+      {:else if $currentScreen.name === 'reports'}
+        <ReportsHub />
       {:else if $currentScreen.name === 'deploy_report'}
         <DeployReport />
       {:else if $currentScreen.name === 'secret_bundles'}
