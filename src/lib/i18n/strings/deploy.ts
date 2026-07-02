@@ -108,6 +108,8 @@ export const ru = {
   'deploy.report.markerPersisted': 'хранится локально (шифровано)',
   'deploy.report.markerGithubOnly': 'только в GitHub, локально не сохранено',
   'deploy.report.valueHidden': 'значение скрыто (чувствительное)',
+  // v1.8.0 (T-000140): CSV export of the (filtered) deploy report.
+  'deploy.report.exportCsv': 'Сохранить CSV',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -220,4 +222,6 @@ export const en: Record<keyof typeof ru, string> = {
   'deploy.report.markerPersisted': 'stored locally (encrypted)',
   'deploy.report.markerGithubOnly': 'only in GitHub, not stored locally',
   'deploy.report.valueHidden': 'value hidden (sensitive)',
+  // v1.8.0 (T-000140): CSV export of the (filtered) deploy report.
+  'deploy.report.exportCsv': 'Export CSV',
 };

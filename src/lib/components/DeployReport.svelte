@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { tStore } from '$lib/i18n';
+  import { tStore, tf } from '$lib/i18n';
   import { openUrl } from '@tauri-apps/plugin-opener';
-  import { listDeployReport } from '$lib/api/tauri-commands';
+  import { save } from '@tauri-apps/plugin-dialog';
+  import { listDeployReport, exportDeployReportCsv } from '$lib/api/tauri-commands';
   import { projects } from '$lib/stores/projects';
   import { selectedRepoId, deployDrillTarget, navigateTo, addToast } from '$lib/stores/ui';
-  import type { DeployReportRow } from '$lib/types';
+  import type { DeployReportRow, DeployReportCsvRow } from '$lib/types';
 
   let rows = $state<DeployReportRow[]>([]);
   let loading = $state(true);
@@ -117,6 +118,34 @@
       addToast(String(err), 'error');
     }
   }
+
+  // v1.8.0 (T-000140): export the currently-filtered rows (WYSIWYG) to CSV via
+  // the OS save dialog + export_deploy_report_csv. db_name uses the same
+  // dbNameOf helper as the on-screen cell; updated_at is formatted DD.MM.YYYY.
+  async function handleExportCsv() {
+    const today = new Date().toISOString().slice(0, 10);
+    const path = await save({
+      defaultPath: `deploy-report-${today}.csv`,
+      filters: [{ name: 'CSV', extensions: ['csv'] }],
+    });
+    if (!path) return; // user cancelled
+    const csvRows: DeployReportCsvRow[] = filtered.map((r) => ({
+      repo: r.repo_name,
+      environment: r.env_name,
+      domain: r.domain,
+      branch: r.deploy_branch,
+      image_tag: r.image_tag,
+      db_name: dbNameOf(r),
+      secrets_count: r.secrets_count,
+      updated_at: fmtDate(r.updated_at),
+    }));
+    try {
+      await exportDeployReportCsv(path, csvRows);
+      addToast(tf('toast.deployCsvExported', path), 'success');
+    } catch (e) {
+      addToast(tf('toast.deployCsvExportFailed', String(e)), 'error');
+    }
+  }
 </script>
 
 <div class="wrap">
@@ -159,6 +188,9 @@
           .replace('{0}', String(filtered.length))
           .replace('{1}', String(projectCount))}
       </div>
+      <button class="control export-btn" onclick={handleExportCsv}>
+        📥 {$tStore('deploy.report.exportCsv' as any)}
+      </button>
     </div>
   {/if}
 
@@ -255,6 +287,8 @@
     border-radius: 5px; padding: 6px 10px; font-size: 12px; min-width: 150px;
   }
   .control.search { min-width: 220px; }
+  .export-btn { min-width: 0; cursor: pointer; align-self: center; white-space: nowrap; }
+  .export-btn:hover { background: rgba(124, 58, 237, 0.12); border-color: var(--accent, #7c3aed); }
   .spacer { flex: 1; }
   .count { align-self: center; color: var(--text-muted); font-size: 12px; }
 
