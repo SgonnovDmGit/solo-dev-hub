@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-07-02
+
+Global AI rules → on-demand skills. The workflow-heavy rules (cross-repo requirements, announcements, api.md contract, phase workflow, release lifecycle, feature flow docs) move out of the always-on CLAUDE.md block into on-demand skills — cutting the always-on context from ~750 to ~215 lines while keeping every rule available the moment it's relevant.
+
+### Added
+- **Workflow rules as on-demand skills (T-000138 / T-000143 / T-000144 / T-000145).** "Sync AI rules" now installs six `sdh-*` workflow skills into `~/.claude/skills/` — Claude Code surfaces each by its `description` only when relevant — and mirrors the same content into every repo's `docs/sdh_skills/*.md`, so any AI agent (not just Claude Code) can read them. One bundled source renders to both targets, so the two never drift.
+- **Trigger index in the thin core (T-000145).** The always-on CLAUDE.md core keeps the small format / versioning / commit contracts and gains a compact "when you… → skill" index that points to the right skill.
+- **Non-Claude pointer + gitignore (T-000146).** Each repo's `CLAUDE.md` section points non-Claude agents at `docs/sdh_skills/`; the folder is gitignored (local, app-synced) like the rest of the operational layer.
+
+### Changed
+- **Always-on rules trimmed (~750 → ~215 lines).** The cross-repo REQ / announcements / api.md-contract / phase-workflow / release-lifecycle / feature-flow clusters no longer load into every session — they load on demand. "Sync AI rules" in Settings now seeds the skills alongside the thin core (T-000147); README documents the new delivery (T-000148).
+
+### Tests
+- 452 Rust (`cargo test --lib`; +1 real-bundle guard asserting all six skills seed with valid frontmatter and render to `docs/sdh_skills/`), ~86 vitest, 0 svelte-check errors. No DB migration.
+
 ## [1.8.0] — 2026-07-02
 
 Reports hub + deploy-report CSV export + secret-push audit. The deploy report moves under a new 📋 Reports section (room for future reports without titlebar creep), gains a CSV export, and is joined by a Secrets audit that reconciles what SDH logged pushing against what actually lives in GitHub right now.
