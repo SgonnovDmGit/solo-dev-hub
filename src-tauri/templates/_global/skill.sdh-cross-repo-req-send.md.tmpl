@@ -1,0 +1,145 @@
+---
+name: sdh-cross-repo-req-send
+description: >
+  Use when YOU want something from another repo and are authoring or closing an
+  OUTGOING cross-repo requirement (client → server, server → microservice) —
+  the sending side of the SDH Message/Receipt pattern. Covers picking the
+  REQ-NNN number, the folder, the body structure, examples, authoring a
+  downstream REQ during forwarding (the Forwarded-from header), and closing a
+  pair (✓ or .impl.md). To ANSWER a REQ you received — skill
+  sdh-cross-repo-req-answer.
+---
+
+You are here if you are **asking another repo for something** and writing an outgoing requirement. REQ is the **reactive** channel: you ask, the other side answers.
+
+- A REQ **arrived** for you and you need to answer with a receipt → skill `sdh-cross-repo-req-answer`.
+- You want to **push** something proactively, expecting no answer (server→client, microservice→parent) → skill `sdh-cross-repo-announce-send`.
+
+**Who sends REQs:** client → server; server → microservice; microservice → another microservice (rare edge case). A client is never a recipient of requirements.
+
+Solo Dev Hub moves files between repos itself — you **never** copy, move, or delete them across a repo boundary manually. Your area is only your own **outgoing** folder.
+
+## Files and ownership
+
+- **Requirement** `REQ-NNN_<slug>.md` — authored by **you**. Your copy is the **source of truth**; the recipient's copy is a synced replica (you edit only your own).
+- **Receipt** `REQ-NNN_<slug>.response.md` — authored by the **recipient**. Its copy is the source of truth; the copy that lands with you is a replica. **You do not edit it.**
+
+`NNN` is chosen at creation and **never** renamed or renumbered. `_<slug>` is a short kebab-case readability hint — recommended but optional (the app matches by the globs `REQ-*.md`).
+
+## Step 1. Pick the number `NNN`
+
+A monotonic counter **within your own outgoing folder** (not global):
+1. Glob `REQ-*.md` in the outgoing folder.
+2. Max existing `NNN`.
+3. New = `max + 1`, zero-padded to 3 digits (`001`, `047`).
+4. Folder empty — start at `001`.
+
+Numbers **grow even after closures** — do not reuse freed slots (keeps the recipient's git history readable).
+
+## Step 2. Put it in your outgoing folder
+
+| You | Your outgoing folder |
+|---|---|
+| Client (→ server) | `docs/backend-requirements/` (flat — a client has one server) |
+| Server (→ microservice) | `docs/microservice-requirements/<microservice-project-name>/` (nested — a server has many microservices) |
+
+Nesting appears when there can be many counterparties. Folder renames (repo renamed on GitHub) are handled by the app — **do not rename manually**.
+
+## Step 3. Write the REQ body
+
+The body is free-form, but a good REQ has structure — so the recipient can estimate scope and check for completion without a round-trip:
+
+```markdown
+# REQ-NNN: <short one-line title>
+
+## Description
+What is needed and **why** — the problem context, not just "do X".
+Without context the recipient guesses intent and often guesses wrong.
+
+## Acceptance criteria
+A checkable "done when…" list:
+- [ ] concrete observable condition 1
+- [ ] concrete observable condition 2
+
+## Context (optional)
+Links, constraints, examples, related endpoints/tables.
+```
+
+**Body rules:**
+- **Phrase in terms of the recipient's contract.** If you are a server writing to a microservice — ask for what *the server needs from the MS*, not "the client wants X" (the microservice has no contract with the client; see "Downstream REQ").
+- **Audience (admin-vs-user), if it matters for RBAC/access, state explicitly in the body** — don't expect the recipient to infer it from the repo name.
+- The more concrete the acceptance criteria, the lower the chance of a `clarification-needed`.
+
+### Example: a full REQ
+
+File `docs/backend-requirements/REQ-007_avatar-upload.md` (client → server):
+
+```markdown
+# REQ-007: User avatar upload
+
+## Description
+The client needs an endpoint to upload an avatar from the profile. Today the
+avatar is set only by an external URL — users ask to upload a file directly.
+
+## Acceptance criteria
+- [ ] `POST /profile/avatar` accepts a multipart file (jpg/png, ≤ 2 MB)
+- [ ] Returns `{ "avatarUrl": string }` with a public link
+- [ ] Type/size validation with error codes in docs/api.md
+
+## Context
+The profile is already documented in docs/server-api/api.md (PATCH /profile).
+Blob storage is at the server's discretion.
+```
+
+## Step 4. Sync delivers the REQ and returns the receipt
+
+- **The app** copies the REQ into the recipient's incoming folder at the next sync.
+- If you later **edit** the REQ — the next sync overwrites the recipient's copy. **The source of truth (you) always wins.**
+- The recipient writes a receipt; **the app returns** its copy to your outgoing folder.
+- You **do not edit** the receipt copy on your side — the edit will be overwritten at sync.
+
+Sync state of the pair shown in the UI (computed from the filesystem): `new` (REQ exists on your side, not yet on the recipient's) → `sent` (both sides, no receipt) → `responded` (receipt appeared).
+
+## Step 5. Close the pair when satisfied with the receipt
+
+Two ways to close (delete) a pair — both remove all files on both sides:
+
+1. **Manual ✓** — the user clicks ✓ in the app (`confirm_requirement`). Available for any responded pair.
+2. **`.impl.md` (LLM-authorable)** — you drop an (optionally empty) file `REQ-NNN_<slug>.impl.md` next to the REQ in your **own outgoing** folder. At the next sync Solo Dev Hub detects it and tears down the whole triple (`.md` + `.response.md` + `.impl.md`) on both sides. This lets the sender's LLM close its own loops without a human ✓.
+
+**`.impl.md` rules:**
+- Authored **only by the sender**, only in the sender's outgoing folder. The file's existence is the signal; empty is fine, any content is ignored by the app.
+- Drop it **only when you are done integrating and satisfied** with the receipt.
+
+**If NOT satisfied** with a final receipt (`implemented` / `partially` / `declined`) — do not "reject"; write a new `REQ-N+1_<slug>.md` with a clarified ask. The original pair may stay open until answered or be closed immediately.
+
+**If the receipt is `clarification-needed`** — a different path: edit the **original** `REQ-NNN.md` inline (do not open `REQ-N+1`), adding the answers. The next sync delivers the updated REQ, the recipient overwrites the receipt with a final status. The loop continues until you write a complete REQ.
+
+## Downstream REQ (forwarding, server only)
+
+When you are a **server** and received a client REQ that requires work in a connected microservice, you write an outgoing REQ to the microservice. This is an ordinary send (steps 1–3) with two differences:
+
+1. **Reformulate in server↔MS contract terms.** Not "the client wants X" verbatim — the microservice has no contract with clients. Ask for what the server needs from the MS.
+2. **Add the linkage header** immediately after the H1:
+
+```markdown
+# REQ-002: Avatar blob storage
+
+**Forwarded-from:** web-app-client/REQ-001
+
+## Description
+...
+```
+
+The header uses the **last-segment / canonical** form of the client repo name (`web-app-client/REQ-001`, not `SgonnovDmGit/web-app-client/REQ-001`), matching the folder names. One client REQ forwarded to several microservices → the same header in **each** downstream REQ.
+
+**Why the header:** it lets the server recover an in-flight chain across sessions. Without it, the link between a client REQ and its downstream MS REQs is not discoverable from the filesystem alone.
+
+Whether and **when** to forward, waiting for the whole chain, and writing the final client receipt — that is the answer side: see skill `sdh-cross-repo-req-answer`, section "Forwarding (triangular flow)".
+
+## What you must NOT do (sender side)
+
+- **Do not author a `REQ-*.md` in someone else's / your incoming folder.** You write only to your own outgoing folder. (If you are a server — do not write a REQ in `docs/client-requirements/<client>/`: the app populates it from the client, and your REQ there will be mistaken for an incoming request. Server-initiated communication to a client goes through announcements.)
+- **Do not edit a `REQ-*.response.md`** — the receipt belongs to the recipient; the edit will be overwritten.
+- **Do not delete** `REQ-*.md` / `.response.md` manually — closing only via ✓ or `.impl.md`.
+- **Do not rename/renumber `NNN`** and **do not rename sync folders** — they are app-managed.

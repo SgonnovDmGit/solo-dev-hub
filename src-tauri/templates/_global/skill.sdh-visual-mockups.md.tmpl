@@ -1,0 +1,32 @@
+---
+name: sdh-visual-mockups
+description: >
+  Use when designing a non-server visual surface — a new screen, landing page,
+  component, or redesign. Mockups via any visual preview available to the agent
+  (artifacts / HTML / rendered images), variants side by side, pixel-precise
+  iteration to acceptance. The accepted mockup is the design gate: it feeds the
+  spec (phase-workflow) and usually enables the autonomous mode
+  (release-lifecycle).
+---
+
+You are here when a feature has a **visual surface** and the main decision is how it looks: a new UI screen, landing page, component, visual redesign. For visual work a mockup is not an illustration but the **carrier of design decisions**: the accepted mockup is the design gate, after which the rest is usually mechanical.
+
+Not for server/non-visual tasks — there the decisions are textual and no mockup is needed.
+
+## Method: show, don't describe (by any available means)
+
+The medium is **any visual preview available to the current agent**: artifacts, a self-contained HTML preview in a browser, rendered images, etc. The medium is secondary — the principle matters: the user **sees** the design, does not read a description of it. What to reproduce regardless of medium:
+
+- **Variants side by side** — 2–4 layouts next to each other (interactive medium — toggles for **variant** / **theme** light-dark / **width** narrow-wide-full in one mockup; static medium — separate renders), to compare live.
+- **Pixel-precise** — iterate on concrete edits ("smaller gap", "chip further left"), not on vague words.
+- **Full-width adaptive** — no artificial `max-width` constraint if the product is full-width.
+
+## Iteration discipline
+
+- **After 2 consecutive "not quite"** — don't run a third blind iteration. Bring in the ui-ux skill + show variants **side by side** (variant/theme/width toggles), let the user point pixel-precisely.
+- **Don't bail to "known limitation / won't fix"** before explicitly listing the remaining options. "So it can't be done?" from the user = a signal you bailed early.
+- **A failed CSS experiment — revert it immediately**, don't hoard it as "defense in depth".
+
+## Output: the accepted mockup is the design gate
+
+The accepted mockup carries the design decisions — the spec text after it can be thin (see the spec step of `sdh-phase-workflow`). And this is usually where all the judgment is settled and the rest is mechanical → the cycle's **autonomous mode** naturally kicks in (see `sdh-release-lifecycle`): the user grants a carry-forward OK at mockup acceptance, and Implementation → Test → the documentation part of Closure roll on without per-stage approvals.

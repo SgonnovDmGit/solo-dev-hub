@@ -1,0 +1,46 @@
+---
+name: sdh-cross-repo-announce-read
+description: >
+  Use at session start to process unsolicited announcements that arrived from
+  another repo — a client reads from its server, a parent server reads from its
+  microservices (ANNOUNCE-NNN.md files in docs/server-announcements/ or
+  docs/microservice-announcements/). Covers scanning the folders, integrating,
+  acknowledging by deleting the file, and committing. To PUSH an announcement
+  yourself — skill sdh-cross-repo-announce-send.
+---
+
+You are here if an announcement **arrived** for you — an unsolicited push from another repo reporting a change that needs your reaction. The sender expects no answer; your acknowledgement is **deleting** the file.
+
+- You want to **push an announcement** to another repo yourself → skill `sdh-cross-repo-announce-send`.
+- A `REQ-*.md` arrived (a requirement awaiting a receipt), not an announcement → skill `sdh-cross-repo-req-answer`.
+
+**Who reads announcements:**
+- **A client** — reads from its server (`docs/server-announcements/`).
+- **A parent server** — reads from its microservices (`docs/microservice-announcements/`). A microservice that has its own connected microservices reads in this same parent role.
+
+A client is read-only: it only receives announcements, never writes.
+
+## Step 1. Scan at session start
+
+Check the folder for your role:
+- **Client** → `docs/server-announcements/`
+- **Parent server** → `docs/microservice-announcements/`
+
+Each subfolder is named after the sender repo/project (last segment, e.g. `web-app-backend`). Inside — `ANNOUNCE-*.md` files.
+
+## Step 2. Process each `ANNOUNCE-*.md`
+
+For each file found:
+1. Read the body (`## Why this matters` / `## What changed` / `## What you need to do` / `## References`).
+2. **Integrate or apply** what's needed — the code/config/behavior changes the "What you need to do" section requires.
+3. **Delete the file.** Deletion is the implicit acknowledgement — there is no `.response.md`, no ✓ through the app. A file you deleted means "accepted and applied".
+
+## Step 3. Commit the deletion
+
+Commit the deletion to your own git history — **together** with the code changes the announcement triggered. This is the only audit trail: Solo Dev Hub does not track announcements.
+
+## Why deleting is fine
+
+Normally the `sdh-cross-repo-req-*` rule forbids the LLM from touching cross-repo files manually. Announcements are the **explicit exception**: the channel has no app-side sync, so the recipient-LLM deletes `ANNOUNCE-*.md` from its own repo itself. The app does not track these files and will not restore them — deletion is final and is the act of acknowledgement.
+
+Do not hoard processed announcements "just in case" — the needed information is already in your code and commit, and a stale `ANNOUNCE-*.md` lying around reads as "not yet processed" and confuses the next session.

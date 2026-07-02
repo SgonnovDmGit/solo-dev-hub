@@ -13,12 +13,18 @@ Workflow-heavy rules are not inlined here — they load on demand. In Claude Cod
 
 | When you… | Skill / file |
 |---|---|
-| create/answer/confirm/forward a cross-repo REQ | `sdh-cross-repo-req` |
-| push an unsolicited announcement to a client / parent server | `sdh-cross-repo-announcements` |
-| add/change/remove an api.md endpoint, or spec against a server surface | `sdh-api-contract` |
+| author or close an OUTGOING cross-repo REQ (you're asking) | `sdh-cross-repo-req-send` |
+| answer a REQ that ARRIVED for you (write a receipt) | `sdh-cross-repo-req-answer` |
+| push an unsolicited announcement to a client / parent server | `sdh-cross-repo-announce-send` |
+| process announcements that arrived (at session start) | `sdh-cross-repo-announce-read` |
+| add/change/remove an api.md endpoint (maintain your contract) | `sdh-api-contract-maintain` |
+| check another repo's server surface before a spec | `sdh-api-contract-consume` |
 | document a multi-file/multi-layer feature flow | `sdh-feature-flow-docs` |
 | scope a non-trivial task (≥2 decisions / cross-boundary / ≥3 subtasks) | `sdh-phase-workflow` |
-| run a release (any SemVer bump) | `sdh-release-lifecycle` |
+| design a non-server visual surface (screen / landing / component) | `sdh-visual-mockups` |
+| run a release (any SemVer bump) — stages, tracks, transitions | `sdh-release-lifecycle` |
+| close a release tag (checklist + git canon) | `sdh-release-closure` |
+| run a retrospective at release closure | `sdh-retro` |
 
 # File formats
 
@@ -145,7 +151,7 @@ Format: `MAJOR.MINOR.PATCH` (e.g. `2.3.1`). Each component is an independent cou
 | Microservice | Breaking API change (affects all consumers) | New functionality | Bug fix |
 | Tool | Major change | New function | Bug fix |
 
-Release workflow: see the `sdh-release-lifecycle` skill for the full step-by-step procedure (manifest bump, Changelog, done.md, smoke, schema regen, closure commit, tag). The **dev** runs `git tag vX.Y.Z` and `git push origin vX.Y.Z` — LLM does not execute git tag/push autonomously.
+Release workflow: see the `sdh-release-lifecycle` skill for the end-to-end stage flow and the `sdh-release-closure` skill for the full closure checklist (manifest bump, Changelog, done.md, smoke, build artifact, schema regen, closure commit, tag) + the canonical git block. The **dev** runs the tag/merge commands — LLM does not execute git tag/push autonomously.
 
 # `Changelog.md`
 

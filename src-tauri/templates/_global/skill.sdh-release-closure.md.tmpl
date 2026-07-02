@@ -1,0 +1,68 @@
+---
+name: sdh-release-closure
+description: >
+  Use when closing a release tag of any SemVer bump — "ready to release",
+  "finalize the docs", "shipping vX.Y", or the last task in scope is done. The
+  10-step closure checklist (version bump, Changelog, done.md, todo cleanup,
+  REQ receipts, verification, build artifact, schema regen, closure commit,
+  tag) plus a canonical git block for the terminal. The full lifecycle — skill
+  sdh-release-lifecycle; the retrospective — skill sdh-retro.
+---
+
+You are here when a release is ready to **close** — the user signals *"ready to release"*, *"finalize the docs"*, *"shipping vX.Y"*, or the last task in scope is done. Surface the full checklist (numbered, with the project's actual paths) and walk it interactively. Do not declare the release "done" until every step is verified.
+
+This is stage 9 of the broader cycle (skill `sdh-release-lifecycle`). After closure — the retro (skill `sdh-retro`).
+
+## Late-catch: a bug found during closure
+
+If a bug surfaces during closure — don't blindly send it to "the next patch". Judge by three criteria:
+- **≤ ~2h fix** AND **high confidence in the cause** AND **within the current release's theme** → **fold it into the current release** (add to scope, fix, record in done.md + the Changelog of this same tag). Don't spin a phantom `vX.Y.Z+1` for a small confident fix.
+- Otherwise (deep/unclear/off-theme) → a task or bug for the next release.
+
+## Closure checklist (10 steps)
+
+Skipping a step leads to documentation rot, lost traceability, or merge pain in the next release.
+
+1. **Version bump.** Projects with a manifest version field (`pubspec.yaml` / `package.json` / `Cargo.toml` / `*.csproj` / `tauri.conf.json`) — bump there. Without one (e.g. a Go server) — in the locations from the project `CLAUDE.md` (typically `Changelog.md`, the version header in `docs/api.md`, hard-coded constants). **The bump class was already decided at the Analysis stage** (see `sdh-release-lifecycle`) — here you just execute it. If the class changed mid-release (scope grew) — re-evaluate and confirm with the user before bumping.
+2. **Changelog.** Move `## [Unreleased]` to `## [X.Y.Z] — YYYY-MM-DD`. Entries by Keep-a-Changelog categories (Added/Changed/Deprecated/Removed/Fixed/Security). Drop empty categories. **Test counts come only from the real smoke run of the Test stage, not from intuition/progress notes.**
+3. **`docs/done.md`.** Append a `## YYYY-MM-DD` section (or extend it) with each closed task: id + short description + version.
+4. **`docs/todo.md` cleanup.** Remove/mark completed tasks; demote stale `in-progress` entries that didn't ship.
+5. **REQ receipts** *(only projects with cross-repo dependencies)* — for each Message/Receipt pair the counterparty closed in this release window, confirm ✓ (the Solo Dev Hub button — deletes the pair on both sides — or the sender's `.impl.md`; skill `sdh-cross-repo-req-send`).
+6. **Verification.** Automated tests / CI green. UI projects: walk the golden path of each changed feature in dev. Backend: exercise the changed endpoints (curl / integration). Verify no regressions in adjacent features, cover empty states and error paths.
+7. **Build / release artifact** *(projects that ship a binary/installer/bundle)* — for projects producing a distributable (desktop exe, CLI binary, installer, packaged bundle), verify the release build **succeeds**, before tagging. Where the full signed build runs only in CI (e.g. on tag push) — do a local dogfood build (`npm run tauri build -- --no-bundle` / `cargo build --release`) to catch compile/bundle breakage pre-tag, and confirm the CI release pipeline is configured/green. **Never tag a release whose artifact hasn't been shown to build.** Not applicable to library / doc-only / source-only projects.
+8. **Schema docs regen** *(server-side projects with a DB only)* — migrations added → regenerate `docs/schema/` via the project command (typically `bash scripts/schema-docs.sh`), stage with the closure commit. Not applicable to client/desktop/CLI without a DB.
+9. **Closure commit.** Stage Changelog + manifest (if any) + `done.md` (if tracked) + `docs/schema/` (if regenerated) + release-only docs in one commit: `chore: vX.Y.Z release closure`. Files unrelated to the release stay outside this commit.
+10. **Tag.** The canonical git block below. **The master/tag commands are run by the user, not the assistant** — show the block and wait.
+
+## Closure git commands: exact and terminal-safe
+
+A frequent failure — git commands are improvised differently each session and in a format that breaks in the VS Code terminal. To avoid that:
+
+- **One stacked block, not command-by-command.** Emit the whole sequence at once, stacked — not a line per message.
+- **PowerShell (the VS Code default terminal).** No `&&` (PowerShell 5.1 doesn't understand it and breaks on paste). The block below is PowerShell-native.
+- **Clean-tree guard — step 0.** Never emit merge/tag without a prior check: a dirty tree (uncommitted sync, doc edits) breaks `switch`/`merge`. `pull --ff-only` saves you from a non-ff push rejection.
+- **Real values, not placeholders.** Substitute the actual number (`1.9.0`), not `X.Y.Z`.
+- **Branches/flow — from the git-flow section of the project `CLAUDE.md`.** Don't reassemble the sequence. `$MAIN` = the repo's release branch (`master` or `main` — differs by repo). The merge source is the integration branch (usually `dev`).
+- **`switch`, not `checkout`** (safer: won't clobber a file by accident). **Annotated tag** `-a -m` (not lightweight — `release.yml` reads the merge commit as ground truth). **`-m` on merge** (otherwise the editor opens and hangs).
+
+Canonical block (the user runs it whole):
+
+```powershell
+$ErrorActionPreference = "Stop"
+$VERSION = "1.9.0"
+$TAG     = "v$VERSION"
+$MAIN    = "master"   # this repo's release branch: master or main
+$START   = (git branch --show-current).Trim()
+
+if (git status --porcelain) { throw "Working tree not clean — commit/stash first" }
+
+git switch $MAIN
+git pull --ff-only origin $MAIN
+git merge --no-ff dev -m "Release $TAG — <short description>"
+git push origin $MAIN
+git tag -a $TAG -m $TAG
+git push origin $TAG
+git switch $START
+```
+
+Why `--no-ff`: `$MAIN` gets both the granular dev commits (for blame/bisect/attribution) and an explicit release marker on top; the tag lands on the merge commit. `git log $MAIN --first-parent` shows only release boundaries.

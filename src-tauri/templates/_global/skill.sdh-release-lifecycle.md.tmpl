@@ -3,79 +3,54 @@ name: sdh-release-lifecycle
 description: >
   Use when running a release of any SemVer bump — the 11-stage lifecycle
   (request, analysis, spec, spec review, plan, plan review, implementation,
-  test, release closure, next-release plan, retro), the stage-transition
-  announcement rules, the retro six-point checklist, and the nine-step
-  release closure checklist.
+  test, closure, next-release plan, retro), the light-vs-full track choice,
+  deciding the bump class at Analysis, and the stage-transition announcement
+  rules. The closure checklist itself — skill sdh-release-closure; the
+  retrospective — skill sdh-retro.
 ---
 
-Use this skill whenever a release of any SemVer bump is starting, in flight, or being closed out — from the first kickoff message through tagging and retrospective. It has two parts: the 11-stage lifecycle that orchestrates a release end-to-end, and the 9-step checklist executed at the "Release closure" stage. The lifecycle wraps per-task implementation work; for how an individual task within the Implementation stage is scoped, specced, and executed, use the `sdh-phase-workflow` skill.
+Use this when a release of any SemVer bump is starting or in flight — from the first kickoff message up to handing off to closure. The lifecycle orchestrates a release end-to-end and wraps per-task implementation; for how an individual task within the Implementation stage is scoped/specced/executed, use skill `sdh-phase-workflow`. Two self-contained pieces are extracted into their own skills: **closure** (9→10-step checklist + git canon) — `sdh-release-closure`; **retro** — `sdh-retro`.
 
-Stages are **soft** — the assistant does not gate transitions strictly, but it **must announce** stage transitions in chat and **must request explicit permission** to skip a stage. The lifecycle applies to non-trivial release work; trivial fast-lane tasks (per the `sdh-phase-workflow` skill's fast-lane/phase-workflow split) bypass the lifecycle entirely.
+Stages are **soft** — the assistant does not gate transitions strictly, but it **must announce** transitions in chat. Trivial fast-lane tasks (per skill `sdh-phase-workflow`) bypass the lifecycle entirely.
+
+## Light track vs full
+
+The fork is decided at the **Analysis** stage, by bump class + number of decisions:
+
+- **Light track** — if the bump is **PATCH**, OR **MINOR with no cross-boundary change and <3 non-obvious decisions**. Collapsed path: Request → Analysis → spec-as-chat → Implementation → Test → Closure → Retro. The **Plan and Plan-review stages are folded into Analysis** by default (tasks straight into `docs/todo.md`, no separate plan-review) — **without** per-stage "may I skip?".
+- **Full track** — **MAJOR always**, plus **MINOR with real design / cross-boundary** (DB schema, contracts, security-sensitive code). All 11 stages.
+
+The boundary is a point of design judgment, not file count (see "what counts as a decision" in `sdh-phase-workflow`). Unsure between light and full → take full.
+
+## Autonomous mode (an overlay on either track)
+
+Orthogonal to scope — it overlays both light and full. The essence: **a single front-loaded gate at design acceptance, then an autonomous run with no per-stage approvals.**
+
+- **When to offer:** all the judgment is settled at design/spec — the rest is mechanical follow-through. Typical for client / landing / visual work (the accepted mockup `sdh-visual-mockups` is the gate).
+- **How it turns on:** at spec/mockup acceptance (stage 4c) the assistant offers: *"design accepted, the rest is mechanical — I'll run Implementation → Test → the documentation part of Closure without approvals, only announcing transitions. OK?"* The grant is the user's. A standing "work without stopping" directive = pre-granted.
+- **What runs autonomously:** stages 5–8 + the documentation part of Closure (bump, Changelog, done.md, closure commit on dev).
+- **Always a stop, even in autonomous mode:** the git canon block (tag / master-merge / master-push) is user-only. Show the block and wait.
+- **Exit from the mode (re-engage):** a new non-obvious decision, a blocker, scope grew → re-evaluate the bump class, smoke revealed a problem → announce a loop back; afterward the autonomous mode may be offered again.
 
 ## Stages
 
-1. **Запрос (Request)** — user kickoff for a release scope, feature batch, or non-trivial task.
-2. **Анализ (Analysis)** — assistant estimates scope, classifies fast-lane vs phase work, surfaces blockers and dependencies, and — for any feature that requires server endpoints — runs the pre-flight server-surface check: grep the synced server contract (`docs/server-api/api.md` for a client repo, or `docs/microservice-api/<ms-project-name>/api.md` for a parent-server consuming a microservice) for each required endpoint × HTTP method before committing to scope. Output: a one-message scope picture the user can confirm or redirect.
-3. **Спека (Spec)** — written spec per the `sdh-phase-workflow` skill's spec step (or chat-thread-as-spec for distributed phase work). Spec includes context, scope, files-to-modify, decisions, and a `## Verification` section per the `sdh-phase-workflow` skill's manual-smoke verification rule.
-4. **Ревью спеки (Spec review)** — three-step procedure:
-   - (a) **Assistant self-review** — explicit pass over the spec checking: ambiguities, internal contradictions, logical gaps, missing files-to-modify, mismatched symbol names between sections, missing localisation / i18n cleanup, missing test updates. The assistant reports what it found (or *"no issues"*) in chat.
-   - (b) **Clarification questions** to the user — only if real questions emerge from (a); do not invent questions for show.
-   - (c) **User OK** — explicit approval. At least one full self-review + OK pass is mandatory before any plan or implementation. The user may request additional review passes if the spec changes substantially.
-5. **План (Plan)** — task breakdown into `docs/todo.md` entries (with id, effort, priority), grouped under the appropriate `## vX.Y.Z — ...` header. Each task should map cleanly to a spec decision or verification step.
-6. **Ревью плана (Plan review)** — same three-step procedure as Spec review (4a / 4b / 4c). Self-review checks: scope alignment with spec, missing tasks, over-broad tasks that should split, priority and effort sanity, task ordering / dependencies.
-7. **Внедрение (Implementation)** — task-by-task per the `sdh-phase-workflow` skill's implementation step, using the project's implementation workflow (subagent-driven or sequential per project bindings). Each completed task moves from `docs/todo.md` to `docs/done.md` as it lands.
-8. **Тест (Test)** — manual smoke per the spec's `## Verification` section, plus automated suites (`cargo test`, `npm test`, `npm run check`, etc.). Test counts and pass/fail go into Changelog only after the smoke run, never from progress notes.
-9. **Закрытие релиза (Release closure)** — full release closure checklist (9 steps — see `## Release closure checklist` in this skill). Tag command is the user's action; assistant only proposes the exact command and waits.
-10. **План на следующий релиз (Next-release plan)** — review `docs/todo.md` backlog, identify candidates for the next milestone, agree on scope. Output: tasks regrouped under the next `## vX.Y.Z — ...` header.
-11. **Ретро (Retro)** — structured retrospective; see `## Retro` in this skill.
+1. **Request** — the user's kickoff for a release scope, feature batch, or non-trivial task.
+2. **Analysis** — the assistant estimates scope, classifies fast-lane vs phase and light vs full track, surfaces blockers/dependencies, and for features needing server endpoints runs the pre-flight surface check (skill `sdh-api-contract-consume`). **The bump class (PATCH/MINOR/MAJOR) and version number are decided here** — not deferred to closure: the `## vX.Y.Z` header in the Plan must be right from the start. MAJOR/MINOR is confirmed with the user here (the "ask before MAJOR/MINOR" rule fires at Analysis). Output: a one-message scope picture + class + version the user confirms or redirects.
+3. **Spec** — a written spec per the spec step of `sdh-phase-workflow` (or thread-as-spec). Includes context, scope, files-to-modify, decisions, and a `## Verification` section. *(Light track: the chat itself serves as the spec.)* **For non-server features with a visual surface — do mockups first (skill `sdh-visual-mockups`); the accepted mockup carries the design decisions, the spec text can be thin.**
+4. **Spec review** — three-step procedure:
+   - (a) **Assistant self-review** — an explicit pass: ambiguities, contradictions, logical gaps, missing files-to-modify, mismatched symbol names, missing i18n cleanup, missing test updates. Report to chat (or *"no issues"*).
+   - (b) **Clarification questions** — only if real ones emerged from (a); don't invent for show.
+   - (c) **User OK** — explicit approval. At least one full self-review + OK pass is mandatory before any plan or implementation.
+5. **Plan** *(full track)* — task breakdown into `docs/todo.md` (id, effort, priority), under the `## vX.Y.Z — ...` confirmed at Analysis. Each task maps cleanly to a spec decision or verification step. *(Light track: folded into Analysis.)*
+6. **Plan review** *(full track)* — same three-step procedure (4a/4b/4c). Self-review: scope alignment with the spec, missing/over-broad tasks, priority/effort sanity, order/dependencies. *(Light track: folded into Analysis.)*
+7. **Implementation** — task by task per the implementation step of `sdh-phase-workflow`, using the project's implementation workflow. Each completed task moves from `docs/todo.md` to `docs/done.md`.
+8. **Test** — manual smoke per the spec's `## Verification` + automated suites (`cargo test`, `npm test`, `npm run check`). **Test counts and pass/fail go into Changelog only AFTER the real smoke, never from progress notes.** A bug surfacing here or at closure — see the late-catch rule in `sdh-release-closure` (a small confident fix folds into the current release).
+9. **Closure** — full checklist + git canon: skill `sdh-release-closure`. The tag command is the user's action.
+10. **Next-release plan** — review the `docs/todo.md` backlog, identify candidates for the next milestone, agree scope. Output: tasks under the next `## vX.Y.Z — ...`.
+11. **Retro** — a structured retrospective: skill `sdh-retro`.
 
 ## Stage transitions
 
-- The assistant announces each transition in chat: **«переходим со стадии <X> на стадию <Y>»** (or English equivalent).
-- Skipping a stage requires explicit user permission, requested in plain language: *"можно сразу импл?" / "без ретро в этот раз?" / "skip plan review?"* — assistant proposes the skip with a one-line reason; user acks or declines.
-- Default is **no skipping**.
-- **Loops back to an earlier stage are allowed but not default.** The chain runs forward by default. A loop (e.g. impl reveals a gap → back to Спека for amendment → re-run Ревью спеки → resume Внедрение) happens on **user request** or when **circumstances force it** (newly discovered constraint, missing endpoint surface, broken assumption). Assistant announces loops the same way as forward transitions: *«обнаружилась дыра в спеке, возвращаемся со стадии 7 на стадию 3 для амендмента, ok?»* — user acks. Without an explicit loop announcement, the lifecycle is strictly forward.
-
-## Retro
-
-The retro stage is **expected** at every release closure unless explicitly skipped by the user. It is **cheap self-improvement** and the highest-leverage stage in the lifecycle for refining how LLM and user work together — observations evaporate at session boundary if not captured.
-
-**Storage:** retro contents are saved to the assistant's auto-memory directory as a `project`-type memory file:
-- Path: `<auto-memory-dir>/retro_v<X_Y_Z>.md` (e.g. `retro_v0_33_0.md`).
-- Index entry added to `MEMORY.md`: `- [Retro v0.33.0](retro_v0_33_0.md) — <one-line hook>`.
-
-Not committed to `docs/` or any repo path. Privacy of internal reflections + persistence across sessions = exactly what auto-memory is for. If the retro count grows large enough to make `MEMORY.md` noisy, consolidate older retros into a single *"patterns observed across N retros"* `feedback` memory — defer until it becomes a real problem.
-
-**Checklist (six points — all are mandatory content of the retro memory file):**
-
-1. **Что сработало хорошо.** Collaboration patterns, working modes, decisions, communications worth keeping for next release.
-2. **Что не сработало.** Friction, scope drift, missed workflow steps, communication misses, planning errors, surprises.
-3. **Степень готовности.** Two-level assessment:
-   - **Release readiness** — was the closed release coherent, or are there sharp corners and workarounds that landed?
-   - **Project readiness overall** — current state of the project as a whole: technical debt, stability, distance to upcoming milestones (e.g. a v1.0.0 public flip), known holes.
-4. **Оценка действий LLM в текущей сессии.** Retrospective judgment of how the assistant performed in this session specifically — not forward-looking advice (that lives implicitly in point 6). What did the LLM do well, what did it slip on, where did it skip steps it shouldn't have, where did it surprise positively.
-5. **Оценка действий пользователя в текущей сессии.** Retrospective judgment of user-side patterns in this session — communication clarity, decision speed, scope discipline, where redirects came at the right time vs too late.
-6. **Process-level lessons.** Are there observations worth promoting to durable memory? Specifically:
-   - New working-style rules → write as `feedback` memory (with **Why:** and **How to apply:** lines per existing memory format).
-   - New project facts → write as `project` memory.
-   - If yes, write the memory file(s) in the same retro pass and link from `MEMORY.md`.
-
-The retro is delivered **as one block**: the assistant writes its full opinion on all six points in a single message — including the proposed memory-file draft inline so the user can ack the wording in one pass. The user then comments / overrides / adds context on any specific point in a follow-up turn; the final memory file reflects the post-comment state.
-
-**Do not stage the retro point-by-point.** Six separate turns waiting for "ok" between each drags the lifecycle's last stage into N+1 round-trips for no information gained — the assistant has all observations from the session already, the user can steer per-point afterwards.
-
-## Release closure checklist
-
-When closing a release tag (any SemVer bump), execute every step in this checklist. Skipping a step leads to documentation rot, lost traceability, or merge-conflict pain in the next release.
-
-1. **Version bump** in the source-of-truth place(s) for this project. Projects with a manifest version field (`pubspec.yaml` / `package.json` / `Cargo.toml` / `*.csproj` / `tauri.conf.json`) — bump there. Projects without a manifest version field (e.g. a Go server) — bump in the locations listed in the per-project `CLAUDE.md` (typical list: `Changelog.md`, version header in `docs/api.md`, hard-coded version constants). Use SemVer rules (PATCH for bug fixes, MINOR for backward-compatible features, MAJOR for breaking changes); ask the user before MAJOR or MINOR bumps.
-2. **Changelog update** — move the `## [Unreleased]` block to `## [X.Y.Z] — YYYY-MM-DD`. Ensure entries follow the Keep-a-Changelog categories (Added/Changed/Deprecated/Removed/Fixed/Security). Drop empty categories.
-3. **`docs/done.md` update** — append a `## YYYY-MM-DD` section (or extend the existing one) with each closed task ID + short description + version.
-4. **`docs/todo.md` cleanup** — mark or remove completed tasks; demote stale `in-progress` entries that didn't ship in this release.
-5. **REQ receipts processing** *(if applicable — only for projects with cross-repo dependencies)* — for any Message/Receipt pair the counterparty closed during this release window, confirm-✓ via the project's REQ exchange mechanism (e.g. Solo Dev Hub UI ✓-button, which deletes the requirement+receipt pair on both sides — or the sender's `.impl.md` acknowledgement where that mechanism is available; see the `sdh-cross-repo-req` skill).
-6. **Verification** — ensure automated tests / CI are green. For projects with UI: walk through the golden path of each changed feature in dev; for backend projects: exercise the changed endpoints (curl / integration suite). Verify no regressions in adjacent untouched features. Cover empty states and error paths.
-7. **Schema docs regen** *(server-side projects with a database only)* — if migrations were added in this release, regenerate `docs/schema/` via the project-specific command (typically `bash scripts/schema-docs.sh`). Stage `docs/schema/` together with the closure commit. Not applicable to client / desktop / CLI projects without a DB.
-8. **Closure commit** — stage Changelog + manifest (if applicable) + `done.md` (if tracked) + `docs/schema/` (if regenerated) + any release-only docs in a single commit with message `chore: vX.Y.Z release closure` (or similar). Project files unrelated to the release stay outside this commit.
-9. **Tag** — `git tag vX.Y.Z` then `git push origin vX.Y.Z`. **User runs the tag command, not the assistant.** Assistant surfaces the exact command and waits.
-
-**How to apply:** When the user signals release intent — *"ready to release"*, *"закрываем релиз"*, *"зафиксируй документацию"*, *"shipping vX.Y"*, or finishes the last task in the release scope — surface the full checklist (numbered, with the project's actual file paths) and walk through it interactively. Do not declare the release "done" until every step is verified. The tag is the user's action; assistant only proposes the exact command.
+- The assistant announces each transition: **"moving from stage <X> to stage <Y>"**.
+- Skipping a stage (in the full track) requires explicit permission: *"can I go straight to impl?" / "no retro this time?"* — the assistant proposes the skip with a one-line reason; the user acks or declines. Default — **no skipping**. *(The light track already folds Plan/Plan-review by default — that's not a "skip", it's the track.)*
+- **Loops back to an earlier stage are allowed but not default.** The chain runs forward by default. A loop (impl reveals a gap → back to Spec for an amendment → re-run Spec-review → resume Implementation) happens on user request or when circumstances force it (new constraint, missing endpoint surface, broken assumption, **scope grew → re-evaluate bump class**). The assistant announces loops the same way: *"a gap surfaced, moving from stage 7 back to stage 3, ok?"* — the user acks. Without an explicit loop announcement, the lifecycle is strictly forward.

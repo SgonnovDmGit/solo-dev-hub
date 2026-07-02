@@ -4,20 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
-## [1.9.0] — 2026-07-02
+## [1.9.0] — 2026-07-03
 
-Global AI rules → on-demand skills. The workflow-heavy rules (cross-repo requirements, announcements, api.md contract, phase workflow, release lifecycle, feature flow docs) move out of the always-on CLAUDE.md block into on-demand skills — cutting the always-on context from ~750 to ~215 lines while keeping every rule available the moment it's relevant.
+Global AI rules → on-demand skills, split by role and refined. The workflow-heavy rules move out of the always-on CLAUDE.md block (~750 → ~215 lines) into **twelve** focused on-demand skills. Rather than a faithful relocation, each rule cluster was split along its real role boundary (sender vs recipient, producer vs consumer) and the release workflow itself was reworked — every rule stays available the moment it's relevant, and each surfaces only for the side actually doing that work.
 
 ### Added
-- **Workflow rules as on-demand skills (T-000138 / T-000143 / T-000144 / T-000145).** "Sync AI rules" now installs six `sdh-*` workflow skills into `~/.claude/skills/` — Claude Code surfaces each by its `description` only when relevant — and mirrors the same content into every repo's `docs/sdh_skills/*.md`, so any AI agent (not just Claude Code) can read them. One bundled source renders to both targets, so the two never drift.
-- **Trigger index in the thin core (T-000145).** The always-on CLAUDE.md core keeps the small format / versioning / commit contracts and gains a compact "when you… → skill" index that points to the right skill.
-- **Non-Claude pointer + gitignore (T-000146).** Each repo's `CLAUDE.md` section points non-Claude agents at `docs/sdh_skills/`; the folder is gitignored (local, app-synced) like the rest of the operational layer.
+- **Workflow rules as twelve on-demand skills (T-000138 / T-000143 / T-000144 / T-000145).** "Sync AI rules" installs the `sdh-*` skills into `~/.claude/skills/` — Claude Code surfaces each by its `description` only when relevant — and mirrors the same content into every repo's `docs/sdh_skills/*.md` for any AI agent. One bundled source renders to both targets, so they never drift. The cross-repo clusters split by role so a client, server, or microservice loads only its side: REQ → `req-send` / `req-answer`; announcements → `announce-send` / `announce-read`; api.md contract → `api-contract-maintain` / `api-contract-consume`. The release cluster split by trigger: `release-lifecycle` (stages) / `release-closure` (checklist + git block) / `retro`.
+- **New `sdh-visual-mockups` skill.** A dedicated design-gate skill for non-server visual work (screen / landing / component): show-don't-describe via any preview the agent has (artifacts / HTML / renders), variants side by side, pixel-precise iteration; the accepted mockup carries the design decisions.
+- **Release workflow reworked (folded into the skills).** Light vs full track (small releases collapse Plan / Plan-review by default); an autonomous-mode overlay (a single front-loaded gate at design acceptance, then Implementation → Test → the doc part of Closure run without per-stage approvals; the git block stays user-only); bump class decided at Analysis, not closure; a late-catch rule (a small confident fix found during closure folds into the current release); a canonical, terminal-safe PowerShell git block (clean-tree guard, `$MAIN` master/main, `switch`, annotated tag) so closure commands stop being improvised; a build-artifact closure step ("never tag a release whose artifact hasn't been shown to build").
+- **Trigger index + non-Claude pointer (T-000145 / T-000146).** The thin core keeps the format / versioning / commit contracts and a compact "when you… → skill" index (12 rows). Each repo's `CLAUDE.md` section points non-Claude agents at `docs/sdh_skills/`; the folder is gitignored (local, app-synced).
 
 ### Changed
-- **Always-on rules trimmed (~750 → ~215 lines).** The cross-repo REQ / announcements / api.md-contract / phase-workflow / release-lifecycle / feature-flow clusters no longer load into every session — they load on demand. "Sync AI rules" in Settings now seeds the skills alongside the thin core (T-000147); README documents the new delivery (T-000148).
+- **Always-on rules trimmed (~750 → ~215 lines).** The workflow clusters no longer load every session — they load on demand. "Sync AI rules" seeds the skills alongside the thin core (T-000147); README documents the new delivery (T-000148). The project git-flow doc adopts `switch` + the canonical closure block for parity with the skill.
 
 ### Tests
-- 452 Rust (`cargo test --lib`; +1 real-bundle guard asserting all six skills seed with valid frontmatter and render to `docs/sdh_skills/`), ~86 vitest, 0 svelte-check errors. No DB migration.
+- 452 Rust (`cargo test --lib`; the real-bundle guard now asserts all twelve skills seed with valid frontmatter and render to `docs/sdh_skills/`), ~86 vitest, 0 svelte-check errors. No DB migration.
 
 ## [1.8.0] — 2026-07-02
 

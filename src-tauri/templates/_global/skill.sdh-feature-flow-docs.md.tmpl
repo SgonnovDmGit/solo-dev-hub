@@ -4,46 +4,63 @@ description: >
   Use when a feature spans more than one file or layer, or has non-trivial
   branching / retry / state-machine logic — authoring and updating
   docs/flows/*.md. Covers what a flow doc describes, the current-vs-planned
-  disambiguation rule, what flow docs are not, and the same-commit update
+  disambiguation rule, what flow docs are NOT, and the same-commit update
   policy.
 ---
 
-Use this skill whenever a feature is complex enough that a reader cannot reconstruct its behavior just by reading the entry-point function — auth, sync, retry, deploy pipeline, and similar multi-layer or multi-branch features. Complex features are documented as flow files in `docs/flows/<feature-name>.md`. The goal: a single source of truth for the sequence of events in the feature, so the reader agrees on how the feature works (or should work) without reading every involved file.
+Use this when a feature is complex enough that a reader **cannot** reconstruct its behavior from a single entry-point function — auth, sync, retry, deploy pipeline, and similar multi-layer or multi-branch features. Such features are documented as flow files in `docs/flows/<feature-name>.md`. The goal: a single source of truth for the sequence of events, so the reader agrees on how the feature works (or should) without reading every involved file.
 
 ## What a flow doc describes
 
-- The sequence of events / steps in the feature: who calls what, in what order, with what arguments and side effects
+- The sequence of events/steps: who calls whom, in what order, with what arguments and side effects
 - Components and layers involved (e.g. UI → Tauri command → Rust handler → DB)
 - Edge cases handled: error paths, retries, empty inputs
-- Non-obvious decisions and the reasoning behind them
+- Non-obvious decisions and their rationale
 - Links to specific files (`src/foo.rs:42`)
 
 ## Current vs planned — the core disambiguation rule
 
-A flow doc may describe both *currently implemented* behavior and *planned* behavior. The reader must always be able to tell which is which.
+A flow doc may describe both *current* and *planned* behavior. The reader must **always** be able to tell which is which.
 
-- Default voice: **present tense** describes current behavior (e.g. *"the sync engine **copies** the file"*) — this implies "this is how it works in HEAD".
-- Anything **not yet implemented** must be marked explicitly: an inline `(planned)` tag, a `> 🚧 Not implemented yet` block, or a separate `## Planned changes` section. Never describe planned behavior in plain present tense — that creates the exact ambiguity this rule prevents.
+- Default voice: **present tense** = current behavior (*"the sync engine **copies** the file"*) — implies "this is how it works in HEAD".
+- Anything **not yet implemented** is marked explicitly: an inline `(planned)` tag, a `> 🚧 Not implemented yet` block, or a separate `## Planned changes` section. Never describe planned behavior in plain present tense — that creates the exact ambiguity this rule prevents.
 - Past tense (*"we **added** copy logic"*) does not belong in a flow doc — that's a changelog entry, not a flow step.
+
+### Example
+
+```markdown
+## Sync engine: copying REQ pairs
+
+1. `run_project_sync` gathers the repo list from `docs/project.md`.
+2. For each pair the engine **copies** `REQ-*.md` into the recipient's inbox
+   (`copy_file_if_changed`, src/sync/project_sync.rs:88).
+3. Receipts are copied back in the same pass.
+
+> 🚧 Not implemented yet
+> The receipt's `## Status:` will be parsed and auto-confirm `implemented`
+> pairs — today confirmation is only manual (✓) or via `.impl.md`. (planned)
+```
+
+The reader sees at once: steps 1–3 are HEAD, the 🚧 block is the future.
 
 ## What flow docs are NOT
 
-- **Not a changelog** — historical changes belong in `Changelog.md`
-- **Not a roadmap** — high-level planned work belongs in `docs/todo.md`. A flow doc may still mention a specific planned step, per the current-vs-planned disambiguation rule in this skill, but it shouldn't be a list of unrelated future tasks.
-- **Not a requirements doc** — incoming cross-repo requirements live in `docs/backend-requirements/` / `docs/client-requirements/<repo>/` / `docs/microservice-requirements/<ms>/` / `docs/server-requirements/`
-- **Not a design memo** — exploratory designs live in their own scoped folder if the project uses one (location varies per project)
+- **Not a changelog** — historical changes go in `Changelog.md`.
+- **Not a roadmap** — high-level plans go in `docs/todo.md`. A flow doc may mention a specific planned step (per the current-vs-planned rule), but it's not a list of unrelated future tasks.
+- **Not a requirements doc** — incoming cross-repo requirements live in `docs/backend-requirements/` / `docs/client-requirements/<repo>/` / `docs/microservice-requirements/<ms>/` / `docs/server-requirements/` (see the `sdh-cross-repo-req-*` skills).
+- **Not a design memo** — exploratory designs live in their own scoped folder if the project uses one.
 
 ## Update policy
 
-- When a feature changes, its flow doc is updated **in the same commit** as the code change — not in a follow-up. Stale flow docs are worse than no flow docs: readers trust them.
+- When a feature changes, its flow doc is updated **in the same commit** as the code — not a follow-up. A stale flow doc is worse than none: readers trust it.
 - When a planned step becomes implemented, drop its `(planned)` marker in the same commit.
-- File-path and function-name references must point to live code. Before writing *"as defined in `foo()` at `bar.rs:42`"*, grep to verify the symbol still exists at that path.
+- File/function references must point at live code. Before writing *"as in `foo()` at `bar.rs:42`"* — grep that the symbol still exists at that path.
 - When a feature is removed, its flow doc is removed in the same commit.
 
 ## When to write a flow doc
 
-- The feature spans more than one file or layer (e.g. crosses presentation → domain, or has a Rust ↔ TS boundary)
-- The flow has non-trivial branching, retry, or state-machine logic
-- A reader cannot reconstruct the behavior just by reading the entry-point function
+- The feature spans more than one file or layer (crosses presentation → domain, or has a Rust ↔ TS boundary).
+- The flow has non-trivial branching, retry, or state-machine logic.
+- A reader cannot reconstruct the behavior from a single entry-point function.
 
 Trivial features (one component, no branching) don't strictly require a flow doc — one may still be written on request (onboarding, hand-off).

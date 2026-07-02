@@ -1,0 +1,128 @@
+---
+name: sdh-cross-repo-req-answer
+description: >
+  Use when a cross-repo REQ ARRIVED for you from another repo and you must
+  answer with a receipt — the receiving side of the SDH Message/Receipt
+  pattern. Covers the receipt format (implemented / partially / declined /
+  clarification-needed), comment rules, the clarification loop, server-side
+  forwarding (scope classification, waiting for the whole chain, consolidated
+  receipt) and microservice responsibility. To REQUEST something yourself —
+  skill sdh-cross-repo-req-send.
+---
+
+You are here if a requirement **arrived** for you from another repo (`REQ-*.md` without a `.response.md`) and you must answer. REQ is the **reactive** channel: one side asks, you answer with a receipt.
+
+- You want to **request something** from another repo yourself → skill `sdh-cross-repo-req-send`.
+- You want to **push** something expecting no answer → skill `sdh-cross-repo-announce-send`.
+
+**Who answers REQs:** a server (a client REQ); a microservice (a server REQ). A client is never a recipient of requirements.
+
+Solo Dev Hub moves files between repos itself — you **never** copy, move, or delete them across a repo boundary manually. Your area is only your own **incoming** folder.
+
+## Files and ownership
+
+- **Requirement** `REQ-NNN_<slug>.md` — authored by the **sender**. You do **not** edit it: the next sync silently overwrites the change (source of truth = sender).
+- **Receipt** `REQ-NNN_<slug>.response.md` — authored by **you**, next to the received REQ, in your incoming folder. Your copy is the **source of truth**; the sender's copy is a replica.
+
+## Where you write the receipt
+
+| You | Your incoming folder (put the receipt here) |
+|---|---|
+| Server (answering a client) | `docs/client-requirements/<client-repo-name>/` (nested — a server has many clients) |
+| Microservice (answering a server) | `docs/server-requirements/` (flat today — see note) |
+
+> **Note:** `docs/server-requirements/` on the microservice side is flat today — it limits a microservice to one parent server without filename collisions. A future release will nest per parent. For now — one parent per microservice.
+
+## Receipt format
+
+The file **must** begin with `## Status:` (one value from the table) plus a `## Comment:` block per the rules:
+
+| Status | Meaning | `## Comment:` |
+|---|---|---|
+| `implemented` | Done as requested | Optional — notes/caveats |
+| `partially` | Done in part; scope reduced | **Required** — what was done vs left out |
+| `declined` | Will not be done | **Required** — why; alternatives if any |
+| `clarification-needed` | Cannot complete: REQ ambiguous/incomplete | **Required** — specific questions listed |
+
+**Empty receipts are forbidden.** A file with no `## Status:` line is invalid. Can't determine the status — that means scope is unclear; write `clarification-needed` with specific questions. Never leave it blank, never write `todo`/placeholder.
+
+### Example: `implemented`
+
+File `docs/client-requirements/web-app-client/REQ-007_avatar-upload.response.md`:
+
+```markdown
+## Status: implemented
+
+## Comment:
+Endpoint `POST /profile/avatar` added, 2 MB limit, jpg/png.
+Error codes `AVATAR_TOO_LARGE` / `AVATAR_BAD_TYPE` documented in
+docs/api.md. Blobs in S3-compatible storage, public link.
+```
+
+### Example: `clarification-needed`
+
+```markdown
+## Status: clarification-needed
+
+## Comment:
+1. Max file size — 2 MB hard-coded or configurable?
+2. Delete the old avatar when a new one is uploaded?
+3. Response shape — only avatarUrl or also metadata (size, type)?
+```
+
+## The clarification-needed loop
+
+When you write `clarification-needed`:
+
+1. **The sender**, in the next session, reads the receipt and edits the **original** `REQ-NNN.md` inline, adding answers (does not open `REQ-N+1`).
+2. Sync delivers you the updated REQ.
+3. **You** re-evaluate scope and **overwrite** your receipt with a final status (`implemented` / `partially` / `declined`). Still ambiguous — overwrite with refined questions.
+4. The loop continues until the sender writes a complete REQ.
+
+The receipt is **mutable on your side** — overwrite it as work progresses or clarifications arrive. The sender never edits your receipt.
+
+## Sync returns the receipt to the sender
+
+You put the receipt in your incoming folder; **the app** copies it back to the sender at the next sync. If you later edit the receipt — sync overwrites the sender's copy (**source of truth = you**).
+
+**The sender closes the pair, not you** (via ✓ or their `.impl.md`). Your work ends at the receipt.
+
+## Forwarding (server only: client → server → microservice)
+
+When a client REQ requires work in a connected microservice, a simple two-party answer is not enough — you cannot answer "not my responsibility", because the client has no contract with the microservice.
+
+1. **Classify scope.** Using your own `docs/project.md` (`## Repositories`, `## Connected microservices`) plus the current handler surface, decide the REQ is:
+   - **server-only** — handle as an ordinary pair;
+   - **MS-only** — entirely a microservice's responsibility;
+   - **mixed** — partly server, partly one/several microservices.
+
+   **"Not my responsibility" is never a valid receipt.** Touches MS work → forward, do not refuse.
+
+2. **For MS-only and mixed, create a downstream REQ** — write an outgoing REQ to the microservice (authoring mechanics + the mandatory `Forwarded-from:` header are in skill `sdh-cross-repo-req-send`, section "Downstream REQ"). Several microservices — one downstream REQ each.
+
+3. **Wait for the whole chain before writing the client receipt.** No interim receipts. The client receipt is written **exactly once** — after every downstream MS-REQ has a receipt **and** your server portion (if mixed) is done — and consolidates the outcome (broken down per microservice if more than one).
+
+4. **Resuming an in-flight forward across sessions.** At session start, for each `docs/client-requirements/<client>/REQ-NNN.md` without your `.response.md`, grep `docs/microservice-requirements/*/REQ-*.md` for a `Forwarded-from: <client-repo>/REQ-NNN` header:
+   - **Match found, downstream has `.response.md`** → write the consolidated client receipt now.
+   - **Match found, no `.response.md`** → chain in flight, wait.
+   - **No match** → forwards not created yet, classify per #1 and act.
+
+**The client receipt contains nothing about microservices** — no `Forwarded-to`, no MS names, no strategy. As the microservice does not know the client, the client does not know the microservice: the server's implementation decomposition stays opaque to the client.
+
+## Microservice responsibility
+
+When you are a **microservice** and received a downstream REQ in `docs/server-requirements/`:
+
+1. **Ignore client identity entirely.** If a client name leaked in (via `Forwarded-from:` or the body) — do not save it in your DB, code, comments. `Forwarded-from:` is metadata for server-side chain-tracing only, not actionable for you. The REQ body is the single source of truth for your scope.
+
+   The one legitimate client-related distinction is **admin-vs-user-facing**, when it affects RBAC/access. The server passes this **explicitly in the REQ body**, not via inferences from the client name. Body silent on audience and it matters → write a `clarification-needed` receipt asking explicitly.
+
+2. **Receipts go only in your own `docs/server-requirements/`.** Never write to a client repo, never create `docs/client-requirements/` — there is no MS↔client channel. "The client is waiting" in the body does NOT mean "go write to the client": the server answers the client after your receipt. Your work ends at the receipt to the server.
+
+## What you must NOT do (recipient side)
+
+- **Do not edit the received `REQ-*.md`** — the edit is overwritten at sync (source of truth = sender).
+- **Do not author a `REQ-*.md` in your incoming folder** (server: `docs/client-requirements/<client>/`; microservice: `docs/server-requirements/`) — the app populates it from the sender; your REQ there goes nowhere and will be mistaken for an incoming one. Your own initiative goes through `sdh-cross-repo-req-send` (if a request) or announcements (if a push).
+- **A microservice never authors `.impl.md`** — an impl file on the recipient side is undeliverable (the incoming folder is overwritten at sync). Closing is the sender's job.
+- **Do not author a `.response.md` for a requirement you did not receive.**
+- **Do not rename sync folders** — they are app-managed.

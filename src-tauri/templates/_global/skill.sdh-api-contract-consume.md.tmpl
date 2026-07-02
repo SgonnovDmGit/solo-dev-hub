@@ -1,0 +1,46 @@
+---
+name: sdh-api-contract-consume
+description: >
+  Use BEFORE drafting a phase spec for a feature that needs another repo's
+  endpoints (client → server, or parent server → microservice) — the pre-flight
+  server-surface check. Grep the synced contract for each required endpoint ×
+  method; if any is missing, open a REQ and do NOT start the spec. To maintain
+  YOUR OWN contract — skill sdh-api-contract-maintain.
+---
+
+You are here if you are about to draft a phase spec for a feature that needs endpoints owned by **another** repo. Before designing — confirm the surface actually exists in the synced contract. The check is read-only and costs one grep; the failure without it surfaces at implementation time after hours of design.
+
+- You **maintain your own** contract (server/MS, changing an endpoint) → skill `sdh-api-contract-maintain`.
+
+**Where the synced contract lives:**
+- **A client** reads the server → `docs/server-api/api.md` (or the `docs/server-api/*.md` set).
+- **A parent server** reads a microservice → `docs/microservice-api/<ms-project-name>/api.md`.
+
+## When it fires
+
+Trigger — the start of phase-level work touching another server: *"let's plan feature X"*, *"design phase Y"*, *"start implementation of Z"* — and the feature needs endpoints. This is the **first read-only action** before entering the chat phase of skill `sdh-phase-workflow`.
+
+## Procedure
+
+1. **List the required endpoints** from the feature description (method + path + access level).
+2. **Grep the synced contract** for each endpoint × HTTP method.
+3. **Report to the user** in plain text — what matched (with line refs) / what's missing.
+4. **If there are gaps** — propose either (a) opening a server-side REQ asking to implement or document the missing surface (skill `sdh-cross-repo-req-send`), or (b) waiting for confirmation from the server team. **Do not start the spec.**
+5. **If the endpoints are fully documented** — proceed to the chat phase of `sdh-phase-workflow` as usual.
+
+## Example
+
+The "avatar upload" feature needs `POST /profile/avatar`.
+
+```
+$ grep -n "POST /profile/avatar" docs/server-api/api.md
+(empty)
+```
+
+Not found → **do not start the spec.** Open a REQ to the server (see `sdh-cross-repo-req-send`):
+
+> `docs/backend-requirements/REQ-007_avatar-upload.md` — asking to implement/document `POST /profile/avatar`.
+
+Resume the spec only after the gap is closed on the server side (the endpoint appears in the synced `api.md`).
+
+**Why not start:** without the check, a spec can target an imagined surface — while one grep would have caught it before hours of design.

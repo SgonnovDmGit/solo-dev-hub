@@ -12,7 +12,7 @@ const SKILL_SUFFIX: &str = ".md.tmpl";
 
 /// Enumerate bundled skill templates as (skill_name, content).
 /// A skill template is a `_global` file named `skill.<name>.md.tmpl`;
-/// `skill_name` is the middle segment (e.g. "sdh-cross-repo-req").
+/// `skill_name` is the middle segment (e.g. "sdh-cross-repo-req-send").
 /// Sorted by name for deterministic output.
 pub fn list_skill_templates(db: &AppDb) -> Result<Vec<(String, String)>, String> {
     let files = db
@@ -122,11 +122,11 @@ mod tests {
     }
 
     /// End-to-end guard: the REAL bundle (via seed_bundled_templates) must carry
-    /// exactly the six sdh-* workflow skills, each with valid frontmatter, and
+    /// exactly the twelve sdh-* workflow skills, each with valid frontmatter, and
     /// they must render to a repo's docs/sdh_skills/. Catches a missing/renamed
     /// or malformed skill template at test time instead of at app runtime.
     #[test]
-    fn test_real_bundle_renders_all_six_skills() {
+    fn test_real_bundle_renders_all_twelve_skills() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.db");
         std::mem::forget(tmp);
@@ -136,12 +136,18 @@ mod tests {
         let skills = list_skill_templates(&db).unwrap();
         let names: Vec<&str> = skills.iter().map(|(n, _)| n.as_str()).collect();
         for expected in [
-            "sdh-cross-repo-req",
-            "sdh-cross-repo-announcements",
-            "sdh-api-contract",
+            "sdh-cross-repo-req-send",
+            "sdh-cross-repo-req-answer",
+            "sdh-cross-repo-announce-send",
+            "sdh-cross-repo-announce-read",
+            "sdh-api-contract-maintain",
+            "sdh-api-contract-consume",
             "sdh-feature-flow-docs",
             "sdh-phase-workflow",
+            "sdh-visual-mockups",
             "sdh-release-lifecycle",
+            "sdh-release-closure",
+            "sdh-retro",
         ] {
             assert!(
                 names.contains(&expected),
@@ -149,7 +155,7 @@ mod tests {
                 expected
             );
         }
-        assert_eq!(skills.len(), 6, "exactly six sdh-* skills in the bundle");
+        assert_eq!(skills.len(), 12, "exactly twelve sdh-* skills in the bundle");
 
         for (name, content) in &skills {
             assert!(
@@ -171,10 +177,10 @@ mod tests {
 
         let repo = TempDir::new().unwrap();
         let n = render_skills_to_repo(&db, repo.path()).unwrap();
-        assert_eq!(n, 6);
+        assert_eq!(n, 12);
         assert!(repo
             .path()
-            .join("docs/sdh_skills/sdh-cross-repo-req.md")
+            .join("docs/sdh_skills/sdh-cross-repo-req-send.md")
             .exists());
     }
 }
