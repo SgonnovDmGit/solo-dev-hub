@@ -62,14 +62,18 @@
 
 <style>
   .toast-container {
+    /* B-000027: container spans the full width at the bottom. Transient
+       success/info toasts hug the right (flex-end); persistent error/warning
+       toasts override to stretch full-width (see .toast-persistent). */
     position: fixed;
     bottom: 16px;
+    left: 16px;
     right: 16px;
     display: flex;
     flex-direction: column;
+    align-items: flex-end;
     gap: 8px;
     z-index: 9999;
-    max-width: 460px;
   }
 
   .toast {
@@ -86,7 +90,7 @@
     font-weight: 400;
     line-height: 1.4;
     text-align: left;
-    width: 100%;
+    max-width: 460px;
     min-width: 240px;
     color: #fff;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
@@ -96,9 +100,13 @@
     opacity: 0.9;
   }
 
-  /* B-000027: persistent variant is a div, not a click-to-dismiss button. */
+  /* B-000027: persistent errors/warnings are non-dismiss-on-click divs AND span
+     the full bottom width, so long messages get horizontal room instead of
+     wrapping in a narrow 460px column. */
   .toast-persistent {
     cursor: default;
+    align-self: stretch;
+    max-width: none;
   }
   .toast-persistent:hover {
     opacity: 1;
