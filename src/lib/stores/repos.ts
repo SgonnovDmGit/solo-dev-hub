@@ -4,8 +4,10 @@ import {
   listAllRepos as tauriListAllRepos,
   upsertRepository,
   assignRepository as tauriAssignRepository,
+  getAutocommitBranch,
+  setAutocommitBranch,
 } from '$lib/api/tauri-commands';
-import { fetchAllRepos } from '$lib/api/github';
+import { fetchAllRepos, listBranches, splitRepoFullName } from '$lib/api/github';
 import { addToast } from './ui';
 import { t, tf } from '$lib/i18n';
 
@@ -32,6 +34,32 @@ export async function loadAllRepos(): Promise<void> {
   } catch (err) {
     addToast(tf('toast.failedToLoadRepos', String(err)), 'error');
   }
+}
+
+// B-000028: portfolio-wide default — right after repos load, sweep every GitHub
+// repo whose auto-commit branch is still empty and set it to `dev` when the repo
+// has one (the integration branch for this workflow), instead of only defaulting
+// when the user opens that repo's detail screen. Idempotent and self-limiting:
+// once a repo is set, the cheap IPC check short-circuits before any GitHub call,
+// so later startups don't re-fetch branches. Runs in the background; per-repo
+// failures (no access / offline) are skipped silently.
+export async function backfillAutocommitDevBranch(token: string): Promise<void> {
+  const repos = get(allRepos).filter((r) => r.github_name && r.github_name.includes('/'));
+  await Promise.all(
+    repos.map(async (r) => {
+      try {
+        const current = await getAutocommitBranch(r.id);
+        if (current && current.trim() !== '') return; // already configured — leave it
+        const { owner, repo: name } = splitRepoFullName(r.github_name!);
+        const branches = await listBranches(token, owner, name);
+        if (branches.some((b) => b.name === 'dev')) {
+          await setAutocommitBranch(r.id, 'dev');
+        }
+      } catch {
+        // No access / offline for this repo — skip; the field stays empty.
+      }
+    }),
+  );
 }
 
 export async function syncFromGitHub(token: string): Promise<void> {

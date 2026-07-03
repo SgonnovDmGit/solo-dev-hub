@@ -6,7 +6,7 @@
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
   import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch } from '$lib/api/tauri-commands';
   import type { RepoRename } from '$lib/types';
-  import { deleteRepoOnGitHub, splitRepoFullName } from '$lib/api/github';
+  import { deleteRepoOnGitHub, splitRepoFullName, listBranches, type BranchInfo } from '$lib/api/github';
   import { addToast } from '$lib/stores/ui';
   import { getRoleLabel, getDisplayName, type Role } from '$lib/types';
   import type { StatsSummary as StatsSummaryData } from '$lib/types';
@@ -37,6 +37,10 @@
   let renames = $state<RepoRename[]>([]);
   // T-000137: per-repo auto-commit target branch for synced cross-repo files (empty = disabled).
   let autocommitBranch = $state('');
+  // B-000028: branch suggestions for the auto-commit field (datalist). Fetched
+  // from GitHub — needs a PAT and a full `owner/repo` name; the field stays a
+  // free-text input, so an empty list just means no autocomplete (offline / no PAT).
+  let branches = $state<BranchInfo[]>([]);
 
   async function loadRenames() {
     if (!repo) { renames = []; return; }
@@ -60,10 +64,43 @@
     }
   }
 
+  // B-000028: fetch the repo's GitHub branches to populate the auto-commit
+  // datalist. Mirrors DeployDetail's DEPLOY_BRANCH fetch — silent on failure so
+  // the free-text field keeps working without a PAT / when offline.
+  async function loadBranches() {
+    branches = [];
+    if (!repo || !$pat || !repo.github_name || !repo.github_name.includes('/')) return;
+    const { owner, repo: name } = splitRepoFullName(repo.github_name);
+    try {
+      branches = await listBranches($pat, owner, name);
+    } catch {
+      branches = [];
+    }
+  }
+
+  // B-000028: load the saved auto-commit branch + branch list, then default an
+  // empty auto-commit target to `dev` when the repo has one (the integration
+  // branch for this workflow). Persisted so auto-commit is truly enabled, not
+  // just displayed. Guarded against a repo switch mid-load.
+  async function loadAutocommitState() {
+    const rid = repo?.id ?? null;
+    await loadAutocommitBranch();
+    await loadBranches();
+    if (repo?.id !== rid || !repo) return;
+    if (autocommitBranch === '' && branches.some((b) => b.name === 'dev')) {
+      autocommitBranch = 'dev';
+      try {
+        await setAutocommitBranch(repo.id, 'dev');
+      } catch (err) {
+        console.warn('autocommit dev-default persist failed', err);
+      }
+    }
+  }
+
   $effect(() => {
     void $selectedRepoId;
     loadRenames();
-    loadAutocommitBranch();
+    void loadAutocommitState();
   });
 
   function startEditName() {
@@ -398,11 +435,19 @@
           <input
             class="chip-input"
             type="text"
+            list="autocommit-branch-list"
             value={autocommitBranch}
             onchange={handleAutocommitBranchChange}
             placeholder={$tStore('repoDetail.autocommitPlaceholder' as any)}
             title={$tStore('repoDetail.autocommitHint' as any)}
           />
+          {#if branches.length > 0}
+            <datalist id="autocommit-branch-list">
+              {#each branches as b (b.name)}
+                <option value={b.name}>{b.isDefault ? `${b.name} (default)` : ''}</option>
+              {/each}
+            </datalist>
+          {/if}
         </div>
 
         <button class="delete-repo-btn row-action" onclick={openDeleteDialog} type="button" disabled={deleting} title={$tStore('repo.deleteButton' as any)}>

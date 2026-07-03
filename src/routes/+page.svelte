@@ -2,11 +2,12 @@
   import { onMount } from 'svelte';
   import '../app.css';
   import { currentScreen, navigateTo, goBack } from '$lib/stores/ui';
-  import { loadSettings } from '$lib/stores/settings';
+  import { get } from 'svelte/store';
+  import { loadSettings, pat } from '$lib/stores/settings';
   import { initUiScale } from '$lib/ui-scale';
   import { loadProjects } from '$lib/stores/projects';
   import { startAutoSyncTimer } from '$lib/stores/autosync';
-  import { loadAllRepos, pendingMergeCases, type AmbiguousMergeCase } from '$lib/stores/repos';
+  import { loadAllRepos, backfillAutocommitDevBranch, pendingMergeCases, type AmbiguousMergeCase } from '$lib/stores/repos';
   import { addToast } from '$lib/stores/ui';
   import { resolveMergeWithLocal, forceInsertGithubRepo } from '$lib/api/tauri-commands';
   import { tStore, tf, initLocale } from '$lib/i18n';
@@ -61,6 +62,10 @@
     await loadSettings();
     await initUiScale();
     await Promise.all([loadProjects(), loadAllRepos()]);
+    // B-000028: default empty auto-commit branches to `dev` portfolio-wide, in
+    // the background (non-blocking) — needs a PAT to read each repo's branches.
+    const token = get(pat);
+    if (token) void backfillAutocommitDevBranch(token);
     // T-000136: settings + projects are loaded → safe to arm the auto-sync timer.
     startAutoSyncTimer();
     checkForUpdate(true);

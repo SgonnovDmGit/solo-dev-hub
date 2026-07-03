@@ -4,11 +4,15 @@
 // (`<repo>/docs/sdh_skills/<name>.md`). Single source -> two render targets.
 
 use crate::db::AppDb;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 const SKILL_PREFIX: &str = "skill.";
 const SKILL_SUFFIX: &str = ".md.tmpl";
+/// Namespace prefix for skills this app owns. Only `sdh-*` entries are ever
+/// pruned — user-authored skills sharing the directory are never touched.
+const SKILL_NAMESPACE: &str = "sdh-";
 
 /// Enumerate bundled skill templates as (skill_name, content).
 /// A skill template is a `_global` file named `skill.<name>.md.tmpl`;
@@ -34,13 +38,17 @@ pub fn list_skill_templates(db: &AppDb) -> Result<Vec<(String, String)>, String>
 /// user-level layout: one folder per skill). Returns count written.
 pub fn render_skills_global(db: &AppDb, claude_dir: &Path) -> Result<usize, String> {
     let skills = list_skill_templates(db)?;
+    let keep: HashSet<String> = skills.iter().map(|(name, _)| name.clone()).collect();
     let mut n = 0;
-    for (name, content) in skills {
-        let dir = claude_dir.join("skills").join(&name);
+    for (name, content) in &skills {
+        let dir = claude_dir.join("skills").join(name);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         fs::write(dir.join("SKILL.md"), content).map_err(|e| e.to_string())?;
         n += 1;
     }
+    // T-000149: drop stale `sdh-*` skill folders no longer in the bundle (e.g.
+    // the pre-split combined skills) so obsolete rules stop surfacing.
+    prune_stale_global_skills(claude_dir, &keep)?;
     Ok(n)
 }
 
@@ -48,14 +56,62 @@ pub fn render_skills_global(db: &AppDb, claude_dir: &Path) -> Result<usize, Stri
 /// copy for non-Claude-Code agents). Returns count written.
 pub fn render_skills_to_repo(db: &AppDb, repo_base: &Path) -> Result<usize, String> {
     let skills = list_skill_templates(db)?;
+    let keep: HashSet<String> = skills.iter().map(|(name, _)| name.clone()).collect();
     let dir = repo_base.join("docs").join("sdh_skills");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut n = 0;
-    for (name, content) in skills {
+    for (name, content) in &skills {
         fs::write(dir.join(format!("{}.md", name)), content).map_err(|e| e.to_string())?;
         n += 1;
     }
+    // T-000149: drop stale `sdh-*.md` reference copies no longer in the bundle.
+    prune_stale_repo_skills(&dir, &keep)?;
     Ok(n)
+}
+
+/// Remove `<claude_dir>/skills/sdh-*` folders that are not in `keep` (the current
+/// bundle). Only the `sdh-` namespace is touched; user-authored skills survive.
+/// A missing skills dir is a no-op. Returns the number of folders pruned.
+fn prune_stale_global_skills(claude_dir: &Path, keep: &HashSet<String>) -> Result<usize, String> {
+    let skills_dir = claude_dir.join("skills");
+    let entries = match fs::read_dir(&skills_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(0), // no skills dir yet — nothing to prune
+    };
+    let mut pruned = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(SKILL_NAMESPACE) && !keep.contains(&name) {
+            fs::remove_dir_all(entry.path()).map_err(|e| e.to_string())?;
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
+/// Remove `<dir>/sdh-*.md` reference copies whose stem is not in `keep`. Only the
+/// `sdh-` namespace is touched. A missing dir is a no-op. Returns count pruned.
+fn prune_stale_repo_skills(dir: &Path, keep: &HashSet<String>) -> Result<usize, String> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(0),
+    };
+    let mut pruned = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if let Some(stem) = fname.strip_suffix(".md") {
+            if stem.starts_with(SKILL_NAMESPACE) && !keep.contains(stem) {
+                fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
+                pruned += 1;
+            }
+        }
+    }
+    Ok(pruned)
 }
 
 #[cfg(test)]
@@ -110,6 +166,47 @@ mod tests {
         let f = tmp.path().join("docs/sdh_skills/sdh-beta.md");
         assert!(f.exists(), "flat <name>.md under docs/sdh_skills");
         assert_eq!(fs::read_to_string(&f).unwrap(), "BETA BODY");
+    }
+
+    #[test]
+    fn test_render_global_prunes_stale_sdh_skills() {
+        let db = db_with_skill(); // current bundle: sdh-alpha, sdh-beta
+        let tmp = TempDir::new().unwrap();
+        // Pre-seed a stale sdh-* skill (a previous, larger set) and a
+        // user-authored non-sdh skill that must survive the prune.
+        let stale = tmp.path().join("skills/sdh-obsolete");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("SKILL.md"), "OLD").unwrap();
+        let user = tmp.path().join("skills/my-own-skill");
+        fs::create_dir_all(&user).unwrap();
+        fs::write(user.join("SKILL.md"), "MINE").unwrap();
+
+        render_skills_global(&db, tmp.path()).unwrap();
+
+        assert!(!stale.exists(), "stale sdh-* skill folder pruned");
+        assert!(user.exists(), "non-sdh user skill left untouched");
+        assert!(tmp.path().join("skills/sdh-alpha/SKILL.md").exists());
+        assert!(tmp.path().join("skills/sdh-beta/SKILL.md").exists());
+    }
+
+    #[test]
+    fn test_render_repo_prunes_stale_sdh_skills() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("docs/sdh_skills");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("sdh-obsolete.md"), "OLD").unwrap();
+        fs::write(dir.join("README.md"), "keep-me").unwrap(); // non-sdh, survives
+
+        render_skills_to_repo(&db, tmp.path()).unwrap();
+
+        assert!(
+            !dir.join("sdh-obsolete.md").exists(),
+            "stale sdh-*.md reference copy pruned"
+        );
+        assert!(dir.join("README.md").exists(), "non-sdh file left untouched");
+        assert!(dir.join("sdh-alpha.md").exists());
+        assert!(dir.join("sdh-beta.md").exists());
     }
 
     #[test]
