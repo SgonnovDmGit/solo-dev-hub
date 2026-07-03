@@ -4,6 +4,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.9.2] — 2026-07-03
+
+Docs/rules patch: the API-contract skills now require partitioning the contract by consumer audience and by volume, instead of one monolithic `api.md`. No app behavior change.
+
+### Changed
+- **API contract partitioned by audience + volume (T-000151).** The `sdh-api-contract-maintain` skill now makes splitting the contract a requirement, not an option: one file per consumer audience under `docs/my_api/` (`client-api.md` / `admin-api.md` / `public-api.md` / `<name>-api.md`, never mixed), plus a hard volume trigger — split a file past ~12 endpoints / ~400 lines into `<audience>-api-<topic>.md`. After a split the old monolithic `api.md` must be deleted (no drift, no duplicate delivery). Flat sync-to-all-consumers is documented as intentional (it enables preprod diagnostics from the client side). The `sdh-api-contract-consume` skill greps the whole `docs/server-api/*.md` set accordingly. Fixes agents defaulting to a single `api.md`.
+
+### Tests
+- 454 Rust / 86 vitest / 0 svelte-check (skill-template text only; no code or schema change).
+
 ## [1.9.1] — 2026-07-03
 
 Dogfood patch: two bugs from daily use plus a skills-sync cleanup and a release-skill refinement. The error/warning toast now spans the full width at the bottom so long messages are readable; the repo-header auto-commit field became a real branch picker; obsolete on-demand skills are pruned on rules sync; and the preprod-smoke access practice is written into the release skill.
