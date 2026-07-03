@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.9.1] — 2026-07-03
+
+Dogfood patch: two bugs from daily use plus a skills-sync cleanup and a release-skill refinement. The error/warning toast now spans the full width at the bottom so long messages are readable; the repo-header auto-commit field became a real branch picker; obsolete on-demand skills are pruned on rules sync; and the preprod-smoke access practice is written into the release skill.
+
+### Fixed
+- **Error/warning toast spans the full bottom width (B-000027).** Persistent error/warning toasts stretch across the whole bottom of the window instead of wrapping inside a narrow 460px column, so long messages have horizontal room (scroll + copy + dismiss unchanged). Transient success/info toasts stay compact, bottom-right.
+- **Auto-commit branch is a real branch picker (B-000028).** The repo-header auto-commit field gained a GitHub-branches datalist (mirrors the deploy `DEPLOY_BRANCH` picker) instead of being a blind free-text box; without a PAT / offline it degrades to plain text. Empty auto-commit branches now default to `dev` when the repo has one — applied portfolio-wide right after repos load (idempotent, self-limiting), not only when the repo's detail screen is opened.
+- **Stale on-demand skills pruned on rules sync (T-000149).** "Sync AI rules" now removes `sdh-*` skill folders (and `docs/sdh_skills/*.md` copies) no longer in the bundle, so the pre-split combined skills stop lingering after the 6→12 split. Only the `sdh-` namespace is touched — user-authored skills are left alone.
+
+### Changed
+- **Preprod-smoke access practice documented (T-000150).** The `sdh-release-lifecycle` Test stage now spells out that a `.env.preprod` holds credentials to *log in* to preprod for the smoke (admin key, project/user keys; OTP: smoke email + cached refresh token) — access for smoking, not the secret set that *launches* preprod — to stop the recurring mix-up.
+
+### Tests
+- 454 Rust (`cargo test --lib`; +2 skill-prune guards), 86 vitest, 0 svelte-check errors. No DB migration.
+
 ## [1.9.0] — 2026-07-03
 
 Global AI rules → on-demand skills, split by role and refined. The workflow-heavy rules move out of the always-on CLAUDE.md block (~750 → ~215 lines) into **twelve** focused on-demand skills. Rather than a faithful relocation, each rule cluster was split along its real role boundary (sender vs recipient, producer vs consumer) and the release workflow itself was reworked — every rule stays available the moment it's relevant, and each surfaces only for the side actually doing that work.
