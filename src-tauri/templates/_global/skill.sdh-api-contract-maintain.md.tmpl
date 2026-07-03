@@ -2,16 +2,39 @@
 name: sdh-api-contract-maintain
 description: >
   Use when adding, changing, or removing a server or microservice endpoint —
-  maintaining the public contract docs/api.md (or the docs/my_api/*.md set).
-  Covers the 5-block per-endpoint format, the "contract in the same commit as
-  the handler" rule, docs/handlers.md internal notes, multi-file docs/my_api/,
-  and the ban on writing handler docs in README. To READ another repo's
-  contract before a spec — skill sdh-api-contract-consume.
+  maintaining the public API contract. Covers partitioning the contract by
+  consumer audience (client-api.md / admin-api.md / public-api.md, never one
+  monolithic api.md) and by volume (split a file past ~12 endpoints / ~400
+  lines; delete the old api.md after splitting), the 5-block per-endpoint
+  format, the "contract in the same commit as the handler" rule,
+  docs/handlers.md internal notes, the docs/my_api/ multi-file sync, and the
+  ban on writing handler docs in README. To READ another repo's contract
+  before a spec — skill sdh-api-contract-consume.
 ---
 
-You are here if you are a **server or microservice** changing your endpoint surface (added/removed a route, changed request/response shape or access level). `docs/api.md` is the **public contract**: clients and parent servers read it cross-repo via sync. Anything documented is a promise; anything not in the contract **does not exist** for consumers, even if live in code.
+You are here if you are a **server or microservice** changing your endpoint surface (added/removed a route, changed request/response shape or access level). Your **public contract** — partitioned by consumer audience into `docs/my_api/*.md`, not one monolithic `api.md` (see **Partition the contract** below) — is read cross-repo by clients and parent servers via sync. Anything documented is a promise; anything not in the contract **does not exist** for consumers, even if live in code.
 
 - You need to **read another repo's** contract before a spec (you are a client/parent) → skill `sdh-api-contract-consume`.
+
+## Partition the contract — by audience, then by volume
+
+`api.md` is **not one monolithic file**. The contract is partitioned, and splitting it is a **requirement, not an option**.
+
+**Axis 1 — consumer audience (always, when there is more than one consumer).** One file per consumer under `docs/my_api/`; audiences are **never mixed** in a file:
+- `client-api.md` — endpoints the client app consumes
+- `admin-api.md` — endpoints the admin panel consumes
+- `public-api.md` — public / unauthenticated
+- `<name>-api.md` — any other consumer (service-to-service, partner), named per project
+
+Exactly one consumer → a single `api.md` is enough.
+
+**Axis 2 — topic, by volume (a hard trigger).** Keep every contract file within budget: **≤ ~12 endpoints OR ~400 lines** (whichever comes first). Over budget → split the audience file by domain: `client-api-auth.md`, `client-api-orders.md`, `client-api-profile.md`. The threshold is mechanical: "one api.md for the whole server" fails it the moment the surface is non-trivial — without a number the agent sees no trigger and never splits "by eye".
+
+**Header and index.** The server version + `## Access model` live once per audience, in `<audience>-api.md`. When topic-split, that file is the **index** — a list of the topic files + the access matrix; the topic files carry only their endpoints + a back-link. When not topic-split, `<audience>-api.md` holds everything.
+
+**After a split the old `api.md` must be gone.** Split into `client-api.md` / `admin-api.md` (/ …) → **delete** the former monolithic `api.md` (and a root `docs/api.md` if you are moving to `my_api/`) in the same commit. Two contracts = drift, and sync would deliver the stale blob to consumers too. One source per audience — no leftover monolith.
+
+**Sync is flat-to-all, by design.** The app copies `docs/my_api/*.md` to **every** consumer, so `admin-api.md` lands in the client repo too. That is **a capability, not a cost**: it enables preprod diagnostics from the client side (in normal use the client simply does not open the admin contract). No per-consumer routing needed.
 
 ## Part A — the `docs/api.md` format
 
@@ -123,13 +146,13 @@ Don't rewrite the whole file at once. Rule: "next time you touch an endpoint, ex
 
 For **breaking** changes (removed endpoint, changed response field, changed access level) — bump MINOR/MAJOR per SemVer and add a `## [Unreleased]` entry to `Changelog.md` in the same commit.
 
-### Multi-file contract via `docs/my_api/`
+### How `docs/my_api/` syncs
 
-You may keep the contract as **multiple** md files instead of one `docs/api.md`. Put any number of `*.md` into a **`docs/my_api/`** folder (e.g. `api.md`, `handlers.md`, `admin-api.md`, `client-api.md`) — Solo Dev Hub copies **every `*.md`** from there into the recipient's existing inbox on each sync:
+The partitioned contract (see **Partition the contract** above) lives in **`docs/my_api/`**. Solo Dev Hub copies **every `*.md`** from there into the recipient's existing inbox on each sync:
 - **Server → Client:** `docs/my_api/*.md` → `docs/server-api/*.md` (flat).
 - **Microservice → Parent:** `docs/my_api/*.md` → `docs/microservice-api/<ms-project-name>/*.md` (flat).
 
-Backward-compatible: the legacy single-file layout (`docs/api.md` + `docs/handlers.md` at the `docs/` root) still works. Use one convention per repo — if both a root `docs/api.md` and `docs/my_api/api.md` exist, the `my_api` copy wins (it lands last). Non-`.md` files in `my_api/` are ignored.
+Backward-compatible: the legacy single-file layout (a root `docs/api.md` + `docs/handlers.md`) still works for a **single-consumer** server. But **don't run both layouts at once** — once you partition into `docs/my_api/`, delete the root `docs/api.md` (see "After a split the old `api.md` must be gone"), or consumers receive two overlapping contracts. Non-`.md` files in `my_api/` are ignored.
 
 ### `docs/handlers.md` — internal implementation notes
 
