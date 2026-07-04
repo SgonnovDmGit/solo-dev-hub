@@ -234,6 +234,33 @@ pub fn commit_paths(
     })
 }
 
+/// True if `rel_path` (repo-relative) is excluded by the repo's ignore rules.
+/// Auto-commit uses this to skip cross-repo folders the dev deliberately
+/// gitignored (their local "inbox"): `git add` refuses an explicitly-named
+/// ignored path with exit 1, which would otherwise abort the whole scoped
+/// commit for every folder in the batch.
+pub fn is_gitignored(git: &GitBinary, local_path: &Path, rel_path: &Path) -> Result<bool, String> {
+    let out = spawn_cmd(&git.0)
+        .arg("check-ignore")
+        .arg("-q")
+        .arg("--")
+        .arg(rel_path)
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git check-ignore failed to start: {}", e))?;
+    // check-ignore exit codes: 0 = path is ignored, 1 = not ignored,
+    // 128 (or any other) = fatal error.
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git check-ignore exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )),
+    }
+}
+
 /// List tracked files that match `.gitignore` rules. Uses `-z` so the parser
 /// is whitespace-safe (filenames with spaces, newlines, quotes all survive).
 /// Git writes UTF-8 to stdout regardless of platform.
@@ -413,6 +440,34 @@ mod tests {
         init_test_repo(tmp.path());
         fs::create_dir(tmp.path().join(".git/rebase-merge")).unwrap();
         assert_eq!(detect_repo_state(tmp.path()), RepoState::MidRebase);
+    }
+
+    #[test]
+    fn test_is_gitignored_true_for_ignored_false_for_tracked() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        fs::write(
+            tmp.path().join(".gitignore"),
+            "docs/backend-requirements/\n",
+        )
+        .unwrap();
+        run_git(tmp.path(), &["add", ".gitignore"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "add gitignore"]);
+        // The trailing-slash pattern only matches an actual directory — create
+        // both folders on disk, exactly as `autocommit_repo` sees them (it only
+        // probes folders that exist).
+        fs::create_dir_all(tmp.path().join("docs/backend-requirements")).unwrap();
+        fs::create_dir_all(tmp.path().join("docs/server-api")).unwrap();
+
+        let git = check_git_available().expect("git available");
+        assert!(
+            is_gitignored(&git, tmp.path(), &PathBuf::from("docs/backend-requirements")).unwrap(),
+            "gitignored folder must report true"
+        );
+        assert!(
+            !is_gitignored(&git, tmp.path(), &PathBuf::from("docs/server-api")).unwrap(),
+            "non-ignored folder must report false"
+        );
     }
 
     #[test]

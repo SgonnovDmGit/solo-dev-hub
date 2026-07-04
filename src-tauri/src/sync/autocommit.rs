@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::git_ops::{commit_paths, CommitOutcome, GitBinary};
+use crate::git_ops::{commit_paths, is_gitignored, CommitOutcome, GitBinary};
 
 /// Doc subfolders that hold cross-repo synced content (REQ pairs, API contracts,
 /// announcements). Auto-commit is scoped (git pathspec) to these — the dev's own
@@ -32,19 +32,30 @@ pub fn autocommit_repo(
     repo_root: &Path,
     branch: &str,
 ) -> Result<CommitOutcome, String> {
-    let existing: Vec<PathBuf> = CROSS_REPO_DIRS
-        .iter()
-        .filter(|d| repo_root.join(d).exists())
-        .map(PathBuf::from)
-        .collect();
-    if existing.is_empty() {
+    // Cross-repo folders present on disk that the dev has NOT gitignored.
+    // A gitignored folder is the dev's deliberate "local inbox" (Option A):
+    // git won't add it, and forcing it in would fight that choice — so skip it.
+    // Skipping also fixes the crash where `git add` on an ignored path exits 1
+    // and aborted the whole commit for the tracked folders alongside it.
+    let mut tracked: Vec<PathBuf> = Vec::new();
+    for d in CROSS_REPO_DIRS {
+        let rel = PathBuf::from(d);
+        if !repo_root.join(&rel).exists() {
+            continue;
+        }
+        if is_gitignored(git, repo_root, &rel)? {
+            continue;
+        }
+        tracked.push(rel);
+    }
+    if tracked.is_empty() {
         return Ok(CommitOutcome::NothingToCommit);
     }
     commit_paths(
         git,
         repo_root,
         branch,
-        &existing,
+        &tracked,
         "chore(sdh-sync): sync cross-repo files",
         Some("Cross-repo requirement, API-contract and announcement files synced by Solo Dev Hub."),
         SDH_COMMIT_NAME,
@@ -212,6 +223,67 @@ mod tests {
             !head_files(tmp.path()).contains(&"docs/server-api/api.md".to_string()),
             "no commit must be made on wrong branch"
         );
+    }
+
+    #[test]
+    fn test_autocommit_repo_skips_gitignored_folder() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        // Dev gitignores the incoming announcements inbox (local-only) but
+        // tracks the synced API contract.
+        write_file(tmp.path(), ".gitignore", "docs/server-announcements/\n");
+        run_git(tmp.path(), &["add", ".gitignore"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "add gitignore"]);
+        write_file(
+            tmp.path(),
+            "docs/server-announcements/ANNOUNCE-001.md",
+            "# a\n",
+        );
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        // Previously the gitignored folder made `git add` exit 1 and aborted
+        // the whole commit; now it's skipped and the tracked file commits.
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 1 });
+
+        let hf = head_files(tmp.path());
+        assert!(
+            hf.contains(&"docs/server-api/api.md".to_string()),
+            "tracked api.md must be committed, got {:?}",
+            hf
+        );
+        assert!(
+            !hf.iter().any(|f| f.contains("ANNOUNCE-001")),
+            "gitignored announcement must NOT be committed, got {:?}",
+            hf
+        );
+    }
+
+    #[test]
+    fn test_autocommit_repo_all_folders_gitignored_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        write_file(
+            tmp.path(),
+            ".gitignore",
+            "docs/backend-requirements/\ndocs/server-announcements/\n",
+        );
+        run_git(tmp.path(), &["add", ".gitignore"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "add gitignore"]);
+        write_file(tmp.path(), "docs/backend-requirements/REQ-001.md", "# r\n");
+        write_file(
+            tmp.path(),
+            "docs/server-announcements/ANNOUNCE-001.md",
+            "# a\n",
+        );
+
+        let git = check_git_available().expect("git available");
+        // Every present cross-repo folder is gitignored → clean no-op, no error.
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
     }
 
     #[test]
