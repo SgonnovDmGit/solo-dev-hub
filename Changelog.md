@@ -4,6 +4,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.9.3] — 2026-07-04
+
+Dogfood patch: auto-commit no longer crashes on gitignored cross-repo folders, plus two rule/skill clarifications for cleaner LLM behavior.
+
+### Fixed
+- **Auto-commit skips gitignored cross-repo folders instead of crashing (T-000152).** When a recipient repo `.gitignore`s its incoming cross-repo inbox (`docs/*-requirements/`, `docs/*-announcements/`), `git add` refused the ignored paths and aborted the whole sync auto-commit (`git add exit 1: paths are ignored`). Auto-commit now detects gitignored folders (`git check-ignore`) and skips them — committing only the cross-repo folders you actually track (e.g. a synced API contract), and treating "all folders ignored" as a clean no-op. Gitignored folders are a deliberate local inbox and are never force-added.
+
+### Changed
+- **Auto-commit rule clarifies gitignore is a valid alternative (T-000153).** The always-on rules now state that committing synced files and `.gitignore`-ing them are two equally valid ways to stop them reading as "foreign" — auto-commit respects the split (commits tracked folders, leaves ignored ones alone), and the two mechanisms are complementary, not a conflict.
+- **Visual-approval gate in the release lifecycle (T-000153).** For a client / landing / any visual release, the Test-stage smoke is the user eyeballing the built/running UI: closure and the git tag/merge block are not shown until the user explicitly approves the visual — even in autonomous mode — and the block is emitted once, not re-posted each turn. Server / tool / microservice releases self-verify via automated smoke (no visual gate). Stops premature tag blocks and repeated command runs.
+
+### Tests
+- 457 Rust (`cargo test --lib`; +3 gitignore-skip guards), 86 vitest, 0 svelte-check errors. No DB migration.
+
 ## [1.9.2] — 2026-07-03
 
 Docs/rules patch: the API-contract skills now require partitioning the contract by consumer audience and by volume, instead of one monolithic `api.md`. No app behavior change.
