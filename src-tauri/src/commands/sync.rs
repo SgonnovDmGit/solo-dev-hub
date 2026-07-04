@@ -100,7 +100,15 @@ pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>,
     Ok(updated)
 }
 
-#[tauri::command]
+// T-000154: runs off the main thread. `run_project_sync` does heavy synchronous
+// work — per-repo skeleton writes plus the portfolio-wide auto-commit block that
+// spawns many `git` subprocesses (check-ignore + add + diff + commit per repo).
+// As a plain `#[tauri::command]` it executed on the Tauri main/UI thread, so the
+// WebView froze for the whole run — perceived as periodic short hangs whenever
+// the background auto-sync timer fired. `(async)` on the sync fn offloads it to a
+// worker thread (AppDb is Send+Sync, its lock is taken per-method, not held
+// across the run), keeping the UI responsive during sync.
+#[tauri::command(async)]
 pub fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String> {
     sync::run_project_sync(&db, project_id)
 }
