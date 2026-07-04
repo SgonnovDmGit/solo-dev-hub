@@ -4,6 +4,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.9.4] — 2026-07-04
+
+Dogfood patch: the background auto-sync no longer freezes the window.
+
+### Fixed
+- **Auto-sync no longer freezes the UI (T-000154).** `sync_project` was a synchronous Tauri command, so its heavy work — per-repo skeleton writes plus the portfolio-wide auto-commit that spawns many `git` subprocesses — ran on the main/UI thread and froze the WebView2 window for the whole run. With the background auto-sync timer firing it, this showed up as short hangs every few seconds. The command now runs off the main thread (`#[tauri::command(async)]`), keeping the window responsive during sync; manual Sync benefits too. The body is unchanged (`AppDb` is `Send + Sync`, its DB lock is taken per-method, not held across the run). The freeze became noticeable right after v1.9.3 — that release fixed the auto-commit crash, so auto-commit now does its full git work instead of aborting early, which made the main-thread block long enough to feel.
+
+### Tests
+- 457 Rust / 86 vitest / 0 svelte-check. Off-main-thread offloading is runtime behavior, not unit-testable — verified by smoke (auto-sync enabled with a short interval; the window stays responsive during sync). No new tests, no DB migration.
+
 ## [1.9.3] — 2026-07-04
 
 Dogfood patch: auto-commit no longer crashes on gitignored cross-repo folders, plus two rule/skill clarifications for cleaner LLM behavior.
