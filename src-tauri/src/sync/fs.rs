@@ -47,7 +47,12 @@ pub fn remove_git_dir(repo_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Scan directory for REQ-*.md files (not .response.md)
+/// Scan directory for REQ-*.md files (not .response.md, not .impl.md).
+/// The `.impl.md` acknowledgement is a close *signal*, not a requirement — it
+/// is consumed by `auto_close_impl_pairs` (which runs first in the sync pass).
+/// Excluding it here is a safety net: if that teardown ever fails partway (e.g.
+/// a Windows file lock on delete), a stray `.impl.md` must not be mistaken for
+/// a requirement and copied to the recipient as a phantom pair.
 pub fn scan_requirements(dir: &Path) -> Vec<String> {
     if !dir.exists() {
         return vec![];
@@ -62,6 +67,7 @@ pub fn scan_requirements(dir: &Path) -> Vec<String> {
                     name.starts_with("REQ-")
                         && name.ends_with(".md")
                         && !name.ends_with(".response.md")
+                        && !name.ends_with(".impl.md")
                 })
                 .collect()
         })
@@ -282,6 +288,20 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains(&"REQ-001.md".to_string()));
         assert!(result.contains(&"REQ-002.md".to_string()));
+    }
+
+    #[test]
+    fn test_scan_requirements_excludes_impl_files() {
+        // A `.impl.md` close-signal must never be treated as a requirement —
+        // otherwise a stray one (left behind if teardown failed) would be
+        // re-copied to the recipient as a phantom pair.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("REQ-001_x.md"), "req").unwrap();
+        fs::write(tmp.path().join("REQ-001_x.impl.md"), "").unwrap();
+
+        let result = scan_requirements(tmp.path());
+        assert_eq!(result, vec!["REQ-001_x.md".to_string()]);
+        assert!(!result.contains(&"REQ-001_x.impl.md".to_string()));
     }
 
     #[test]

@@ -110,6 +110,9 @@ Two ways to close (delete) a pair — both remove all files on both sides:
 **`.impl.md` rules:**
 - Authored **only by the sender**, only in the sender's outgoing folder. The file's existence is the signal; empty is fine, any content is ignored by the app.
 - Drop it **only when you are done integrating and satisfied** with the receipt.
+- **Dropping `.impl.md` is the ENTIRE close action — then STOP.** Do not also delete the `REQ-NNN.md`, the `.response.md`, or the `.impl.md` yourself. The app tears down all three, on both sides, at the next sync — let one sync run and do not "tidy up" the files by hand.
+
+> **Failure mode — base-REQ resurrection.** If you delete the `.impl.md` yourself (or delete the `.response.md`) *before* a sync has processed the close, the auto-close never fires — and because the sender's copy of `REQ-NNN.md` is the **source of truth**, the *next* sync re-copies it to the recipient with no receipt attached. The recipient then sees a live "open" requirement that was already implemented, and puzzles over why. So after dropping `.impl.md`: **touch nothing, let a sync run — the app does every deletion.**
 
 **If NOT satisfied** with a final receipt (`implemented` / `partially` / `declined`) — do not "reject"; write a new `REQ-N+1_<slug>.md` with a clarified ask. The original pair may stay open until answered or be closed immediately.
 
@@ -141,5 +144,5 @@ Whether and **when** to forward, waiting for the whole chain, and writing the fi
 
 - **Do not author a `REQ-*.md` in someone else's / your incoming folder.** You write only to your own outgoing folder. (If you are a server — do not write a REQ in `docs/client-requirements/<client>/`: the app populates it from the client, and your REQ there will be mistaken for an incoming request. Server-initiated communication to a client goes through announcements.)
 - **Do not edit a `REQ-*.response.md`** — the receipt belongs to the recipient; the edit will be overwritten.
-- **Do not delete** `REQ-*.md` / `.response.md` manually — closing only via ✓ or `.impl.md`.
+- **Do not delete** `REQ-*.md` / `.response.md` / `.impl.md` by hand — the app removes all of them. Closing is **only** via ✓ or dropping `.impl.md`; deleting files manually orphans the base REQ and resurrects it on the recipient (see §5 "Failure mode").
 - **Do not rename/renumber `NNN`** and **do not rename sync folders** — they are app-managed.
