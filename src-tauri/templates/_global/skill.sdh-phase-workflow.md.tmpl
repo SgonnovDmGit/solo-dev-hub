@@ -29,6 +29,8 @@ Use this when scoping a user request, before starting implementation. For any re
 4. **User OK** — the user reviews the spec (or thread), approves or returns corrections. Iterate until approved. Do not start implementation before approval.
 5. **Implementation** — task by task. Each task commits on completion per the project's implementation workflow.
 
+**Filing tasks in `docs/todo.md`:** any task this spec spawns (or that surfaces mid-work) goes **under a `## vX.Y.Z` roadmap header** — the version you expect to ship it in — never a flat backlog. The only open question allowed is timing relative to the next MAJOR; see "Task filing — always the roadmap, never a backlog" in skill `sdh-release-lifecycle`.
+
 This sequence is one task-level cycle. It runs inside the broader release lifecycle (skill `sdh-release-lifecycle`): that skill's "Implementation" stage is where these five steps execute per task, and its own Spec / Spec-review stages mirror steps 2–4 at the release level.
 
 ## Project bindings (per-project `CLAUDE.md` defines)
