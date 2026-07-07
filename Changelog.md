@@ -4,6 +4,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.9.5] — 2026-07-07
+
+Dogfood patch: a closed cross-repo REQ no longer resurrects on the recipient, plus workflow-skill refinements (task filing, next-release stage, todo hygiene).
+
+### Fixed
+- **A closed REQ no longer reappears as "open" on the recipient (T-000155).** Closing a pair means dropping `.impl.md` and letting one sync tear the triple down — but if the files were deleted by hand (impl/response removed, base `REQ-NNN.md` left behind), the sender's base is the source of truth and every later sync re-copied it to the recipient with no receipt, so a done requirement looked open. The app can't produce this state itself (it deletes base first), so the fix is behavioral: the REQ skills now forbid manual deletion explicitly and document the resurrection failure mode. Code safety net: `scan_requirements` now excludes `*.impl.md`, so a stray impl file (left if a teardown ever fails midway, e.g. a Windows file lock) is never mistaken for a requirement and re-synced as a phantom pair.
+
+### Changed
+- **REQ skills spell out "drop `.impl.md`, then STOP" (T-000155).** `sdh-cross-repo-req-send` §5 now states dropping `.impl.md` is the entire close action — do not also delete base / response / impl by hand; let one sync run. Adds `.impl.md` to the no-manual-delete list plus a "base-REQ resurrection" failure-mode box. `sdh-cross-repo-req-answer` gains "do not delete your own `.response.md` to tidy up".
+- **Tasks always land on the roadmap, never a backlog (T-000156).** `sdh-release-lifecycle` gains a "Task filing" rule: every `docs/todo.md` task goes under a `## vX.Y.Z` header; the only allowed uncertainty is timing relative to the next MAJOR (place it pre- or post-major, still on the timeline) — no flat unsorted bucket. Referenced from the Plan stage and `sdh-phase-workflow`.
+- **Next-release-plan stage reframed as re-estimation, not design (T-000156).** Stage 10 is now a short re-estimate/re-slice of the next release's already-filed tasks — re-check effort/priority, split overgrown tasks, drop moot ones — explicitly not a spec/brainstorm/"phase 2". Cheap, expected every closure, but bounded.
+- **Closure deletes shipped tasks from todo.md outright (T-000156).** `sdh-release-closure` step 4 now forbids leaving `done`/`✓` annotations, struck rows, or what-and-how prose in todo.md — completion lives only in done.md.
+- **Requirements-sync flow doc rewritten.** `docs/flows/requirements-sync.md` was stuck at v0.14.0 (monolithic `sync.rs`/`lib.rs`, manual-✓ only). Now documents the split modules, the `.impl.md` auto-close, v1.7.0 auto-sync/auto-commit, and the resurrection failure mode.
+
+### Tests
+- 458 Rust (`cargo test --lib`; +1 scan_requirements-excludes-impl guard) / 86 vitest / 0 svelte-check errors. No DB migration. Skill/doc changes are text, verified by review.
+
 ## [1.9.4] — 2026-07-04
 
 Dogfood patch: the background auto-sync no longer freezes the window.

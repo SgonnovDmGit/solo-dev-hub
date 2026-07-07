@@ -125,4 +125,5 @@ When you are a **microservice** and received a downstream REQ in `docs/server-re
 - **Do not author a `REQ-*.md` in your incoming folder** (server: `docs/client-requirements/<client>/`; microservice: `docs/server-requirements/`) — the app populates it from the sender; your REQ there goes nowhere and will be mistaken for an incoming one. Your own initiative goes through `sdh-cross-repo-req-send` (if a request) or announcements (if a push).
 - **A microservice never authors `.impl.md`** — an impl file on the recipient side is undeliverable (the incoming folder is overwritten at sync). Closing is the sender's job.
 - **Do not author a `.response.md` for a requirement you did not receive.**
+- **Do not delete your `.response.md` (or the received `REQ-*.md`) to "clean up".** Closing is the sender's job (✓ / `.impl.md`), and the app removes both sides. If you delete your receipt early, the sender's base REQ — its source of truth — re-syncs to you with no receipt, and a requirement you already answered reappears as open.
 - **Do not rename sync folders** — they are app-managed.
