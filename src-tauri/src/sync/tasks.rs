@@ -29,6 +29,48 @@ pub struct SyncTasksReport {
 pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, String> {
     use std::collections::{HashMap, HashSet};
 
+    /// Drop repeated ids within one MD file, keeping the LAST occurrence.
+    ///
+    /// T-000157: the DB maps below are built once, before the loops, and are
+    /// never refreshed with rows inserted during the same pass. So a duplicate
+    /// id inside a single file took the INSERT branch twice and hit
+    /// `UNIQUE(repository_id, task_id, source)`, aborting the whole repo's
+    /// sync (and leaving `tasks_migrated_at` unset, so it re-failed on every ↻).
+    /// Real-world trigger: the same task listed under two `## vX.Y.Z` headers
+    /// after a re-plan that didn't delete the old row. Last wins — the later
+    /// header is the more recent intent, mirroring the done-beats-todo rule below.
+    fn dedupe_by_id<T>(
+        items: Vec<T>,
+        id_of: impl Fn(&T) -> &str,
+        what: &str,
+        repo_id: i64,
+    ) -> Vec<T> {
+        let mut last_index: HashMap<String, usize> = HashMap::new();
+        for (i, it) in items.iter().enumerate() {
+            last_index.insert(id_of(it).to_string(), i);
+        }
+        if last_index.len() == items.len() {
+            return items;
+        }
+        items
+            .into_iter()
+            .enumerate()
+            .filter(|(i, it)| {
+                let keep = last_index.get(id_of(it)) == Some(i);
+                if !keep {
+                    eprintln!(
+                        "[sync_tasks repo={}] duplicate id {} in {} — keeping the last occurrence",
+                        repo_id,
+                        id_of(it),
+                        what
+                    );
+                }
+                keep
+            })
+            .map(|(_, it)| it)
+            .collect()
+    }
+
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
 
     let local_path = match repo.local_path.clone() {
@@ -93,6 +135,10 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
     } else {
         (Vec::new(), String::new())
     };
+
+    // T-000157: collapse duplicate ids before diffing against the DB.
+    let todo_tasks = dedupe_by_id(todo_tasks, |t| t.id.as_str(), "todo.md", repo_id);
+    let done_tasks = dedupe_by_id(done_tasks, |t| t.id.as_str(), "done.md", repo_id);
 
     // Load existing DB rows keyed by task_id string
     let db_todos = db
@@ -421,6 +467,44 @@ mod tests {
         let r2 = sync_tasks_for_repo(&db, repo.id).unwrap();
         assert_eq!(r2.imported, 0);
         assert_eq!(r2.events_emitted, 0);
+        std::mem::forget(tmp);
+    }
+
+    /// T-000157: the same id under two `## vX.Y.Z` headers used to blow up on
+    /// `UNIQUE(repository_id, task_id, source)` and abort the repo's sync.
+    /// Now the last occurrence wins and the sync completes.
+    #[test]
+    fn test_sync_tasks_duplicate_id_in_todo_keeps_last() {
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_path.join("docs")).unwrap();
+        std::fs::write(
+            repo_path.join("docs/todo.md"),
+            "## v1.0.0\n\n- [ ] T-000083 | Task | 4 | medium | open | 2026-07-14\n\n\
+             ## v1.1.0\n\n- [ ] T-000083 | Task | 4 | medium | open | 2026-07-14\n\
+             - [ ] T-000088 | Other | 2 | low | open | 2026-07-14\n",
+        )
+        .unwrap();
+        let repo = db
+            .insert_local_repository(repo_path.to_str().unwrap(), "dup_repo", None, None)
+            .unwrap();
+
+        let report = sync_tasks_for_repo(&db, repo.id).unwrap();
+        assert_eq!(
+            report.imported, 2,
+            "duplicate id must be collapsed to one row"
+        );
+
+        let todos = db.list_tasks_by_repo(repo.id, "todo").unwrap();
+        assert_eq!(todos.len(), 2);
+        let dup = todos.iter().find(|t| t.task_id == "T-000083").unwrap();
+        assert_eq!(
+            dup.version.as_deref(),
+            Some("v1.1.0"),
+            "last occurrence wins — the later version header"
+        );
+        assert!(db.get_tasks_migrated_at(repo.id).unwrap().is_some());
         std::mem::forget(tmp);
     }
 

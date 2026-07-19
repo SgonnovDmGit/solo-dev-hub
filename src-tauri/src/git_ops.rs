@@ -461,7 +461,12 @@ mod tests {
 
         let git = check_git_available().expect("git available");
         assert!(
-            is_gitignored(&git, tmp.path(), &PathBuf::from("docs/backend-requirements")).unwrap(),
+            is_gitignored(
+                &git,
+                tmp.path(),
+                &PathBuf::from("docs/backend-requirements")
+            )
+            .unwrap(),
             "gitignored folder must report true"
         );
         assert!(

@@ -204,7 +204,10 @@ mod tests {
             !dir.join("sdh-obsolete.md").exists(),
             "stale sdh-*.md reference copy pruned"
         );
-        assert!(dir.join("README.md").exists(), "non-sdh file left untouched");
+        assert!(
+            dir.join("README.md").exists(),
+            "non-sdh file left untouched"
+        );
         assert!(dir.join("sdh-alpha.md").exists());
         assert!(dir.join("sdh-beta.md").exists());
     }
@@ -252,7 +255,11 @@ mod tests {
                 expected
             );
         }
-        assert_eq!(skills.len(), 12, "exactly twelve sdh-* skills in the bundle");
+        assert_eq!(
+            skills.len(),
+            12,
+            "exactly twelve sdh-* skills in the bundle"
+        );
 
         for (name, content) in &skills {
             assert!(
