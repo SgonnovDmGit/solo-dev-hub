@@ -151,8 +151,9 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Next**
 
-- **v1.11.0** — in-app multilingual help screen documenting the LLM operating contract.
-- **v1.12.0** — cross-platform builds (macOS / Linux).
+- **v1.11.0** — in-app multilingual help screen: onboarding core (quick start, project setup, bug workflow).
+- **v1.12.0** — help screen part two: the cross-repo and LLM operating contract sections.
+- **v1.13.0** — cross-platform builds (macOS / Linux).
 - **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix.
 
 Per-release detail lives in the [Changelog](Changelog.md); the day-to-day task list is kept locally and is not part of the repository.
