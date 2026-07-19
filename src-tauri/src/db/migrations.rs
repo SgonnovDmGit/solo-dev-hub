@@ -922,6 +922,41 @@ mod tests {
         AppDb::new(PathBuf::from(":memory:")).unwrap()
     }
 
+    /// T-000083: materialize a fresh, fully-migrated (and empty) database so
+    /// `tbls` can introspect the schema. Not a test — a generator, hence
+    /// `#[ignore]`; it only runs when `scripts/schema-docs.sh` asks for it:
+    ///
+    /// ```text
+    /// SDH_SCHEMA_DB_PATH=/tmp/schema.db \
+    ///   cargo test --lib db::migrations::tests::export_fresh_schema_db -- --ignored --exact
+    /// ```
+    ///
+    /// Lives here rather than in `examples/` because `mod db` is private —
+    /// generating docs shouldn't widen the crate's public surface.
+    #[test]
+    #[ignore]
+    fn export_fresh_schema_db() {
+        let path = std::env::var("SDH_SCHEMA_DB_PATH")
+            .expect("set SDH_SCHEMA_DB_PATH to the file the schema should be written to");
+        let path = PathBuf::from(path);
+        if path.exists() {
+            std::fs::remove_file(&path).expect("remove stale schema db");
+        }
+        let db = AppDb::new(path.clone()).expect("create + migrate schema db");
+        let version: i32 = db
+            .conn
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let latest = MIGRATIONS.last().expect("migration list is not empty").0;
+        assert_eq!(
+            version, latest,
+            "fresh db must be at the latest schema version"
+        );
+        eprintln!("schema db written to {} (v{})", path.display(), version);
+    }
+
     #[test]
     fn test_db_init_creates_tables() {
         let db = make_db();

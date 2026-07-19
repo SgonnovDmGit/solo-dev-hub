@@ -1,0 +1,1988 @@
+{
+  "name": "Solo Dev Hub — SQLite schema",
+  "tables": [
+    {
+      "name": "projects",
+      "type": "table",
+      "comment": "A portfolio project — the unit that groups repositories and can consume microservice projects.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "nullable": true,
+          "default": "CURRENT_TIMESTAMP"
+        },
+        {
+          "name": "project_type",
+          "type": "TEXT",
+          "nullable": false,
+          "default": "'standard'",
+          "comment": "Added v12, default 'standard'. No SQL CHECK — the legal vocabulary is enforced in Rust only."
+        },
+        {
+          "name": "sort_order",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "0",
+          "comment": "Manual ordering (v14); back-filled as id * 10 to leave gaps for inserts."
+        },
+        {
+          "name": "auto_sync_enabled",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "0",
+          "comment": "v28 — 0/1 opt-in for the background auto-sync timer."
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "projects",
+          "columns": [
+            "id"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE projects (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            name TEXT NOT NULL,\n            description TEXT,\n            created_at DATETIME DEFAULT CURRENT_TIMESTAMP\n        , project_type TEXT NOT NULL DEFAULT 'standard', sort_order INTEGER NOT NULL DEFAULT 0, auto_sync_enabled INTEGER NOT NULL DEFAULT 0)"
+    },
+    {
+      "name": "settings",
+      "type": "table",
+      "comment": "Flat key/value application settings. Never holds secrets — the GitHub PAT and the encryption data key live in the OS credential store.",
+      "columns": [
+        {
+          "name": "key",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "value",
+          "type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_settings_1",
+          "def": "PRIMARY KEY (key)",
+          "table": "settings",
+          "columns": [
+            "key"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "key",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (key)",
+          "table": "settings",
+          "columns": [
+            "key"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_settings_1",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (key)",
+          "table": "settings",
+          "columns": [
+            "key"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE settings (\n            key TEXT PRIMARY KEY,\n            value TEXT\n        )"
+    },
+    {
+      "name": "templates",
+      "type": "table",
+      "comment": "Deploy/scaffold template files per language key, including each stack's meta.json (v25 reads it to decide which placeholders are repo-scope).",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "language_key",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "file_name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "content",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "is_custom",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "0",
+          "comment": "0 = seeded from the bundled templates, 1 = edited by the user (never overwritten by re-seeding)."
+        },
+        {
+          "name": "updated_at",
+          "type": "TEXT",
+          "nullable": false,
+          "default": "CURRENT_TIMESTAMP"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_templates_1",
+          "def": "UNIQUE (language_key, file_name)",
+          "table": "templates",
+          "columns": [
+            "language_key",
+            "file_name"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "templates",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_templates_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (language_key, file_name)",
+          "table": "templates",
+          "columns": [
+            "language_key",
+            "file_name"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE templates (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            language_key TEXT NOT NULL,\n            file_name TEXT NOT NULL,\n            content TEXT NOT NULL,\n            is_custom INTEGER NOT NULL DEFAULT 0,\n            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\n            UNIQUE(language_key, file_name)\n         )"
+    },
+    {
+      "name": "project_microservices",
+      "type": "table",
+      "comment": "Many-to-many link between a parent project and a consumed microservice project. Rebuilt in v12 — before that it linked a project to a repository. Composite PK plus CHECK(project_id != microservice_project_id), so a project cannot consume itself.",
+      "columns": [
+        {
+          "name": "project_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "microservice_project_id",
+          "type": "INTEGER",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_project_microservices_1",
+          "def": "PRIMARY KEY (project_id, microservice_project_id)",
+          "table": "project_microservices",
+          "columns": [
+            "project_id",
+            "microservice_project_id"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "project_id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (project_id)",
+          "table": "project_microservices",
+          "columns": [
+            "project_id"
+          ]
+        },
+        {
+          "name": "microservice_project_id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (microservice_project_id)",
+          "table": "project_microservices",
+          "columns": [
+            "microservice_project_id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (microservice_project_id) REFERENCES projects (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "project_microservices",
+          "referenced_table": "projects",
+          "columns": [
+            "microservice_project_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 1)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (project_id) REFERENCES projects (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "project_microservices",
+          "referenced_table": "projects",
+          "columns": [
+            "project_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_project_microservices_1",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (project_id, microservice_project_id)",
+          "table": "project_microservices",
+          "columns": [
+            "project_id",
+            "microservice_project_id"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK (project_id != microservice_project_id)",
+          "table": "project_microservices",
+          "columns": [
+            "project_id",
+            "microservice_project_id"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE \"project_microservices\" (\n            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n            microservice_project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n            PRIMARY KEY (project_id, microservice_project_id),\n            CHECK (project_id != microservice_project_id)\n         )"
+    },
+    {
+      "name": "repositories",
+      "type": "table",
+      "comment": "A repository belonging to at most one project. May be GitHub-backed or local-only.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "project_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "comment": "ON DELETE SET NULL — the only non-cascading FK in the schema. Deleting a project orphans its repositories rather than destroying them."
+        },
+        {
+          "name": "github_name",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "UNIQUE, and nullable since v13 so local-only repos (never pushed to GitHub) can exist. The last path segment is the canonical folder name used for all cross-repo doc folders."
+        },
+        {
+          "name": "github_url",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "role",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "'microservice' is still legal here but is legacy: v12 NULLed every such row when microservice became a project type rather than a repo role."
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "language",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "last_pushed_at",
+          "type": "DATETIME",
+          "nullable": true
+        },
+        {
+          "name": "added_at",
+          "type": "DATETIME",
+          "nullable": true,
+          "default": "CURRENT_TIMESTAMP"
+        },
+        {
+          "name": "updated_at",
+          "type": "DATETIME",
+          "nullable": true,
+          "default": "CURRENT_TIMESTAMP"
+        },
+        {
+          "name": "local_path",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "github_id",
+          "type": "INTEGER",
+          "nullable": true,
+          "comment": "Stable GitHub identifier — the basis of rename detection."
+        },
+        {
+          "name": "deploy_target",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "Matches templates.language_key."
+        },
+        {
+          "name": "sort_order",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "0"
+        },
+        {
+          "name": "bugs_migrated_at",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "Lazy-migration marker (v18); NULL means the repo's MD has never been imported."
+        },
+        {
+          "name": "tasks_migrated_at",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "Lazy-migration marker (v21). While NULL, the first task sync suppresses 'created' events so backfilling legacy files doesn't flood the timeline."
+        },
+        {
+          "name": "deploy_repo_config",
+          "type": "TEXT",
+          "nullable": false,
+          "default": "'{}'",
+          "comment": "v25 — JSON map of repo-wide (not per-environment) deploy placeholder values."
+        },
+        {
+          "name": "autocommit_branch",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "v28 — NULL means auto-commit is off for this repo."
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_repositories_1",
+          "def": "UNIQUE (github_name)",
+          "table": "repositories",
+          "columns": [
+            "github_name"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "repositories",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (project_id) REFERENCES projects (id) ON UPDATE NO ACTION ON DELETE SET NULL MATCH NONE",
+          "table": "repositories",
+          "referenced_table": "projects",
+          "columns": [
+            "project_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_repositories_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (github_name)",
+          "table": "repositories",
+          "columns": [
+            "github_name"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(role IN ('server','client','test_client','admin_client','microservice','landing','tool','other'))",
+          "table": "repositories",
+          "columns": [
+            "role"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE \"repositories\" (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,\n            github_name TEXT UNIQUE,\n            github_url TEXT,\n            role TEXT CHECK(role IN ('server','client','test_client','admin_client','microservice','landing','tool','other')),\n            description TEXT,\n            language TEXT,\n            last_pushed_at DATETIME,\n            added_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n            local_path TEXT,\n            github_id INTEGER,\n            deploy_target TEXT\n         , sort_order INTEGER NOT NULL DEFAULT 0, bugs_migrated_at TEXT, tasks_migrated_at TEXT, deploy_repo_config TEXT NOT NULL DEFAULT '{}', autocommit_branch TEXT)"
+    },
+    {
+      "name": "repo_renames",
+      "type": "table",
+      "comment": "Append-only log of repository renames, written when a known github_id shows up under a new github_name. The sync preamble replays every entry to rename cross-repo folders on the counterparty's disk. There is deliberately no applied_at column — idempotency comes from filesystem checks, not DB state.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "repository_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "old_canonical",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "new_canonical",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "renamed_at",
+          "type": "DATETIME",
+          "nullable": false,
+          "default": "CURRENT_TIMESTAMP"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_repo_renames_repo",
+          "def": "CREATE INDEX idx_repo_renames_repo ON repo_renames(repository_id)",
+          "table": "repo_renames",
+          "columns": [
+            "repository_id"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "repo_renames",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "repo_renames",
+          "referenced_table": "repositories",
+          "columns": [
+            "repository_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE repo_renames (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n            old_canonical TEXT NOT NULL,\n            new_canonical TEXT NOT NULL,\n            renamed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP\n         )"
+    },
+    {
+      "name": "bugs",
+      "type": "table",
+      "comment": "Source of truth for bug reports. docs/bug-reports.md in each repo is a generated, LLM-facing view of this table — protected fields are restored from here on every reconcile.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "repository_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "numeric_id",
+          "type": "INTEGER",
+          "nullable": false,
+          "comment": "Per-repository counter; display_id is its rendered form (B-000042)."
+        },
+        {
+          "name": "display_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "severity",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "category",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "fix_attempts",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "0",
+          "comment": "App-managed: incremented on each transition into 'testing'. Never written by an AI agent — this is what makes the attempt history honest."
+        },
+        {
+          "name": "comment",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "confirmed_at",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "archived_from_md_at",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "v22 — set when the agent removes a confirmed row from the MD file. After that, regeneration permanently excludes the row."
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_bugs_confirmed_at",
+          "def": "CREATE INDEX idx_bugs_confirmed_at ON bugs(confirmed_at)\n             WHERE confirmed_at IS NOT NULL",
+          "table": "bugs",
+          "columns": [
+            "confirmed_at"
+          ]
+        },
+        {
+          "name": "idx_bugs_repo_date",
+          "def": "CREATE INDEX idx_bugs_repo_date ON bugs(repository_id, created_at)",
+          "table": "bugs",
+          "columns": [
+            "repository_id",
+            "created_at"
+          ]
+        },
+        {
+          "name": "idx_bugs_status",
+          "def": "CREATE INDEX idx_bugs_status ON bugs(status)",
+          "table": "bugs",
+          "columns": [
+            "status"
+          ]
+        },
+        {
+          "name": "idx_bugs_repo",
+          "def": "CREATE INDEX idx_bugs_repo ON bugs(repository_id)",
+          "table": "bugs",
+          "columns": [
+            "repository_id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_bugs_1",
+          "def": "UNIQUE (repository_id, numeric_id)",
+          "table": "bugs",
+          "columns": [
+            "repository_id",
+            "numeric_id"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "bugs",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "bugs",
+          "referenced_table": "repositories",
+          "columns": [
+            "repository_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_bugs_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (repository_id, numeric_id)",
+          "table": "bugs",
+          "columns": [
+            "repository_id",
+            "numeric_id"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(severity IN ('critical','major','medium','minor'))",
+          "table": "bugs",
+          "columns": [
+            "severity"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(category IN ('ui_ux','ux_flow','logic','auth','database','performance','security','integration','other'))",
+          "table": "bugs",
+          "columns": [
+            "category"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(status IN ('created','in-progress','testing','rejected','confirmed'))",
+          "table": "bugs",
+          "columns": [
+            "status"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE bugs (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n            numeric_id INTEGER NOT NULL,\n            display_id TEXT NOT NULL,\n            created_at TEXT NOT NULL,\n            description TEXT NOT NULL,\n            severity TEXT NOT NULL CHECK(severity IN ('critical','major','medium','minor')),\n            category TEXT NOT NULL CHECK(category IN ('ui_ux','ux_flow','logic','auth','database','performance','security','integration','other')),\n            status TEXT NOT NULL CHECK(status IN ('created','in-progress','testing','rejected','confirmed')),\n            fix_attempts INTEGER NOT NULL DEFAULT 0,\n            comment TEXT,\n            confirmed_at TEXT, archived_from_md_at TEXT,\n            UNIQUE(repository_id, numeric_id)\n         )"
+    },
+    {
+      "name": "bug_events",
+      "type": "table",
+      "comment": "Append-only bug lifecycle log (v19), so attempts-per-period metrics are computed from events rather than a running counter. Invariant: the count of 'entered_testing' events for a bug equals bugs.fix_attempts.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "bug_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "event_type",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "ts",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "from_status",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "to_status",
+          "type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_bug_events_type_ts",
+          "def": "CREATE INDEX idx_bug_events_type_ts ON bug_events(event_type, ts)",
+          "table": "bug_events",
+          "columns": [
+            "event_type",
+            "ts"
+          ]
+        },
+        {
+          "name": "idx_bug_events_ts",
+          "def": "CREATE INDEX idx_bug_events_ts ON bug_events(ts)",
+          "table": "bug_events",
+          "columns": [
+            "ts"
+          ]
+        },
+        {
+          "name": "idx_bug_events_bug",
+          "def": "CREATE INDEX idx_bug_events_bug ON bug_events(bug_id)",
+          "table": "bug_events",
+          "columns": [
+            "bug_id"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "bug_events",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (bug_id) REFERENCES bugs (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "bug_events",
+          "referenced_table": "bugs",
+          "columns": [
+            "bug_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(event_type IN ( 'created','taken','entered_testing','confirmed','rejected','reopened' ))",
+          "table": "bug_events",
+          "columns": [
+            "event_type"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE bug_events (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             bug_id INTEGER NOT NULL REFERENCES bugs(id) ON DELETE CASCADE,\n             event_type TEXT NOT NULL CHECK(event_type IN (\n                 'created','taken','entered_testing','confirmed','rejected','reopened'\n             )),\n             ts TEXT NOT NULL,\n             from_status TEXT,\n             to_status TEXT\n         )"
+    },
+    {
+      "name": "deploy_environments",
+      "type": "table",
+      "comment": "One deploy environment (prod / staging / any custom name) for a repository; 1:N per repo since v20, which replaced the single deploy_manifests row.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "repository_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "workflow_name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "image_tag",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "compose_service",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "deploy_branch",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "sort_order",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "0"
+        },
+        {
+          "name": "extras",
+          "type": "TEXT",
+          "nullable": false,
+          "default": "'{}'",
+          "comment": "JSON map of environment-scope placeholder values. Repo-wide ones live in repositories.deploy_repo_config."
+        },
+        {
+          "name": "updated_at",
+          "type": "TEXT",
+          "nullable": false,
+          "default": "CURRENT_TIMESTAMP"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_deploy_env_repo",
+          "def": "CREATE INDEX idx_deploy_env_repo ON deploy_environments(repository_id)",
+          "table": "deploy_environments",
+          "columns": [
+            "repository_id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_deploy_environments_1",
+          "def": "UNIQUE (repository_id, name)",
+          "table": "deploy_environments",
+          "columns": [
+            "repository_id",
+            "name"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "deploy_environments",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "deploy_environments",
+          "referenced_table": "repositories",
+          "columns": [
+            "repository_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_deploy_environments_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (repository_id, name)",
+          "table": "deploy_environments",
+          "columns": [
+            "repository_id",
+            "name"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE deploy_environments (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n            name TEXT NOT NULL,\n            workflow_name TEXT NOT NULL,\n            image_tag TEXT NOT NULL,\n            compose_service TEXT NOT NULL,\n            domain TEXT NOT NULL,\n            deploy_branch TEXT NOT NULL,\n            sort_order INTEGER NOT NULL DEFAULT 0,\n            extras TEXT NOT NULL DEFAULT '{}',\n            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\n            UNIQUE(repository_id, name)\n         )"
+    },
+    {
+      "name": "deploy_secrets",
+      "type": "table",
+      "comment": "Per-environment per-secret flags: which role the secret plays and whether it is included or overridden. Values are NOT stored here.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "deploy_env_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "secret_name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "role",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "build / deploy / runtime — decides where the secret is injected."
+        },
+        {
+          "name": "included",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "1",
+          "comment": "0 excludes the secret from this environment without deleting its configuration."
+        },
+        {
+          "name": "override_enabled",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "0"
+        },
+        {
+          "name": "sort_order",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "0"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_deploy_secrets_env",
+          "def": "CREATE INDEX idx_deploy_secrets_env ON deploy_secrets(deploy_env_id)",
+          "table": "deploy_secrets",
+          "columns": [
+            "deploy_env_id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_deploy_secrets_1",
+          "def": "UNIQUE (deploy_env_id, secret_name)",
+          "table": "deploy_secrets",
+          "columns": [
+            "deploy_env_id",
+            "secret_name"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "deploy_secrets",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (deploy_env_id) REFERENCES deploy_environments (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "deploy_secrets",
+          "referenced_table": "deploy_environments",
+          "columns": [
+            "deploy_env_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_deploy_secrets_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (deploy_env_id, secret_name)",
+          "table": "deploy_secrets",
+          "columns": [
+            "deploy_env_id",
+            "secret_name"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(role IN ('build','deploy','runtime'))",
+          "table": "deploy_secrets",
+          "columns": [
+            "role"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE deploy_secrets (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            deploy_env_id INTEGER NOT NULL REFERENCES deploy_environments(id) ON DELETE CASCADE,\n            secret_name TEXT NOT NULL,\n            role TEXT CHECK(role IN ('build','deploy','runtime')),\n            included INTEGER NOT NULL DEFAULT 1,\n            override_enabled INTEGER NOT NULL DEFAULT 0,\n            sort_order INTEGER NOT NULL DEFAULT 0,\n            UNIQUE(deploy_env_id, secret_name)\n         )"
+    },
+    {
+      "name": "tasks",
+      "type": "table",
+      "comment": "Mirror of docs/todo.md and docs/done.md. Polarity is the reverse of bugs — here the Markdown is canonical and this table is rebuilt from it on each sync, because tasks are hand-edited far more often than bugs.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "repository_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "task_id",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "The display id as written in Markdown (T-000042 / F-000013 / D-000001) — TEXT, not a foreign key. Note task_events.task_id is a different thing: an INTEGER FK to tasks.id."
+        },
+        {
+          "name": "prefix",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "effort",
+          "type": "REAL",
+          "nullable": true
+        },
+        {
+          "name": "priority",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "No SQL CHECK — critical / high / medium / low are enforced in Rust."
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "No SQL CHECK — open / in-progress / review are enforced in Rust."
+        },
+        {
+          "name": "version",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "Inherited from the nearest preceding '## vX.Y.Z' header in todo.md."
+        },
+        {
+          "name": "source",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "'todo' or 'done'. Part of the uniqueness key, so the same id may exist once per source during a transition."
+        },
+        {
+          "name": "created_at",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "TEXT",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_tasks_status",
+          "def": "CREATE INDEX idx_tasks_status ON tasks(status) WHERE status IS NOT NULL",
+          "table": "tasks",
+          "columns": [
+            "status"
+          ]
+        },
+        {
+          "name": "idx_tasks_repo_source",
+          "def": "CREATE INDEX idx_tasks_repo_source ON tasks(repository_id, source)",
+          "table": "tasks",
+          "columns": [
+            "repository_id",
+            "source"
+          ]
+        },
+        {
+          "name": "idx_tasks_repo",
+          "def": "CREATE INDEX idx_tasks_repo ON tasks(repository_id)",
+          "table": "tasks",
+          "columns": [
+            "repository_id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_tasks_1",
+          "def": "UNIQUE (repository_id, task_id, source)",
+          "table": "tasks",
+          "columns": [
+            "repository_id",
+            "task_id",
+            "source"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "tasks",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "tasks",
+          "referenced_table": "repositories",
+          "columns": [
+            "repository_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_tasks_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (repository_id, task_id, source)",
+          "table": "tasks",
+          "columns": [
+            "repository_id",
+            "task_id",
+            "source"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(prefix IN ('T','F','D'))",
+          "table": "tasks",
+          "columns": [
+            "prefix"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(source IN ('todo','done'))",
+          "table": "tasks",
+          "columns": [
+            "source"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE tasks (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             task_id TEXT NOT NULL,\n             prefix TEXT NOT NULL CHECK(prefix IN ('T','F','D')),\n             description TEXT NOT NULL,\n             effort REAL,\n             priority TEXT,\n             status TEXT,\n             version TEXT,\n             source TEXT NOT NULL CHECK(source IN ('todo','done')),\n             created_at TEXT NOT NULL,\n             updated_at TEXT NOT NULL,\n             UNIQUE(repository_id, task_id, source)\n         )"
+    },
+    {
+      "name": "task_events",
+      "type": "table",
+      "comment": "Append-only task lifecycle log, the task-side twin of bug_events.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "task_id",
+          "type": "INTEGER",
+          "nullable": false,
+          "comment": "INTEGER FK to tasks.id — not the display id (that is tasks.task_id, TEXT)."
+        },
+        {
+          "name": "event_type",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "ts",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "from_status",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "to_status",
+          "type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_task_events_type_ts",
+          "def": "CREATE INDEX idx_task_events_type_ts ON task_events(event_type, ts)",
+          "table": "task_events",
+          "columns": [
+            "event_type",
+            "ts"
+          ]
+        },
+        {
+          "name": "idx_task_events_ts",
+          "def": "CREATE INDEX idx_task_events_ts ON task_events(ts)",
+          "table": "task_events",
+          "columns": [
+            "ts"
+          ]
+        },
+        {
+          "name": "idx_task_events_task",
+          "def": "CREATE INDEX idx_task_events_task ON task_events(task_id)",
+          "table": "task_events",
+          "columns": [
+            "task_id"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "task_events",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (task_id) REFERENCES tasks (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "task_events",
+          "referenced_table": "tasks",
+          "columns": [
+            "task_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(event_type IN ( 'created','taken','review','done','reopened' ))",
+          "table": "task_events",
+          "columns": [
+            "event_type"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE task_events (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n             event_type TEXT NOT NULL CHECK(event_type IN (\n                 'created','taken','review','done','reopened'\n             )),\n             ts TEXT NOT NULL,\n             from_status TEXT,\n             to_status TEXT\n         )"
+    },
+    {
+      "name": "deploy_events",
+      "type": "table",
+      "comment": "Log of deploy operations (template render, GitHub secret set/delete). deploy_env_id is nullable so repo-level actions can be recorded too.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "deploy_env_id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "repository_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "action",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "ts",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "details",
+          "type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_deploy_events_repo",
+          "def": "CREATE INDEX idx_deploy_events_repo ON deploy_events(repository_id)",
+          "table": "deploy_events",
+          "columns": [
+            "repository_id"
+          ]
+        },
+        {
+          "name": "idx_deploy_events_ts",
+          "def": "CREATE INDEX idx_deploy_events_ts ON deploy_events(ts)",
+          "table": "deploy_events",
+          "columns": [
+            "ts"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "deploy_events",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "deploy_events",
+          "referenced_table": "repositories",
+          "columns": [
+            "repository_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 1)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (deploy_env_id) REFERENCES deploy_environments (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "deploy_events",
+          "referenced_table": "deploy_environments",
+          "columns": [
+            "deploy_env_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(action IN ('render','env_secret_set','env_secret_delete'))",
+          "table": "deploy_events",
+          "columns": [
+            "action"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE deploy_events (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             deploy_env_id INTEGER REFERENCES deploy_environments(id) ON DELETE CASCADE,\n             repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             action TEXT NOT NULL CHECK(action IN ('render','env_secret_set','env_secret_delete')),\n             ts TEXT NOT NULL,\n             details TEXT\n         )"
+    },
+    {
+      "name": "project_renames",
+      "type": "table",
+      "comment": "Project-level twin of repo_renames (v24). Needed because microservice-api/\u003cname\u003e/ folders on the parent-server side are keyed by project name, which repo_renames does not cover.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "project_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "old_name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "new_name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "renamed_at",
+          "type": "DATETIME",
+          "nullable": false,
+          "default": "CURRENT_TIMESTAMP"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_project_renames_project",
+          "def": "CREATE INDEX idx_project_renames_project ON project_renames(project_id)",
+          "table": "project_renames",
+          "columns": [
+            "project_id"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "project_renames",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (project_id) REFERENCES projects (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "project_renames",
+          "referenced_table": "projects",
+          "columns": [
+            "project_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE project_renames (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n            old_name TEXT NOT NULL,\n            new_name TEXT NOT NULL,\n            renamed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP\n         )"
+    },
+    {
+      "name": "sync_events",
+      "type": "table",
+      "comment": "Log of sync operations, feeding the timeline. repository_id is nullable — a NULL row is a portfolio-wide sync rather than a per-repo one.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "repository_id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "sync_type",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "project_sync / tasks / secret / requirements / migration. 'migration' was added in v25 to record deploy-config conflicts resolved by first-env-wins."
+        },
+        {
+          "name": "ts",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "change_count",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "0"
+        },
+        {
+          "name": "details",
+          "type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_sync_events_repo",
+          "def": "CREATE INDEX idx_sync_events_repo ON sync_events(repository_id)",
+          "table": "sync_events",
+          "columns": [
+            "repository_id"
+          ]
+        },
+        {
+          "name": "idx_sync_events_ts",
+          "def": "CREATE INDEX idx_sync_events_ts ON sync_events(ts)",
+          "table": "sync_events",
+          "columns": [
+            "ts"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "sync_events",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "sync_events",
+          "referenced_table": "repositories",
+          "columns": [
+            "repository_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(sync_type IN ('project_sync','tasks','secret','requirements','migration'))",
+          "table": "sync_events",
+          "columns": [
+            "sync_type",
+            "ts"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE \"sync_events\" (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             repository_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,\n             sync_type TEXT NOT NULL CHECK(sync_type IN ('project_sync','tasks','secret','requirements','migration')),\n             ts TEXT NOT NULL,\n             change_count INTEGER NOT NULL DEFAULT 0,\n             details TEXT\n         )"
+    },
+    {
+      "name": "secret_bundles",
+      "type": "table",
+      "comment": "v26 — a named, reusable set of secret values (the SSH / DB / npm keys you apply across repos). Portfolio-wide: deliberately not tied to a repository.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "nullable": false,
+          "default": "''"
+        },
+        {
+          "name": "created_at",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "TEXT",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_secret_bundles_1",
+          "def": "UNIQUE (name)",
+          "table": "secret_bundles",
+          "columns": [
+            "name"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "secret_bundles",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_secret_bundles_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (name)",
+          "table": "secret_bundles",
+          "columns": [
+            "name"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE secret_bundles (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            name        TEXT NOT NULL UNIQUE,\n            description TEXT NOT NULL DEFAULT '',\n            created_at  TEXT NOT NULL,\n            updated_at  TEXT NOT NULL\n        )"
+    },
+    {
+      "name": "secret_bundle_items",
+      "type": "table",
+      "comment": "One secret inside a bundle, encrypted with the same key and cipher as deploy_secret_values.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "bundle_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "secret_name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "ciphertext",
+          "type": "BLOB",
+          "nullable": false
+        },
+        {
+          "name": "nonce",
+          "type": "BLOB",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_secret_bundle_items_1",
+          "def": "UNIQUE (bundle_id, secret_name)",
+          "table": "secret_bundle_items",
+          "columns": [
+            "bundle_id",
+            "secret_name"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "secret_bundle_items",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (bundle_id) REFERENCES secret_bundles (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "secret_bundle_items",
+          "referenced_table": "secret_bundles",
+          "columns": [
+            "bundle_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_secret_bundle_items_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (bundle_id, secret_name)",
+          "table": "secret_bundle_items",
+          "columns": [
+            "bundle_id",
+            "secret_name"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE secret_bundle_items (\n            id          INTEGER PRIMARY KEY AUTOINCREMENT,\n            bundle_id   INTEGER NOT NULL REFERENCES secret_bundles(id) ON DELETE CASCADE,\n            secret_name TEXT NOT NULL,\n            ciphertext  BLOB NOT NULL,\n            nonce       BLOB NOT NULL,\n            UNIQUE(bundle_id, secret_name)\n        )"
+    },
+    {
+      "name": "deploy_secret_values",
+      "type": "table",
+      "comment": "v27 — persisted deploy secret values, encrypted at rest with AES-256-GCM. The data key lives in the OS keyring; no plaintext value is ever stored.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "deploy_env_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "secret_name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "ciphertext",
+          "type": "BLOB",
+          "nullable": false,
+          "comment": "AES-256-GCM ciphertext. Never logged, never exported."
+        },
+        {
+          "name": "nonce",
+          "type": "BLOB",
+          "nullable": false,
+          "comment": "Per-value random nonce; required to decrypt ciphertext."
+        },
+        {
+          "name": "updated_at",
+          "type": "TEXT",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_deploy_secret_values_1",
+          "def": "UNIQUE (deploy_env_id, secret_name)",
+          "table": "deploy_secret_values",
+          "columns": [
+            "deploy_env_id",
+            "secret_name"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "deploy_secret_values",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (deploy_env_id) REFERENCES deploy_environments (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "deploy_secret_values",
+          "referenced_table": "deploy_environments",
+          "columns": [
+            "deploy_env_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_deploy_secret_values_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (deploy_env_id, secret_name)",
+          "table": "deploy_secret_values",
+          "columns": [
+            "deploy_env_id",
+            "secret_name"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE deploy_secret_values (\n            id            INTEGER PRIMARY KEY AUTOINCREMENT,\n            deploy_env_id INTEGER NOT NULL REFERENCES deploy_environments(id) ON DELETE CASCADE,\n            secret_name   TEXT NOT NULL,\n            ciphertext    BLOB NOT NULL,\n            nonce         BLOB NOT NULL,\n            updated_at    TEXT NOT NULL,\n            UNIQUE(deploy_env_id, secret_name)\n        )"
+    }
+  ],
+  "relations": [
+    {
+      "table": "project_microservices",
+      "columns": [
+        "microservice_project_id"
+      ],
+      "cardinality": "zero_or_one",
+      "parent_table": "projects",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (microservice_project_id) REFERENCES projects (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "project_microservices",
+      "columns": [
+        "project_id"
+      ],
+      "cardinality": "zero_or_one",
+      "parent_table": "projects",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (project_id) REFERENCES projects (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "repositories",
+      "columns": [
+        "project_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "projects",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "zero_or_one",
+      "def": "FOREIGN KEY (project_id) REFERENCES projects (id) ON UPDATE NO ACTION ON DELETE SET NULL MATCH NONE"
+    },
+    {
+      "table": "repo_renames",
+      "columns": [
+        "repository_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "bugs",
+      "columns": [
+        "repository_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "bug_events",
+      "columns": [
+        "bug_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "bugs",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (bug_id) REFERENCES bugs (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "deploy_environments",
+      "columns": [
+        "repository_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "deploy_secrets",
+      "columns": [
+        "deploy_env_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "deploy_environments",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (deploy_env_id) REFERENCES deploy_environments (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "tasks",
+      "columns": [
+        "repository_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "task_events",
+      "columns": [
+        "task_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "tasks",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (task_id) REFERENCES tasks (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "deploy_events",
+      "columns": [
+        "repository_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "deploy_events",
+      "columns": [
+        "deploy_env_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "deploy_environments",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "zero_or_one",
+      "def": "FOREIGN KEY (deploy_env_id) REFERENCES deploy_environments (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "project_renames",
+      "columns": [
+        "project_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "projects",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (project_id) REFERENCES projects (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "sync_events",
+      "columns": [
+        "repository_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "zero_or_one",
+      "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "secret_bundle_items",
+      "columns": [
+        "bundle_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "secret_bundles",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (bundle_id) REFERENCES secret_bundles (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "deploy_secret_values",
+      "columns": [
+        "deploy_env_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "deploy_environments",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (deploy_env_id) REFERENCES deploy_environments (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    }
+  ],
+  "driver": {
+    "name": "sqlite",
+    "database_version": "3.53.2"
+  }
+}
