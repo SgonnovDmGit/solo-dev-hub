@@ -4,6 +4,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-07-19
+
+Contributor documentation: an architecture overview, a generated SQLite schema reference, and a pass over the public docs that had drifted.
+
+### Added
+- **`docs/ARCHITECTURE.md` (T-000082)** — a contributor-facing map: the layer diagram, what each Rust and frontend module owns, the load-bearing decisions *with their rationale* (Tauri over Electron, SQLite over JSON, the asymmetric Markdown↔DB sync, file-copy cross-repo sync instead of git remotes, secrets encrypted at rest, git via the system CLI), the cross-repo requirement flow as a sequence diagram, and an index of every flow doc. `CLAUDE.md` covers the same ground for AI assistants; this one is for people.
+- **`docs/schema/` — generated SQLite reference (T-000083)** — ER diagram plus a page per table (18 tables, no views, schema v28), produced by [tbls](https://github.com/k1LoW/tbls) via `npm run schema:docs`. The script builds a throwaway database by running every migration against an empty file, so the docs describe the code rather than any developer's app data; re-running is byte-for-byte deterministic. Table and column descriptions live in `.tbls.yml` (SQLite has no `COMMENT ON`) and are injected into the generated pages.
+
+### Changed
+- **`CLAUDE.md` resynced with reality (T-000158)** — the AI-facing project map had drifted far enough to be actively misleading: it described schema v22 (actual: v28), listed a `bug_stats` VIEW dropped back in v23, called `project_microservices` a project↔repository link (it has been project↔project since v12), claimed `DeployScreen` was deleted (it is alive as the Deploy tab body), and stopped its evolution log at v0.27.0. Also refreshed the module map after the v1.4.x/v1.5.0 splits and the test baseline.
+- **Public docs de-drifted (T-000159)** — both READMEs advertised a *~11 MB* binary (actual: ~19 MB) and *~790* i18n keys (actual: ~850), and their Roadmap sections still presented **v1.4.1 as current** with future version numbers that reality had long overtaken. Rewritten against the shipped history, with `docs/roadmap.md` replanned around the three remaining milestones. Both READMEs gained a Contributing section pointing at the new docs.
+- **Release-closure rule fixed at the source (T-000159)** — the `sdh-release-closure` skill scoped its schema-regen step to *"server-side projects with a DB only"* and explicitly excluded desktop/CLI apps. That wording is why this repo — a desktop tool with 28 migrations — never regenerated schema docs. The trigger is now the presence of a database, not the project type.
+
+### Tests
+- 459 Rust (1 ignored: the schema-export generator), 86 vitest, svelte-check clean.
+
 ## [1.9.6] — 2026-07-19
 
 Dogfood patch: a duplicated task id in `todo.md` no longer aborts a repo's task sync.
