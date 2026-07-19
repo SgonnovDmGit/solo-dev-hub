@@ -1,0 +1,181 @@
+# tbls config — generates docs/schema/ from the live schema.
+#
+# The DSN points at a throwaway database that `scripts/schema-docs.sh` builds
+# by running every migration (v1..N) against an empty file, so the docs describe
+# the code, not whatever state a particular developer's app data is in.
+#
+#   bash scripts/schema-docs.sh
+#
+# Everything in docs/schema/ is generated — never hand-edit it. Table and column
+# descriptions belong in the `comments:` block below (SQLite has no COMMENT ON,
+# so tbls injects them from here).
+
+dsn: ${TBLS_DSN}
+docPath: docs/schema
+
+# Without this the generated title would be the throwaway file's name (schema.db).
+name: Solo Dev Hub — SQLite schema
+
+er:
+  format: svg
+  comment: true
+
+format:
+  adjust: true
+
+comments:
+  - table: projects
+    tableComment: >-
+      A portfolio project — the unit that groups repositories and can consume
+      microservice projects.
+    columnComments:
+      project_type: >-
+        Added v12, default 'standard'. No SQL CHECK — the legal vocabulary is
+        enforced in Rust only.
+      sort_order: Manual ordering (v14); back-filled as id * 10 to leave gaps for inserts.
+      auto_sync_enabled: v28 — 0/1 opt-in for the background auto-sync timer.
+
+  - table: repositories
+    tableComment: >-
+      A repository belonging to at most one project. May be GitHub-backed or
+      local-only.
+    columnComments:
+      github_name: >-
+        UNIQUE, and nullable since v13 so local-only repos (never pushed to
+        GitHub) can exist. The last path segment is the canonical folder name
+        used for all cross-repo doc folders.
+      github_id: Stable GitHub identifier — the basis of rename detection.
+      project_id: >-
+        ON DELETE SET NULL — the only non-cascading FK in the schema. Deleting a
+        project orphans its repositories rather than destroying them.
+      role: >-
+        'microservice' is still legal here but is legacy: v12 NULLed every such
+        row when microservice became a project type rather than a repo role.
+      deploy_target: Matches templates.language_key.
+      deploy_repo_config: v25 — JSON map of repo-wide (not per-environment) deploy placeholder values.
+      autocommit_branch: v28 — NULL means auto-commit is off for this repo.
+      bugs_migrated_at: Lazy-migration marker (v18); NULL means the repo's MD has never been imported.
+      tasks_migrated_at: >-
+        Lazy-migration marker (v21). While NULL, the first task sync suppresses
+        'created' events so backfilling legacy files doesn't flood the timeline.
+
+  - table: settings
+    tableComment: >-
+      Flat key/value application settings. Never holds secrets — the GitHub PAT
+      and the encryption data key live in the OS credential store.
+
+  - table: project_microservices
+    tableComment: >-
+      Many-to-many link between a parent project and a consumed microservice
+      project. Rebuilt in v12 — before that it linked a project to a repository.
+      Composite PK plus CHECK(project_id != microservice_project_id), so a
+      project cannot consume itself.
+
+  - table: templates
+    tableComment: >-
+      Deploy/scaffold template files per language key, including each stack's
+      meta.json (v25 reads it to decide which placeholders are repo-scope).
+    columnComments:
+      is_custom: 0 = seeded from the bundled templates, 1 = edited by the user (never overwritten by re-seeding).
+
+  - table: repo_renames
+    tableComment: >-
+      Append-only log of repository renames, written when a known github_id
+      shows up under a new github_name. The sync preamble replays every entry to
+      rename cross-repo folders on the counterparty's disk. There is deliberately
+      no applied_at column — idempotency comes from filesystem checks, not DB state.
+
+  - table: project_renames
+    tableComment: >-
+      Project-level twin of repo_renames (v24). Needed because
+      microservice-api/<name>/ folders on the parent-server side are keyed by
+      project name, which repo_renames does not cover.
+
+  - table: bugs
+    tableComment: >-
+      Source of truth for bug reports. docs/bug-reports.md in each repo is a
+      generated, LLM-facing view of this table — protected fields are restored
+      from here on every reconcile.
+    columnComments:
+      numeric_id: Per-repository counter; display_id is its rendered form (B-000042).
+      fix_attempts: >-
+        App-managed: incremented on each transition into 'testing'. Never written
+        by an AI agent — this is what makes the attempt history honest.
+      archived_from_md_at: >-
+        v22 — set when the agent removes a confirmed row from the MD file. After
+        that, regeneration permanently excludes the row.
+
+  - table: bug_events
+    tableComment: >-
+      Append-only bug lifecycle log (v19), so attempts-per-period metrics are
+      computed from events rather than a running counter. Invariant: the count of
+      'entered_testing' events for a bug equals bugs.fix_attempts.
+
+  - table: deploy_environments
+    tableComment: >-
+      One deploy environment (prod / staging / any custom name) for a repository;
+      1:N per repo since v20, which replaced the single deploy_manifests row.
+    columnComments:
+      extras: JSON map of environment-scope placeholder values. Repo-wide ones live in repositories.deploy_repo_config.
+
+  - table: deploy_secrets
+    tableComment: >-
+      Per-environment per-secret flags: which role the secret plays and whether
+      it is included or overridden. Values are NOT stored here.
+    columnComments:
+      role: build / deploy / runtime — decides where the secret is injected.
+      included: 0 excludes the secret from this environment without deleting its configuration.
+
+  - table: deploy_secret_values
+    tableComment: >-
+      v27 — persisted deploy secret values, encrypted at rest with AES-256-GCM.
+      The data key lives in the OS keyring; no plaintext value is ever stored.
+    columnComments:
+      ciphertext: AES-256-GCM ciphertext. Never logged, never exported.
+      nonce: Per-value random nonce; required to decrypt ciphertext.
+
+  - table: secret_bundles
+    tableComment: >-
+      v26 — a named, reusable set of secret values (the SSH / DB / npm keys you
+      apply across repos). Portfolio-wide: deliberately not tied to a repository.
+
+  - table: secret_bundle_items
+    tableComment: >-
+      One secret inside a bundle, encrypted with the same key and cipher as
+      deploy_secret_values.
+
+  - table: tasks
+    tableComment: >-
+      Mirror of docs/todo.md and docs/done.md. Polarity is the reverse of bugs —
+      here the Markdown is canonical and this table is rebuilt from it on each
+      sync, because tasks are hand-edited far more often than bugs.
+    columnComments:
+      task_id: >-
+        The display id as written in Markdown (T-000042 / F-000013 / D-000001) —
+        TEXT, not a foreign key. Note task_events.task_id is a different thing:
+        an INTEGER FK to tasks.id.
+      source: >-
+        'todo' or 'done'. Part of the uniqueness key, so the same id may exist
+        once per source during a transition.
+      version: Inherited from the nearest preceding '## vX.Y.Z' header in todo.md.
+      status: No SQL CHECK — open / in-progress / review are enforced in Rust.
+      priority: No SQL CHECK — critical / high / medium / low are enforced in Rust.
+
+  - table: task_events
+    tableComment: Append-only task lifecycle log, the task-side twin of bug_events.
+    columnComments:
+      task_id: INTEGER FK to tasks.id — not the display id (that is tasks.task_id, TEXT).
+
+  - table: sync_events
+    tableComment: >-
+      Log of sync operations, feeding the timeline. repository_id is nullable —
+      a NULL row is a portfolio-wide sync rather than a per-repo one.
+    columnComments:
+      sync_type: >-
+        project_sync / tasks / secret / requirements / migration. 'migration' was
+        added in v25 to record deploy-config conflicts resolved by first-env-wins.
+
+  - table: deploy_events
+    tableComment: >-
+      Log of deploy operations (template render, GitHub secret set/delete).
+      deploy_env_id is nullable so repo-level actions can be recorded too.
