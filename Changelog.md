@@ -4,6 +4,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.9.6] — 2026-07-19
+
+Dogfood patch: a duplicated task id in `todo.md` no longer aborts a repo's task sync.
+
+### Fixed
+- **Duplicate task id in one MD file no longer breaks the portfolio refresh (T-000157).** Listing the same task under two `## vX.Y.Z` headers — what a re-plan leaves behind when the old row isn't deleted — made task sync try to INSERT the id twice and hit `UNIQUE(repository_id, task_id, source)`. The repo's sync aborted before `tasks_migrated_at` was set, so Dashboard ↻ surfaced `Tasks <repo>: UNIQUE constraint failed…` on every press and that repo's tasks never reached the DB. Repeated ids are now collapsed before the DB diff, keeping the **last** occurrence (the later version header is the more recent intent) and logging a warning; done.md gets the same treatment.
+
+### Tests
+- 459 Rust (+1: duplicate-id sync), 86 vitest, svelte-check clean.
+
 ## [1.9.5] — 2026-07-07
 
 Dogfood patch: a closed cross-repo REQ no longer resurrects on the recipient, plus workflow-skill refinements (task filing, next-release stage, todo hygiene).
