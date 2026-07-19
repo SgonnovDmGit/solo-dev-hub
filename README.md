@@ -35,7 +35,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 - **Activity timeline** — multi-source events (bugs, tasks, syncs, deploys, repo renames) across the entire portfolio. Date-range / kind / repo / search filters.
 - **Templates** — per-language seeds for `.gitignore`, `.gitattributes`, deploy YAML, CLAUDE.md sections. Customize once in the app, sync into every project.
 - **PAT in OS keyring** — your GitHub token goes into Windows Credential Manager (OS-level), never SQLite, never `.env`, never a plaintext file.
-- **Single .exe, ~11 MB** — Tauri v2 + WebView2. No Electron bloat. No daemon. No telemetry. The only background network call is the update-checker pinging GitHub Releases once on startup; everything else is on your explicit action.
+- **Single .exe, ~19 MB** — Tauri v2 + WebView2. No Electron bloat. No daemon. No telemetry. The only background network call is the update-checker pinging GitHub Releases once on startup; everything else is on your explicit action.
 
 ![Bugs tab — per-repo bug list with severity, category, status workflow and per-bug attempts counter](docs/screenshots/repo-bugs.png)
 
@@ -56,7 +56,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 - **Backend** — Rust: SQLite via `rusqlite`, file I/O for sync, Windows Credential Manager via `keyring`
 - **GitHub API** — `@octokit/rest` (called directly from the JS side, never proxied through Rust)
 - **Graph** — Cytoscape.js with concentric layout, theme-aware
-- **i18n** — Russian (default) + English, ~790 type-safe keys, no runtime dependency
+- **i18n** — Russian (default) + English, ~850 type-safe keys, no runtime dependency
 - **Autoupdate** — `tauri-plugin-updater` with Ed25519 signing; production builds via GitHub Actions on `v*` tag push
 
 ## Getting started
@@ -125,24 +125,37 @@ git push origin master vX.Y.Z
 
 The full release runbook (key rotation, CI troubleshooting, hotfix flow) — [docs/RELEASING.md](docs/RELEASING.md).
 
+### Contributing
+
+Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the load-bearing design decisions and why they were made, and the cross-repo requirement flow. Database schema, ER diagram and per-table notes live in [docs/schema/](docs/schema/); per-feature deep dives in [docs/flows/](docs/flows/).
+
 ### AI rules
 
 `CLAUDE.md` (gitignored) carries the in-project AI rules. The app's "Sync to ~/.claude/CLAUDE.md" feature installs a thin always-on core (file formats, versioning, commit conventions) into your user-level Claude Code config, plus the workflow-heavy rules (cross-repo requirements, announcements, api.md contract, phase workflow, release lifecycle) as on-demand `sdh-*` skills in `~/.claude/skills/` — they surface only when relevant instead of loading every session. The same skill content syncs into each repo's `docs/sdh_skills/`, so any AI agent (not just Claude Code) can read it. Per-project CLAUDE.md sits in each repo's root.
 
 ## Roadmap
 
-- **v1.4.1** *(current — 2026-06-15)* — patch: decomposed the `sync_project` handler out of the command layer into a `sync/project_sync.rs` domain module (zero behavior change), plus a dev-workflow self-heal that auto-frees port 1420 before `tauri dev`.
-- **v1.4.0** — internal refactor milestone: split the Rust command layer (`lib.rs` → `commands/`) and the TypeScript bindings (`tauri-commands.ts` → directory), extracted the sidebar resizer into its own component; ships with a secret-bundles screen polish (readable multi-line `SSH_KEY` editing) and a broken-theme fix (2026-06-14).
-- **v1.3.0** — reusable encrypted secret bundles (enter SSH / DB / npm values once, apply to any repo's or deploy environment's GitHub secrets), plus a deploy repo-config cross-repo leak fix (2026-06-14).
-- **v1.2.0** — portfolio deploy report (all deploy environments in one screen, grouped by project, with drill-down to each), `.gitattributes` managed template, plus dashboard custom date-range and per-repo secrets-draft fixes (2026-06-02).
-- **v1.1.0** — verdict-rollback for bugs (↩ reopen button on confirmed/rejected), full-height secrets bulk-paste, unified dialog button labels (2026-05-25).
-- **v1.0.0** — public launch (2026-05-18), MIT-licensed open source, frozen-contract era begins.
-- **v1.4.1–v1.6** — further internal refactors (decomposing the 570-line `sync_project` handler, UI component splits) + contributor docs (`docs/ARCHITECTURE.md`, SQLite ER-graph).
-- **v1.7.0** — in-app multilingual help screen documenting the LLM operating contract.
-- **v1.8.0** — cross-platform builds (macOS / Linux).
-- **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix, REQ auto-accept with `## Status:` frontmatter.
+**Shipped**
 
-Full backlog and per-version task lists — [`docs/roadmap.md`](docs/roadmap.md).
+- **v1.10.0** *(current — 2026-07-19)* — contributor documentation: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and a generated SQLite schema reference ([`docs/schema/`](docs/schema/), tbls — ER diagram plus a page per table).
+- **v1.9.x** — the AI rule set moved from always-on instructions to 12 role-scoped on-demand skills; auto-commit now respects `.gitignore`; sync moved off the UI thread; cross-repo requirement teardown hardened.
+- **v1.8.0** — Reports section: portfolio deploy report and secret-push audit, with CSV export.
+- **v1.7.0** — workflow automation: auto-sync on a timer, auto-commit of synced cross-repo files, requirement auto-close via `.impl.md`.
+- **v1.6.0** — deploy secret values persist between sessions, encrypted at rest.
+- **v1.5.0** — UI component splits (project detail and secrets panel).
+- **v1.4.x** — internal refactor milestone: the Rust command layer and TypeScript bindings split into per-domain modules.
+- **v1.3.0** — reusable encrypted secret bundles: enter SSH / DB / npm values once, apply to any repo or deploy environment.
+- **v1.2.0** — portfolio deploy report with drill-down; `.gitattributes` managed template.
+- **v1.1.0** — verdict rollback for bugs (↩ reopen on confirmed/rejected).
+- **v1.0.0** — public launch (2026-05-18), MIT-licensed open source.
+
+**Next**
+
+- **v1.11.0** — in-app multilingual help screen documenting the LLM operating contract.
+- **v1.12.0** — cross-platform builds (macOS / Linux).
+- **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix.
+
+Per-release detail lives in the [Changelog](Changelog.md); the day-to-day task list is kept locally and is not part of the repository.
 
 ## Support development
 
