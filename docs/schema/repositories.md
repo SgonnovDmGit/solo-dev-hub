@@ -22,7 +22,7 @@ CREATE TABLE "repositories" (
             local_path TEXT,
             github_id INTEGER,
             deploy_target TEXT
-         , sort_order INTEGER NOT NULL DEFAULT 0, bugs_migrated_at TEXT, tasks_migrated_at TEXT, deploy_repo_config TEXT NOT NULL DEFAULT '{}', autocommit_branch TEXT)
+         , sort_order INTEGER NOT NULL DEFAULT 0, bugs_migrated_at TEXT, tasks_migrated_at TEXT, deploy_repo_config TEXT NOT NULL DEFAULT '{}', autocommit_branch TEXT, codex_source_path TEXT)
 ```
 
 </details>
@@ -49,6 +49,7 @@ CREATE TABLE "repositories" (
 | tasks_migrated_at  | TEXT     |                   | true     |                                                                                                                                                                                 |                         | Lazy-migration marker (v21). While NULL, the first task sync suppresses 'created' events so backfilling legacy files doesn't flood the timeline.                               |
 | deploy_repo_config | TEXT     | '{}'              | false    |                                                                                                                                                                                 |                         | v25 — JSON map of repo-wide (not per-environment) deploy placeholder values.                                                                                                   |
 | autocommit_branch  | TEXT     |                   | true     |                                                                                                                                                                                 |                         | v28 — NULL means auto-commit is off for this repo.                                                                                                                             |
+| codex_source_path  | TEXT     |                   | true     |                                                                                                                                                                                 |                         |                                                                                                                                                                                |
 
 ## Constraints
 

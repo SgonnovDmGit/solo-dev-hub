@@ -385,6 +385,11 @@
           "type": "TEXT",
           "nullable": true,
           "comment": "v28 — NULL means auto-commit is off for this repo."
+        },
+        {
+          "name": "codex_source_path",
+          "type": "TEXT",
+          "nullable": true
         }
       ],
       "indexes": [
@@ -439,7 +444,7 @@
           ]
         }
       ],
-      "def": "CREATE TABLE \"repositories\" (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,\n            github_name TEXT UNIQUE,\n            github_url TEXT,\n            role TEXT CHECK(role IN ('server','client','test_client','admin_client','microservice','landing','tool','other')),\n            description TEXT,\n            language TEXT,\n            last_pushed_at DATETIME,\n            added_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n            local_path TEXT,\n            github_id INTEGER,\n            deploy_target TEXT\n         , sort_order INTEGER NOT NULL DEFAULT 0, bugs_migrated_at TEXT, tasks_migrated_at TEXT, deploy_repo_config TEXT NOT NULL DEFAULT '{}', autocommit_branch TEXT)"
+      "def": "CREATE TABLE \"repositories\" (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,\n            github_name TEXT UNIQUE,\n            github_url TEXT,\n            role TEXT CHECK(role IN ('server','client','test_client','admin_client','microservice','landing','tool','other')),\n            description TEXT,\n            language TEXT,\n            last_pushed_at DATETIME,\n            added_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n            local_path TEXT,\n            github_id INTEGER,\n            deploy_target TEXT\n         , sort_order INTEGER NOT NULL DEFAULT 0, bugs_migrated_at TEXT, tasks_migrated_at TEXT, deploy_repo_config TEXT NOT NULL DEFAULT '{}', autocommit_branch TEXT, codex_source_path TEXT)"
     },
     {
       "name": "repo_renames",
