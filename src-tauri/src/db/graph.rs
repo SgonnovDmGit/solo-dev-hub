@@ -87,21 +87,29 @@ impl AppDb {
             })
             .collect();
 
-        // Cross-project edges (microservices)
+        // Cross-project edges (connected microservices + codices)
         if project_type == "standard" {
-            // project_microservices: project_id = parent, microservice_project_id = ms
+            // project_microservices: project_id = parent, microservice_project_id = child.
+            // The table is shared across connected types; the child's project_type
+            // becomes the node role so the graph styles a codex (📚) distinctly from
+            // a microservice (⚙). T-000169.
             let mut ms_stmt = conn.prepare(
-                "SELECT p.id, p.name FROM projects p
+                "SELECT p.id, p.name, p.project_type FROM projects p
                  JOIN project_microservices pm ON p.id = pm.microservice_project_id
                  WHERE pm.project_id = ?1 ORDER BY p.sort_order, p.id",
             )?;
-            let ms_rows: Vec<(i64, String)> = ms_stmt
+            let ms_rows: Vec<(i64, String, String)> = ms_stmt
                 .query_map(rusqlite::params![project_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?
                 .collect::<SqlResult<Vec<_>>>()?;
-            for (ms_id, ms_name) in ms_rows {
-                let node = project_to_node(ms_id, ms_name, "microservice");
+            for (ms_id, ms_name, ms_type) in ms_rows {
+                let role = if ms_type == "codex" {
+                    "codex"
+                } else {
+                    "microservice"
+                };
+                let node = project_to_node(ms_id, ms_name, role);
                 edges.push(GraphEdge {
                     source: center_id.clone(),
                     target: node.id.clone(),
@@ -182,6 +190,26 @@ mod tests {
             .any(|e| matches!(e.kind, GraphEdgeKind::CrossProjectMs));
         assert!(has_inproj);
         assert!(has_cross);
+    }
+
+    #[test]
+    fn test_get_project_graph_connected_codex_has_codex_role() {
+        // T-000169: a connected codex project appears in the ring with role="codex"
+        // (not "microservice"), so the frontend styles it distinctly.
+        let db = make_db();
+        let p = db.create_project("Consumer", None, "standard").unwrap();
+        db.insert_local_repository("/s", "server-repo", Some(p.id), Some("server"))
+            .unwrap();
+        let codex = db.create_project("Practices", None, "codex").unwrap();
+        db.connect_codex(p.id, codex.id).unwrap();
+
+        let g = db.get_project_graph(p.id).unwrap();
+        let codex_node = g
+            .ring
+            .iter()
+            .find(|n| n.project_id == Some(codex.id))
+            .expect("codex node in ring");
+        assert_eq!(codex_node.role.as_deref(), Some("codex"));
     }
 
     #[test]

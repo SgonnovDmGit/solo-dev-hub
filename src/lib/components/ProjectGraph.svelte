@@ -31,6 +31,7 @@
     const accentServer = cs.getPropertyValue('--accent').trim() || '#5b9dd9';
     const accentClient = '#4ade80';
     const accentMs = '#c084fc';
+    const accentCodex = '#a855f7'; // T-000169: codex project node (📚 via ROLE_ICONS)
     const accentTool = textMuted;
 
     return [
@@ -54,6 +55,7 @@
       { selector: 'node[role = "test_client"]',  style: { 'border-color': accentClient }},
       { selector: 'node[role = "admin_client"]', style: { 'border-color': accentClient }},
       { selector: 'node[role = "microservice"]', style: { 'border-color': accentMs }},
+      { selector: 'node[role = "codex"]',        style: { 'border-color': accentCodex }},
       { selector: 'node[role = "tool"]',         style: { 'border-color': accentTool }},
       { selector: 'edge', style: {
         'line-color': textMuted,
