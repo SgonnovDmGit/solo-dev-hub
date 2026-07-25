@@ -26,7 +26,7 @@ Trigger — you're about to design or implement something the svod speaks to: a 
 1. **Scan the inbox** for what's relevant — `docs/codex/<name>/rules/`, `.../lessons/`, `.../cases/`. Grep for the topic (`grep -rn "retry" docs/codex/`).
 2. **Apply the matching rules/lessons** as canon — the svod is the portfolio's agreed practice, not a suggestion box. If a `rule` says "always X / never Y", follow it the way you'd follow a CLAUDE.md rule.
 3. **Never edit the inbox.** It's a read-only mirror — any local edit is silently overwritten on the next sync (full mirror + prune). There is nothing to commit; the folder is gitignored.
-4. **To contribute back** — a new case worth capturing, a lesson you'd generalize, or a rule you think is wrong — do **not** touch the inbox. Open a REQ to the Codex proposing the addition/change (skill `sdh-cross-repo-req-send`, into `docs/backend-requirements/` toward the Codex). The maintainer curates it into the svod, and it mirrors back to everyone on the next sync.
+4. **To contribute back** — a new case worth capturing, a lesson you'd generalize, or a rule you think is wrong — do **not** touch the inbox. Open a REQ to the Codex proposing the addition/change (skill `sdh-cross-repo-req-send`). You consume the codex like a microservice you depend on, so the REQ goes into **`docs/microservice-requirements/<codex-repo>/REQ-NNN.md`** (the same folder as a server→microservice REQ) — Solo Dev Hub syncs it to the codex's `docs/server-requirements/<your-repo>/`. The maintainer curates it into the svod, answers with a `.response.md`, and the accepted change mirrors back to everyone on the next sync.
 
 ## Example
 
