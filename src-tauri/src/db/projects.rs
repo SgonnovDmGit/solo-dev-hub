@@ -435,10 +435,35 @@ impl AppDb {
         Ok(false)
     }
 
+    /// Connected projects of type 'microservice'. The `project_microservices`
+    /// table is a generic project→project dependency table shared with other
+    /// connected types (e.g. codices), so filter by `project_type` to keep
+    /// microservice-expecting callers correct.
     pub fn list_project_microservices(&self, project_id: i64) -> SqlResult<Vec<i64>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT microservice_project_id FROM project_microservices WHERE project_id = ?1 ORDER BY microservice_project_id",
+            "SELECT pm.microservice_project_id
+             FROM project_microservices pm
+             INNER JOIN projects p ON p.id = pm.microservice_project_id
+             WHERE pm.project_id = ?1 AND p.project_type = 'microservice'
+             ORDER BY pm.microservice_project_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![project_id], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Connected projects of type 'codex'. Same shared `project_microservices`
+    /// table as microservices — filtered to the codex type. No non-test caller
+    /// yet (wired up by a later Codex task); `#[allow(dead_code)]` until then.
+    #[allow(dead_code)]
+    pub fn list_connected_codices(&self, project_id: i64) -> SqlResult<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pm.microservice_project_id
+             FROM project_microservices pm
+             INNER JOIN projects p ON p.id = pm.microservice_project_id
+             WHERE pm.project_id = ?1 AND p.project_type = 'codex'
+             ORDER BY pm.microservice_project_id",
         )?;
         let rows = stmt.query_map(rusqlite::params![project_id], |row| row.get(0))?;
         rows.collect()
@@ -486,34 +511,41 @@ impl AppDb {
         rows.collect()
     }
 
-    /// Find exactly one 'server' role repository inside a microservice project.
-    /// Err if 0 or >1 matches — sync direction needs a single clear target.
-    pub fn server_repo_of_microservice(&self, ms_project_id: i64) -> Result<Repository, String> {
-        let servers = {
+    /// Find exactly one repository of the given `role` inside a project.
+    /// Err if 0 or >1 matches — cross-repo delivery needs a single clear target.
+    pub fn repo_of_project_with_role(
+        &self,
+        project_id: i64,
+        role: &str,
+    ) -> Result<Repository, String> {
+        let matches = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn
                 .prepare(
                     "SELECT id, project_id, github_name, github_url, role, description, language, last_pushed_at, added_at, updated_at, local_path, github_id, deploy_target
-                     FROM repositories WHERE project_id = ?1 AND role = 'server'",
+                     FROM repositories WHERE project_id = ?1 AND role = ?2",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
-                .query_map(rusqlite::params![ms_project_id], row_to_repo)
+                .query_map(rusqlite::params![project_id, role], row_to_repo)
                 .map_err(|e| e.to_string())?;
             rows.collect::<SqlResult<Vec<Repository>>>()
                 .map_err(|e| e.to_string())?
         };
-        match servers.len() {
-            0 => Err(format!(
-                "Microservice project {} has no server-repo",
-                ms_project_id
-            )),
-            1 => Ok(servers.into_iter().next().unwrap()),
+        match matches.len() {
+            0 => Err(format!("Project {} has no {}-repo", project_id, role)),
+            1 => Ok(matches.into_iter().next().unwrap()),
             n => Err(format!(
-                "Microservice project {} has {} server-repos (expected exactly 1)",
-                ms_project_id, n
+                "Project {} has {} {}-repos (expected exactly 1)",
+                project_id, n, role
             )),
         }
+    }
+
+    /// Find exactly one 'server' role repository inside a microservice project.
+    /// Err if 0 or >1 matches — sync direction needs a single clear target.
+    pub fn server_repo_of_microservice(&self, ms_project_id: i64) -> Result<Repository, String> {
+        self.repo_of_project_with_role(ms_project_id, "server")
     }
 
     /// Change project_type. Only blocked when the project is currently a **microservice**
@@ -952,6 +984,58 @@ mod tests {
             .unwrap();
         let err = db.server_repo_of_microservice(ms3).unwrap_err();
         assert!(err.contains("2"));
+    }
+
+    #[test]
+    fn test_repo_of_project_with_role_exact_one() {
+        let db = make_db();
+        let p = db.create_project("proj", None, "standard").unwrap();
+
+        // 0 matches → Err
+        let err = db
+            .repo_of_project_with_role(p.id, "admin_client")
+            .unwrap_err();
+        assert!(err.contains("no admin_client-repo"));
+
+        // Exactly 1 → Ok
+        db.insert_local_repository("/tmp/admin1", "admin1", Some(p.id), Some("admin_client"))
+            .unwrap();
+        let r = db.repo_of_project_with_role(p.id, "admin_client").unwrap();
+        assert_eq!(r.role.as_deref(), Some("admin_client"));
+
+        // 2 matches → Err
+        db.insert_local_repository("/tmp/admin2", "admin2", Some(p.id), Some("admin_client"))
+            .unwrap();
+        let err = db
+            .repo_of_project_with_role(p.id, "admin_client")
+            .unwrap_err();
+        assert!(err.contains("2"));
+    }
+
+    #[test]
+    fn test_list_connected_codices_vs_microservices() {
+        let db = make_db();
+        let parent = db.create_project("parent", None, "standard").unwrap();
+        let ms = make_ms_project(&db, "ms", false);
+        let codex = db.create_project("codex", None, "codex").unwrap();
+
+        db.connect_microservice(parent.id, ms).unwrap();
+        // No codex-connect method yet (later task) — insert the generic
+        // project→project row directly.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO project_microservices (project_id, microservice_project_id) VALUES (?1, ?2)",
+                rusqlite::params![parent.id, codex.id],
+            )
+            .unwrap();
+        }
+
+        let ms_list = db.list_project_microservices(parent.id).unwrap();
+        assert_eq!(ms_list, vec![ms]);
+
+        let codex_list = db.list_connected_codices(parent.id).unwrap();
+        assert_eq!(codex_list, vec![codex.id]);
     }
 
     #[test]

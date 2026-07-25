@@ -67,6 +67,7 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         "autocommit_branch_and_auto_sync",
         mig_v28_workflow_automation_columns,
     ),
+    (29, "codex_source_path", mig_v29_codex_source_path),
 ];
 
 impl AppDb {
@@ -913,6 +914,16 @@ fn mig_v28_workflow_automation_columns(conn: &Connection) -> SqlResult<()> {
     )
 }
 
+fn mig_v29_codex_source_path(conn: &Connection) -> SqlResult<()> {
+    // T-000162: DB foundation for the Codex project-type feature. Nullable
+    // source-path column on repositories — populated by a later accessor task,
+    // so no default and not wired into `row_to_repo` yet.
+    conn.execute_batch(
+        "ALTER TABLE repositories ADD COLUMN codex_source_path TEXT;
+         PRAGMA user_version = 29;",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,11 +1228,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v28 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v29 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 29);
 
         drop(conn);
         let _ = repo;
@@ -1288,7 +1299,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 29);
     }
 
     #[test]
