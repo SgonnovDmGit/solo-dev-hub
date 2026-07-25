@@ -453,9 +453,8 @@ impl AppDb {
     }
 
     /// Connected projects of type 'codex'. Same shared `project_microservices`
-    /// table as microservices — filtered to the codex type. No non-test caller
-    /// yet (wired up by a later Codex task); `#[allow(dead_code)]` until then.
-    #[allow(dead_code)]
+    /// table as microservices — filtered to the codex type. Consumed by the
+    /// codex broadcast pass in `run_project_sync` (T-000165).
     pub fn list_connected_codices(&self, project_id: i64) -> SqlResult<Vec<i64>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

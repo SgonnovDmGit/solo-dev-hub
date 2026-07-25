@@ -722,6 +722,20 @@ impl AppDb {
         })?;
         Ok(rows.filter_map(Result::ok).collect())
     }
+
+    // ── T-000165: Codex broadcast source path ─────────────────────────────────
+
+    /// Codex source-path for a lane repo: the folder under the repo root whose
+    /// contents are broadcast to consumers. NULL column → default `practices`.
+    /// (v29 column, read via targeted query — not part of `Repository`/`row_to_repo`.)
+    pub fn codex_source_path_for_repo(&self, repo_id: i64) -> SqlResult<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(codex_source_path, 'practices') FROM repositories WHERE id = ?1",
+            rusqlite::params![repo_id],
+            |row| row.get(0),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1549,5 +1563,32 @@ mod tests {
         // Repo id 99999 doesn't exist — should return empty map, not crash.
         let cfg = db.get_repo_deploy_config(99999).unwrap();
         assert!(cfg.is_empty());
+    }
+
+    // ── T-000165: codex_source_path_for_repo ──────────────────────────────────
+
+    #[test]
+    fn test_codex_source_path_for_repo_default_and_custom() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/codex-src", "codex-src", None, None)
+            .unwrap();
+
+        // NULL column → default "practices".
+        assert_eq!(db.codex_source_path_for_repo(repo.id).unwrap(), "practices");
+
+        // After setting a custom folder, the helper returns it verbatim.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE repositories SET codex_source_path = 'docs/practices' WHERE id = ?1",
+                rusqlite::params![repo.id],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.codex_source_path_for_repo(repo.id).unwrap(),
+            "docs/practices"
+        );
     }
 }

@@ -717,6 +717,40 @@ fn sync_microservice_to_parents(
     }
 }
 
+/// Codex broadcast pass. Two directions, both idempotent:
+/// - Consumer-driven: this project pulls every connected codex's svod into its
+///   own same-role repos.
+/// - Codex-driven: if this project IS a codex, it pushes its svod into every
+///   connected consumer.
+///
+/// Folds each per-(codex,consumer) outcome into the shared counters — mirror
+/// writes into `copied`, prunes into `migrated` (a structural change to the
+/// consumer's mirror), errors appended.
+fn run_codex_broadcast(db: &AppDb, project_id: i64, project_type: &str, c: &mut SyncCounters) {
+    let mut fold = |o: sync::CodexBroadcastOutcome| {
+        c.copied += o.copied;
+        c.migrated += o.pruned;
+        c.errors.extend(o.errors);
+    };
+    // Consumer-driven: pull each connected codex into this project.
+    for codex_id in db.list_connected_codices(project_id).unwrap_or_default() {
+        fold(sync::broadcast_codex_to_consumer(db, codex_id, project_id));
+    }
+    // Codex-driven: push this codex's svod into each connected consumer.
+    if project_type == "codex" {
+        for consumer in db
+            .list_parents_of_microservice(project_id)
+            .unwrap_or_default()
+        {
+            fold(sync::broadcast_codex_to_consumer(
+                db,
+                project_id,
+                consumer.id,
+            ));
+        }
+    }
+}
+
 /// Orchestrator for a full project sync — the body of the former
 /// `sync_project` Tauri command. Writes Phase-0 skeletons to every repo, then
 /// runs the directional REQ / api / handlers copies based on project topology.
@@ -857,6 +891,10 @@ pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, Strin
             sync_microservice_to_parents(db, project_id, ms_server, &mut c);
         }
     }
+
+    // T-000165: codex broadcast — pull connected codices' svods into this
+    // project, and (if this project is a codex) push its svod to consumers.
+    run_codex_broadcast(db, project_id, &project_type, &mut c);
 
     // T-000137: auto-commit synced cross-repo files in opted-in repos (portfolio-wide;
     // pathspec-scoped, so untouched repos and the dev's own WIP are no-ops).
