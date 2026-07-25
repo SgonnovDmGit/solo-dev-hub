@@ -91,6 +91,11 @@ pub fn assign_repository(
     project_id: Option<i64>,
     role: Option<String>,
 ) -> Result<Repository, String> {
+    // Codex composition gate: when assigning INTO a project, block roles a codex
+    // project can't hold. When project_id is None the repo is being unassigned — no gate.
+    if let Some(pid) = project_id {
+        db.enforce_codex_repo_gate(pid, role.as_deref(), id)?;
+    }
     db.assign_repository(id, project_id, role.as_deref())
         .map_err(|e| e.to_string())
 }
