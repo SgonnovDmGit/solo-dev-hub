@@ -1,0 +1,56 @@
+---
+name: sdh-codex-maintain
+description: >
+  Use when you curate a Codex svod (you're the publisher of a practices library):
+  adding/revising a rule, case, or lesson, or deciding where a practice belongs.
+  Covers the case→lesson→rule format, the CLAUDE.md↔svod boundary, and when a
+  critical lesson also warrants an announcement. To CONSUME someone else's svod —
+  skill sdh-codex-consume.
+---
+
+You are here if you maintain a **Codex** — a "publishing" project whose product is a curated svod of engineering practices broadcast read-only to its connected consumers. Your job is to keep the svod canonical, well-structured, and correctly scoped.
+
+- You **receive** another Codex's svod (you're a consumer) → skill `sdh-codex-consume`.
+
+**Where the svod lives and how it travels:**
+- The source is your Codex lane repo's practices folder — `practices/` by default (or the configured `codex_source_path`), typically split into `rules/` (normative), `cases/` (concrete incidents), `lessons/` (generalizations).
+- On sync it's **mirrored read-only** into every connected consumer's `docs/codex/<your-codex-name>/`, **role-matched by lane**: your `server` lane repo publishes to consumers' `server` repos, your `admin_client` lane repo to their `admin_client` repos. A file you delete from the svod is pruned from every consumer.
+
+## When it fires
+
+Trigger — you're about to write or revise a practice: a new incident worth canonizing, a rule that needs tightening, a lesson that generalizes several cases. Or you're deciding whether a piece of guidance even belongs in the svod versus a single repo's CLAUDE.md.
+
+## The three-layer format
+
+A strong svod entry moves from the concrete to the normative:
+
+1. **Case** (`cases/`) — what actually happened, concretely: the incident, the symptom, the fix. One real event.
+2. **Lesson** (`lessons/`) — the generalization drawn from one or more cases: "this class of bug happens when …".
+3. **Rule** (`rules/`) — the normative distillation: "always X / never Y". Short, greppable, actionable.
+
+Link them: a rule cites the lesson, a lesson cites its cases. A rule with no case behind it is folklore; a case with no rule is an untended log.
+
+## The CLAUDE.md ↔ svod boundary
+
+- **Repo-specific** rules (this repo's build command, its module layout, its local quirks) stay in that repo's own `CLAUDE.md`.
+- **Cross-cutting, portfolio-wide** practices (a retry policy every server should follow, an auth convention, a deploy discipline) belong in the **svod** — write once, broadcast to all.
+- Don't duplicate. If a rule already lives in a consumer's CLAUDE.md but applies to many repos, promote it into the svod and let the mirror carry it everywhere.
+
+## Routine addition vs critical push
+
+- **Routine** additions/revisions just land in the svod folder and reach consumers passively on their next sync — no extra action.
+- A **critical** lesson consumers must act on **now** (a rule that invalidates code they're shipping, a security practice) also warrants an **announcement** (skill `sdh-cross-repo-announce-send`) alongside the svod entry — the svod carries the durable rule, the announcement is the "read this now" nudge.
+
+## Incoming contributions
+
+Consumers can't edit their read-only inbox — they propose additions/changes via REQ. Those arrive in your **`docs/server-requirements/<consumer-repo>/REQ-NNN.md`** (a consumer treats the codex like a microservice it depends on). Answer and curate them the normal way (skill `sdh-cross-repo-req-answer`): write the `.response.md` alongside, fold the accepted ones into the case/lesson/rule structure, and the change mirrors back to everyone on the next sync.
+
+## Example
+
+A consumer files a REQ: "your retry rule doesn't cover non-idempotent endpoints — we double-charged." You:
+
+1. Write `cases/2026-07_double-charge.md` — the concrete incident.
+2. Generalize in `lessons/retry-idempotency.md` — retries are only safe on idempotent operations.
+3. Tighten `rules/retry.md` — "never auto-retry a non-idempotent write without an idempotency key."
+4. It's shipping-critical → also push an announcement so consumers patch now, not on next read.
+5. Answer the REQ (`sdh-cross-repo-req-answer`) pointing at the new rule.

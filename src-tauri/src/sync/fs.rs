@@ -135,6 +135,83 @@ pub fn copy_file_if_changed(source: &Path, target: &Path) -> Result<bool, String
     Ok(true)
 }
 
+/// Outcome of a directory mirror pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MirrorOutcome {
+    /// Files written because content was new or changed.
+    pub copied: usize,
+    /// Files and directories removed from `dst` because they vanished from `src`.
+    pub pruned: usize,
+}
+
+/// Mirror `src` tree onto `dst` read-only: copy changed files (via
+/// `copy_file_if_changed`, preserving relative subpaths) and prune any file or
+/// directory under `dst` that has no counterpart under `src`. `dst` is created
+/// if missing. Returns counts of files copied and entries pruned.
+///
+/// Errors if `src` is missing or is not a directory (the caller is responsible
+/// for checking source existence — a mirror of "nothing" would wipe `dst`,
+/// which must be an explicit caller decision, not a silent side effect).
+pub fn mirror_dir(src: &Path, dst: &Path) -> Result<MirrorOutcome, String> {
+    if !src.exists() {
+        return Err(format!("Mirror source not found: {}", src.display()));
+    }
+    if !src.is_dir() {
+        return Err(format!(
+            "Mirror source is not a directory: {}",
+            src.display()
+        ));
+    }
+    // Ensure the destination root exists even when src holds no files.
+    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+
+    let mut outcome = MirrorOutcome::default();
+    copy_tree(src, dst, &mut outcome.copied)?;
+    prune_tree(src, dst, &mut outcome.pruned)?;
+    Ok(outcome)
+}
+
+/// Recursively copy every file under `src` into the matching path under `dst`,
+/// skipping unchanged content. `copied` is incremented for each real write.
+fn copy_tree(src: &Path, dst: &Path, copied: &mut usize) -> Result<(), String> {
+    let entries = fs::read_dir(src).map_err(|e| e.to_string())?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_tree(&src_path, &dst_path, copied)?;
+        } else if src_path.is_file() && copy_file_if_changed(&src_path, &dst_path)? {
+            *copied += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively remove any entry under `dst` whose counterpart under `src` is
+/// gone. A vanished directory is removed whole (counted once) and not descended
+/// into; a vanished file is removed and counted once.
+fn prune_tree(src: &Path, dst: &Path, pruned: &mut usize) -> Result<(), String> {
+    let entries = fs::read_dir(dst).map_err(|e| e.to_string())?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let dst_path = entry.path();
+        let src_path = src.join(entry.file_name());
+        if dst_path.is_dir() {
+            if src_path.is_dir() {
+                // Counterpart survives — descend to prune within it.
+                prune_tree(&src_path, &dst_path, pruned)?;
+            } else {
+                // Whole subtree gone from src — remove as a unit, count once.
+                fs::remove_dir_all(&dst_path).map_err(|e| e.to_string())?;
+                *pruned += 1;
+            }
+        } else if !src_path.exists() {
+            fs::remove_file(&dst_path).map_err(|e| e.to_string())?;
+            *pruned += 1;
+        }
+    }
+    Ok(())
+}
+
 /// T-000139: copy every `*.md` from `<sender_docs>/my_api/` into `recipient_inbox`
 /// (flat). Returns the count of files actually written (content changed). A
 /// missing `my_api` folder → Ok(0). Non-`.md` files and subdirectories are
@@ -472,5 +549,147 @@ mod tests {
             0,
             "unchanged content must be skipped on the second call"
         );
+    }
+
+    // --- T-000164: mirror_dir ---
+
+    /// Build a small nested source tree: a.txt, b.txt, sub/c.txt, sub/deep/d.txt.
+    fn build_src_tree(root: &Path) {
+        fs::create_dir_all(root.join("sub/deep")).unwrap();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        fs::write(root.join("b.txt"), "b").unwrap();
+        fs::write(root.join("sub/c.txt"), "c").unwrap();
+        fs::write(root.join("sub/deep/d.txt"), "d").unwrap();
+    }
+
+    #[test]
+    fn test_mirror_dir_fresh_copies_all_nested() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst"); // does not exist yet
+        build_src_tree(&src);
+
+        let out = mirror_dir(&src, &dst).unwrap();
+
+        assert_eq!(out.copied, 4, "all four files copied");
+        assert_eq!(out.pruned, 0);
+        assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(dst.join("sub/c.txt")).unwrap(), "c");
+        assert_eq!(fs::read_to_string(dst.join("sub/deep/d.txt")).unwrap(), "d");
+    }
+
+    #[test]
+    fn test_mirror_dir_idempotent_second_pass() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        build_src_tree(&src);
+
+        mirror_dir(&src, &dst).unwrap();
+        let out = mirror_dir(&src, &dst).unwrap();
+
+        assert_eq!(
+            out,
+            MirrorOutcome::default(),
+            "nothing copied, nothing pruned"
+        );
+    }
+
+    #[test]
+    fn test_mirror_dir_prunes_deleted_file() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        build_src_tree(&src);
+        mirror_dir(&src, &dst).unwrap();
+
+        fs::remove_file(src.join("b.txt")).unwrap();
+        let out = mirror_dir(&src, &dst).unwrap();
+
+        assert_eq!(out.copied, 0);
+        assert_eq!(out.pruned, 1);
+        assert!(!dst.join("b.txt").exists(), "removed file pruned");
+        assert!(dst.join("a.txt").exists(), "other files remain");
+        assert!(dst.join("sub/c.txt").exists());
+    }
+
+    #[test]
+    fn test_mirror_dir_prunes_deleted_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        build_src_tree(&src);
+        mirror_dir(&src, &dst).unwrap();
+
+        // Remove the whole sub/ (holds c.txt and deep/d.txt) from src.
+        fs::remove_dir_all(src.join("sub")).unwrap();
+        let out = mirror_dir(&src, &dst).unwrap();
+
+        assert_eq!(out.copied, 0);
+        assert_eq!(
+            out.pruned, 1,
+            "the subdir is counted once, not per file inside it"
+        );
+        assert!(!dst.join("sub").exists(), "subtree pruned whole");
+        assert!(dst.join("a.txt").exists());
+    }
+
+    #[test]
+    fn test_mirror_dir_recopies_changed_content() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        build_src_tree(&src);
+        mirror_dir(&src, &dst).unwrap();
+
+        fs::write(src.join("a.txt"), "a-changed").unwrap();
+        let out = mirror_dir(&src, &dst).unwrap();
+
+        assert_eq!(out.copied, 1, "only the changed file is re-copied");
+        assert_eq!(out.pruned, 0);
+        assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "a-changed");
+        assert_eq!(fs::read_to_string(dst.join("b.txt")).unwrap(), "b");
+    }
+
+    #[test]
+    fn test_mirror_dir_missing_src_errors() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("nope");
+        let dst = tmp.path().join("dst");
+        let result = mirror_dir(&src, &dst);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_mirror_dir_prunes_extraneous_dst_only_file() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("keep.txt"), "keep").unwrap();
+        // Pre-seed dst with a file that never existed in src.
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("stray.txt"), "stray").unwrap();
+
+        let out = mirror_dir(&src, &dst).unwrap();
+
+        assert_eq!(out.copied, 1);
+        assert_eq!(out.pruned, 1, "the dst-only file is pruned on first mirror");
+        assert!(dst.join("keep.txt").exists());
+        assert!(!dst.join("stray.txt").exists());
+    }
+
+    #[test]
+    fn test_mirror_dir_empty_src_creates_dst() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap(); // valid dir, no files
+
+        let out = mirror_dir(&src, &dst).unwrap();
+
+        assert_eq!(out, MirrorOutcome::default());
+        assert!(dst.is_dir(), "dst is created even for an empty source");
     }
 }

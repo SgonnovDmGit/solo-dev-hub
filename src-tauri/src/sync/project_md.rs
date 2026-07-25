@@ -22,6 +22,7 @@ pub fn generate_project_md(db: &AppDb, project_id: i64, repo_root: &Path) -> Res
 
     let type_display = match project.project_type.as_str() {
         "microservice" => "⚙ Microservice",
+        "codex" => "📚 Codex",
         _ => "📁 Standard",
     };
 
@@ -86,6 +87,51 @@ pub fn generate_project_md(db: &AppDb, project_id: i64, repo_root: &Path) -> Res
                 "| {} | {} | {} | {} |\n",
                 ms_proj.name, srv_label, path_label, gh_label
             ));
+        }
+        md.push('\n');
+    }
+
+    // T-000166: a codex publishes on up to two audience lanes (server,
+    // admin_client), each backed by one repo in the codex project. Its svod
+    // lands in the consumer's same-role repo under docs/codex/<codex-name>/.
+    // Render one row per lane the codex actually has.
+    let codex_ids = db
+        .list_connected_codices(project_id)
+        .map_err(|e| e.to_string())?;
+    md.push_str("## Connected Codices\n\n");
+    if codex_ids.is_empty() {
+        md.push_str("_No connected codices._\n\n");
+    } else {
+        md.push_str("| Codex | Lane | Source repo | Path | Inbox |\n");
+        md.push_str("|-------|------|-------------|------|-------|\n");
+        for codex_id in &codex_ids {
+            let codex_proj = db.get_project(*codex_id).map_err(|e| e.to_string())?;
+            let inbox = format!("docs/codex/{}/", codex_proj.name);
+            let mut any_lane = false;
+            for lane in ["server", "admin_client"] {
+                if let Ok(repo) = db.repo_of_project_with_role(*codex_id, lane) {
+                    any_lane = true;
+                    let path = repo
+                        .local_path
+                        .clone()
+                        .unwrap_or_else(|| "_no local path configured_".to_string());
+                    md.push_str(&format!(
+                        "| {} | {} | {} | {} | {} |\n",
+                        codex_proj.name,
+                        lane,
+                        repo.display_name(),
+                        path,
+                        inbox
+                    ));
+                }
+            }
+            // A codex with no resolvable lane repos still gets a visible marker row.
+            if !any_lane {
+                md.push_str(&format!(
+                    "| {} | ⚠ no lane repos | — | — | {} |\n",
+                    codex_proj.name, inbox
+                ));
+            }
         }
         md.push('\n');
     }
@@ -263,6 +309,98 @@ mod tests {
             "should signal missing path explicitly in table row; got:\n{}",
             content
         );
+    }
+
+    /// T-000166: a project of type `codex` renders the 📚 Codex type label.
+    #[test]
+    fn test_generate_project_md_codex_type_label() {
+        let db = make_test_db();
+        let codex = db.create_project("RulesCodex", None, "codex").unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        generate_project_md(&db, codex.id, tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
+        assert!(content.contains("# RulesCodex"));
+        assert!(content.contains("📚 Codex"));
+    }
+
+    /// T-000166: a consumer project with a connected codex that publishes on
+    /// both `server` and `admin_client` lanes renders one Connected Codices row
+    /// per lane, and the codex stays OUT of the Connected microservices section.
+    #[test]
+    fn test_generate_project_md_connected_codices_section() {
+        let db = make_test_db();
+        let consumer = db.create_project("WebApp", None, "standard").unwrap();
+
+        let codex = db.create_project("DesignCodex", None, "codex").unwrap();
+        let codex_srv = db
+            .upsert_repository("owner/design-codex-server", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(codex_srv.id, Some(codex.id), Some("server"))
+            .unwrap();
+        db.set_repo_local_path(codex_srv.id, Some("/home/dev/design-codex-server"))
+            .unwrap();
+
+        let codex_admin = db
+            .upsert_repository("owner/design-codex-admin", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(codex_admin.id, Some(codex.id), Some("admin_client"))
+            .unwrap();
+        db.set_repo_local_path(codex_admin.id, Some("/home/dev/design-codex-admin"))
+            .unwrap();
+
+        // connect_microservice gates on target type='microservice'; a codex
+        // target is rejected, so insert the project→project edge directly.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO project_microservices (project_id, microservice_project_id) VALUES (?1, ?2)",
+                rusqlite::params![consumer.id, codex.id],
+            )
+            .unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        generate_project_md(&db, consumer.id, tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
+        assert!(content.contains("## Connected Codices"));
+        // Codex name + inbox path.
+        assert!(content.contains("DesignCodex"));
+        assert!(content.contains("docs/codex/DesignCodex/"));
+        // One row per lane, with the source-repo display name.
+        assert!(
+            content.contains("| DesignCodex | server | design-codex-server | /home/dev/design-codex-server | docs/codex/DesignCodex/ |"),
+            "server lane row expected; got:\n{}",
+            content
+        );
+        assert!(
+            content.contains("| DesignCodex | admin_client | design-codex-admin | /home/dev/design-codex-admin | docs/codex/DesignCodex/ |"),
+            "admin_client lane row expected; got:\n{}",
+            content
+        );
+        // Codex must NOT bleed into the microservices section.
+        assert!(
+            content.contains("_No connected microservices._"),
+            "codex must stay out of the microservices section; got:\n{}",
+            content
+        );
+    }
+
+    /// T-000166: a project with no connected codices still renders the section
+    /// with the empty-state placeholder.
+    #[test]
+    fn test_generate_project_md_no_connected_codices_placeholder() {
+        let db = make_test_db();
+        let proj = db.create_project("Plain", None, "standard").unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        generate_project_md(&db, proj.id, tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
+        assert!(content.contains("## Connected Codices"));
+        assert!(content.contains("_No connected codices._"));
     }
 
     #[test]

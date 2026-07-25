@@ -435,10 +435,34 @@ impl AppDb {
         Ok(false)
     }
 
+    /// Connected projects of type 'microservice'. The `project_microservices`
+    /// table is a generic project→project dependency table shared with other
+    /// connected types (e.g. codices), so filter by `project_type` to keep
+    /// microservice-expecting callers correct.
     pub fn list_project_microservices(&self, project_id: i64) -> SqlResult<Vec<i64>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT microservice_project_id FROM project_microservices WHERE project_id = ?1 ORDER BY microservice_project_id",
+            "SELECT pm.microservice_project_id
+             FROM project_microservices pm
+             INNER JOIN projects p ON p.id = pm.microservice_project_id
+             WHERE pm.project_id = ?1 AND p.project_type = 'microservice'
+             ORDER BY pm.microservice_project_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![project_id], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Connected projects of type 'codex'. Same shared `project_microservices`
+    /// table as microservices — filtered to the codex type. Consumed by the
+    /// codex broadcast pass in `run_project_sync` (T-000165).
+    pub fn list_connected_codices(&self, project_id: i64) -> SqlResult<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pm.microservice_project_id
+             FROM project_microservices pm
+             INNER JOIN projects p ON p.id = pm.microservice_project_id
+             WHERE pm.project_id = ?1 AND p.project_type = 'codex'
+             ORDER BY pm.microservice_project_id",
         )?;
         let rows = stmt.query_map(rusqlite::params![project_id], |row| row.get(0))?;
         rows.collect()
@@ -449,6 +473,58 @@ impl AppDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, name, description, created_at, project_type, auto_sync_enabled FROM projects WHERE project_type = 'microservice' ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                created_at: row.get(3)?,
+                project_type: row.get(4)?,
+                auto_sync_enabled: row.get::<_, bool>(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Connect a consumer project to a codex project. Mirror of `connect_microservice`
+    /// but the target must be `project_type='codex'`. Same shared `project_microservices`
+    /// table + same cycle guard (codices participate in the generic project→project graph).
+    pub fn connect_codex(&self, project_id: i64, codex_project_id: i64) -> Result<(), String> {
+        let ctype: String = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT project_type FROM projects WHERE id = ?1",
+                rusqlite::params![codex_project_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?
+        };
+        if ctype != "codex" {
+            return Err("Target project is not of type 'codex'".to_string());
+        }
+        if self
+            .is_reachable(codex_project_id, project_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Err(
+                "Cycle detected: target already references this project transitively".to_string(),
+            );
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO project_microservices (project_id, microservice_project_id) VALUES (?1, ?2)",
+            rusqlite::params![project_id, codex_project_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// List all projects of type 'codex' (for the consumer's connect dropdown).
+    pub fn list_codex_projects(&self) -> SqlResult<Vec<Project>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, created_at, project_type, auto_sync_enabled FROM projects WHERE project_type = 'codex' ORDER BY name",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Project {
@@ -486,42 +562,113 @@ impl AppDb {
         rows.collect()
     }
 
-    /// Find exactly one 'server' role repository inside a microservice project.
-    /// Err if 0 or >1 matches — sync direction needs a single clear target.
-    pub fn server_repo_of_microservice(&self, ms_project_id: i64) -> Result<Repository, String> {
-        let servers = {
+    /// Find exactly one repository of the given `role` inside a project.
+    /// Err if 0 or >1 matches — cross-repo delivery needs a single clear target.
+    pub fn repo_of_project_with_role(
+        &self,
+        project_id: i64,
+        role: &str,
+    ) -> Result<Repository, String> {
+        let matches = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn
                 .prepare(
                     "SELECT id, project_id, github_name, github_url, role, description, language, last_pushed_at, added_at, updated_at, local_path, github_id, deploy_target
-                     FROM repositories WHERE project_id = ?1 AND role = 'server'",
+                     FROM repositories WHERE project_id = ?1 AND role = ?2",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
-                .query_map(rusqlite::params![ms_project_id], row_to_repo)
+                .query_map(rusqlite::params![project_id, role], row_to_repo)
                 .map_err(|e| e.to_string())?;
             rows.collect::<SqlResult<Vec<Repository>>>()
                 .map_err(|e| e.to_string())?
         };
-        match servers.len() {
-            0 => Err(format!(
-                "Microservice project {} has no server-repo",
-                ms_project_id
-            )),
-            1 => Ok(servers.into_iter().next().unwrap()),
+        match matches.len() {
+            0 => Err(format!("Project {} has no {}-repo", project_id, role)),
+            1 => Ok(matches.into_iter().next().unwrap()),
             n => Err(format!(
-                "Microservice project {} has {} server-repos (expected exactly 1)",
-                ms_project_id, n
+                "Project {} has {} {}-repos (expected exactly 1)",
+                project_id, n, role
             )),
         }
     }
 
-    /// Change project_type. Only blocked when the project is currently a **microservice**
-    /// that is connected to parents — changing its type would leave parents with a dangling
-    /// "microservice" pointer into a standard project. Repos and own-connected microservices
-    /// are NOT a blocker.
+    /// Find exactly one 'server' role repository inside a microservice project.
+    /// Err if 0 or >1 matches — sync direction needs a single clear target.
+    pub fn server_repo_of_microservice(&self, ms_project_id: i64) -> Result<Repository, String> {
+        self.repo_of_project_with_role(ms_project_id, "server")
+    }
+
+    /// Core Codex composition rule for a single repo slot, evaluated against the
+    /// project's OTHER repos (id != `exclude_repo_id`). Assumes the caller has already
+    /// decided the project is (or is becoming) codex. Operates on an already-locked
+    /// connection so it can be reused both by the assignment gate and the type switch.
+    ///
+    /// Rule: role ∈ {server, admin_client}, and no other repo holds that same role.
+    fn check_codex_repo_slot(
+        conn: &rusqlite::Connection,
+        project_id: i64,
+        role: Option<&str>,
+        exclude_repo_id: i64,
+    ) -> Result<(), String> {
+        let r = match role {
+            Some("server") => "server",
+            Some("admin_client") => "admin_client",
+            _ => {
+                return Err(
+                    "Codex projects accept only 'server' or 'admin_client' repos".to_string(),
+                )
+            }
+        };
+        let dup: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM repositories WHERE project_id = ?1 AND role = ?2 AND id != ?3",
+                rusqlite::params![project_id, r, exclude_repo_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if dup >= 1 {
+            return Err(format!("Codex project already has a '{}' repo", r));
+        }
+        Ok(())
+    }
+
+    /// Codex projects may hold only `server`/`admin_client` repos, at most one of each.
+    /// No-op (Ok) for non-codex projects. `exclude_repo_id` is the repo being assigned,
+    /// excluded from the duplicate-role check so re-assigning the same repo is allowed.
+    pub fn enforce_codex_repo_gate(
+        &self,
+        project_id: i64,
+        role: Option<&str>,
+        exclude_repo_id: i64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let ptype: String = conn
+            .query_row(
+                "SELECT project_type FROM projects WHERE id = ?1",
+                rusqlite::params![project_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if ptype != "codex" {
+            return Ok(());
+        }
+        Self::check_codex_repo_slot(&conn, project_id, role, exclude_repo_id)
+    }
+
+    /// Change project_type. Accepts `standard` / `microservice` / `codex`.
+    ///
+    /// If the project is currently consumed by parents via `project_microservices`
+    /// (`parent_count > 0`), it may still switch **among** the parent-consumable types
+    /// (`microservice` ↔ `codex`), but must NOT become `standard` — that would leave
+    /// parents with a dangling pointer into a plain project. Disconnect the parents first.
+    /// Own repos and own-connected microservices are NOT a blocker.
+    ///
+    /// Switching **to `codex`** additionally requires the project's current repos to
+    /// satisfy the Codex composition gate: only `server`/`admin_client` roles, at most
+    /// one of each (shared with `enforce_codex_repo_gate` via `check_codex_repo_slot`).
     pub fn update_project_type(&self, id: i64, new_type: &str) -> Result<Project, String> {
-        if new_type != "standard" && new_type != "microservice" {
+        if new_type != "standard" && new_type != "microservice" && new_type != "codex" {
             return Err(format!("Invalid project_type: {}", new_type));
         }
         {
@@ -533,11 +680,36 @@ impl AppDb {
                     |row| row.get(0),
                 )
                 .map_err(|e| e.to_string())?;
-            if parent_count > 0 {
+            if parent_count > 0 && new_type == "standard" {
                 return Err(
-                    "Project is connected to parents as a microservice — disconnect first"
+                    "Project is connected to parents — cannot become 'standard'; disconnect first"
                         .to_string(),
                 );
+            }
+            // Switching to codex: the project's CURRENT repos must satisfy the Codex
+            // composition gate (only server/admin_client, at most one each). Reuses
+            // check_codex_repo_slot per repo so the rule lives in one place.
+            if new_type == "codex" {
+                let repos: Vec<(i64, Option<String>)> = {
+                    let mut stmt = conn
+                        .prepare("SELECT id, role FROM repositories WHERE project_id = ?1")
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![id], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    rows.collect::<SqlResult<Vec<_>>>()
+                        .map_err(|e| e.to_string())?
+                };
+                for (repo_id, role) in &repos {
+                    Self::check_codex_repo_slot(&conn, id, role.as_deref(), *repo_id).map_err(
+                        |_| {
+                            "Cannot switch to Codex: repos must be only 'server'/'admin_client', one each"
+                                .to_string()
+                        },
+                    )?;
+                }
             }
             conn.execute(
                 "UPDATE projects SET project_type = ?1 WHERE id = ?2",
@@ -955,6 +1127,103 @@ mod tests {
     }
 
     #[test]
+    fn test_repo_of_project_with_role_exact_one() {
+        let db = make_db();
+        let p = db.create_project("proj", None, "standard").unwrap();
+
+        // 0 matches → Err
+        let err = db
+            .repo_of_project_with_role(p.id, "admin_client")
+            .unwrap_err();
+        assert!(err.contains("no admin_client-repo"));
+
+        // Exactly 1 → Ok
+        db.insert_local_repository("/tmp/admin1", "admin1", Some(p.id), Some("admin_client"))
+            .unwrap();
+        let r = db.repo_of_project_with_role(p.id, "admin_client").unwrap();
+        assert_eq!(r.role.as_deref(), Some("admin_client"));
+
+        // 2 matches → Err
+        db.insert_local_repository("/tmp/admin2", "admin2", Some(p.id), Some("admin_client"))
+            .unwrap();
+        let err = db
+            .repo_of_project_with_role(p.id, "admin_client")
+            .unwrap_err();
+        assert!(err.contains("2"));
+    }
+
+    #[test]
+    fn test_list_connected_codices_vs_microservices() {
+        let db = make_db();
+        let parent = db.create_project("parent", None, "standard").unwrap();
+        let ms = make_ms_project(&db, "ms", false);
+        let codex = db.create_project("codex", None, "codex").unwrap();
+
+        db.connect_microservice(parent.id, ms).unwrap();
+        // No codex-connect method yet (later task) — insert the generic
+        // project→project row directly.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO project_microservices (project_id, microservice_project_id) VALUES (?1, ?2)",
+                rusqlite::params![parent.id, codex.id],
+            )
+            .unwrap();
+        }
+
+        let ms_list = db.list_project_microservices(parent.id).unwrap();
+        assert_eq!(ms_list, vec![ms]);
+
+        let codex_list = db.list_connected_codices(parent.id).unwrap();
+        assert_eq!(codex_list, vec![codex.id]);
+    }
+
+    #[test]
+    fn test_connect_codex_rejects_non_codex_target() {
+        let db = make_db();
+        let consumer = db.create_project("consumer", None, "standard").unwrap();
+        // standard target
+        let std_target = db.create_project("not-codex", None, "standard").unwrap();
+        let err = db.connect_codex(consumer.id, std_target.id).unwrap_err();
+        assert!(err.contains("not of type 'codex'"), "got: {err}");
+        // microservice target
+        let ms = make_ms_project(&db, "ms", false);
+        let err = db.connect_codex(consumer.id, ms).unwrap_err();
+        assert!(err.contains("not of type 'codex'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_connect_codex_happy_and_lists() {
+        let db = make_db();
+        let consumer = db.create_project("consumer", None, "standard").unwrap();
+        let codex = db.create_project("codex", None, "codex").unwrap();
+
+        db.connect_codex(consumer.id, codex.id).unwrap();
+        assert_eq!(
+            db.list_connected_codices(consumer.id).unwrap(),
+            vec![codex.id]
+        );
+        let all_codices = db.list_codex_projects().unwrap();
+        assert_eq!(all_codices.len(), 1);
+        assert_eq!(all_codices[0].id, codex.id);
+
+        // Disconnect via the shared generic edge-delete → no codices left.
+        db.disconnect_microservice(consumer.id, codex.id).unwrap();
+        assert!(db.list_connected_codices(consumer.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_connect_codex_cycle_guard() {
+        let db = make_db();
+        // Two codices; A→B then B→A would form a 2-cycle in the shared graph.
+        let a = db.create_project("codex-A", None, "codex").unwrap();
+        let b = db.create_project("codex-B", None, "codex").unwrap();
+        db.connect_codex(a.id, b.id).unwrap();
+        let err = db.connect_codex(b.id, a.id).unwrap_err();
+        assert!(err.contains("Cycle"), "got: {err}");
+    }
+
+    #[test]
     fn test_update_project_type_blocked_only_when_connected_as_microservice() {
         let db = make_db();
         // Setup: project A is microservice with own repo + own connected ms B.
@@ -978,6 +1247,98 @@ mod tests {
         // Invalid type rejected
         let err = db.update_project_type(a, "garbage").unwrap_err();
         assert!(err.contains("Invalid"));
+    }
+
+    // ── Codex gate tests (T-000163) ───────────────────────────────────────────
+
+    #[test]
+    fn test_enforce_codex_repo_gate() {
+        let db = make_db();
+        let codex = db.create_project("codex", None, "codex").unwrap();
+        let srv = db
+            .insert_local_repository("/tmp/csrv", "csrv", Some(codex.id), Some("server"))
+            .unwrap();
+
+        // Assigning an admin_client into the codex passes (distinct role).
+        let admin = db
+            .insert_local_repository("/tmp/cadmin", "cadmin", None, None)
+            .unwrap();
+        db.enforce_codex_repo_gate(codex.id, Some("admin_client"), admin.id)
+            .unwrap();
+
+        // A 2nd server fails — role already taken by `srv`.
+        let srv2 = db
+            .insert_local_repository("/tmp/csrv2", "csrv2", None, None)
+            .unwrap();
+        let err = db
+            .enforce_codex_repo_gate(codex.id, Some("server"), srv2.id)
+            .unwrap_err();
+        assert!(err.contains("already has a 'server'"), "got: {err}");
+
+        // Re-assigning the SAME server repo is allowed (excluded from dup check).
+        db.enforce_codex_repo_gate(codex.id, Some("server"), srv.id)
+            .unwrap();
+
+        // A `client` role is rejected outright.
+        let err = db
+            .enforce_codex_repo_gate(codex.id, Some("client"), srv2.id)
+            .unwrap_err();
+        assert!(
+            err.contains("only 'server' or 'admin_client'"),
+            "got: {err}"
+        );
+
+        // No-op for a standard project — any role passes.
+        let std = db.create_project("std", None, "standard").unwrap();
+        db.enforce_codex_repo_gate(std.id, Some("client"), srv2.id)
+            .unwrap();
+        db.enforce_codex_repo_gate(std.id, None, srv2.id).unwrap();
+    }
+
+    #[test]
+    fn test_update_project_type_microservice_codex_switch() {
+        let db = make_db();
+        // A is a microservice connected to parent C.
+        let a = make_ms_project(&db, "A", true);
+        let c = db.create_project("C", None, "standard").unwrap();
+        db.connect_microservice(c.id, a).unwrap();
+
+        // Connected → codex succeeds (both are parent-consumable types).
+        let updated = db.update_project_type(a, "codex").unwrap();
+        assert_eq!(updated.project_type, "codex");
+
+        // Same connected project → standard fails (dangling parent pointer).
+        let err = db.update_project_type(a, "standard").unwrap_err();
+        assert!(err.contains("cannot become 'standard'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_update_project_type_to_codex_rejects_bad_composition() {
+        let db = make_db();
+        // Project with a `client` repo can't become codex.
+        let p = db.create_project("P", None, "standard").unwrap();
+        db.insert_local_repository("/tmp/pc", "pc", Some(p.id), Some("client"))
+            .unwrap();
+        let err = db.update_project_type(p.id, "codex").unwrap_err();
+        assert!(err.contains("Cannot switch to Codex"), "got: {err}");
+
+        // Two servers also violate the ≤1-each rule.
+        let q = db.create_project("Q", None, "standard").unwrap();
+        db.insert_local_repository("/tmp/qs1", "qs1", Some(q.id), Some("server"))
+            .unwrap();
+        db.insert_local_repository("/tmp/qs2", "qs2", Some(q.id), Some("server"))
+            .unwrap();
+        let err = db.update_project_type(q.id, "codex").unwrap_err();
+        assert!(err.contains("Cannot switch to Codex"), "got: {err}");
+
+        // Clean composition (one server + one admin_client) → codex succeeds.
+        let r = db.create_project("R", None, "standard").unwrap();
+        db.insert_local_repository("/tmp/rs", "rs", Some(r.id), Some("server"))
+            .unwrap();
+        db.insert_local_repository("/tmp/ra", "ra", Some(r.id), Some("admin_client"))
+            .unwrap();
+        let updated = db.update_project_type(r.id, "codex").unwrap();
+        assert_eq!(updated.project_type, "codex");
     }
 
     // ── Templates tests ───────────────────────────────────────────────────────

@@ -278,15 +278,22 @@ fn sync_client_to_server(
     }
 }
 
-/// F-012: Server → Microservice sync. For each connected microservice-project,
-/// resolve its single server-repo and sync REQ-*.md into that repo's
+/// F-012: Server → Microservice sync. For each connected child-project, resolve
+/// its single server-repo and sync REQ-*.md into that repo's
 /// docs/server-requirements/, plus rename replays, Case B/C migrations, and
 /// api.md / handlers.md propagation onto the parent.
+///
+/// T-000172: reused for connected **codices** too — the consumer↔codex REQ pair
+/// is the same shape as parent↔microservice (anchored on each side's server
+/// repo). `skip_api_contract` is set for codices: a svod has no `docs/api.md` /
+/// `docs/my_api/`, so the api-contract propagation is skipped while the REQ /
+/// response / rename-replay machinery runs identically.
 fn sync_server_to_microservice(
     db: &AppDb,
     srv: &Repository,
     srv_base: &Path,
     microservice_ids: &[i64],
+    skip_api_contract: bool,
     c: &mut SyncCounters,
 ) {
     for ms_project_id in microservice_ids {
@@ -513,57 +520,61 @@ fn sync_server_to_microservice(
             }
         }
 
-        // 0.9.0: Microservice → Parent server — api.md + handlers.md
-        // Target on parent: docs/microservice-api/<ms-project-name>/{api,handlers}.md
-        let ms_api_src = ms_base.join("docs").join("api.md");
-        let ms_api_dst = srv_base
-            .join("docs")
-            .join("microservice-api")
-            .join(&ms_name)
-            .join("api.md");
-        if ms_api_src.exists() {
-            match sync::copy_file_if_changed(&ms_api_src, &ms_api_dst) {
-                Ok(true) => c.copied += 1,
-                Ok(false) => {}
-                Err(e) => c.errors.push(format!(
-                    "Copy ms api.md from {}: {}",
-                    ms_server_repo.display_name(),
-                    e
-                )),
-            }
-        }
-        let ms_handlers_src = ms_base.join("docs").join("handlers.md");
-        let ms_handlers_dst = srv_base
-            .join("docs")
-            .join("microservice-api")
-            .join(&ms_name)
-            .join("handlers.md");
-        if ms_handlers_src.exists() {
-            match sync::copy_file_if_changed(&ms_handlers_src, &ms_handlers_dst) {
-                Ok(true) => c.copied += 1,
-                Ok(false) => {}
-                Err(e) => c.errors.push(format!(
-                    "Copy ms handlers.md from {}: {}",
-                    ms_server_repo.display_name(),
-                    e
-                )),
-            }
-        }
-
-        // T-000139: blind-copy the microservice's docs/my_api/*.md into the parent's microservice-api/<ms_name> inbox.
-        match sync::copy_my_api_dir(
-            &ms_base.join("docs"),
-            &srv_base
+        // 0.9.0: Microservice → Parent server — api.md + handlers.md + my_api.
+        // Target on parent: docs/microservice-api/<ms-project-name>/{api,handlers}.md.
+        // T-000172: skipped for codices — a svod has no api contract, only its
+        // practices (delivered by the separate broadcast pass).
+        if !skip_api_contract {
+            let ms_api_src = ms_base.join("docs").join("api.md");
+            let ms_api_dst = srv_base
                 .join("docs")
                 .join("microservice-api")
-                .join(&ms_name),
-        ) {
-            Ok(n) => c.copied += n,
-            Err(e) => c.errors.push(format!(
-                "Copy ms my_api from {}: {}",
-                ms_server_repo.display_name(),
-                e
-            )),
+                .join(&ms_name)
+                .join("api.md");
+            if ms_api_src.exists() {
+                match sync::copy_file_if_changed(&ms_api_src, &ms_api_dst) {
+                    Ok(true) => c.copied += 1,
+                    Ok(false) => {}
+                    Err(e) => c.errors.push(format!(
+                        "Copy ms api.md from {}: {}",
+                        ms_server_repo.display_name(),
+                        e
+                    )),
+                }
+            }
+            let ms_handlers_src = ms_base.join("docs").join("handlers.md");
+            let ms_handlers_dst = srv_base
+                .join("docs")
+                .join("microservice-api")
+                .join(&ms_name)
+                .join("handlers.md");
+            if ms_handlers_src.exists() {
+                match sync::copy_file_if_changed(&ms_handlers_src, &ms_handlers_dst) {
+                    Ok(true) => c.copied += 1,
+                    Ok(false) => {}
+                    Err(e) => c.errors.push(format!(
+                        "Copy ms handlers.md from {}: {}",
+                        ms_server_repo.display_name(),
+                        e
+                    )),
+                }
+            }
+
+            // T-000139: blind-copy the microservice's docs/my_api/*.md into the parent's microservice-api/<ms_name> inbox.
+            match sync::copy_my_api_dir(
+                &ms_base.join("docs"),
+                &srv_base
+                    .join("docs")
+                    .join("microservice-api")
+                    .join(&ms_name),
+            ) {
+                Ok(n) => c.copied += n,
+                Err(e) => c.errors.push(format!(
+                    "Copy ms my_api from {}: {}",
+                    ms_server_repo.display_name(),
+                    e
+                )),
+            }
         }
     }
 }
@@ -576,10 +587,15 @@ fn sync_server_to_microservice(
 /// they happen to trigger Sync themselves. Rename-replay is intentionally not
 /// duplicated here — parent-driven sync remains the authority for that, this
 /// block does the steady-state file copies only.
+///
+/// T-000172: also driven for a **codex** initiator (its consumers are the
+/// "parents"). `skip_api` is set for codices — a svod pushes no api.md/my_api to
+/// consumers (that's the broadcast pass), only its REQ responses.
 fn sync_microservice_to_parents(
     db: &AppDb,
     project_id: i64,
     ms_server: &Repository,
+    skip_api: bool,
     c: &mut SyncCounters,
 ) {
     if let Some(ref ms_path) = ms_server.local_path {
@@ -635,37 +651,40 @@ fn sync_microservice_to_parents(
                 }
                 let parent_canonical = parent_server.canonical_folder_name();
 
-                // MS → parent: api.md + handlers.md
-                for filename in ["api.md", "handlers.md"] {
-                    let src = ms_base.join("docs").join(filename);
-                    if !src.exists() {
-                        continue;
+                // MS → parent: api.md + handlers.md + my_api. T-000172: skipped
+                // for a codex initiator — the svod carries no api contract.
+                if !skip_api {
+                    for filename in ["api.md", "handlers.md"] {
+                        let src = ms_base.join("docs").join(filename);
+                        if !src.exists() {
+                            continue;
+                        }
+                        let dst = parent_base
+                            .join("docs")
+                            .join("microservice-api")
+                            .join(&ms_project_name)
+                            .join(filename);
+                        match sync::copy_file_if_changed(&src, &dst) {
+                            Ok(true) => c.copied += 1,
+                            Ok(false) => {}
+                            Err(e) => c.errors.push(format!(
+                                "Copy {} -> parent {}: {}",
+                                filename, parent_project.name, e
+                            )),
+                        }
                     }
-                    let dst = parent_base
-                        .join("docs")
-                        .join("microservice-api")
-                        .join(&ms_project_name)
-                        .join(filename);
-                    match sync::copy_file_if_changed(&src, &dst) {
-                        Ok(true) => c.copied += 1,
-                        Ok(false) => {}
-                        Err(e) => c.errors.push(format!(
-                            "Copy {} -> parent {}: {}",
-                            filename, parent_project.name, e
-                        )),
-                    }
-                }
 
-                // T-000139: blind-copy the ms's docs/my_api/*.md into the parent's microservice-api/<ms_project_name> inbox.
-                match sync::copy_my_api_dir(
-                    &ms_base.join("docs"),
-                    &parent_base
-                        .join("docs")
-                        .join("microservice-api")
-                        .join(&ms_project_name),
-                ) {
-                    Ok(n) => c.copied += n,
-                    Err(e) => c.errors.push(format!("Copy ms my_api -> parent: {}", e)),
+                    // T-000139: blind-copy the ms's docs/my_api/*.md into the parent's microservice-api/<ms_project_name> inbox.
+                    match sync::copy_my_api_dir(
+                        &ms_base.join("docs"),
+                        &parent_base
+                            .join("docs")
+                            .join("microservice-api")
+                            .join(&ms_project_name),
+                    ) {
+                        Ok(n) => c.copied += n,
+                        Err(e) => c.errors.push(format!("Copy ms my_api -> parent: {}", e)),
+                    }
                 }
 
                 // parent → MS: REQ-*.md (source of truth on parent side)
@@ -713,6 +732,40 @@ fn sync_microservice_to_parents(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Codex broadcast pass. Two directions, both idempotent:
+/// - Consumer-driven: this project pulls every connected codex's svod into its
+///   own same-role repos.
+/// - Codex-driven: if this project IS a codex, it pushes its svod into every
+///   connected consumer.
+///
+/// Folds each per-(codex,consumer) outcome into the shared counters — mirror
+/// writes into `copied`, prunes into `migrated` (a structural change to the
+/// consumer's mirror), errors appended.
+fn run_codex_broadcast(db: &AppDb, project_id: i64, project_type: &str, c: &mut SyncCounters) {
+    let mut fold = |o: sync::CodexBroadcastOutcome| {
+        c.copied += o.copied;
+        c.migrated += o.pruned;
+        c.errors.extend(o.errors);
+    };
+    // Consumer-driven: pull each connected codex into this project.
+    for codex_id in db.list_connected_codices(project_id).unwrap_or_default() {
+        fold(sync::broadcast_codex_to_consumer(db, codex_id, project_id));
+    }
+    // Codex-driven: push this codex's svod into each connected consumer.
+    if project_type == "codex" {
+        for consumer in db
+            .list_parents_of_microservice(project_id)
+            .unwrap_or_default()
+        {
+            fold(sync::broadcast_codex_to_consumer(
+                db,
+                project_id,
+                consumer.id,
+            ));
         }
     }
 }
@@ -848,15 +901,26 @@ pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, Strin
             }
 
             sync_client_to_server(db, srv_base, &clients, &mut c);
-            sync_server_to_microservice(db, srv, srv_base, &microservice_ids, &mut c);
+            sync_server_to_microservice(db, srv, srv_base, &microservice_ids, false, &mut c);
+            // T-000172: consumer → codex REQ pair, anchored on each side's server
+            // repo (same shape as parent↔microservice), api-contract skipped.
+            let codex_ids = db.list_connected_codices(project_id).unwrap_or_default();
+            sync_server_to_microservice(db, srv, srv_base, &codex_ids, true, &mut c);
         }
     }
 
-    if project_type == "microservice" {
+    // Reverse REQ direction from a consumed project's own side: a microservice or
+    // a codex pushes responses to / pulls REQs from its parent consumers.
+    if project_type == "microservice" || project_type == "codex" {
         if let Some(ms_server) = server {
-            sync_microservice_to_parents(db, project_id, ms_server, &mut c);
+            let skip_api = project_type == "codex";
+            sync_microservice_to_parents(db, project_id, ms_server, skip_api, &mut c);
         }
     }
+
+    // T-000165: codex broadcast — pull connected codices' svods into this
+    // project, and (if this project is a codex) push its svod to consumers.
+    run_codex_broadcast(db, project_id, &project_type, &mut c);
 
     // T-000137: auto-commit synced cross-repo files in opted-in repos (portfolio-wide;
     // pathspec-scoped, so untouched repos and the dev's own WIP are no-ops).
@@ -908,4 +972,114 @@ pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, Strin
     );
 
     Ok(c.into_result())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // A local repo's canonical_folder_name falls back to its description
+    // (github_name is NULL for local repos), so the display_name passed here is
+    // the folder name used in the REQ paths.
+    fn make_db() -> AppDb {
+        AppDb::new(PathBuf::from(":memory:")).unwrap()
+    }
+
+    /// T-000172: a REQ raised on a consumer for a connected codex is delivered to
+    /// the codex's server-lane repo, and the codex's response comes back — the
+    /// same parent↔microservice REQ round-trip, over a codex edge, with the
+    /// api-contract propagation skipped.
+    #[test]
+    fn test_codex_req_roundtrip_and_api_skip() {
+        let db = make_db();
+        let consumer_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let consumer_base = consumer_dir.path();
+        let codex_base = codex_dir.path();
+
+        // Consumer (standard) with a server repo; codex with a server-lane repo.
+        let consumer = db.create_project("Consumer", None, "standard").unwrap();
+        db.insert_local_repository(
+            consumer_base.to_str().unwrap(),
+            "consumer-backend",
+            Some(consumer.id),
+            Some("server"),
+        )
+        .unwrap();
+        let codex = db.create_project("Practices", None, "codex").unwrap();
+        db.insert_local_repository(
+            codex_base.to_str().unwrap(),
+            "practices-server",
+            Some(codex.id),
+            Some("server"),
+        )
+        .unwrap();
+        db.connect_codex(consumer.id, codex.id).unwrap();
+
+        // Consumer raises a REQ toward the codex (canonical folder = codex server
+        // repo's name), and the codex happens to also have an api.md that must NOT
+        // propagate (api-contract is skipped for codices).
+        let consumer_req_dir = consumer_base
+            .join("docs")
+            .join("microservice-requirements")
+            .join("practices-server");
+        fs::create_dir_all(&consumer_req_dir).unwrap();
+        fs::write(
+            consumer_req_dir.join("REQ-001_add-retry-rule.md"),
+            "Please add a retry idempotency rule.",
+        )
+        .unwrap();
+        fs::create_dir_all(codex_base.join("docs")).unwrap();
+        fs::write(
+            codex_base.join("docs").join("api.md"),
+            "not a real contract",
+        )
+        .unwrap();
+
+        run_project_sync(&db, consumer.id).unwrap();
+
+        // REQ landed on the codex side under server-requirements/<consumer-canonical>/.
+        let codex_req = codex_base
+            .join("docs")
+            .join("server-requirements")
+            .join("consumer-backend")
+            .join("REQ-001_add-retry-rule.md");
+        assert!(
+            codex_req.exists(),
+            "consumer's REQ must be delivered to the codex's server-requirements"
+        );
+
+        // api-contract was NOT propagated — no microservice-api inbox for the codex.
+        assert!(
+            !consumer_base
+                .join("docs")
+                .join("microservice-api")
+                .join("Practices")
+                .join("api.md")
+                .exists(),
+            "a codex must not push an api.md to the consumer"
+        );
+
+        // The codex answers with a response; next sync brings it back to the consumer.
+        fs::write(
+            codex_base
+                .join("docs")
+                .join("server-requirements")
+                .join("consumer-backend")
+                .join("REQ-001_add-retry-rule.response.md"),
+            "Added rules/retry.md — idempotency key now required.",
+        )
+        .unwrap();
+
+        run_project_sync(&db, consumer.id).unwrap();
+
+        let consumer_response = consumer_req_dir.join("REQ-001_add-retry-rule.response.md");
+        assert!(
+            consumer_response.exists(),
+            "the codex's response must be copied back to the consumer"
+        );
+    }
 }

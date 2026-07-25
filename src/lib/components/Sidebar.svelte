@@ -104,7 +104,7 @@
   let showNewProjectForm = $state(false);
   let newProjectName = $state('');
   let newProjectDesc = $state('');
-  let newProjectType = $state<'standard' | 'microservice'>('standard');
+  let newProjectType = $state<'standard' | 'microservice' | 'codex'>('standard');
   let isCreating = $state(false);
 
 
@@ -231,12 +231,19 @@
       const c = cleaned.slice(0, 1).toUpperCase();
       return `⚙${c}`;
     }
+    if (project.project_type === 'codex') {
+      // Codex: 📚 + 1 char
+      const c = cleaned.slice(0, 1).toUpperCase();
+      return `📚${c}`;
+    }
     // Standard: first 2 chars
     return cleaned.slice(0, 2).toUpperCase() || '??';
   }
 
   function projectColor(project: { project_type: string }): string {
-    return project.project_type === 'microservice' ? '#3b82f6' : '#475569';
+    if (project.project_type === 'microservice') return '#3b82f6';
+    if (project.project_type === 'codex') return '#a855f7';
+    return '#475569';
   }
 
   function toggleSidebarCollapsed() {
@@ -619,6 +626,7 @@
         <select bind:value={newProjectType}>
           <option value="standard">📁 {$tStore('project.typeStandard' as any)}</option>
           <option value="microservice">⚙ {$tStore('project.typeMicroservice' as any)}</option>
+          <option value="codex">📚 {$tStore('project.typeCodex' as any)}</option>
         </select>
       </label>
       <div class="form-actions">
@@ -705,6 +713,8 @@
             >
               {#if project.project_type === 'microservice'}
                 <span class="type-icon" title={$tStore('project.typeMicroservice' as any)}>⚙</span>
+              {:else if project.project_type === 'codex'}
+                <span class="type-icon" title={$tStore('project.typeCodex' as any)}>📚</span>
               {/if}
               {project.name}
               {#if repos.length > 0}

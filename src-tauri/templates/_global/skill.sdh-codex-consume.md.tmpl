@@ -1,0 +1,42 @@
+---
+name: sdh-codex-consume
+description: >
+  Use when a practices svod has landed in docs/codex/<name>/ and you're applying
+  its rules/lessons to your work. The inbox is a read-only, gitignored mirror —
+  apply what's relevant, never edit it (edits are overwritten on next sync), and
+  propose additions/changes back via a REQ. To CURATE a svod (you're the
+  publisher) — skill sdh-codex-maintain.
+---
+
+You are here if a Codex has broadcast its svod of engineering practices into your repo and you're about to build something the svod has guidance on. A Codex is a "publishing" project whose product is not endpoints but a curated body of practice docs — rules, cases, lessons. Treat the svod as canon reference: apply it, don't call it.
+
+- You **curate your own** svod (you're the Codex publisher) → skill `sdh-codex-maintain`.
+- The distinction from an API contract: `sdh-api-contract-consume` is about a **surface you call**; a codex is about **lessons you apply**. Same sync shape, different payload.
+
+**Where the svod lives:**
+- `docs/codex/<codex-name>/` — a **read-only, gitignored inbox**. It's a **full mirror** of the Codex's practices folder (typically `rules/`, `cases/`, `lessons/`), refreshed on every sync. A file removed from the svod disappears here too (mirror-with-prune).
+- Delivery is **role-matched by lane**: your `server` repo receives the server-audience svod, your `admin_client` repo the admin-audience svod. Each lands in that repo's own `docs/codex/<codex-name>/`.
+
+## When it fires
+
+Trigger — you're about to design or implement something the svod speaks to: a retry policy, an auth flow, an error-handling convention, a deploy practice. Before reaching for your own instinct, check whether the connected Codex has already canonized a rule or lesson on it.
+
+## Procedure
+
+1. **Scan the inbox** for what's relevant — `docs/codex/<name>/rules/`, `.../lessons/`, `.../cases/`. Grep for the topic (`grep -rn "retry" docs/codex/`).
+2. **Apply the matching rules/lessons** as canon — the svod is the portfolio's agreed practice, not a suggestion box. If a `rule` says "always X / never Y", follow it the way you'd follow a CLAUDE.md rule.
+3. **Never edit the inbox.** It's a read-only mirror — any local edit is silently overwritten on the next sync (full mirror + prune). There is nothing to commit; the folder is gitignored.
+4. **To contribute back** — a new case worth capturing, a lesson you'd generalize, or a rule you think is wrong — do **not** touch the inbox. Open a REQ to the Codex proposing the addition/change (skill `sdh-cross-repo-req-send`). You consume the codex like a microservice you depend on, so the REQ goes into **`docs/microservice-requirements/<codex-repo>/REQ-NNN.md`** (the same folder as a server→microservice REQ) — Solo Dev Hub syncs it to the codex's `docs/server-requirements/<your-repo>/`. The maintainer curates it into the svod, answers with a `.response.md`, and the accepted change mirrors back to everyone on the next sync.
+
+## Example
+
+You're adding a webhook retry loop. Before designing the backoff:
+
+```
+$ grep -rn "backoff" docs/codex/Swan_Practices/
+docs/codex/Swan_Practices/rules/retry.md:12: Always cap at 5 attempts, jittered exponential backoff, never fixed-interval.
+```
+
+Found → follow the rule as canon; don't reinvent the policy. If you discover the rule doesn't cover a case you hit (e.g. non-idempotent endpoints), capture it as a REQ to the Codex — not as a local edit to the inbox.
+
+**Why not edit locally:** the inbox is a mirror, so your edit vanishes on the next sync and never reaches anyone else. The REQ path is the only way a practice actually changes for the portfolio.

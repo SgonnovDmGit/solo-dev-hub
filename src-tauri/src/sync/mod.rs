@@ -6,6 +6,7 @@
 pub mod autocommit;
 pub mod bugs;
 pub mod claude_md;
+pub mod codex;
 pub mod fs;
 pub mod gitattributes;
 pub mod gitignore;
@@ -19,6 +20,7 @@ pub mod tasks;
 pub use autocommit::*;
 pub use bugs::*;
 pub use claude_md::*;
+pub use codex::*;
 pub use fs::*;
 pub use gitattributes::*;
 pub use gitignore::*;

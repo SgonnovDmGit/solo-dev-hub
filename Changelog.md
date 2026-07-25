@@ -4,6 +4,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-07-25
+
+Codex — a new "publishing" project type. Its product is not endpoints but a curated svod of engineering practices, broadcast read-only to the projects that consume it. This is the api-contract sync mechanism with a different payload: the same producer→consumer edges, but the consumer-LLM reads the delivered files as "lessons I apply" rather than "a surface I call".
+
+### Added
+- **Codex project type (T-000162…171).** A Codex publishes a practices folder (`practices/` by default, per-lane configurable via migration v29's `codex_source_path`) that is mirrored read-only into every connected consumer. Delivery is **role-matched by audience lane**: a codex repo of role `server` broadcasts to each consumer's `server` repo, `admin_client` to their `admin_client` repo — reusing the existing roles, no new ones. The svod lands in the consumer's `docs/codex/<name>/`, a gitignored inbox kept as a full mirror (files removed from the svod are pruned at the consumer). Missing a consumer's role-repo surfaces as an error; a lane the codex doesn't publish is silently skipped.
+- **Codex in the UI.** The create dialog and header type-select gain a **📚 Codex** option; a Codex switches freely to/from Microservice even while it has consumers (only "→ Standard" stays blocked). The Microservices tab is now **Connections**, holding two sections — Microservices and **Codices** — plus, for a codex, a **Consumers** view of who it broadcasts to. A codex project's repo role-picker is narrowed to `server`/`admin_client` (the composition gate — ≤1 of each — is also enforced server-side). The project graph shows a consumed codex as a filled-purple 📚 node, distinct from microservices, in **any** consumer's graph (standard or microservice).
+- **Contribution REQ channel over codex edges (T-000172).** A consumer proposes a practice change back to the codex through the normal REQ mechanism — the consumer↔codex pair is the same shape as parent↔microservice, anchored on each side's server repo (`docs/microservice-requirements/<codex>/` ⇄ the codex's `docs/server-requirements/<consumer>/`), with responses and rename-replay handled by the existing machinery. Only the api-contract propagation is skipped (a svod carries no api.md). Both sync directions are wired, so either side can drive the round-trip.
+- **Two role-split skills.** `sdh-codex-consume` (a consumer applies the svod, never edits the read-only inbox, proposes changes back via a REQ) and `sdh-codex-maintain` (a publisher curates the case→lesson→rule structure, keeps the CLAUDE.md↔svod boundary, and pushes a critical lesson via an announcement). Both are added to the global trigger table and mirrored into every managed repo's `docs/sdh_skills/`.
+- **Flow doc `docs/flows/codex-broadcast.md`** — the model, lanes, role-matched delivery, gitignored inbox, `(type, role)` branching, composition gate, and the microservice↔codex retype.
+
+### Changed
+- **Cross-repo channels branch on `(project_type, role)`, not role alone.** The api-contract sync skips codices (they have no `docs/my_api/`), and `project.md` renders a codex distinctly (`📚 Codex` label, a dedicated "Connected Codices" section, codices excluded from "Connected microservices"). The addressing resolver `server_repo_of_microservice` was generalized to `repo_of_project_with_role(pid, role)`, with the server variant kept as a thin wrapper.
+- **`docs/schema/` regenerated** for migration v29 (adds `repositories.codex_source_path`).
+
+### Tests
+- 488 Rust (+29 over v1.10.0's baseline: mirror-with-prune, broadcast role-matching, the composition gate, the microservice↔codex switch, project.md rendering, connection commands, graph role/forward-edge, the codex REQ round-trip; 1 ignored: the schema-export generator), 86 vitest, svelte-check clean.
+
 ## [1.10.0] — 2026-07-19
 
 Contributor documentation: an architecture overview, a generated SQLite schema reference, and a pass over the public docs that had drifted.

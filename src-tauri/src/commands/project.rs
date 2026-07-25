@@ -11,7 +11,7 @@ pub fn create_project(
     description: Option<String>,
     project_type: String,
 ) -> Result<Project, String> {
-    if project_type != "standard" && project_type != "microservice" {
+    if project_type != "standard" && project_type != "microservice" && project_type != "codex" {
         return Err(format!("Invalid project_type: {}", project_type));
     }
     db.create_project(&name, description.as_deref(), &project_type)
@@ -80,6 +80,28 @@ pub fn list_project_microservices(db: State<AppDb>, project_id: i64) -> Result<V
 #[tauri::command]
 pub fn list_microservice_projects(db: State<AppDb>) -> Result<Vec<Project>, String> {
     db.list_microservice_projects().map_err(|e| e.to_string())
+}
+
+// ── Codex connection commands (T-000168) ─────────────────────────────────────
+
+#[tauri::command]
+pub fn connect_codex(
+    db: State<AppDb>,
+    project_id: i64,
+    codex_project_id: i64,
+) -> Result<(), String> {
+    db.connect_codex(project_id, codex_project_id)
+}
+
+#[tauri::command]
+pub fn list_connected_codices(db: State<AppDb>, project_id: i64) -> Result<Vec<i64>, String> {
+    db.list_connected_codices(project_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_codex_projects(db: State<AppDb>) -> Result<Vec<Project>, String> {
+    db.list_codex_projects().map_err(|e| e.to_string())
 }
 
 #[tauri::command]

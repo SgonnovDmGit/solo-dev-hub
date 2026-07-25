@@ -4,6 +4,7 @@
   import {
     connectMicroservice, disconnectMicroservice, listProjectMicroservices,
     listMicroserviceProjects, serverRepoOfMicroservice,
+    connectCodex, listConnectedCodices, listCodexProjects,
   } from '$lib/api/tauri-commands';
   import type { Project, Repository } from '$lib/types';
 
@@ -19,6 +20,10 @@
   // Connected microservice-project IDs for current project
   let connectedMicroserviceIds = $state<number[]>([]);
 
+  // T-000168: Codices — connectable codex projects + connected ids
+  let allCodexProjects = $state<Project[]>([]);
+  let connectedCodexIds = $state<number[]>([]);
+
   // Cached server-repo info per microservice-project (for inline display)
   let msServerRepoCache = $state<Record<number, { repo: Repository | null; error: string | null }>>({});
 
@@ -32,6 +37,37 @@
     }
   }
 
+  // T-000168: load codex projects + this project's connected codices.
+  async function loadCodices() {
+    if (!project) return;
+    try {
+      connectedCodexIds = await listConnectedCodices(project.id);
+      allCodexProjects = await listCodexProjects();
+    } catch (err) {
+      addToast(String(err), 'error');
+    }
+  }
+
+  async function toggleCodex(codexProjectId: number) {
+    if (!project) return;
+    try {
+      if (connectedCodexIds.includes(codexProjectId)) {
+        // Disconnect reuses the generic edge-delete command.
+        await disconnectMicroservice(project.id, codexProjectId);
+      } else {
+        await connectCodex(project.id, codexProjectId);
+      }
+      await loadCodices();
+    } catch (err: any) {
+      const msg = String(err);
+      if (msg.toLowerCase().includes('cycle')) {
+        addToast($tStore('toast.cycleDetected' as any), 'error');
+      } else {
+        addToast(msg, 'error');
+      }
+    }
+  }
+
   async function loadServerRepoFor(msProjectId: number) {
     try {
       const repo = await serverRepoOfMicroservice(msProjectId);
@@ -42,7 +78,7 @@
   }
 
   $effect(() => {
-    if (project) loadMicroservices();
+    if (project) { loadMicroservices(); loadCodices(); }
   });
 
   $effect(() => {
@@ -81,9 +117,7 @@
 
 <!-- Microservices section (connecting other microservice-projects to this one) -->
 <div class="microservices-section">
-  <div class="tab-toolbar">
-    <span class="tab-count">{allMicroserviceProjects.filter(ms => ms.id !== project.id).length}</span>
-  </div>
+  <div class="section-label">{$tStore('project.microservices')} <span class="tab-count">{allMicroserviceProjects.filter(ms => ms.id !== project.id).length}</span></div>
 
   {#if allMicroserviceProjects.filter(ms => ms.id !== project.id).length === 0}
     <div class="empty-repos">
@@ -126,13 +160,49 @@
   {/if}
 </div>
 
-<!-- F-012: for microservice-projects, show connected parents -->
-{#if project.project_type === 'microservice'}
+<!-- T-000168: Codices section (connecting codex-projects — practice svods — to this one) -->
+<div class="microservices-section">
+  <div class="section-label">📚 {$tStore('project.codices' as any)} <span class="tab-count">{allCodexProjects.filter(cx => cx.id !== project.id).length}</span></div>
+
+  {#if allCodexProjects.filter(cx => cx.id !== project.id).length === 0}
+    <div class="empty-repos">
+      <div class="empty-title">{$tStore('project.noCodices' as any)}</div>
+      <div class="empty-hint">{$tStore('project.noCodicesHint' as any)}</div>
+    </div>
+  {:else}
+    <div class="microservice-list">
+      {#each allCodexProjects.filter(cx => cx.id !== project.id) as cx (cx.id)}
+        {@const isConnected = connectedCodexIds.includes(cx.id)}
+        <div class="microservice-row">
+          <button class="ghost repo-link" onclick={() => { selectedProjectId.set(cx.id); currentScreen.set({ name: 'project' }); }}>
+            <span class="ms-icon">📚</span>
+            {cx.name}
+          </button>
+          <span class="ms-server-info">→ docs/codex/{cx.name}/</span>
+          <button
+            class="toggle-btn"
+            class:connected={isConnected}
+            onclick={() => toggleCodex(cx.id)}
+          >
+            {isConnected ? $tStore('project.connected') : $tStore('project.disconnected')}
+          </button>
+        </div>
+      {/each}
+    </div>
+  {/if}
+</div>
+
+<!-- F-012 / T-000168: microservice → parents ("Connected to"); codex → consumers -->
+{#if project.project_type === 'microservice' || project.project_type === 'codex'}
+  {@const isCodex = project.project_type === 'codex'}
   <div class="microservices-section">
-    <div class="section-label">{$tStore('project.connectedParents' as any)} <span class="tab-count">{parents.length}</span></div>
+    <div class="section-label">
+      {isCodex ? $tStore('project.codexConsumers' as any) : $tStore('project.connectedParents' as any)}
+      <span class="tab-count">{parents.length}</span>
+    </div>
     {#if parents.length === 0}
       <div class="empty-repos">
-        <div class="empty-title">{$tStore('project.connectedParentsEmpty' as any)}</div>
+        <div class="empty-title">{isCodex ? $tStore('project.codexConsumersEmpty' as any) : $tStore('project.connectedParentsEmpty' as any)}</div>
       </div>
     {:else}
       <div class="microservice-list">
@@ -186,13 +256,6 @@
 
   .repo-link:hover {
     text-decoration: underline;
-  }
-
-  .tab-toolbar {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 8px;
   }
 
   .tab-count {

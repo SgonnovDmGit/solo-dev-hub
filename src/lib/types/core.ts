@@ -5,11 +5,13 @@ export interface Project {
   name: string;
   description: string | null;
   created_at: string;
-  project_type: string; // "standard" | "microservice"
+  project_type: string; // "standard" | "microservice" | "codex"
   auto_sync_enabled: boolean; // T-000136: per-project background auto-sync opt-in
 }
 
-export type ProjectType = 'standard' | 'microservice';
+// T-000168: 'codex' — a publishing project type whose product is a practices
+// svod broadcast read-only to connected consumers (see docs/flows/codex-broadcast.md).
+export type ProjectType = 'standard' | 'microservice' | 'codex';
 
 export interface Repository {
   id: number;
@@ -73,6 +75,7 @@ export const ROLE_ICONS: Record<string, string> = {
   test_client: '\u{1F9EA}',
   admin_client: '\u{1F6E1}',
   microservice: '\u{2699}',
+  codex: '\u{1F4DA}', // 📚 — codex project node in the graph
   landing: '\u{1F310}',
   tool: '\u{1F527}',
   other: '\u{1F4E6}',

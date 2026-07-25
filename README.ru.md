@@ -151,8 +151,9 @@ git push origin master vX.Y.Z
 
 **Дальше**
 
-- **v1.11.0** — in-app мультиязычный help-экран, документирующий LLM operating contract.
-- **v1.12.0** — cross-platform сборки (macOS / Linux).
+- **v1.11.0** — in-app мультиязычный help-экран: onboarding-ядро (быстрый старт, настройка проектов, работа с багами).
+- **v1.12.0** — вторая часть справки: разделы кросс-репо обмена и LLM operating contract.
+- **v1.13.0** — cross-platform сборки (macOS / Linux).
 - **v2.0.0** — Windows Authenticode code signing (убирает SmartScreen warning), read-only API viewer + матрица совместимости клиент/сервер.
 
 Детали по релизам — в [Changelog](Changelog.ru.md); повседневный список задач ведётся локально и в репозиторий не входит.

@@ -218,4 +218,17 @@ mod tests {
         assert!(content.contains("text=auto eol=lf"));
         assert!(content.contains("*.exe binary"));
     }
+
+    #[test]
+    fn test_bundled_global_gitignore_ignores_codex_inbox() {
+        // T-000167: the codex svod inbox is a synced read-only mirror — it must
+        // be gitignored so auto-commit skips it and it never clutters the
+        // consumer's history.
+        let content = bundled_file_content("_global", ".gitignore.tmpl")
+            .expect(".gitignore.tmpl must be bundled");
+        assert!(
+            content.contains("docs/codex/"),
+            "managed .gitignore must ignore the codex inbox docs/codex/"
+        );
+    }
 }
