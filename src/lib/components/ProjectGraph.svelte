@@ -55,7 +55,9 @@
       { selector: 'node[role = "test_client"]',  style: { 'border-color': accentClient }},
       { selector: 'node[role = "admin_client"]', style: { 'border-color': accentClient }},
       { selector: 'node[role = "microservice"]', style: { 'border-color': accentMs }},
-      { selector: 'node[role = "codex"]',        style: { 'border-color': accentCodex }},
+      // Codex node is FILLED purple (not just a border) so it's unmistakable next
+      // to the violet microservice nodes — every other node is surface-bg + colored border.
+      { selector: 'node[role = "codex"]',        style: { 'border-color': accentCodex, 'background-color': accentCodex, 'color': '#ffffff' }},
       { selector: 'node[role = "tool"]',         style: { 'border-color': accentTool }},
       { selector: 'edge', style: {
         'line-color': textMuted,

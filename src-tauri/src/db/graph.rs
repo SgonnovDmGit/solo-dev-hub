@@ -9,9 +9,9 @@ impl AppDb {
     /// - 'standard' → server-role repo (or first by sort_order if none)
     /// - 'microservice' → the project's main repo
     ///
-    /// Ring: for standard projects = other repos in project + connected microservice
-    /// projects (1-hop, via project_microservices). For microservice projects =
-    /// parent server projects (reverse lookup via project_microservices).
+    /// Ring: in-project repos + forward 1-hop connections (microservices & codices
+    /// this project consumes) for EVERY type, plus — for consumable types
+    /// (microservice / codex) — the reverse parent projects that consume it.
     pub fn get_project_graph(&self, project_id: i64) -> SqlResult<ProjectGraph> {
         let conn = self.conn.lock().unwrap();
 
@@ -87,12 +87,14 @@ impl AppDb {
             })
             .collect();
 
-        // Cross-project edges (connected microservices + codices)
-        if project_type == "standard" {
-            // project_microservices: project_id = parent, microservice_project_id = child.
-            // The table is shared across connected types; the child's project_type
-            // becomes the node role so the graph styles a codex (📚) distinctly from
-            // a microservice (⚙). T-000169.
+        // Forward edges: microservices + codices THIS project consumes. Runs for
+        // EVERY project type — a codex (or microservice) can be consumed by a
+        // microservice consumer too, not only a standard project (T-000169: the
+        // svod must show in a microservice consumer's graph). project_microservices:
+        // project_id = consumer, microservice_project_id = child. The child's
+        // project_type becomes the node role so a codex (📚) styles distinctly from
+        // a microservice (⚙).
+        {
             let mut ms_stmt = conn.prepare(
                 "SELECT p.id, p.name, p.project_type FROM projects p
                  JOIN project_microservices pm ON p.id = pm.microservice_project_id
@@ -117,9 +119,11 @@ impl AppDb {
                 });
                 ring.push(node);
             }
-        } else {
-            // microservice project — find parent server projects (reverse lookup)
-            // project_microservices: project_id = parent, microservice_project_id = ms
+        }
+
+        // Reverse edges: parent projects that consume THIS one. Meaningful only for
+        // consumable types (microservice / codex) — a standard project is never a child.
+        if project_type != "standard" {
             let mut p_stmt = conn.prepare(
                 "SELECT p.id, p.name FROM projects p
                  JOIN project_microservices pm ON p.id = pm.project_id
@@ -210,6 +214,34 @@ mod tests {
             .find(|n| n.project_id == Some(codex.id))
             .expect("codex node in ring");
         assert_eq!(codex_node.role.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn test_get_project_graph_microservice_consumer_shows_connected_codex() {
+        // T-000169: a codex can be consumed by a MICROSERVICE consumer, not only a
+        // standard project — its svod node must appear in the microservice's graph
+        // (forward edge), alongside any parents (reverse edge).
+        let db = make_db();
+        let ms = db
+            .create_project("BillingSvc", None, "microservice")
+            .unwrap();
+        db.insert_local_repository("/ms", "billing-backend", Some(ms.id), Some("server"))
+            .unwrap();
+        let parent = db.create_project("Portal", None, "standard").unwrap();
+        db.connect_microservice(parent.id, ms.id).unwrap(); // parent consumes the ms
+        let codex = db.create_project("Practices", None, "codex").unwrap();
+        db.connect_codex(ms.id, codex.id).unwrap(); // the ms consumes the codex
+
+        let g = db.get_project_graph(ms.id).unwrap();
+        // Forward: the codex appears with role="codex".
+        let codex_node = g
+            .ring
+            .iter()
+            .find(|n| n.project_id == Some(codex.id))
+            .expect("connected codex must appear in a microservice consumer's graph");
+        assert_eq!(codex_node.role.as_deref(), Some("codex"));
+        // Reverse: the parent still appears (server node).
+        assert!(g.ring.iter().any(|n| n.project_id == Some(parent.id)));
     }
 
     #[test]
