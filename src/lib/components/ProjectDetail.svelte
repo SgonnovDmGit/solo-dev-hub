@@ -16,10 +16,19 @@
   import type { Project, Repository } from '$lib/types';
 
   const roleKeys: Role[] = ['server', 'admin_client', 'client', 'test_client', 'landing', 'tool', 'other'];
-  const roles = roleKeys.map((key) => [key, getRoleLabel(key)] as [Role, string]);
 
   // Find the current project reactively
   const project = $derived($projects.find((p) => p.id === $selectedProjectId) ?? null);
+
+  // T-000168: a Codex project accepts only the two audience-lane roles.
+  // The composition gate is enforced server-side; narrowing the picker here
+  // makes the rule visible before the user triggers a rejected assignment.
+  const roleOptions = $derived(
+    (project?.project_type === 'codex'
+      ? (['server', 'admin_client'] as Role[])
+      : roleKeys
+    ).map((key) => [key, getRoleLabel(key)] as [Role, string])
+  );
   const rolePriority: Record<string, number> = {
     server: 0, admin_client: 1, client: 2, test_client: 3,
     landing: 4, tool: 5,
@@ -45,7 +54,9 @@
   let parentsOfMicroservice = $state<Project[]>([]);
 
   async function loadParents() {
-    if (!project || project.project_type !== 'microservice') {
+    // T-000168: both microservice and codex projects have "parents" via the
+    // shared project_microservices edge — for a codex those parents ARE its consumers.
+    if (!project || (project.project_type !== 'microservice' && project.project_type !== 'codex')) {
       parentsOfMicroservice = [];
       return;
     }
@@ -121,7 +132,7 @@
         {$tStore('project.tabRepos' as any)}
       </button>
       <button class="tab-btn" class:active={activeTab === 'microservices'} onclick={() => (activeTab = 'microservices')}>
-        {$tStore('project.tabMicroservices' as any)}
+        {$tStore('project.tabConnections' as any)}
       </button>
       <button class="tab-btn" class:active={activeTab === 'graph'} onclick={() => (activeTab = 'graph')}>
         {$tStore('project.tabGraph' as any)}
@@ -182,7 +193,7 @@
                         handleRoleChange(repo.id, (e.target as HTMLSelectElement).value)}
                       title={$tStore('project.setRole')}
                     >
-                      {#each roles as [key, label] (key)}
+                      {#each roleOptions as [key, label] (key)}
                         <option value={key}>{label}</option>
                       {/each}
                     </select>

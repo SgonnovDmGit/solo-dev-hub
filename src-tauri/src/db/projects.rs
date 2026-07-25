@@ -487,6 +487,58 @@ impl AppDb {
         rows.collect()
     }
 
+    /// Connect a consumer project to a codex project. Mirror of `connect_microservice`
+    /// but the target must be `project_type='codex'`. Same shared `project_microservices`
+    /// table + same cycle guard (codices participate in the generic project→project graph).
+    pub fn connect_codex(&self, project_id: i64, codex_project_id: i64) -> Result<(), String> {
+        let ctype: String = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT project_type FROM projects WHERE id = ?1",
+                rusqlite::params![codex_project_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?
+        };
+        if ctype != "codex" {
+            return Err("Target project is not of type 'codex'".to_string());
+        }
+        if self
+            .is_reachable(codex_project_id, project_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Err(
+                "Cycle detected: target already references this project transitively".to_string(),
+            );
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO project_microservices (project_id, microservice_project_id) VALUES (?1, ?2)",
+            rusqlite::params![project_id, codex_project_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// List all projects of type 'codex' (for the consumer's connect dropdown).
+    pub fn list_codex_projects(&self) -> SqlResult<Vec<Project>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, created_at, project_type, auto_sync_enabled FROM projects WHERE project_type = 'codex' ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                created_at: row.get(3)?,
+                project_type: row.get(4)?,
+                auto_sync_enabled: row.get::<_, bool>(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// List projects that have this microservice-project connected.
     pub fn list_parents_of_microservice(&self, ms_project_id: i64) -> SqlResult<Vec<Project>> {
         let conn = self.conn.lock().unwrap();
@@ -1124,6 +1176,51 @@ mod tests {
 
         let codex_list = db.list_connected_codices(parent.id).unwrap();
         assert_eq!(codex_list, vec![codex.id]);
+    }
+
+    #[test]
+    fn test_connect_codex_rejects_non_codex_target() {
+        let db = make_db();
+        let consumer = db.create_project("consumer", None, "standard").unwrap();
+        // standard target
+        let std_target = db.create_project("not-codex", None, "standard").unwrap();
+        let err = db.connect_codex(consumer.id, std_target.id).unwrap_err();
+        assert!(err.contains("not of type 'codex'"), "got: {err}");
+        // microservice target
+        let ms = make_ms_project(&db, "ms", false);
+        let err = db.connect_codex(consumer.id, ms).unwrap_err();
+        assert!(err.contains("not of type 'codex'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_connect_codex_happy_and_lists() {
+        let db = make_db();
+        let consumer = db.create_project("consumer", None, "standard").unwrap();
+        let codex = db.create_project("codex", None, "codex").unwrap();
+
+        db.connect_codex(consumer.id, codex.id).unwrap();
+        assert_eq!(
+            db.list_connected_codices(consumer.id).unwrap(),
+            vec![codex.id]
+        );
+        let all_codices = db.list_codex_projects().unwrap();
+        assert_eq!(all_codices.len(), 1);
+        assert_eq!(all_codices[0].id, codex.id);
+
+        // Disconnect via the shared generic edge-delete → no codices left.
+        db.disconnect_microservice(consumer.id, codex.id).unwrap();
+        assert!(db.list_connected_codices(consumer.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_connect_codex_cycle_guard() {
+        let db = make_db();
+        // Two codices; A→B then B→A would form a 2-cycle in the shared graph.
+        let a = db.create_project("codex-A", None, "codex").unwrap();
+        let b = db.create_project("codex-B", None, "codex").unwrap();
+        db.connect_codex(a.id, b.id).unwrap();
+        let err = db.connect_codex(b.id, a.id).unwrap_err();
+        assert!(err.contains("Cycle"), "got: {err}");
     }
 
     #[test]

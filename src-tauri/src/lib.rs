@@ -153,6 +153,10 @@ pub fn run() {
             commands::project::list_parents_of_microservice,
             commands::project::update_project_type,
             commands::project::server_repo_of_microservice,
+            // Codex connections
+            commands::project::connect_codex,
+            commands::project::list_connected_codices,
+            commands::project::list_codex_projects,
             // Settings
             commands::misc::get_setting,
             commands::misc::set_setting,

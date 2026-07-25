@@ -24,7 +24,7 @@ export async function loadProjects(): Promise<void> {
 export async function addProject(
   name: string,
   description?: string,
-  projectType: 'standard' | 'microservice' = 'standard',
+  projectType: 'standard' | 'microservice' | 'codex' = 'standard',
 ): Promise<Project | null> {
   try {
     const project = await tauriCreateProject(name, description, projectType);

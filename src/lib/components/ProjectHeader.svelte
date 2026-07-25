@@ -12,10 +12,10 @@
   }
   let { project, hasParents }: Props = $props();
 
-  // F-012: type-change is blocked ONLY when this project is a microservice connected
-  // to parents (standard projects referencing it). Repos and own-connected microservices
-  // don't matter — user can freely reshape a project.
-  const canChangeType = $derived(!hasParents);
+  // T-000168: with parents (consumers), a project may still switch BETWEEN the
+  // parent-consumable types (microservice ↔ codex) — only "→ standard" is blocked
+  // (it would leave consumers with a dangling pointer). So the select stays
+  // enabled; instead the `standard` option alone is disabled when hasParents.
 
   // Inline edit state for name
   let editingName = $state(false);
@@ -30,7 +30,7 @@
 
   // Type-change confirm
   let showTypeChangeConfirm = $state(false);
-  let pendingNewType = $state<'standard' | 'microservice'>('standard');
+  let pendingNewType = $state<'standard' | 'microservice' | 'codex'>('standard');
 
   function startEditName() {
     editNameValue = project.name;
@@ -75,7 +75,7 @@
 
   // B-003: select-based type change — open ConfirmDialog with chosen value
   function handleTypeSelectChange(e: Event) {
-    const newType = (e.target as HTMLSelectElement).value as 'standard' | 'microservice';
+    const newType = (e.target as HTMLSelectElement).value as 'standard' | 'microservice' | 'codex';
     if (newType === project.project_type) return;
     pendingNewType = newType;
     showTypeChangeConfirm = true;
@@ -161,19 +161,19 @@
     <!-- Обёртка span с title: browsers не показывают title на disabled-элементах надёжно -->
     <span
       class="type-select-wrapper"
-      title={canChangeType ? '' : $tStore('project.changeTypeDisabled' as any)}
+      title={hasParents ? $tStore('project.changeTypeDisabled' as any) : ''}
     >
       <select
         class="type-select"
         value={project.project_type}
         onchange={handleTypeSelectChange}
-        disabled={!canChangeType}
       >
-        <option value="standard">📁 {$tStore('project.typeStandard' as any)}</option>
+        <option value="standard" disabled={hasParents}>📁 {$tStore('project.typeStandard' as any)}</option>
         <option value="microservice">⚙ {$tStore('project.typeMicroservice' as any)}</option>
+        <option value="codex">📚 {$tStore('project.typeCodex' as any)}</option>
       </select>
-      {#if !canChangeType}
-        <span class="type-lock-icon" aria-hidden="true">🔒</span>
+      {#if hasParents}
+        <span class="type-lock-icon" aria-hidden="true" title={$tStore('project.changeTypeDisabled' as any)}>🔒</span>
       {/if}
     </span>
     <span class="meta-sep">•</span>
@@ -229,7 +229,7 @@
 {#if showTypeChangeConfirm && project}
   <ConfirmDialog
     title={$tStore('project.changeType' as any)}
-    message={$tStore('project.changeTypeConfirm' as any).replace('{0}', pendingNewType === 'microservice' ? $tStore('project.typeMicroservice' as any) : $tStore('project.typeStandard' as any))}
+    message={$tStore('project.changeTypeConfirm' as any).replace('{0}', pendingNewType === 'microservice' ? $tStore('project.typeMicroservice' as any) : pendingNewType === 'codex' ? $tStore('project.typeCodex' as any) : $tStore('project.typeStandard' as any))}
     onConfirm={confirmTypeChange}
     onCancel={() => (showTypeChangeConfirm = false)}
   />
