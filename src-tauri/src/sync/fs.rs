@@ -246,6 +246,27 @@ pub fn copy_my_api_dir(sender_docs: &Path, recipient_inbox: &Path) -> Result<usi
     Ok(copied)
 }
 
+/// T-000173: count regular FILES (not directories) under `root`, recursively.
+/// Returns 0 if `root` does not exist or is not a directory. Same std::fs
+/// walking idiom as `copy_tree` — no external walkdir crate.
+pub fn count_files_recursive(root: &Path) -> usize {
+    if !root.is_dir() {
+        return 0;
+    }
+    let mut count = 0usize;
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                count += count_files_recursive(&path);
+            } else if path.is_file() {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 /// Move a file atomically: write to target first, then delete source.
 /// If write fails, source remains intact — no data loss.
 /// Target's parent directory is created if needed.
@@ -678,6 +699,28 @@ mod tests {
         assert_eq!(out.pruned, 1, "the dst-only file is pruned on first mirror");
         assert!(dst.join("keep.txt").exists());
         assert!(!dst.join("stray.txt").exists());
+    }
+
+    // --- T-000173: count_files_recursive ---
+
+    #[test]
+    fn test_count_files_recursive_missing_or_empty_is_zero() {
+        // Missing path → 0.
+        assert_eq!(
+            count_files_recursive(Path::new("/nonexistent/abc123/xyz")),
+            0
+        );
+        // Empty dir → 0.
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(count_files_recursive(tmp.path()), 0);
+    }
+
+    #[test]
+    fn test_count_files_recursive_counts_nested_files_only() {
+        let tmp = TempDir::new().unwrap();
+        // a.txt, b.txt, sub/c.txt, sub/deep/d.txt = 4 files across 2 nested dirs.
+        build_src_tree(tmp.path());
+        assert_eq!(count_files_recursive(tmp.path()), 4);
     }
 
     #[test]
