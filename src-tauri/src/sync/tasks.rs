@@ -97,8 +97,8 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
 
     // Read and parse todo.md
     let (todo_tasks, todo_mtime) = if todo_path.exists() {
-        let content =
-            std::fs::read_to_string(&todo_path).map_err(|e| format!("read todo.md: {}", e))?;
+        let content = crate::export::read_to_string_lossy(&todo_path)
+            .map_err(|e| format!("read todo.md: {}", e))?;
         let mtime = std::fs::metadata(&todo_path)
             .ok()
             .and_then(|m| m.modified().ok())
@@ -119,8 +119,8 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
     // missing — `todo_mtime` was wrong here because the entry came from
     // done.md, not todo.md (review H5).
     let (done_tasks, done_mtime) = if done_path.exists() {
-        let content =
-            std::fs::read_to_string(&done_path).map_err(|e| format!("read done.md: {}", e))?;
+        let content = crate::export::read_to_string_lossy(&done_path)
+            .map_err(|e| format!("read done.md: {}", e))?;
         let mtime = std::fs::metadata(&done_path)
             .ok()
             .and_then(|m| m.modified().ok())

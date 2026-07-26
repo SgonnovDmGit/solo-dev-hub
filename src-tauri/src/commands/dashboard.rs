@@ -187,8 +187,11 @@ fn aggregate_tasks_done(
     for r in repos {
         if let Some(lp) = &r.local_path {
             let done_path = std::path::PathBuf::from(lp).join("docs").join("done.md");
+            // Never gate the whole dashboard on one repo's unreadable done.md —
+            // a bad file contributes 0 and the rest still aggregates (the read is
+            // already UTF-8-tolerant; this defends against any residual IO error).
             let entries = crate::export::parse_done_entries_in_period(&done_path, start, end)
-                .map_err(|e| e.to_string())?;
+                .unwrap_or_default();
             total += entries.iter().map(|(_, n)| n).sum::<i64>();
         }
     }
@@ -211,8 +214,11 @@ fn tasks_daily_flow(
     for r in repos {
         if let Some(lp) = &r.local_path {
             let done_path = std::path::PathBuf::from(lp).join("docs").join("done.md");
+            // Never gate the whole dashboard on one repo's unreadable done.md —
+            // a bad file contributes 0 and the rest still aggregates (the read is
+            // already UTF-8-tolerant; this defends against any residual IO error).
             let entries = crate::export::parse_done_entries_in_period(&done_path, start, end)
-                .map_err(|e| e.to_string())?;
+                .unwrap_or_default();
             for (date, count) in entries {
                 *per_day.entry(date).or_insert(0) += count;
             }

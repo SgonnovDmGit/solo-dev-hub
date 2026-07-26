@@ -226,7 +226,7 @@ pub fn parse_done_entries_in_period(
     if !path.exists() {
         return Ok(vec![]);
     }
-    let content = std::fs::read_to_string(path)?;
+    let content = super::read_to_string_lossy(path)?;
     let mut current_date: Option<String> = None;
     let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 

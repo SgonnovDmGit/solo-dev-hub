@@ -47,7 +47,7 @@ fn write_claude_section(claude_md_path: &Path, rendered: &str) -> Result<(), Str
         return Ok(());
     }
 
-    let content = fs::read_to_string(claude_md_path).map_err(|e| e.to_string())?;
+    let content = crate::export::read_to_string_lossy(claude_md_path).map_err(|e| e.to_string())?;
     let has_begin = content.contains("manager:begin");
     let has_end = content.contains("manager:end");
 
