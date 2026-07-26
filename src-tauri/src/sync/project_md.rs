@@ -136,9 +136,53 @@ pub fn generate_project_md(db: &AppDb, project_id: i64, repo_root: &Path) -> Res
         md.push('\n');
     }
 
+    // Keep the "## Parent projects" heading verbatim — the announce workflow
+    // greps that exact string. Only the rows differ by project type.
     md.push_str("## Parent projects\n\n");
     if parents.is_empty() {
         md.push_str("_No parent projects._\n\n");
+    } else if project.project_type == "codex" {
+        // T-000175: for a codex's own project.md, `parents` are its CONSUMERS.
+        // Resolve each consumer by the codex's audience lane (server /
+        // admin_client) instead of always the server repo — a codex-for-admins
+        // must point at consumers' admin repos, not their server repos. Only
+        // lanes the codex itself publishes on are probed. Inbox is this codex's
+        // own folder in the consumer's tree.
+        let inbox = format!("docs/codex/{}/", project.name);
+        let codex_lanes: Vec<&str> = ["server", "admin_client"]
+            .into_iter()
+            .filter(|lane| db.repo_of_project_with_role(project_id, lane).is_ok())
+            .collect();
+        md.push_str("| Consumer | Lane | Contact repo | Path | Inbox |\n");
+        md.push_str("|----------|------|--------------|------|-------|\n");
+        for p in &parents {
+            let mut any_lane = false;
+            for lane in &codex_lanes {
+                if let Ok(repo) = db.repo_of_project_with_role(p.id, lane) {
+                    any_lane = true;
+                    let path = repo
+                        .local_path
+                        .clone()
+                        .unwrap_or_else(|| "_no local path configured_".to_string());
+                    md.push_str(&format!(
+                        "| {} | {} | {} | {} | {} |\n",
+                        p.name,
+                        lane,
+                        repo.display_name(),
+                        path,
+                        inbox
+                    ));
+                }
+            }
+            // A consumer with no matching-lane repo still gets a marker row.
+            if !any_lane {
+                md.push_str(&format!(
+                    "| {} | ⚠ no matching-lane repo | — | — | {} |\n",
+                    p.name, inbox
+                ));
+            }
+        }
+        md.push('\n');
     } else {
         // F-000040: include each parent server-repo's local path so MS-LLM
         // can write proactive announcements directly into that filesystem.
@@ -401,6 +445,72 @@ mod tests {
         let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
         assert!(content.contains("## Connected Codices"));
         assert!(content.contains("_No connected codices._"));
+    }
+
+    /// T-000175: a codex's own project.md resolves each consumer by the codex's
+    /// audience lane, not the consumer's server repo. A codex reaching admins
+    /// must point at the consumer's `admin_client` repo, and its server repo
+    /// path must NOT leak into the Parent projects section.
+    #[test]
+    fn test_generate_project_md_codex_parents_show_matching_lane_repo() {
+        let db = make_test_db();
+
+        let codex = db.create_project("AdminCodex", None, "codex").unwrap();
+        let codex_admin = db
+            .upsert_repository("owner/admin-codex-admin", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(codex_admin.id, Some(codex.id), Some("admin_client"))
+            .unwrap();
+        db.set_repo_local_path(codex_admin.id, Some("/home/dev/admin-codex-admin"))
+            .unwrap();
+
+        let consumer = db.create_project("ShopAdmin", None, "standard").unwrap();
+        let consumer_srv = db
+            .upsert_repository("owner/shop-admin-server", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(consumer_srv.id, Some(consumer.id), Some("server"))
+            .unwrap();
+        db.set_repo_local_path(consumer_srv.id, Some("/home/dev/shop-admin-server"))
+            .unwrap();
+        let consumer_admin = db
+            .upsert_repository("owner/shop-admin-panel", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(consumer_admin.id, Some(consumer.id), Some("admin_client"))
+            .unwrap();
+        db.set_repo_local_path(consumer_admin.id, Some("/home/dev/shop-admin-panel"))
+            .unwrap();
+
+        // connect_microservice gates on target type='microservice'; a codex
+        // target is rejected, so insert the project→project edge directly.
+        // Consumer is the "parent" of the codex in this table's direction.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO project_microservices (project_id, microservice_project_id) VALUES (?1, ?2)",
+                rusqlite::params![consumer.id, codex.id],
+            )
+            .unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        // Generate the CODEX's own project.md.
+        generate_project_md(&db, codex.id, tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
+        // Heading kept verbatim for the announce workflow grep.
+        assert!(content.contains("## Parent projects"));
+        // Consumer resolved by the codex's admin_client lane.
+        assert!(
+            content.contains("| ShopAdmin | admin_client | shop-admin-panel | /home/dev/shop-admin-panel | docs/codex/AdminCodex/ |"),
+            "consumer admin_client lane row expected; got:\n{}",
+            content
+        );
+        // The consumer's server repo path must NOT appear in this section.
+        assert!(
+            !content.contains("/home/dev/shop-admin-server"),
+            "consumer's server repo path must not leak into codex Parent projects section; got:\n{}",
+            content
+        );
     }
 
     #[test]
