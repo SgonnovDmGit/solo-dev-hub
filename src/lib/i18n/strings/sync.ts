@@ -21,6 +21,10 @@ export const ru = {
   'sync.autoClosed': 'Авто-закрыто пар: {0}',
   'sync.committed': 'Авто-коммит в репозиториях: {0}',
   'sync.willAutoClose': 'Будет авто-закрыт при следующей синхронизации (есть .impl.md)',
+  // T-000173: codex broadcast visibility
+  'sync.codexIncoming': 'Своды — входящие',
+  'sync.codexOutgoing': 'Свод — исходящие',
+  'sync.codexFiles': '{0} файлов',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -46,4 +50,7 @@ export const en: Record<keyof typeof ru, string> = {
   'sync.autoClosed': 'Auto-closed pairs: {0}',
   'sync.committed': 'Auto-committed in repos: {0}',
   'sync.willAutoClose': 'Will auto-close on next sync (.impl.md present)',
+  'sync.codexIncoming': 'Codices — incoming',
+  'sync.codexOutgoing': 'Codex — outgoing',
+  'sync.codexFiles': '{0} files',
 };

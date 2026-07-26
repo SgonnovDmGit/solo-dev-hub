@@ -4,11 +4,12 @@
   import { allRepos } from '$lib/stores/repos';
   import { projects } from '$lib/stores/projects';
   import { tStore } from '$lib/i18n';
-  import { syncProject, listProjectRequirements, confirmRequirement } from '$lib/api/tauri-commands';
+  import { syncProject, listProjectRequirements, confirmRequirement, listCodexEdges } from '$lib/api/tauri-commands';
   import { noteManualSync } from '$lib/stores/autosync';
-  import { getDisplayName, type RequirementInfo } from '$lib/types';
+  import { getDisplayName, type RequirementInfo, type CodexEdgeInfo } from '$lib/types';
 
   let requirements = $state<RequirementInfo[]>([]);
+  let codexEdges = $state<CodexEdgeInfo[]>([]);
   let syncing = $state(false);
   let loading = $state(true);
 
@@ -23,7 +24,11 @@
     if (!projectId) return;
     loading = true;
     try {
-      requirements = await listProjectRequirements(projectId);
+      // T-000173: load REQ pairs + codex broadcast edges together.
+      [requirements, codexEdges] = await Promise.all([
+        listProjectRequirements(projectId),
+        listCodexEdges(projectId),
+      ]);
     } catch (e) {
       addToast(String(e), 'error');
     } finally {
@@ -164,6 +169,20 @@
     if (status === 'responded') return 'badge-responded';
     return '';
   }
+
+  // T-000173: codex broadcast edges, split by direction and grouped by codex.
+  const codexIncoming = $derived(codexEdges.filter((e) => e.direction === 'incoming'));
+  const codexOutgoing = $derived(codexEdges.filter((e) => e.direction === 'outgoing'));
+
+  function groupByCodex(list: CodexEdgeInfo[]): [string, CodexEdgeInfo[]][] {
+    const groups = new Map<string, CodexEdgeInfo[]>();
+    for (const e of list) {
+      const arr = groups.get(e.codex_name);
+      if (arr) arr.push(e);
+      else groups.set(e.codex_name, [e]);
+    }
+    return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }
 </script>
 
 <div class="sync-screen">
@@ -181,7 +200,7 @@
 
   {#if loading}
     <div class="loading">{$tStore('sync.syncing')}</div>
-  {:else if requirements.length === 0}
+  {:else if requirements.length === 0 && codexEdges.length === 0}
     <div class="empty">
       <div class="empty-title">{$tStore('sync.noRequirements')}</div>
       <div class="empty-hint">{$tStore('sync.noRequirementsHint')}</div>
@@ -304,8 +323,38 @@
         {/each}
       </div>
     {/if}
+
+    {@render codexSection(codexIncoming, 'sync.codexIncoming')}
+    {@render codexSection(codexOutgoing, 'sync.codexOutgoing')}
   {/if}
 </div>
+
+{#snippet codexSection(list: CodexEdgeInfo[], labelKey: string)}
+  {#if list.length > 0}
+    <div class="section">
+      <div class="section-label"><span class="codex-emoji">&#128218;</span> {$tStore(labelKey as any)}</div>
+      {#each groupByCodex(list) as [codexName, edges] (codexName)}
+        <div class="source-group">
+          <div class="source-header">&#128218; {codexName}</div>
+          <div class="req-list">
+            {#each edges as e (e.codex_name + '::' + e.consumer_name + '::' + e.lane)}
+              <div class="req-row">
+                <div class="req-info">
+                  <span class="req-filename">{e.source_repo} &rarr; {e.target_repo}</span>
+                  <span class="inbox">&#8627; {e.inbox}</span>
+                </div>
+                <div class="req-actions">
+                  <span class="filecount">{$tStore('sync.codexFiles').replace('{0}', String(e.file_count))}</span>
+                  <span class="badge badge-lane">{e.lane}</span>
+                </div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/each}
+    </div>
+  {/if}
+{/snippet}
 
 <style>
   .sync-screen {
@@ -471,6 +520,31 @@
     font-size: 11px;
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
+  }
+
+  /* T-000173: codex broadcast section */
+  .codex-emoji {
+    font-size: 12px;
+  }
+
+  .inbox {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: monospace;
+    opacity: 0.85;
+  }
+
+  .filecount {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .badge-lane {
+    background-color: rgba(168, 85, 247, 0.15);
+    border-color: rgba(168, 85, 247, 0.5);
+    color: rgb(168, 85, 247);
+    font-family: monospace;
   }
 
   .badge-new {
