@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use crate::git_ops::{commit_paths, is_gitignored, CommitOutcome, GitBinary};
 
 /// Doc subfolders that hold cross-repo synced content (REQ pairs, API contracts,
-/// announcements). Auto-commit is scoped (git pathspec) to these — the dev's own
-/// WIP anywhere else (including docs/ root files like the sender's own api.md, or
-/// the skeleton CLAUDE.md/.gitignore) is never swept in.
+/// announcements). Auto-commit is scoped (git pathspec) to these (plus the
+/// managed root files below) — the dev's own WIP anywhere else (including docs/
+/// root files like the sender's own api.md, or the skeleton CLAUDE.md /
+/// docs/project.md) is never swept in.
 pub const CROSS_REPO_DIRS: &[&str] = &[
     "docs/backend-requirements",
     "docs/client-requirements",
@@ -19,6 +20,12 @@ pub const CROSS_REPO_DIRS: &[&str] = &[
     "docs/server-announcements",
     "docs/microservice-announcements",
 ];
+
+/// App-managed root files written by the sync skeleton (a managed block is
+/// merged into each on every sync). Auto-committed alongside the cross-repo
+/// folders so a template change (e.g. a new .gitignore line) doesn't sit as a
+/// foreign uncommitted diff. Skip-if-gitignored, same as the folders.
+pub const MANAGED_ROOT_FILES: &[&str] = &[".gitignore", ".gitattributes"];
 
 pub const SDH_COMMIT_NAME: &str = "Solo Dev Hub";
 pub const SDH_COMMIT_EMAIL: &str = "noreply@solodevhub.app";
@@ -48,6 +55,19 @@ pub fn autocommit_repo(
         }
         tracked.push(rel);
     }
+    // Managed root files (.gitignore / .gitattributes) — same existence +
+    // skip-if-gitignored logic. A repo that gitignores its own .gitignore or
+    // .gitattributes just skips it (no crash).
+    for f in MANAGED_ROOT_FILES {
+        let rel = PathBuf::from(f);
+        if !repo_root.join(&rel).exists() {
+            continue;
+        }
+        if is_gitignored(git, repo_root, &rel)? {
+            continue;
+        }
+        tracked.push(rel);
+    }
     if tracked.is_empty() {
         return Ok(CommitOutcome::NothingToCommit);
     }
@@ -57,7 +77,7 @@ pub fn autocommit_repo(
         branch,
         &tracked,
         "chore(sdh-sync): sync cross-repo files",
-        Some("Cross-repo requirement, API-contract and announcement files synced by Solo Dev Hub."),
+        Some("Cross-repo requirement, API-contract and announcement files (plus managed root files) synced by Solo Dev Hub."),
         SDH_COMMIT_NAME,
         SDH_COMMIT_EMAIL,
     )
@@ -297,5 +317,83 @@ mod tests {
         let git = check_git_available().expect("git available");
         let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
         assert_eq!(outcome, CommitOutcome::NothingToCommit);
+    }
+
+    #[test]
+    fn test_autocommit_commits_managed_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        // App-managed .gitignore (with a managed-block marker line) written by
+        // the sync skeleton, plus a synced cross-repo file — both uncommitted.
+        write_file(
+            tmp.path(),
+            ".gitignore",
+            "# manager:begin\ndocs/codex/\n# manager:end\n",
+        );
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+
+        let hf = head_files(tmp.path());
+        assert!(
+            hf.contains(&".gitignore".to_string()),
+            "managed .gitignore must be in HEAD tree, got {:?}",
+            hf
+        );
+    }
+
+    #[test]
+    fn test_autocommit_commits_managed_gitattributes() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        // App-managed .gitattributes written by the sync skeleton, plus a synced
+        // cross-repo file — both uncommitted.
+        write_file(tmp.path(), ".gitattributes", "* text=auto\n");
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+
+        let hf = head_files(tmp.path());
+        assert!(
+            hf.contains(&".gitattributes".to_string()),
+            "managed .gitattributes must be in HEAD tree, got {:?}",
+            hf
+        );
+    }
+
+    #[test]
+    fn test_autocommit_skips_gitignored_managed_root_file() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        // A committed .gitignore that ignores .gitattributes.
+        write_file(tmp.path(), ".gitignore", ".gitattributes\n");
+        run_git(tmp.path(), &["add", ".gitignore"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "add gitignore"]);
+        // The gitignored .gitattributes plus a tracked synced file.
+        write_file(tmp.path(), ".gitattributes", "* text=auto\n");
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 1 });
+
+        let hf = head_files(tmp.path());
+        assert!(
+            hf.contains(&"docs/server-api/api.md".to_string()),
+            "tracked api.md must be committed, got {:?}",
+            hf
+        );
+        assert!(
+            !hf.contains(&".gitattributes".to_string()),
+            "gitignored .gitattributes must NOT be committed, got {:?}",
+            hf
+        );
     }
 }
