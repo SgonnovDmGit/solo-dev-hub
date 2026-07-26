@@ -15,7 +15,7 @@ pub fn read_bugs_from_file(file_path: String) -> Result<ReadBugsResult, String> 
             warnings: vec![],
         });
     }
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let content = crate::export::read_to_string_lossy(path).map_err(|e| e.to_string())?;
 
     // Detect format: legacy starts with "# Bug List:", new format does not
     if content.trim_start().starts_with("# Bug List:") {

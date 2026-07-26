@@ -89,6 +89,23 @@ pub struct RequirementInfo {
     pub has_impl: bool,
 }
 
+/// T-000173: one codex BROADCAST edge — a codex svod delivered to a consumer
+/// repo on a given lane. Distinct from REQ pairs (`RequirementInfo`): this is
+/// one-way broadcast visibility for the sync screen. snake_case JSON keys to
+/// match `RequirementInfo` (frontend reads snake_case).
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct CodexEdgeInfo {
+    pub codex_name: String,    // codex project name
+    pub consumer_name: String, // consumer project name
+    pub lane: String,          // "server" | "admin_client"
+    pub source_repo: String,   // codex lane repo display_name()
+    pub target_repo: String,   // consumer lane repo display_name()
+    pub inbox: String,         // "docs/codex/<codex_name>/"
+    pub file_count: usize,     // files in the codex source folder (0 if unresolved)
+    pub direction: String,     // "incoming" | "outgoing"
+    pub status: String,        // "synced" (inbox mirrors source) | "pending"
+}
+
 /// F-033: history record of a repository rename.
 /// Written when `upsert_repository_with_outcome` detects a `github_name` change
 /// for an existing repo (matched by `github_id`). Used by sync-preamble to

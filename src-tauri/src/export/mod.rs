@@ -18,6 +18,7 @@ pub use bugs::{generate_bug_reports, parse_bug_reports};
 pub use bugs_legacy::parse_markdown_legacy;
 pub use deploy_csv::deploy_report_to_csv;
 pub use todo_done::{parse_done_entries_in_period, parse_done_tasks, parse_todo_tasks};
+pub use util::read_to_string_lossy;
 // Kept exported for parity with pre-split surface (was `pub fn` in flat export.rs).
 #[allow(unused_imports)]
 pub use util::split_pipe_respecting_escape;

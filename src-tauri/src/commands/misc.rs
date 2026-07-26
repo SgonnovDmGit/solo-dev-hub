@@ -51,7 +51,7 @@ pub fn read_repo_todo(db: State<AppDb>, repo_id: i64) -> Result<ReadTodoResult, 
             warnings: Vec::new(),
         });
     }
-    let content = std::fs::read_to_string(&full).map_err(|e| e.to_string())?;
+    let content = export::read_to_string_lossy(&full).map_err(|e| e.to_string())?;
     let (tasks, warnings) = export::parse_todo_tasks(&content);
     Ok(ReadTodoResult { tasks, warnings })
 }
@@ -72,7 +72,7 @@ pub fn read_repo_done(db: State<AppDb>, repo_id: i64) -> Result<ReadDoneResult, 
             warnings: Vec::new(),
         });
     }
-    let content = std::fs::read_to_string(&full).map_err(|e| e.to_string())?;
+    let content = export::read_to_string_lossy(&full).map_err(|e| e.to_string())?;
     let (tasks, warnings) = export::parse_done_tasks(&content);
     Ok(ReadDoneResult { tasks, warnings })
 }

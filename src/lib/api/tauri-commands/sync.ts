@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SyncResult, RequirementInfo, RepoRename } from '$lib/types';
+import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo } from '$lib/types';
 
 
 // ── Requirements sync commands ──────────────────────────────────────────────
@@ -23,6 +23,11 @@ export async function syncProject(projectId: number): Promise<SyncResult> {
 
 export async function listProjectRequirements(projectId: number): Promise<RequirementInfo[]> {
   return invoke<RequirementInfo[]>('list_project_requirements', { projectId });
+}
+
+// T-000173: codex broadcast edges (svod → consumer repo, per lane) for the sync screen.
+export async function listCodexEdges(projectId: number): Promise<CodexEdgeInfo[]> {
+  return invoke<CodexEdgeInfo[]>('list_codex_edges', { projectId });
 }
 
 export async function confirmRequirement(

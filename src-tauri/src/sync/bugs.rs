@@ -171,8 +171,8 @@ pub fn migrate_bugs_for_repo(db: &AppDb, repo_id: i64) -> Result<MigrationReport
             already: false,
         });
     }
-    let content =
-        fs::read_to_string(&path).map_err(|e| format!("Read {} failed: {}", path.display(), e))?;
+    let content = crate::export::read_to_string_lossy(&path)
+        .map_err(|e| format!("Read {} failed: {}", path.display(), e))?;
     let (file_notes, warnings) = export::parse_bug_reports(&content);
     for w in &warnings {
         eprintln!("[migrate_bugs repo={}] parse warn: {}", repo_id, w);
@@ -247,7 +247,7 @@ pub fn reconcile_bugs_for_repo(db: &AppDb, repo_id: i64) -> Result<(), String> {
     // Read MD (missing file = empty rows, all active DB bugs "restored").
     let path = bug_reports_path(local_path);
     let file_notes: Vec<FileBugNote> = if path.exists() {
-        let content = fs::read_to_string(&path)
+        let content = crate::export::read_to_string_lossy(&path)
             .map_err(|e| format!("Read {} failed: {}", path.display(), e))?;
         let (notes, warnings) = export::parse_bug_reports(&content);
         for w in &warnings {

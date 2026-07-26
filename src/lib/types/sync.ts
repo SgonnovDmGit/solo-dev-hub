@@ -23,6 +23,22 @@ export interface RequirementInfo {
   has_impl?: boolean;
 }
 
+/** T-000173: one codex broadcast edge (svod → consumer repo, per lane) surfaced
+ * in the sync screen. snake_case mirrors the Rust `CodexEdgeInfo` (no rename_all). */
+export interface CodexEdgeInfo {
+  codex_name: string;
+  consumer_name: string;
+  lane: string;
+  source_repo: string;
+  target_repo: string;
+  inbox: string;
+  file_count: number;
+  /** "incoming" (this project consumes the codex) | "outgoing" (this project IS the codex). */
+  direction: string;
+  /** "synced" (inbox already mirrors the source) | "pending" (not yet delivered / stale). */
+  status: string;
+}
+
 /** F-033: rename-log entry. */
 export interface RepoRename {
   id: number;

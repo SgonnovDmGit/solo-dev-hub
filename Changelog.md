@@ -4,6 +4,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.11.1] — 2026-07-27
+
+Dogfood patch on the v1.11.0 Codex release: an admin-audience codex is no longer server-blind, the sync screen surfaces codex broadcast, the managed root files auto-commit, and a mis-encoded Markdown file no longer blanks the dashboard.
+
+### Added
+- **Codex broadcast visibility in the sync screen (T-000173).** The Requirements Sync screen gains a 📚 codex section alongside the REQ groups: per-codex rows show `source-repo → consumer-repo`, the audience lane, the `docs/codex/<name>/` inbox and the svod file count, split into incoming (codices this project consumes) and outgoing (this codex's consumers). Each edge carries a synced/pending badge — synced when the consumer inbox already mirrors the source byte-for-byte, pending when the svod changed or hasn't been delivered yet.
+
+### Changed
+- **Managed `.gitignore` / `.gitattributes` auto-committed on sync (T-000176).** The sync writes a managed block into each repo's `.gitignore` and `.gitattributes`; a template change (e.g. v1.11.0's `docs/codex/` line) previously left them as foreign uncommitted diffs. Auto-commit now includes both managed root files, skip-if-gitignored exactly like the cross-repo folders.
+
+### Fixed
+- **An admin-audience Codex is no longer server-blind (T-000175).** v1.11.0 delivered the svod lane-matched (server↔server, admin_client↔admin_client) but reused the server-anchored microservice plumbing for the REQ / announce / project.md side — so a codex whose audience lane was `admin_client` (no server repo) had a silent contribution channel and its `project.md` pointed at consumers' server repos. The REQ now runs per lane-edge (a dedicated `sync_req_pair` / `run_codex_req_channels` path; the shared microservice functions stay untouched), and a codex's `project.md` resolves each consumer by the codex's own lanes. A two-lane codex gets one independent channel per lane.
+- **A non-UTF-8 Markdown file no longer blanks the dashboard (T-000177).** A repo whose `todo.md` / `done.md` wasn't valid UTF-8 (UTF-16 / BOM / a stray byte) made the read fail with "stream did not contain valid UTF-8", and the dashboard aggregation propagated it, leaving the whole board empty. All nine user-editable-Markdown read sites (todo / done / bug-reports / CLAUDE) now decode lossily, and the dashboard skips a repo it can't parse instead of aborting.
+
+### Tests
+- 502 Rust (+14 over v1.11.0's 488: per-lane REQ round-trips, project.md lane resolution, auto-commit managed root files, `list_codex_edges` + synced/pending status, `dirs_in_sync`, lossy Markdown read; 1 ignored: the schema-export generator), 86 vitest, svelte-check clean.
+
 ## [1.11.0] — 2026-07-25
 
 Codex — a new "publishing" project type. Its product is not endpoints but a curated svod of engineering practices, broadcast read-only to the projects that consume it. This is the api-contract sync mechanism with a different payload: the same producer→consumer edges, but the consumer-LLM reads the delivered files as "lessons I apply" rather than "a surface I call".

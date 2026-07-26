@@ -521,6 +521,126 @@ pub fn list_project_requirements(
     Ok(result)
 }
 
+// ── Codex broadcast edges (T-000173) ─────────────────────────────────────────
+
+/// Codex BROADCAST edges for a project — separate from REQ pairs. Shows which
+/// codex svod is delivered to which consumer repo, on which lane, to what inbox,
+/// with a file count. Covers both directions: this project's incoming codices
+/// and (if it IS a codex) its outgoing consumers.
+#[tauri::command]
+pub fn list_codex_edges(db: State<AppDb>, project_id: i64) -> Result<Vec<CodexEdgeInfo>, String> {
+    codex_edges_for(&db, project_id)
+}
+
+/// Command body factored out so it can be exercised in unit tests without a
+/// live `State<AppDb>` (which a `#[tauri::command]` fn requires).
+fn codex_edges_for(db: &AppDb, project_id: i64) -> Result<Vec<CodexEdgeInfo>, String> {
+    let project = db.get_project(project_id).map_err(|e| e.to_string())?;
+    let lanes = ["server", "admin_client"];
+    let mut edges: Vec<CodexEdgeInfo> = Vec::new();
+
+    // Incoming: this project consumes connected codices.
+    for codex_id in db.list_connected_codices(project_id).unwrap_or_default() {
+        let Ok(codex) = db.get_project(codex_id) else {
+            continue;
+        };
+        for lane in lanes {
+            let Ok(consumer_repo) = db.repo_of_project_with_role(project_id, lane) else {
+                continue;
+            };
+            let Ok(codex_repo) = db.repo_of_project_with_role(codex_id, lane) else {
+                continue;
+            };
+            let source_dir = codex_source_dir(db, &codex_repo);
+            let file_count = source_dir
+                .as_deref()
+                .map(sync::count_files_recursive)
+                .unwrap_or(0);
+            let status = codex_edge_status(source_dir.as_deref(), &consumer_repo, &codex.name);
+            edges.push(CodexEdgeInfo {
+                codex_name: codex.name.clone(),
+                consumer_name: project.name.clone(),
+                lane: lane.to_string(),
+                source_repo: codex_repo.display_name(),
+                target_repo: consumer_repo.display_name(),
+                inbox: format!("docs/codex/{}/", codex.name),
+                file_count,
+                direction: "incoming".to_string(),
+                status,
+            });
+        }
+    }
+
+    // Outgoing: this project IS a codex → its consumers.
+    if project.project_type == "codex" {
+        for consumer in db
+            .list_parents_of_microservice(project_id)
+            .unwrap_or_default()
+        {
+            for lane in lanes {
+                let Ok(codex_repo) = db.repo_of_project_with_role(project_id, lane) else {
+                    continue;
+                };
+                let Ok(consumer_repo) = db.repo_of_project_with_role(consumer.id, lane) else {
+                    continue;
+                };
+                let source_dir = codex_source_dir(db, &codex_repo);
+                let file_count = source_dir
+                    .as_deref()
+                    .map(sync::count_files_recursive)
+                    .unwrap_or(0);
+                let status =
+                    codex_edge_status(source_dir.as_deref(), &consumer_repo, &project.name);
+                edges.push(CodexEdgeInfo {
+                    codex_name: project.name.clone(),
+                    consumer_name: consumer.name.clone(),
+                    lane: lane.to_string(),
+                    source_repo: codex_repo.display_name(),
+                    target_repo: consumer_repo.display_name(),
+                    inbox: format!("docs/codex/{}/", project.name),
+                    file_count,
+                    direction: "outgoing".to_string(),
+                    status,
+                });
+            }
+        }
+    }
+
+    Ok(edges)
+}
+
+/// Resolve a codex repo's configured source folder (practices by default) on disk.
+/// None if the repo has no local_path.
+fn codex_source_dir(db: &AppDb, codex_repo: &Repository) -> Option<std::path::PathBuf> {
+    let local = codex_repo.local_path.as_deref()?;
+    let source = db
+        .codex_source_path_for_repo(codex_repo.id)
+        .unwrap_or_else(|_| "practices".to_string());
+    Some(std::path::Path::new(local).join(source))
+}
+
+/// Broadcast edge status: "synced" if the consumer's inbox already mirrors the
+/// codex source folder exactly, else "pending" (not yet delivered or stale).
+fn codex_edge_status(
+    source_dir: Option<&std::path::Path>,
+    consumer_repo: &Repository,
+    codex_name: &str,
+) -> String {
+    let (Some(src), Some(consumer_local)) = (source_dir, consumer_repo.local_path.as_deref())
+    else {
+        return "pending".to_string();
+    };
+    let inbox = std::path::Path::new(consumer_local)
+        .join("docs")
+        .join("codex")
+        .join(codex_name);
+    if sync::dirs_in_sync(src, &inbox) {
+        "synced".to_string()
+    } else {
+        "pending".to_string()
+    }
+}
+
 #[tauri::command]
 pub fn confirm_requirement(
     db: State<AppDb>,
@@ -553,6 +673,120 @@ pub fn list_rename_history(db: State<AppDb>) -> Result<Vec<RepoRename>, String> 
 #[tauri::command]
 pub fn list_renames_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<RepoRename>, String> {
     db.list_renames_for_repo(repo_id).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn make_db() -> AppDb {
+        AppDb::new(PathBuf::from(":memory:")).unwrap()
+    }
+
+    // T-000173: a consumer connected to a codex sees one incoming edge per
+    // shared lane, with the codex source folder's file count.
+    #[test]
+    fn test_codex_edges_incoming_edge_for_admin_lane() {
+        let db = make_db();
+        let tmp = TempDir::new().unwrap();
+
+        let codex = db.create_project("MyCodex", None, "codex").unwrap();
+        let consumer = db.create_project("Consumer", None, "standard").unwrap();
+
+        // Codex admin_client repo with a practices/ folder holding 2 files.
+        let cx_admin = tmp.path().join("codex-admin");
+        let practices = cx_admin.join("practices");
+        fs::create_dir_all(&practices).unwrap();
+        fs::write(practices.join("intro.md"), "intro").unwrap();
+        fs::write(practices.join("style.md"), "style").unwrap();
+        db.insert_local_repository(
+            cx_admin.to_str().unwrap(),
+            "codex-admin",
+            Some(codex.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+
+        // Consumer admin_client repo (same lane).
+        let co_admin = tmp.path().join("consumer-admin");
+        fs::create_dir_all(&co_admin).unwrap();
+        db.insert_local_repository(
+            co_admin.to_str().unwrap(),
+            "consumer-admin",
+            Some(consumer.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+
+        db.connect_codex(consumer.id, codex.id).unwrap();
+
+        let edges = codex_edges_for(&db, consumer.id).unwrap();
+
+        assert_eq!(edges.len(), 1, "one lane shared → one edge: {:?}", edges);
+        let e = &edges[0];
+        assert_eq!(e.direction, "incoming");
+        assert_eq!(e.lane, "admin_client");
+        assert_eq!(e.codex_name, "MyCodex");
+        assert_eq!(e.consumer_name, "Consumer");
+        assert_eq!(e.source_repo, "codex-admin");
+        assert_eq!(e.target_repo, "consumer-admin");
+        assert_eq!(e.inbox, "docs/codex/MyCodex/");
+        assert_eq!(e.file_count, 2);
+        // Inbox not created yet → the edge reports pending.
+        assert_eq!(e.status, "pending", "undelivered svod is pending");
+    }
+
+    // T-000173: once the consumer inbox mirrors the codex source, the edge
+    // reports synced; a stale/edited source flips it back to pending.
+    #[test]
+    fn test_codex_edge_status_synced_then_pending() {
+        let db = make_db();
+        let tmp = TempDir::new().unwrap();
+
+        let codex = db.create_project("MyCodex", None, "codex").unwrap();
+        let consumer = db.create_project("Consumer", None, "standard").unwrap();
+
+        let cx_admin = tmp.path().join("codex-admin");
+        let practices = cx_admin.join("practices");
+        fs::create_dir_all(&practices).unwrap();
+        fs::write(practices.join("intro.md"), "intro").unwrap();
+        db.insert_local_repository(
+            cx_admin.to_str().unwrap(),
+            "codex-admin",
+            Some(codex.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+
+        let co_admin = tmp.path().join("consumer-admin");
+        // Inbox mirrors the source exactly → synced.
+        let inbox = co_admin.join("docs").join("codex").join("MyCodex");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(inbox.join("intro.md"), "intro").unwrap();
+        db.insert_local_repository(
+            co_admin.to_str().unwrap(),
+            "consumer-admin",
+            Some(consumer.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+        db.connect_codex(consumer.id, codex.id).unwrap();
+
+        assert_eq!(
+            codex_edges_for(&db, consumer.id).unwrap()[0].status,
+            "synced"
+        );
+
+        // Edit the source → inbox now stale → pending.
+        fs::write(practices.join("intro.md"), "intro v2").unwrap();
+        assert_eq!(
+            codex_edges_for(&db, consumer.id).unwrap()[0].status,
+            "pending"
+        );
+    }
 }
 
 // ── T-000137: per-repo auto-commit branch selector ────────────────────────────
