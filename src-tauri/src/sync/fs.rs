@@ -1,7 +1,7 @@
 // Filesystem primitives: path safety, file copy/move, REQ scan helpers.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Ensure repo root folder exists on disk. Returns error if missing — never creates.
 /// Used as a guard at entry points before any create_dir_all calls, so that a stale
@@ -265,6 +265,50 @@ pub fn count_files_recursive(root: &Path) -> usize {
         }
     }
     count
+}
+
+/// True iff `dst` is an exact mirror of `src`: identical set of relative file
+/// paths and identical bytes for each file. Returns false if `src` is missing or
+/// empty (nothing to deliver) or `dst` is missing. Lets a codex broadcast edge
+/// report synced vs pending without performing the copy — same semantics
+/// `mirror_dir` would produce (a mirror is in sync when it would copy/prune 0).
+pub fn dirs_in_sync(src: &Path, dst: &Path) -> bool {
+    if !src.is_dir() || !dst.is_dir() {
+        return false;
+    }
+    let mut src_files: Vec<PathBuf> = Vec::new();
+    collect_rel_files(src, Path::new(""), &mut src_files);
+    if src_files.is_empty() {
+        return false; // no svod content → nothing is "synced"
+    }
+    let mut dst_files: Vec<PathBuf> = Vec::new();
+    collect_rel_files(dst, Path::new(""), &mut dst_files);
+    src_files.sort();
+    dst_files.sort();
+    if src_files != dst_files {
+        return false;
+    }
+    src_files.iter().all(|rel| {
+        matches!(
+            (fs::read(src.join(rel)), fs::read(dst.join(rel))),
+            (Ok(a), Ok(b)) if a == b
+        )
+    })
+}
+
+/// Collect relative file paths (dirs recursed, files pushed) under `root`.
+fn collect_rel_files(root: &Path, prefix: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let rel = prefix.join(entry.file_name());
+            if path.is_dir() {
+                collect_rel_files(&path, &rel, out);
+            } else if path.is_file() {
+                out.push(rel);
+            }
+        }
+    }
 }
 
 /// Move a file atomically: write to target first, then delete source.
@@ -721,6 +765,32 @@ mod tests {
         // a.txt, b.txt, sub/c.txt, sub/deep/d.txt = 4 files across 2 nested dirs.
         build_src_tree(tmp.path());
         assert_eq!(count_files_recursive(tmp.path()), 4);
+    }
+
+    #[test]
+    fn test_dirs_in_sync_matches_only_on_identical_tree() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        // Missing dst → not in sync.
+        build_src_tree(&src);
+        assert!(!dirs_in_sync(&src, &dst));
+        // Empty source (dir exists, no files) → not "synced".
+        let empty = tmp.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(tmp.path().join("empty2")).unwrap();
+        assert!(!dirs_in_sync(&empty, &tmp.path().join("empty2")));
+        // Exact mirror → in sync.
+        mirror_dir(&src, &dst).unwrap();
+        assert!(dirs_in_sync(&src, &dst));
+        // Edit one file → out of sync.
+        fs::write(dst.join("a.txt"), "changed").unwrap();
+        assert!(!dirs_in_sync(&src, &dst));
+        // Restore, then add an extra file on dst → out of sync (prune pending).
+        mirror_dir(&src, &dst).unwrap();
+        assert!(dirs_in_sync(&src, &dst));
+        fs::write(dst.join("extra.txt"), "x").unwrap();
+        assert!(!dirs_in_sync(&src, &dst));
     }
 
     #[test]

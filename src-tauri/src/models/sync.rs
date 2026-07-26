@@ -103,6 +103,7 @@ pub struct CodexEdgeInfo {
     pub inbox: String,         // "docs/codex/<codex_name>/"
     pub file_count: usize,     // files in the codex source folder (0 if unresolved)
     pub direction: String,     // "incoming" | "outgoing"
+    pub status: String,        // "synced" (inbox mirrors source) | "pending"
 }
 
 /// F-033: history record of a repository rename.

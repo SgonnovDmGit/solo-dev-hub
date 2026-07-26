@@ -25,6 +25,8 @@ export const ru = {
   'sync.codexIncoming': 'Своды — входящие',
   'sync.codexOutgoing': 'Свод — исходящие',
   'sync.codexFiles': '{0} файлов',
+  'sync.codexSynced': 'Синхронизировано',
+  'sync.codexPending': 'Ожидает синка',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -53,4 +55,6 @@ export const en: Record<keyof typeof ru, string> = {
   'sync.codexIncoming': 'Codices — incoming',
   'sync.codexOutgoing': 'Codex — outgoing',
   'sync.codexFiles': '{0} files',
+  'sync.codexSynced': 'Synced',
+  'sync.codexPending': 'Pending sync',
 };

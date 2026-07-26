@@ -35,6 +35,8 @@ export interface CodexEdgeInfo {
   file_count: number;
   /** "incoming" (this project consumes the codex) | "outgoing" (this project IS the codex). */
   direction: string;
+  /** "synced" (inbox already mirrors the source) | "pending" (not yet delivered / stale). */
+  status: string;
 }
 
 /** F-033: rename-log entry. */

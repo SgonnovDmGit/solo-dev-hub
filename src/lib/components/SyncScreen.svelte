@@ -183,6 +183,14 @@
     }
     return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   }
+
+  function codexStatusLabel(status: string): string {
+    return status === 'synced' ? $tStore('sync.codexSynced') : $tStore('sync.codexPending');
+  }
+
+  function codexStatusClass(status: string): string {
+    return status === 'synced' ? 'badge-responded' : 'badge-new';
+  }
 </script>
 
 <div class="sync-screen">
@@ -346,6 +354,7 @@
                 <div class="req-actions">
                   <span class="filecount">{$tStore('sync.codexFiles').replace('{0}', String(e.file_count))}</span>
                   <span class="badge badge-lane">{e.lane}</span>
+                  <span class="badge {codexStatusClass(e.status)}">{codexStatusLabel(e.status)}</span>
                 </div>
               </div>
             {/each}

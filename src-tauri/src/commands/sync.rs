@@ -551,7 +551,12 @@ fn codex_edges_for(db: &AppDb, project_id: i64) -> Result<Vec<CodexEdgeInfo>, St
             let Ok(codex_repo) = db.repo_of_project_with_role(codex_id, lane) else {
                 continue;
             };
-            let file_count = codex_source_file_count(db, &codex_repo);
+            let source_dir = codex_source_dir(db, &codex_repo);
+            let file_count = source_dir
+                .as_deref()
+                .map(sync::count_files_recursive)
+                .unwrap_or(0);
+            let status = codex_edge_status(source_dir.as_deref(), &consumer_repo, &codex.name);
             edges.push(CodexEdgeInfo {
                 codex_name: codex.name.clone(),
                 consumer_name: project.name.clone(),
@@ -561,6 +566,7 @@ fn codex_edges_for(db: &AppDb, project_id: i64) -> Result<Vec<CodexEdgeInfo>, St
                 inbox: format!("docs/codex/{}/", codex.name),
                 file_count,
                 direction: "incoming".to_string(),
+                status,
             });
         }
     }
@@ -578,7 +584,13 @@ fn codex_edges_for(db: &AppDb, project_id: i64) -> Result<Vec<CodexEdgeInfo>, St
                 let Ok(consumer_repo) = db.repo_of_project_with_role(consumer.id, lane) else {
                     continue;
                 };
-                let file_count = codex_source_file_count(db, &codex_repo);
+                let source_dir = codex_source_dir(db, &codex_repo);
+                let file_count = source_dir
+                    .as_deref()
+                    .map(sync::count_files_recursive)
+                    .unwrap_or(0);
+                let status =
+                    codex_edge_status(source_dir.as_deref(), &consumer_repo, &project.name);
                 edges.push(CodexEdgeInfo {
                     codex_name: project.name.clone(),
                     consumer_name: consumer.name.clone(),
@@ -588,6 +600,7 @@ fn codex_edges_for(db: &AppDb, project_id: i64) -> Result<Vec<CodexEdgeInfo>, St
                     inbox: format!("docs/codex/{}/", project.name),
                     file_count,
                     direction: "outgoing".to_string(),
+                    status,
                 });
             }
         }
@@ -596,15 +609,36 @@ fn codex_edges_for(db: &AppDb, project_id: i64) -> Result<Vec<CodexEdgeInfo>, St
     Ok(edges)
 }
 
-/// Count files in a codex repo's configured source folder (practices by default).
-fn codex_source_file_count(db: &AppDb, codex_repo: &Repository) -> usize {
-    let Some(local) = codex_repo.local_path.as_deref() else {
-        return 0;
-    };
+/// Resolve a codex repo's configured source folder (practices by default) on disk.
+/// None if the repo has no local_path.
+fn codex_source_dir(db: &AppDb, codex_repo: &Repository) -> Option<std::path::PathBuf> {
+    let local = codex_repo.local_path.as_deref()?;
     let source = db
         .codex_source_path_for_repo(codex_repo.id)
         .unwrap_or_else(|_| "practices".to_string());
-    sync::count_files_recursive(&std::path::Path::new(local).join(source))
+    Some(std::path::Path::new(local).join(source))
+}
+
+/// Broadcast edge status: "synced" if the consumer's inbox already mirrors the
+/// codex source folder exactly, else "pending" (not yet delivered or stale).
+fn codex_edge_status(
+    source_dir: Option<&std::path::Path>,
+    consumer_repo: &Repository,
+    codex_name: &str,
+) -> String {
+    let (Some(src), Some(consumer_local)) = (source_dir, consumer_repo.local_path.as_deref())
+    else {
+        return "pending".to_string();
+    };
+    let inbox = std::path::Path::new(consumer_local)
+        .join("docs")
+        .join("codex")
+        .join(codex_name);
+    if sync::dirs_in_sync(src, &inbox) {
+        "synced".to_string()
+    } else {
+        "pending".to_string()
+    }
 }
 
 #[tauri::command]
@@ -701,6 +735,57 @@ mod tests {
         assert_eq!(e.target_repo, "consumer-admin");
         assert_eq!(e.inbox, "docs/codex/MyCodex/");
         assert_eq!(e.file_count, 2);
+        // Inbox not created yet → the edge reports pending.
+        assert_eq!(e.status, "pending", "undelivered svod is pending");
+    }
+
+    // T-000173: once the consumer inbox mirrors the codex source, the edge
+    // reports synced; a stale/edited source flips it back to pending.
+    #[test]
+    fn test_codex_edge_status_synced_then_pending() {
+        let db = make_db();
+        let tmp = TempDir::new().unwrap();
+
+        let codex = db.create_project("MyCodex", None, "codex").unwrap();
+        let consumer = db.create_project("Consumer", None, "standard").unwrap();
+
+        let cx_admin = tmp.path().join("codex-admin");
+        let practices = cx_admin.join("practices");
+        fs::create_dir_all(&practices).unwrap();
+        fs::write(practices.join("intro.md"), "intro").unwrap();
+        db.insert_local_repository(
+            cx_admin.to_str().unwrap(),
+            "codex-admin",
+            Some(codex.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+
+        let co_admin = tmp.path().join("consumer-admin");
+        // Inbox mirrors the source exactly → synced.
+        let inbox = co_admin.join("docs").join("codex").join("MyCodex");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(inbox.join("intro.md"), "intro").unwrap();
+        db.insert_local_repository(
+            co_admin.to_str().unwrap(),
+            "consumer-admin",
+            Some(consumer.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+        db.connect_codex(consumer.id, codex.id).unwrap();
+
+        assert_eq!(
+            codex_edges_for(&db, consumer.id).unwrap()[0].status,
+            "synced"
+        );
+
+        // Edit the source → inbox now stale → pending.
+        fs::write(practices.join("intro.md"), "intro v2").unwrap();
+        assert_eq!(
+            codex_edges_for(&db, consumer.id).unwrap()[0].status,
+            "pending"
+        );
     }
 }
 
