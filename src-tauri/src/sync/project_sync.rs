@@ -770,6 +770,190 @@ fn run_codex_broadcast(db: &AppDb, project_id: i64, project_type: &str, c: &mut 
     }
 }
 
+/// T-000175: role-agnostic single consumer→codex REQ edge. `sender` is always
+/// the consumer (raises the REQ), `recipient` is always the codex (answers with
+/// a `.response.md`). Caller guarantees both repos have a `local_path` and their
+/// roots exist. Mirrors the steady-state part of `sync_server_to_microservice`
+/// (rename replay → auto-close → REQ copy → response copy-back).
+///
+/// Case B (flat→canonical server-side folder) and Case C (flat→nested ms-side
+/// folder) migrations, plus api/handlers/my_api propagation, are intentionally
+/// omitted here: codex REQ folders are born nested/canonical (no legacy flat
+/// layout to migrate), and a svod carries no api contract (its practices ship
+/// via the separate broadcast pass).
+fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mut SyncCounters) {
+    let sender_base = Path::new(sender.local_path.as_deref().unwrap());
+    let recipient_base = Path::new(recipient.local_path.as_deref().unwrap());
+
+    let sender_req_parent = sender_base.join("docs").join("microservice-requirements");
+    let recipient_srv_parent = recipient_base.join("docs").join("server-requirements");
+
+    let sender_dir = sender_req_parent.join(recipient.canonical_folder_name());
+    let recipient_dir = recipient_srv_parent.join(sender.canonical_folder_name());
+
+    // Replay recipient (codex) repo renames on the sender's microservice-requirements/ side.
+    match db.list_renames_for_repo(recipient.id) {
+        Ok(renames) => {
+            for r in renames {
+                match sync::replay_rename_in_dir(
+                    &sender_req_parent,
+                    &r.old_canonical,
+                    &r.new_canonical,
+                ) {
+                    Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
+                    Ok(sync::RenameOutcome::NoOp) => {}
+                    Ok(sync::RenameOutcome::Collision) => c.errors.push(format!(
+                        "Rename collision on consumer side: both {}/ and {}/ exist under microservice-requirements — manual intervention needed",
+                        r.old_canonical, r.new_canonical
+                    )),
+                    Err(e) => c.errors.push(format!(
+                        "Rename replay {} → {} on consumer: {}",
+                        r.old_canonical, r.new_canonical, e
+                    )),
+                }
+            }
+        }
+        Err(e) => c.errors.push(format!(
+            "List renames for codex repo {}: {}",
+            recipient.id, e
+        )),
+    }
+
+    // Replay sender (consumer) repo renames on the recipient's server-requirements/ side.
+    match db.list_renames_for_repo(sender.id) {
+        Ok(renames) => {
+            for r in renames {
+                match sync::replay_rename_in_dir(
+                    &recipient_srv_parent,
+                    &r.old_canonical,
+                    &r.new_canonical,
+                ) {
+                    Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
+                    Ok(sync::RenameOutcome::NoOp) => {}
+                    Ok(sync::RenameOutcome::Collision) => c.errors.push(format!(
+                        "Rename collision on codex side: both {}/ and {}/ exist under server-requirements — manual intervention needed",
+                        r.old_canonical, r.new_canonical
+                    )),
+                    Err(e) => c.errors.push(format!(
+                        "Rename replay {} → {} on codex: {}",
+                        r.old_canonical, r.new_canonical, e
+                    )),
+                }
+            }
+        }
+        Err(e) => c.errors.push(format!(
+            "List renames for consumer repo {}: {}",
+            sender.id, e
+        )),
+    }
+
+    // F-000039: auto-close pairs the consumer (sender) acknowledged via .impl.md.
+    match sync::auto_close_impl_pairs(&sender_dir, &recipient_dir) {
+        Ok(closed) => c.auto_closed.extend(closed),
+        Err(e) => c
+            .errors
+            .push(format!("Auto-close impl (consumer->codex): {}", e)),
+    }
+
+    // Copy REQ-*.md from consumer (source of truth) to codex.
+    for req_file in sync::scan_requirements(&sender_dir) {
+        let src = sender_dir.join(&req_file);
+        let dst = recipient_dir.join(&req_file);
+        match sync::copy_file_if_changed(&src, &dst) {
+            Ok(true) => c.copied += 1,
+            Ok(false) => {}
+            Err(e) => c.errors.push(format!("Copy {} -> codex: {}", req_file, e)),
+        }
+    }
+
+    // Copy *.response.md from codex (source of truth) back to consumer.
+    for resp_file in sync::scan_responses(&recipient_dir) {
+        let src = recipient_dir.join(&resp_file);
+        let dst = sender_dir.join(&resp_file);
+        match sync::copy_file_if_changed(&src, &dst) {
+            Ok(true) => c.responses += 1,
+            Ok(false) => {}
+            Err(e) => c
+                .errors
+                .push(format!("Copy {} -> consumer: {}", resp_file, e)),
+        }
+    }
+}
+
+/// T-000175: codex REQ channels, per-lane. Unlike the broadcast (svod content),
+/// REQ/response between a consumer and a codex now follows the *same lane edges*
+/// as the broadcast — `server↔server` and `admin_client↔admin_client` — instead
+/// of being anchored solely on each side's server repo. An admin-only codex (no
+/// server repo) therefore gets a working REQ channel on its admin lane.
+///
+/// Both orientations keep the consumer as the sender and the codex as the
+/// recipient of a `sync_req_pair` edge.
+fn run_codex_req_channels(db: &AppDb, project_id: i64, project_type: &str, c: &mut SyncCounters) {
+    const LANES: [&str; 2] = ["server", "admin_client"];
+
+    // A repo passes the guard when it has a local_path and its root exists.
+    // Returns None (after pushing an error) otherwise.
+    let guard = |repo: &Repository, c: &mut SyncCounters| -> bool {
+        let Some(ref lp) = repo.local_path else {
+            c.errors.push(format!(
+                "Codex REQ: {} repo {} has no local_path",
+                repo.role.as_deref().unwrap_or("?"),
+                repo.display_name()
+            ));
+            return false;
+        };
+        let base = Path::new(lp);
+        if sync::ensure_root_exists(base).is_err() {
+            c.errors.push(format!(
+                "Codex REQ: {} repo {} root missing",
+                repo.role.as_deref().unwrap_or("?"),
+                repo.display_name()
+            ));
+            return false;
+        }
+        true
+    };
+
+    // Consumer-driven: this project consumes every connected codex — one edge
+    // per lane where both sides have a matching-role repo.
+    for codex_id in db.list_connected_codices(project_id).unwrap_or_default() {
+        for lane in LANES {
+            let Ok(consumer_repo) = db.repo_of_project_with_role(project_id, lane) else {
+                continue;
+            };
+            let Ok(codex_repo) = db.repo_of_project_with_role(codex_id, lane) else {
+                continue;
+            };
+            if !guard(&consumer_repo, c) || !guard(&codex_repo, c) {
+                continue;
+            }
+            sync_req_pair(db, &consumer_repo, &codex_repo, c);
+        }
+    }
+
+    // Codex-driven: if this project IS a codex, drive the same per-lane edges
+    // toward each connected consumer.
+    if project_type == "codex" {
+        for consumer in db
+            .list_parents_of_microservice(project_id)
+            .unwrap_or_default()
+        {
+            for lane in LANES {
+                let Ok(codex_repo) = db.repo_of_project_with_role(project_id, lane) else {
+                    continue;
+                };
+                let Ok(consumer_repo) = db.repo_of_project_with_role(consumer.id, lane) else {
+                    continue;
+                };
+                if !guard(&consumer_repo, c) || !guard(&codex_repo, c) {
+                    continue;
+                }
+                sync_req_pair(db, &consumer_repo, &codex_repo, c);
+            }
+        }
+    }
+}
+
 /// Orchestrator for a full project sync — the body of the former
 /// `sync_project` Tauri command. Writes Phase-0 skeletons to every repo, then
 /// runs the directional REQ / api / handlers copies based on project topology.
@@ -902,25 +1086,25 @@ pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, Strin
 
             sync_client_to_server(db, srv_base, &clients, &mut c);
             sync_server_to_microservice(db, srv, srv_base, &microservice_ids, false, &mut c);
-            // T-000172: consumer → codex REQ pair, anchored on each side's server
-            // repo (same shape as parent↔microservice), api-contract skipped.
-            let codex_ids = db.list_connected_codices(project_id).unwrap_or_default();
-            sync_server_to_microservice(db, srv, srv_base, &codex_ids, true, &mut c);
         }
     }
 
-    // Reverse REQ direction from a consumed project's own side: a microservice or
-    // a codex pushes responses to / pulls REQs from its parent consumers.
-    if project_type == "microservice" || project_type == "codex" {
+    // Reverse REQ direction from a microservice's own side: it pushes responses
+    // to / pulls REQs from its parent consumers. Codex REQ channels are handled
+    // separately (per-lane) by run_codex_req_channels below.
+    if project_type == "microservice" {
         if let Some(ms_server) = server {
-            let skip_api = project_type == "codex";
-            sync_microservice_to_parents(db, project_id, ms_server, skip_api, &mut c);
+            sync_microservice_to_parents(db, project_id, ms_server, false, &mut c);
         }
     }
 
     // T-000165: codex broadcast — pull connected codices' svods into this
     // project, and (if this project is a codex) push its svod to consumers.
     run_codex_broadcast(db, project_id, &project_type, &mut c);
+
+    // T-000175: codex REQ channels — per-lane (server↔server, admin↔admin)
+    // consumer→codex REQ pairs, so an admin-only codex isn't server-blind.
+    run_codex_req_channels(db, project_id, &project_type, &mut c);
 
     // T-000137: auto-commit synced cross-repo files in opted-in repos (portfolio-wide;
     // pathspec-scoped, so untouched repos and the dev's own WIP are no-ops).
@@ -1080,6 +1264,267 @@ mod tests {
         assert!(
             consumer_response.exists(),
             "the codex's response must be copied back to the consumer"
+        );
+    }
+
+    /// T-000175: a REQ over the admin_client lane round-trips when the codex has
+    /// ONLY an admin repo (no server repo). Proves the REQ channel follows lane
+    /// edges, not the server anchor.
+    #[test]
+    fn test_codex_req_admin_lane_roundtrip() {
+        let db = make_db();
+        let consumer_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let consumer_base = consumer_dir.path();
+        let codex_base = codex_dir.path();
+
+        let consumer = db.create_project("Consumer", None, "standard").unwrap();
+        db.insert_local_repository(
+            consumer_base.to_str().unwrap(),
+            "consumer-admin",
+            Some(consumer.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+        let codex = db.create_project("Practices", None, "codex").unwrap();
+        db.insert_local_repository(
+            codex_base.to_str().unwrap(),
+            "practices-admin",
+            Some(codex.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+        db.connect_codex(consumer.id, codex.id).unwrap();
+
+        // Consumer raises a REQ toward the codex on the admin lane.
+        let consumer_req_dir = consumer_base
+            .join("docs")
+            .join("microservice-requirements")
+            .join("practices-admin");
+        fs::create_dir_all(&consumer_req_dir).unwrap();
+        fs::write(
+            consumer_req_dir.join("REQ-001_admin-rule.md"),
+            "Please add an admin-panel accessibility rule.",
+        )
+        .unwrap();
+
+        run_project_sync(&db, consumer.id).unwrap();
+
+        // REQ landed on the codex's admin repo under server-requirements/<consumer-admin>/.
+        let codex_req = codex_base
+            .join("docs")
+            .join("server-requirements")
+            .join("consumer-admin")
+            .join("REQ-001_admin-rule.md");
+        assert!(
+            codex_req.exists(),
+            "consumer's admin-lane REQ must be delivered to the codex's admin repo"
+        );
+
+        // Codex answers; next sync brings it back.
+        fs::write(
+            codex_base
+                .join("docs")
+                .join("server-requirements")
+                .join("consumer-admin")
+                .join("REQ-001_admin-rule.response.md"),
+            "Added rules/admin-a11y.md.",
+        )
+        .unwrap();
+
+        run_project_sync(&db, consumer.id).unwrap();
+
+        let consumer_response = consumer_req_dir.join("REQ-001_admin-rule.response.md");
+        assert!(
+            consumer_response.exists(),
+            "the codex's admin-lane response must be copied back to the consumer"
+        );
+    }
+
+    /// T-000175: an admin-only codex must not cause a server-requirements folder
+    /// in the consumer's server repo — the server lane has no codex counterpart,
+    /// so only the admin edge delivers.
+    #[test]
+    fn test_codex_req_admin_only_no_server_folder() {
+        let db = make_db();
+        let consumer_srv_dir = TempDir::new().unwrap();
+        let consumer_adm_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let consumer_srv_base = consumer_srv_dir.path();
+        let consumer_adm_base = consumer_adm_dir.path();
+        let codex_base = codex_dir.path();
+
+        let consumer = db.create_project("Consumer", None, "standard").unwrap();
+        db.insert_local_repository(
+            consumer_srv_base.to_str().unwrap(),
+            "consumer-backend",
+            Some(consumer.id),
+            Some("server"),
+        )
+        .unwrap();
+        db.insert_local_repository(
+            consumer_adm_base.to_str().unwrap(),
+            "consumer-admin",
+            Some(consumer.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+        let codex = db.create_project("Practices", None, "codex").unwrap();
+        db.insert_local_repository(
+            codex_base.to_str().unwrap(),
+            "practices-admin",
+            Some(codex.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+        db.connect_codex(consumer.id, codex.id).unwrap();
+
+        // REQ raised on the admin lane only.
+        let consumer_req_dir = consumer_adm_base
+            .join("docs")
+            .join("microservice-requirements")
+            .join("practices-admin");
+        fs::create_dir_all(&consumer_req_dir).unwrap();
+        fs::write(
+            consumer_req_dir.join("REQ-010_admin-rule.md"),
+            "Admin-only rule.",
+        )
+        .unwrap();
+
+        run_project_sync(&db, consumer.id).unwrap();
+
+        // Admin edge delivered.
+        assert!(
+            codex_base
+                .join("docs")
+                .join("server-requirements")
+                .join("consumer-admin")
+                .join("REQ-010_admin-rule.md")
+                .exists(),
+            "admin-lane REQ must be delivered to the admin-only codex"
+        );
+
+        // No server-requirements folder was created in the consumer's server repo
+        // for this codex (the server lane has no codex counterpart).
+        assert!(
+            !consumer_srv_base
+                .join("docs")
+                .join("server-requirements")
+                .exists(),
+            "an admin-only codex must not create a server-requirements folder in the consumer server repo"
+        );
+    }
+
+    /// T-000175: server and admin lanes are independent REQ pairs — a REQ placed
+    /// on one lane must not leak into the other lane's folders.
+    #[test]
+    fn test_codex_req_two_lanes_are_independent() {
+        let db = make_db();
+        let consumer_srv_dir = TempDir::new().unwrap();
+        let consumer_adm_dir = TempDir::new().unwrap();
+        let codex_srv_dir = TempDir::new().unwrap();
+        let codex_adm_dir = TempDir::new().unwrap();
+        let consumer_srv_base = consumer_srv_dir.path();
+        let consumer_adm_base = consumer_adm_dir.path();
+        let codex_srv_base = codex_srv_dir.path();
+        let codex_adm_base = codex_adm_dir.path();
+
+        let consumer = db.create_project("Consumer", None, "standard").unwrap();
+        db.insert_local_repository(
+            consumer_srv_base.to_str().unwrap(),
+            "consumer-backend",
+            Some(consumer.id),
+            Some("server"),
+        )
+        .unwrap();
+        db.insert_local_repository(
+            consumer_adm_base.to_str().unwrap(),
+            "consumer-admin",
+            Some(consumer.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+        let codex = db.create_project("Practices", None, "codex").unwrap();
+        db.insert_local_repository(
+            codex_srv_base.to_str().unwrap(),
+            "practices-server",
+            Some(codex.id),
+            Some("server"),
+        )
+        .unwrap();
+        db.insert_local_repository(
+            codex_adm_base.to_str().unwrap(),
+            "practices-admin",
+            Some(codex.id),
+            Some("admin_client"),
+        )
+        .unwrap();
+        db.connect_codex(consumer.id, codex.id).unwrap();
+
+        // REQ on the server edge.
+        let consumer_srv_req_dir = consumer_srv_base
+            .join("docs")
+            .join("microservice-requirements")
+            .join("practices-server");
+        fs::create_dir_all(&consumer_srv_req_dir).unwrap();
+        fs::write(
+            consumer_srv_req_dir.join("REQ-100_server-rule.md"),
+            "Server-lane rule.",
+        )
+        .unwrap();
+
+        // REQ on the admin edge.
+        let consumer_adm_req_dir = consumer_adm_base
+            .join("docs")
+            .join("microservice-requirements")
+            .join("practices-admin");
+        fs::create_dir_all(&consumer_adm_req_dir).unwrap();
+        fs::write(
+            consumer_adm_req_dir.join("REQ-200_admin-rule.md"),
+            "Admin-lane rule.",
+        )
+        .unwrap();
+
+        run_project_sync(&db, consumer.id).unwrap();
+
+        // Each REQ landed only in its own lane's folder.
+        assert!(
+            codex_srv_base
+                .join("docs")
+                .join("server-requirements")
+                .join("consumer-backend")
+                .join("REQ-100_server-rule.md")
+                .exists(),
+            "server-lane REQ must land in the codex server repo"
+        );
+        assert!(
+            codex_adm_base
+                .join("docs")
+                .join("server-requirements")
+                .join("consumer-admin")
+                .join("REQ-200_admin-rule.md")
+                .exists(),
+            "admin-lane REQ must land in the codex admin repo"
+        );
+
+        // No cross-contamination between lanes.
+        assert!(
+            !codex_adm_base
+                .join("docs")
+                .join("server-requirements")
+                .join("consumer-backend")
+                .join("REQ-100_server-rule.md")
+                .exists(),
+            "server-lane REQ must NOT appear in the admin repo"
+        );
+        assert!(
+            !codex_srv_base
+                .join("docs")
+                .join("server-requirements")
+                .join("consumer-admin")
+                .join("REQ-200_admin-rule.md")
+                .exists(),
+            "admin-lane REQ must NOT appear in the server repo"
         );
     }
 }
