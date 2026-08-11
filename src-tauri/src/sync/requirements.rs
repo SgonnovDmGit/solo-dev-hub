@@ -146,7 +146,17 @@ pub fn replay_rename_in_dir(parent: &Path, old: &str, new: &str) -> Result<Renam
         return Ok(RenameOutcome::NoOp);
     }
     if new_dir.exists() {
-        return Ok(RenameOutcome::Collision);
+        let is_empty = fs::read_dir(&new_dir)
+            .map_err(|e| format!("fs::read_dir {}: {}", new_dir.display(), e))?
+            .next()
+            .is_none();
+        if is_empty {
+            // Auto-heal: an empty destination dir has nothing to lose — remove it and merge.
+            fs::remove_dir(&new_dir)
+                .map_err(|e| format!("fs::remove_dir {}: {}", new_dir.display(), e))?;
+        } else {
+            return Ok(RenameOutcome::Collision);
+        }
     }
     fs::rename(&old_dir, &new_dir).map_err(|e| {
         format!(
@@ -386,12 +396,14 @@ mod tests {
         let parent = tmp.path();
         fs::create_dir_all(parent.join("old-name")).unwrap();
         fs::create_dir_all(parent.join("new-name")).unwrap();
+        // new-name is non-empty → genuine collision (empty new-name now auto-heals)
+        fs::write(parent.join("new-name/REQ-existing.md"), "y").unwrap();
 
         let result = replay_rename_in_dir(parent, "old-name", "new-name").unwrap();
         assert_eq!(
             result,
             RenameOutcome::Collision,
-            "both dirs present → collision"
+            "both dirs present and new non-empty → collision"
         );
         assert!(parent.join("old-name").exists(), "old preserved");
         assert!(parent.join("new-name").exists(), "new preserved");
@@ -403,6 +415,22 @@ mod tests {
         fs::create_dir_all(tmp.path().join("same")).unwrap();
         let result = replay_rename_in_dir(tmp.path(), "same", "same").unwrap();
         assert_eq!(result, RenameOutcome::NoOp);
+    }
+
+    #[test]
+    fn test_replay_rename_empty_new_merges() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path();
+        fs::create_dir_all(parent.join("old-name")).unwrap();
+        fs::write(parent.join("old-name/REQ-001.md"), "x").unwrap();
+        // new exists but is empty → auto-heal: remove it and proceed with rename
+        fs::create_dir_all(parent.join("new-name")).unwrap();
+
+        let result = replay_rename_in_dir(parent, "old-name", "new-name").unwrap();
+        assert_eq!(result, RenameOutcome::Renamed);
+        assert!(!parent.join("old-name").exists());
+        assert!(parent.join("new-name").exists());
+        assert!(parent.join("new-name/REQ-001.md").exists());
     }
 
     // ── F-033 Stage 1f Case B: migrate_subfolder_rename ──────────────────────

@@ -4,6 +4,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-07-27
+
+A workflow-tooling release: the multi-agent development loop gets its own skill, and several recurring release-process frictions — caught across retros — are fixed at the source.
+
+### Added
+- **`sdh-agent-collaboration` skill.** Codifies development split across two or more AI agents by role — Architect (drafts the spec), Implementer (builds to it), Reviewer (verifies the result) — with a recommended default mapping, a spec-plus-an-optional-note handoff contract, a three-pass review loop (spec compliance → shared-contract integrity → code quality), and how retro ownership works across agents. Ships to every managed repo's `docs/sdh_skills/` and surfaces on-demand in Claude Code.
+
+### Changed
+- **`sdh-release-lifecycle` — the implementation plan is the AI's own artifact, not a user gate.** The single user-approval gate is spec acceptance; the task breakdown no longer asks for sign-off. Added an **autonomy stop rule** (stop only at a fork the spec doesn't cover — no self-directed pauses), a **stage-10 gate** (the next-release re-estimation must precede the retro), a **bump-class re-check** when scope grows mid-release, and an **anti-loop safeguard** (repeating a step without progress or hitting an unsatisfiable gate → stop and escalate, don't circle).
+- **`sdh-retro` reshaped** from six scored points to four actionable-first ones (what worked/didn't, readiness, **what to change in the process**, lessons → memory). The per-user assessment is removed from the formal retro; the retro now saves immediately without a "save?" prompt.
+- **`sdh-release-closure` — quiet background dev/build servers before the git block** (their writes dirty the tree and trip the clean-tree guard), plus an anti-loop cross-reference.
+
+### Fixed
+- **Rename-replay no longer stalls on an empty destination folder (T-000161).** When a cross-repo rename is replayed and the destination folder already exists but is **empty**, it is now removed and the rename completes (a real merge) instead of reporting a false "collision — manual intervention needed". A genuinely non-empty collision still surfaces the error.
+
+### Tests
+- 503 Rust (+1 over v1.11.1's 502: empty-dir rename-replay merge; the skills-bundle guard now asserts 15 sdh-* skills; 1 ignored: the schema-export generator), 86 vitest, svelte-check clean.
+
 ## [1.11.1] — 2026-07-27
 
 Dogfood patch on the v1.11.0 Codex release: an admin-audience codex is no longer server-blind, the sync screen surfaces codex broadcast, the managed root files auto-commit, and a mis-encoded Markdown file no longer blanks the dashboard.
