@@ -13,10 +13,17 @@
   const filteredNav = $derived.by(() => {
     const q = search.trim().toLowerCase();
     if (!q) return helpNav;
+    // Search section CONTENT, not just the table of contents: match the group
+    // title + the item label + the section body text (item.searchKeys).
     return helpNav
       .map((group) => ({
         ...group,
-        items: group.items.filter((item) => $tStore(item.labelKey).toLowerCase().includes(q)),
+        items: group.items.filter((item) =>
+          [group.titleKey, item.labelKey, ...item.searchKeys]
+            .map((k) => $tStore(k).toLowerCase())
+            .join(' ')
+            .includes(q),
+        ),
       }))
       .filter((group) => group.items.length > 0);
   });

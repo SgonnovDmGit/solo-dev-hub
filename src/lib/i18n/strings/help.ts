@@ -53,18 +53,21 @@ export const ru = {
     'Баги — ядро приложения: понятный статус-воркфлоу и чёткая граница того, что правит AI-агент, а что только вы.',
   'help.bg.flow.h': 'Жизненный цикл',
   'help.bg.flow.p':
-    'Вы создаёте баг (created). Агент берёт его в работу (in-progress), чинит и переводит в testing с комментарием. Вы проверяете и подтверждаете (confirmed) или отклоняете (rejected).',
+    'Вы создаёте баг («Создан»). Агент берёт его в работу («В работе»), чинит и переводит в «Тестирование» с комментарием. Вы проверяете и подтверждаете («Подтверждён») или отклоняете («Отклонён»).',
   'help.bg.edit.h': 'Что правит агент, а что нет',
   'help.bg.edit.col1': 'Поле',
   'help.bg.edit.col2': 'Кто меняет',
+  'help.bg.edit.r1field': 'Статус, комментарий',
   'help.bg.edit.r1who': 'агент и вы',
+  'help.bg.edit.r2field': 'Описание, важность, категория',
   'help.bg.edit.r2who': 'только вы (в приложении)',
-  'help.bg.edit.r3who': 'только приложение (авто при переходе в testing)',
+  'help.bg.edit.r3field': 'Число попыток исправления',
+  'help.bg.edit.r3who': 'только приложение (авто при переходе в «Тестирование»)',
   'help.bg.edit.note':
     'Защищённые поля агент не может переписать — при любой его правке они восстанавливаются.',
   'help.bg.confirm.h': 'Подтверждение ✓',
   'help.bg.confirm.p':
-    'После проверки нажмите ✓ — строка помечается confirmed, и агент вычистит её при следующем проходе.',
+    'После проверки нажмите ✓ — строка помечается как «Подтверждён», и агент вычистит её при следующем проходе.',
   'help.bg.confirm.callout':
     'Создавать баги — только через «+ Добавить баг», чтобы id, дата и статистика связались корректно.',
 } as const;
@@ -124,18 +127,21 @@ export const en: Record<keyof typeof ru, string> = {
     'Bugs are the heart of the app: a clear status workflow and a firm boundary between what the AI agent edits and what only you do.',
   'help.bg.flow.h': 'Lifecycle',
   'help.bg.flow.p':
-    'You create a bug (created). The agent takes it (in-progress), fixes it and moves it to testing with a comment. You verify and either confirm (confirmed) or reject (rejected).',
+    'You create a bug (“Created”). The agent takes it (“In Progress”), fixes it and moves it to “Testing” with a comment. You verify and either confirm (“Confirmed”) or reject (“Rejected”).',
   'help.bg.edit.h': 'What the agent edits, and what it doesn’t',
   'help.bg.edit.col1': 'Field',
   'help.bg.edit.col2': 'Who edits',
+  'help.bg.edit.r1field': 'Status, comment',
   'help.bg.edit.r1who': 'agent and you',
+  'help.bg.edit.r2field': 'Description, severity, category',
   'help.bg.edit.r2who': 'only you (in the app)',
-  'help.bg.edit.r3who': 'only the app (auto on entering testing)',
+  'help.bg.edit.r3field': 'Fix-attempt count',
+  'help.bg.edit.r3who': 'only the app (auto on entering “Testing”)',
   'help.bg.edit.note':
     'The agent cannot overwrite protected fields — they are restored on any edit it makes.',
   'help.bg.confirm.h': 'Confirmation ✓',
   'help.bg.confirm.p':
-    'After verifying, press ✓ — the row is marked confirmed and the agent cleans it up on its next pass.',
+    'After verifying, press ✓ — the row is marked “Confirmed” and the agent cleans it up on its next pass.',
   'help.bg.confirm.callout':
     'Create bugs only via “+ Add bug”, so the id, date and statistics wire up correctly.',
 };
