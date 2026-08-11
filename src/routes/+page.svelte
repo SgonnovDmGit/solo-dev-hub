@@ -30,6 +30,7 @@
   import SecretAudit from '$lib/components/SecretAudit.svelte';
   import SecretBundles from '$lib/components/SecretBundles.svelte';
   import GlobalClaudeEditor from '$lib/components/GlobalClaudeEditor.svelte';
+  import Help from '$lib/components/Help.svelte';
   import InputContextMenu from '$lib/components/InputContextMenu.svelte';
   import logo from '$lib/assets/logo.png';
 
@@ -210,6 +211,14 @@
       </button>
       <button
         class="ghost titlebar-btn"
+        class:active={$currentScreen.name === 'help'}
+        onclick={() => $currentScreen.name === 'help' ? goBack() : navigateTo('help')}
+        title={$tStore('help.tooltip' as any)}
+      >
+        ❓ {$tStore('help.title' as any)}
+      </button>
+      <button
+        class="ghost titlebar-btn"
         class:active={$currentScreen.name === 'about'}
         onclick={() => $currentScreen.name === 'about' ? goBack() : navigateTo('about')}
         title={$tStore('about.tooltip' as any)}
@@ -294,6 +303,8 @@
         <SecretBundles />
       {:else if $currentScreen.name === 'global_claude_editor'}
         <GlobalClaudeEditor />
+      {:else if $currentScreen.name === 'help'}
+        <Help />
       {/if}
     </main>
   </div>

@@ -4,6 +4,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.13.0] — 2026-08-12
+
+The first slice of the in-app help: a navigable onboarding guide reachable from the titlebar.
+
+### Added
+- **In-app help screen — onboarding core (T-000087).** A new `❓ Help` titlebar screen with a two-pane docs layout — a left section tree plus search, and a scrollable content pane with anchored sections. It covers the single-user onboarding path: **Quick start** (what the app is, first run in three steps), **Project setup** (projects, repository roles, workspace root, PAT), and **Bug workflow** (the status lifecycle, what the AI agent may edit vs. what only you do, the ✓-confirmation). Fully localized (ru/en). The frame is built for the full section set — the cross-repo / deploy / LLM-contract sections follow in a later release (content-only, no shell changes).
+
+### Tests
+- 503 Rust (unchanged vs v1.12.0 — this release is frontend-only, no Rust touched; 1 ignored: the schema-export generator), 86 vitest, svelte-check clean.
+
 ## [1.12.0] — 2026-07-27
 
 A workflow-tooling release: the multi-agent development loop gets its own skill, and several recurring release-process frictions — caught across retros — are fixed at the source.
