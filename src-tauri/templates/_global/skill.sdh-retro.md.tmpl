@@ -2,10 +2,10 @@
 name: sdh-retro
 description: >
   Use at release closure (or when the user asks for a retro) to run a
-  structured retrospective — 6 mandatory points (what worked / what didn't /
-  readiness / assessment of the LLM / assessment of the user / process-level
-  lessons) and save it to auto-memory as a project memory. Delivered as one
-  block, not point by point.
+  structured retrospective — 4 actionable-first points (what worked / didn't,
+  readiness, what to change in the process, lessons → memory) saved to
+  auto-memory as a project memory. No user scoring (that lives in the informal
+  session-reflection). Delivered as one block, saved immediately.
 ---
 
 You are here at the retro stage — the last in the release cycle (skill `sdh-release-lifecycle`), or whenever the user asks for a retro directly. The retro is **expected** at every closure unless the user explicitly skips it. It is **cheap self-improvement** and the highest-leverage stage for tuning how the LLM and user work together — observations evaporate at the session boundary if not captured.
@@ -18,22 +18,26 @@ The retro is saved to the assistant's auto-memory directory as a `project`-type 
 
 Not committed to `docs/` or any repo path. Privacy of internal reflections + persistence across sessions = exactly what auto-memory is for. If retros multiply and make `MEMORY.md` noisy — consolidate older ones into a single `feedback` memory *"patterns across N retros"*; defer until it's a real problem.
 
-## Checklist (six points — all mandatory content of the retro file)
+## Precondition — stage 10 first
 
-1. **What worked well.** Collaboration patterns, working modes, decisions, communications worth keeping for the next release.
-2. **What didn't work.** Friction, scope drift, missed workflow steps, communication misses, planning errors, surprises.
-3. **Readiness.** Two levels:
+Before running the retro, confirm the **next-release re-estimation (stage 10 of `sdh-release-lifecycle`)** actually happened — the recurring slip is jumping impl/closure → retro and skipping it. If stage 10 wasn't done, do it first, then the retro.
+
+## Checklist (four points — all mandatory content of the retro file)
+
+Actionable-first: the retro exists to *change how the next release goes*, not to score anyone.
+
+1. **What worked / what didn't.** The collaboration patterns, working modes, and decisions worth keeping — and the friction: scope drift, missed workflow steps, planning errors, surprises. Include an honest read of **the LLM's own actions this session** (what it did well, where it slipped or skipped steps) — that feeds point 4. **Do not score the user here** — the affectionate, honest critique of the user lives in the informal `session-reflection` skill, not in the formal retro.
+2. **Readiness.** Two levels:
    - **Release readiness** — was the closed release coherent, or did sharp corners and workarounds land?
-   - **Project readiness overall** — current state: technical debt, stability, distance to upcoming milestones, known holes.
-4. **Assessment of the LLM's actions this session.** A retrospective judgment of how the assistant performed in this session specifically — not forward-looking advice (that's implicit in point 6). What it did well, where it slipped, where it skipped steps, where it surprised positively.
-5. **Assessment of the user's actions this session.** A retrospective judgment of the user's patterns this session — communication clarity, decision speed, scope discipline, where redirects came in time vs too late.
-6. **Process-level lessons.** Observations worth promoting to durable memory:
+   - **Project readiness overall** — technical debt, stability, distance to upcoming milestones, known holes.
+3. **What to change in the process.** The actionable core. Concrete edits to the workflow itself — a skill, a gate, a repo-internal process step — surfaced by how *this* session actually went. **Explicitly flag any loop, stuck state, self-made impossible gate, or token burn**, and name the process change that prevents a repeat. "The process bit us, here's the fix" becomes a real edit here, not a lament — usually paired with a memory (point 4) or a direct skill/gate change in the same pass.
+4. **Lessons → durable memory.** Observations worth promoting:
    - New working-style rules → a `feedback` memory (with **Why:** and **How to apply:** lines per the memory format).
    - New project facts → a `project` memory.
    - If yes — write the memory file(s) in the same retro pass and link from `MEMORY.md`.
 
 ## How to deliver
 
-The retro is delivered **as one block**: the full opinion on all six points in a single message — including the proposed memory-file draft inline, so the user can ack the wording in one pass. The user then comments / overrides / adds context on any point in a follow-up turn; the final file reflects the post-comment state.
+The retro is delivered **as one block**: the full opinion on all four points in a single message — including the proposed memory-file draft inline. **Save it immediately** — write the retro file (and any feedback/project memory) in the same pass. **Do not ask "save or not?"** — saving is the default; the user comments / overrides / adds context afterward and the final file reflects the post-comment state. Asking permission to save is a wasted round-trip: the assistant already has all the observations, the user steers post-hoc.
 
-**Do not stage the retro point by point.** Six separate turns waiting for "ok" between each drag the cycle's last stage into N+1 round-trips for no information gained — the assistant already has all the observations from the session, the user steers per-point afterward.
+**Do not stage the retro point by point.** Separate turns waiting for "ok" between each drag the cycle's last stage into N+1 round-trips for no information gained.

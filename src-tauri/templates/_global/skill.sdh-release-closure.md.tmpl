@@ -13,6 +13,8 @@ You are here when a release is ready to **close** — the user signals *"ready t
 
 This is stage 9 of the broader cycle (skill `sdh-release-lifecycle`). After closure — the retro (skill `sdh-retro`).
 
+**Don't loop on a gate you can't satisfy.** Closure is where an agent most often circles — a verification/build/clean-tree check keeps failing and it retries the same pass, burning tokens. If a step fails the same way twice, STOP: question whether the gate is real or self-imposed, and escalate to the user rather than trying a third identical time (see "Anti-loop" in `sdh-release-lifecycle`).
+
 ## Late-catch: a bug found during closure
 
 If a bug surfaces during closure — don't blindly send it to "the next patch". Judge by three criteria:
@@ -41,6 +43,7 @@ A frequent failure — git commands are improvised differently each session and 
 - **One stacked block, not command-by-command.** Emit the whole sequence at once, stacked — not a line per message.
 - **PowerShell (the VS Code default terminal).** No `&&` (PowerShell 5.1 doesn't understand it and breaks on paste). The block below is PowerShell-native.
 - **Clean-tree guard — step 0.** Never emit merge/tag without a prior check: a dirty tree (uncommitted sync, doc edits) breaks `switch`/`merge`. `pull --ff-only` saves you from a non-ff push rejection.
+- **Quiet background processes first.** Before you emit the block, stop any dev/build server you spawned (`npm run tauri dev`, `cargo watch`, `vite`, a `run_in_background` build). Their writes to `target/` / build output dirty the working tree and trip the clean-tree guard — which then reads as a bug in the *script* rather than a stray process you left running. Kill them, confirm `git status` is clean, then show the block.
 - **Real values, not placeholders.** Substitute the actual number (`1.9.0`), not `X.Y.Z`.
 - **Branches/flow — from the git-flow section of the project `CLAUDE.md`.** Don't reassemble the sequence. `$MAIN` = the repo's release branch (`master` or `main` — differs by repo). The merge source is the integration branch (usually `dev`).
 - **`switch`, not `checkout`** (safer: won't clobber a file by accident). **Annotated tag** `-a -m` (not lightweight — `release.yml` reads the merge commit as ground truth). **`-m` on merge** (otherwise the editor opens and hangs).
