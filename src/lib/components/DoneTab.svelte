@@ -14,8 +14,15 @@
     render?: 'default' | 'monospace' | 'priority-color' | 'date';
     flex?: number;
     wrap?: boolean;
+    sortWeight?: Record<string, number>;
+    labelMap?: Record<string, string>;
+    titleMap?: Record<string, string>;
     sortCompare?: (a: any, b: any) => number;
   }
+
+  // T-000180: grid row = Task plus a derived typeGroup so ops classes (O/M)
+  // are filterable/sortable via a dedicated "Тип" column.
+  type TaskRow = Task & { typeGroup: string };
 
   interface Props { repoId: number; }
   let { repoId }: Props = $props();
@@ -23,12 +30,36 @@
   let tasks = $state<Task[]>([]);
   let loading = $state(true);
 
+  // T-000180: map prefix → type group. O = technical ops, M = marketing ops,
+  // everything else (T/F/D) = code. Recomputes when `tasks` changes.
+  const rows = $derived<TaskRow[]>(
+    tasks.map((t) => ({
+      ...t,
+      typeGroup: t.prefix === 'O' ? 'ops-tech' : t.prefix === 'M' ? 'ops-mktg' : 'code',
+    }))
+  );
+
   // The "Date" column reflects when the task was marked done. `updated_at`
   // is set by `update_task_source` when source flips todo → done; for
   // historical done entries imported from done.md it falls back to the
   // entry's date header. `created_at` would be wrong here — that's task-
   // creation date (often months before completion).
-  const columns: ColumnDef<Task>[] = $derived([
+  const columns: ColumnDef<TaskRow>[] = $derived([
+    {
+      key: 'typeGroup',
+      label: $tStore('tasks.col.type' as any),
+      sortable: true,
+      filter: 'select',
+      selectOptions: ['code', 'ops-tech', 'ops-mktg'],
+      flex: 0.5,
+      sortWeight: { code: 0, 'ops-tech': 1, 'ops-mktg': 2 },
+      labelMap: { code: '‹/›', 'ops-tech': '⚙', 'ops-mktg': '📣' },
+      titleMap: {
+        code: $tStore('tasks.type.code' as any),
+        'ops-tech': $tStore('tasks.type.opsTech' as any),
+        'ops-mktg': $tStore('tasks.type.opsMktg' as any),
+      },
+    },
     { key: 'task_id', label: $tStore('done.col.id' as any), sortable: true, render: 'monospace', flex: 0.6 },
     { key: 'description', label: $tStore('done.col.description' as any), sortable: false, filter: 'text', flex: 4, wrap: true },
     { key: 'updated_at', label: $tStore('done.col.date' as any), sortable: true, render: 'date', flex: 1 },
@@ -73,7 +104,7 @@
     {#key repoId}
       <DataGrid
         {columns}
-        rows={tasks}
+        {rows}
         defaultSort={{ key: 'updated_at', direction: 'desc' }}
         persistKey={`done_grid_state_${repoId}`}
         emptyMessage={$tStore('done.empty' as any)}
