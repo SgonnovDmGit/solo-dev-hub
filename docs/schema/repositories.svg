@@ -5,127 +5,127 @@
  -->
 <!-- Title: repositories Pages: 1 -->
 <svg width="7754pt" height="1684pt"
- viewBox="0.00 0.00 7754.38 1684.40" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+ viewBox="0.00 0.00 7754.29 1684.40" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
 <g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 1680.4)">
 <title>repositories</title>
-<polygon fill="white" stroke="none" points="-4,4 -4,-1680.4 7750.38,-1680.4 7750.38,4 -4,4"/>
+<polygon fill="white" stroke="none" points="-4,4 -4,-1680.4 7750.29,-1680.4 7750.29,4 -4,4"/>
 <!-- repositories -->
 <g id="node1" class="node">
 <title>repositories</title>
-<polygon fill="#efefef" stroke="none" points="3726.77,-1015.4 3726.77,-1061.4 4957.83,-1061.4 4957.83,-1015.4 3726.77,-1015.4"/>
-<polygon fill="none" stroke="black" points="3726.77,-1015.4 3726.77,-1061.4 4957.83,-1061.4 4957.83,-1015.4 3726.77,-1015.4"/>
-<text text-anchor="start" x="4265.68" y="-1039.2" font-family="Arial Bold" font-size="18.00">repositories</text>
-<text text-anchor="start" x="4349.66" y="-1039.2" font-family="Arial" font-size="14.00">    </text>
-<text text-anchor="start" x="4380.78" y="-1039.2" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
-<text text-anchor="start" x="4086.28" y="-1024.8" font-family="Arial" font-size="14.00" fill="#333333">A repository belonging to at most one project. May be GitHub&#45;backed or local&#45;only.</text>
-<polygon fill="none" stroke="black" points="3726.77,-984.6 3726.77,-1015.4 4957.83,-1015.4 4957.83,-984.6 3726.77,-984.6"/>
-<text text-anchor="start" x="3733.77" y="-996.8" font-family="Arial" font-size="14.00">id </text>
-<text text-anchor="start" x="3748.56" y="-996.8" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="3726.77,-953.8 3726.77,-984.6 4957.83,-984.6 4957.83,-953.8 3726.77,-953.8"/>
-<text text-anchor="start" x="3733.77" y="-966" font-family="Arial" font-size="14.00">project_id </text>
-<text text-anchor="start" x="3798.36" y="-966" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<text text-anchor="start" x="3868.37" y="-966" font-family="Arial" font-size="14.00"> ON DELETE SET NULL — the only non&#45;cascading FK in the schema. Deleting a project orphans its repositories rather than destroying them.</text>
-<polygon fill="none" stroke="black" points="3726.77,-923 3726.77,-953.8 4957.83,-953.8 4957.83,-923 3726.77,-923"/>
-<text text-anchor="start" x="3733.77" y="-935.2" font-family="Arial" font-size="14.00">github_name </text>
-<text text-anchor="start" x="3818.61" y="-935.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="3862.17" y="-935.2" font-family="Arial" font-size="14.00"> UNIQUE, and nullable since v13 so local&#45;only repos (never pushed to GitHub) can exist. The last path segment is the canonical folder name used for all cross&#45;repo doc folders.</text>
-<polygon fill="none" stroke="black" points="3726.77,-892.2 3726.77,-923 4957.83,-923 4957.83,-892.2 3726.77,-892.2"/>
-<text text-anchor="start" x="3733.77" y="-904.4" font-family="Arial" font-size="14.00">github_url </text>
-<text text-anchor="start" x="3799.15" y="-904.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="3726.77,-861.4 3726.77,-892.2 4957.83,-892.2 4957.83,-861.4 3726.77,-861.4"/>
-<text text-anchor="start" x="3733.77" y="-873.6" font-family="Arial" font-size="14.00">role </text>
-<text text-anchor="start" x="3761" y="-873.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="3804.56" y="-873.6" font-family="Arial" font-size="14.00"> &#39;microservice&#39; is still legal here but is legacy: v12 NULLed every such row when microservice became a project type rather than a repo role.</text>
-<polygon fill="none" stroke="black" points="3726.77,-830.6 3726.77,-861.4 4957.83,-861.4 4957.83,-830.6 3726.77,-830.6"/>
-<text text-anchor="start" x="3733.77" y="-842.8" font-family="Arial" font-size="14.00">description </text>
-<text text-anchor="start" x="3805.36" y="-842.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="3726.77,-799.8 3726.77,-830.6 4957.83,-830.6 4957.83,-799.8 3726.77,-799.8"/>
-<text text-anchor="start" x="3733.77" y="-812" font-family="Arial" font-size="14.00">language </text>
-<text text-anchor="start" x="3795.27" y="-812" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="3726.77,-769 3726.77,-799.8 4957.83,-799.8 4957.83,-769 3726.77,-769"/>
-<text text-anchor="start" x="3733.77" y="-781.2" font-family="Arial" font-size="14.00">last_pushed_at </text>
-<text text-anchor="start" x="3832.62" y="-781.2" font-family="Arial" font-size="14.00" fill="#666666">[DATETIME]</text>
-<polygon fill="none" stroke="black" points="3726.77,-738.2 3726.77,-769 4957.83,-769 4957.83,-738.2 3726.77,-738.2"/>
-<text text-anchor="start" x="3733.77" y="-750.4" font-family="Arial" font-size="14.00">added_at </text>
-<text text-anchor="start" x="3796.05" y="-750.4" font-family="Arial" font-size="14.00" fill="#666666">[DATETIME]</text>
-<polygon fill="none" stroke="black" points="3726.77,-707.4 3726.77,-738.2 4957.83,-738.2 4957.83,-707.4 3726.77,-707.4"/>
-<text text-anchor="start" x="3733.77" y="-719.6" font-family="Arial" font-size="14.00">updated_at </text>
-<text text-anchor="start" x="3807.73" y="-719.6" font-family="Arial" font-size="14.00" fill="#666666">[DATETIME]</text>
-<polygon fill="none" stroke="black" points="3726.77,-676.6 3726.77,-707.4 4957.83,-707.4 4957.83,-676.6 3726.77,-676.6"/>
-<text text-anchor="start" x="3733.77" y="-688.8" font-family="Arial" font-size="14.00">local_path </text>
-<text text-anchor="start" x="3801.49" y="-688.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="3726.77,-645.8 3726.77,-676.6 4957.83,-676.6 4957.83,-645.8 3726.77,-645.8"/>
-<text text-anchor="start" x="3733.77" y="-658" font-family="Arial" font-size="14.00">github_id </text>
-<text text-anchor="start" x="3794.49" y="-658" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<text text-anchor="start" x="3864.49" y="-658" font-family="Arial" font-size="14.00"> Stable GitHub identifier — the basis of rename detection.</text>
-<polygon fill="none" stroke="black" points="3726.77,-615 3726.77,-645.8 4957.83,-645.8 4957.83,-615 3726.77,-615"/>
-<text text-anchor="start" x="3733.77" y="-627.2" font-family="Arial" font-size="14.00">deploy_target </text>
-<text text-anchor="start" x="3822.5" y="-627.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="3866.06" y="-627.2" font-family="Arial" font-size="14.00"> Matches templates.language_key.</text>
-<polygon fill="none" stroke="black" points="3726.77,-584.2 3726.77,-615 4957.83,-615 4957.83,-584.2 3726.77,-584.2"/>
-<text text-anchor="start" x="3733.77" y="-596.4" font-family="Arial" font-size="14.00">sort_order </text>
-<text text-anchor="start" x="3801.47" y="-596.4" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="3726.77,-553.4 3726.77,-584.2 4957.83,-584.2 4957.83,-553.4 3726.77,-553.4"/>
-<text text-anchor="start" x="3733.77" y="-565.6" font-family="Arial" font-size="14.00">bugs_migrated_at </text>
-<text text-anchor="start" x="3849.73" y="-565.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="3893.29" y="-565.6" font-family="Arial" font-size="14.00"> Lazy&#45;migration marker (v18); NULL means the repo&#39;s MD has never been imported.</text>
-<polygon fill="none" stroke="black" points="3726.77,-522.6 3726.77,-553.4 4957.83,-553.4 4957.83,-522.6 3726.77,-522.6"/>
-<text text-anchor="start" x="3733.77" y="-534.8" font-family="Arial" font-size="14.00">tasks_migrated_at </text>
-<text text-anchor="start" x="3852.05" y="-534.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="3895.61" y="-534.8" font-family="Arial" font-size="14.00"> Lazy&#45;migration marker (v21). While NULL, the first task sync suppresses &#39;created&#39; events so backfilling legacy files doesn&#39;t flood the timeline.</text>
-<polygon fill="none" stroke="black" points="3726.77,-491.8 3726.77,-522.6 4957.83,-522.6 4957.83,-491.8 3726.77,-491.8"/>
-<text text-anchor="start" x="3733.77" y="-504" font-family="Arial" font-size="14.00">deploy_repo_config </text>
-<text text-anchor="start" x="3859.87" y="-504" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="3903.42" y="-504" font-family="Arial" font-size="14.00"> v25 — JSON map of repo&#45;wide (not per&#45;environment) deploy placeholder values.</text>
-<polygon fill="none" stroke="black" points="3726.77,-461 3726.77,-491.8 4957.83,-491.8 4957.83,-461 3726.77,-461"/>
-<text text-anchor="start" x="3733.77" y="-473.2" font-family="Arial" font-size="14.00">autocommit_branch </text>
-<text text-anchor="start" x="3860.61" y="-473.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="3904.17" y="-473.2" font-family="Arial" font-size="14.00"> v28 — NULL means auto&#45;commit is off for this repo.</text>
-<polygon fill="none" stroke="black" points="3726.77,-430.2 3726.77,-461 4957.83,-461 4957.83,-430.2 3726.77,-430.2"/>
-<text text-anchor="start" x="3733.77" y="-442.4" font-family="Arial" font-size="14.00">codex_source_path </text>
-<text text-anchor="start" x="3859.86" y="-442.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" stroke-width="3" points="3725.27,-428.7 3725.27,-1062.9 4959.33,-1062.9 4959.33,-428.7 3725.27,-428.7"/>
+<polygon fill="#efefef" stroke="none" points="3614.77,-1015.4 3614.77,-1061.4 4845.83,-1061.4 4845.83,-1015.4 3614.77,-1015.4"/>
+<polygon fill="none" stroke="black" points="3614.77,-1015.4 3614.77,-1061.4 4845.83,-1061.4 4845.83,-1015.4 3614.77,-1015.4"/>
+<text text-anchor="start" x="4153.68" y="-1039.2" font-family="Arial Bold" font-size="18.00">repositories</text>
+<text text-anchor="start" x="4237.66" y="-1039.2" font-family="Arial" font-size="14.00">    </text>
+<text text-anchor="start" x="4268.78" y="-1039.2" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
+<text text-anchor="start" x="3974.28" y="-1024.8" font-family="Arial" font-size="14.00" fill="#333333">A repository belonging to at most one project. May be GitHub&#45;backed or local&#45;only.</text>
+<polygon fill="none" stroke="black" points="3614.77,-984.6 3614.77,-1015.4 4845.83,-1015.4 4845.83,-984.6 3614.77,-984.6"/>
+<text text-anchor="start" x="3621.77" y="-996.8" font-family="Arial" font-size="14.00">id </text>
+<text text-anchor="start" x="3636.56" y="-996.8" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="3614.77,-953.8 3614.77,-984.6 4845.83,-984.6 4845.83,-953.8 3614.77,-953.8"/>
+<text text-anchor="start" x="3621.77" y="-966" font-family="Arial" font-size="14.00">project_id </text>
+<text text-anchor="start" x="3686.36" y="-966" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<text text-anchor="start" x="3756.37" y="-966" font-family="Arial" font-size="14.00"> ON DELETE SET NULL — the only non&#45;cascading FK in the schema. Deleting a project orphans its repositories rather than destroying them.</text>
+<polygon fill="none" stroke="black" points="3614.77,-923 3614.77,-953.8 4845.83,-953.8 4845.83,-923 3614.77,-923"/>
+<text text-anchor="start" x="3621.77" y="-935.2" font-family="Arial" font-size="14.00">github_name </text>
+<text text-anchor="start" x="3706.61" y="-935.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="3750.17" y="-935.2" font-family="Arial" font-size="14.00"> UNIQUE, and nullable since v13 so local&#45;only repos (never pushed to GitHub) can exist. The last path segment is the canonical folder name used for all cross&#45;repo doc folders.</text>
+<polygon fill="none" stroke="black" points="3614.77,-892.2 3614.77,-923 4845.83,-923 4845.83,-892.2 3614.77,-892.2"/>
+<text text-anchor="start" x="3621.77" y="-904.4" font-family="Arial" font-size="14.00">github_url </text>
+<text text-anchor="start" x="3687.15" y="-904.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="3614.77,-861.4 3614.77,-892.2 4845.83,-892.2 4845.83,-861.4 3614.77,-861.4"/>
+<text text-anchor="start" x="3621.77" y="-873.6" font-family="Arial" font-size="14.00">role </text>
+<text text-anchor="start" x="3649" y="-873.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="3692.56" y="-873.6" font-family="Arial" font-size="14.00"> &#39;microservice&#39; is still legal here but is legacy: v12 NULLed every such row when microservice became a project type rather than a repo role.</text>
+<polygon fill="none" stroke="black" points="3614.77,-830.6 3614.77,-861.4 4845.83,-861.4 4845.83,-830.6 3614.77,-830.6"/>
+<text text-anchor="start" x="3621.77" y="-842.8" font-family="Arial" font-size="14.00">description </text>
+<text text-anchor="start" x="3693.36" y="-842.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="3614.77,-799.8 3614.77,-830.6 4845.83,-830.6 4845.83,-799.8 3614.77,-799.8"/>
+<text text-anchor="start" x="3621.77" y="-812" font-family="Arial" font-size="14.00">language </text>
+<text text-anchor="start" x="3683.27" y="-812" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="3614.77,-769 3614.77,-799.8 4845.83,-799.8 4845.83,-769 3614.77,-769"/>
+<text text-anchor="start" x="3621.77" y="-781.2" font-family="Arial" font-size="14.00">last_pushed_at </text>
+<text text-anchor="start" x="3720.62" y="-781.2" font-family="Arial" font-size="14.00" fill="#666666">[DATETIME]</text>
+<polygon fill="none" stroke="black" points="3614.77,-738.2 3614.77,-769 4845.83,-769 4845.83,-738.2 3614.77,-738.2"/>
+<text text-anchor="start" x="3621.77" y="-750.4" font-family="Arial" font-size="14.00">added_at </text>
+<text text-anchor="start" x="3684.05" y="-750.4" font-family="Arial" font-size="14.00" fill="#666666">[DATETIME]</text>
+<polygon fill="none" stroke="black" points="3614.77,-707.4 3614.77,-738.2 4845.83,-738.2 4845.83,-707.4 3614.77,-707.4"/>
+<text text-anchor="start" x="3621.77" y="-719.6" font-family="Arial" font-size="14.00">updated_at </text>
+<text text-anchor="start" x="3695.73" y="-719.6" font-family="Arial" font-size="14.00" fill="#666666">[DATETIME]</text>
+<polygon fill="none" stroke="black" points="3614.77,-676.6 3614.77,-707.4 4845.83,-707.4 4845.83,-676.6 3614.77,-676.6"/>
+<text text-anchor="start" x="3621.77" y="-688.8" font-family="Arial" font-size="14.00">local_path </text>
+<text text-anchor="start" x="3689.49" y="-688.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="3614.77,-645.8 3614.77,-676.6 4845.83,-676.6 4845.83,-645.8 3614.77,-645.8"/>
+<text text-anchor="start" x="3621.77" y="-658" font-family="Arial" font-size="14.00">github_id </text>
+<text text-anchor="start" x="3682.49" y="-658" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<text text-anchor="start" x="3752.49" y="-658" font-family="Arial" font-size="14.00"> Stable GitHub identifier — the basis of rename detection.</text>
+<polygon fill="none" stroke="black" points="3614.77,-615 3614.77,-645.8 4845.83,-645.8 4845.83,-615 3614.77,-615"/>
+<text text-anchor="start" x="3621.77" y="-627.2" font-family="Arial" font-size="14.00">deploy_target </text>
+<text text-anchor="start" x="3710.5" y="-627.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="3754.06" y="-627.2" font-family="Arial" font-size="14.00"> Matches templates.language_key.</text>
+<polygon fill="none" stroke="black" points="3614.77,-584.2 3614.77,-615 4845.83,-615 4845.83,-584.2 3614.77,-584.2"/>
+<text text-anchor="start" x="3621.77" y="-596.4" font-family="Arial" font-size="14.00">sort_order </text>
+<text text-anchor="start" x="3689.47" y="-596.4" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="3614.77,-553.4 3614.77,-584.2 4845.83,-584.2 4845.83,-553.4 3614.77,-553.4"/>
+<text text-anchor="start" x="3621.77" y="-565.6" font-family="Arial" font-size="14.00">bugs_migrated_at </text>
+<text text-anchor="start" x="3737.73" y="-565.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="3781.29" y="-565.6" font-family="Arial" font-size="14.00"> Lazy&#45;migration marker (v18); NULL means the repo&#39;s MD has never been imported.</text>
+<polygon fill="none" stroke="black" points="3614.77,-522.6 3614.77,-553.4 4845.83,-553.4 4845.83,-522.6 3614.77,-522.6"/>
+<text text-anchor="start" x="3621.77" y="-534.8" font-family="Arial" font-size="14.00">tasks_migrated_at </text>
+<text text-anchor="start" x="3740.05" y="-534.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="3783.61" y="-534.8" font-family="Arial" font-size="14.00"> Lazy&#45;migration marker (v21). While NULL, the first task sync suppresses &#39;created&#39; events so backfilling legacy files doesn&#39;t flood the timeline.</text>
+<polygon fill="none" stroke="black" points="3614.77,-491.8 3614.77,-522.6 4845.83,-522.6 4845.83,-491.8 3614.77,-491.8"/>
+<text text-anchor="start" x="3621.77" y="-504" font-family="Arial" font-size="14.00">deploy_repo_config </text>
+<text text-anchor="start" x="3747.87" y="-504" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="3791.42" y="-504" font-family="Arial" font-size="14.00"> v25 — JSON map of repo&#45;wide (not per&#45;environment) deploy placeholder values.</text>
+<polygon fill="none" stroke="black" points="3614.77,-461 3614.77,-491.8 4845.83,-491.8 4845.83,-461 3614.77,-461"/>
+<text text-anchor="start" x="3621.77" y="-473.2" font-family="Arial" font-size="14.00">autocommit_branch </text>
+<text text-anchor="start" x="3748.61" y="-473.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="3792.17" y="-473.2" font-family="Arial" font-size="14.00"> v28 — NULL means auto&#45;commit is off for this repo.</text>
+<polygon fill="none" stroke="black" points="3614.77,-430.2 3614.77,-461 4845.83,-461 4845.83,-430.2 3614.77,-430.2"/>
+<text text-anchor="start" x="3621.77" y="-442.4" font-family="Arial" font-size="14.00">codex_source_path </text>
+<text text-anchor="start" x="3747.86" y="-442.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" stroke-width="3" points="3613.27,-428.7 3613.27,-1062.9 4847.33,-1062.9 4847.33,-428.7 3613.27,-428.7"/>
 </g>
 <!-- projects -->
 <g id="node8" class="node">
 <title>projects</title>
-<polygon fill="#efefef" stroke="none" points="3977.39,-258.8 3977.39,-304.8 4707.21,-304.8 4707.21,-258.8 3977.39,-258.8"/>
-<polygon fill="none" stroke="black" points="3977.39,-258.8 3977.39,-304.8 4707.21,-304.8 4707.21,-258.8 3977.39,-258.8"/>
-<text text-anchor="start" x="4279.18" y="-282.6" font-family="Arial Bold" font-size="18.00">projects</text>
-<text text-anchor="start" x="4336.16" y="-282.6" font-family="Arial" font-size="14.00">    </text>
-<text text-anchor="start" x="4367.28" y="-282.6" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
-<text text-anchor="start" x="4053.22" y="-268.2" font-family="Arial" font-size="14.00" fill="#333333">A portfolio project — the unit that groups repositories and can consume microservice projects.</text>
-<polygon fill="none" stroke="black" points="3977.39,-228 3977.39,-258.8 4707.21,-258.8 4707.21,-228 3977.39,-228"/>
-<text text-anchor="start" x="3984.39" y="-240.2" font-family="Arial" font-size="14.00">id </text>
-<text text-anchor="start" x="3999.17" y="-240.2" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="3977.39,-197.2 3977.39,-228 4707.21,-228 4707.21,-197.2 3977.39,-197.2"/>
-<text text-anchor="start" x="3984.39" y="-209.4" font-family="Arial" font-size="14.00">name </text>
-<text text-anchor="start" x="4023.3" y="-209.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="3977.39,-166.4 3977.39,-197.2 4707.21,-197.2 4707.21,-166.4 3977.39,-166.4"/>
-<text text-anchor="start" x="3984.39" y="-178.6" font-family="Arial" font-size="14.00">description </text>
-<text text-anchor="start" x="4055.98" y="-178.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="3977.39,-135.6 3977.39,-166.4 4707.21,-166.4 4707.21,-135.6 3977.39,-135.6"/>
-<text text-anchor="start" x="3984.39" y="-147.8" font-family="Arial" font-size="14.00">created_at </text>
-<text text-anchor="start" x="4054.44" y="-147.8" font-family="Arial" font-size="14.00" fill="#666666">[DATETIME]</text>
-<polygon fill="none" stroke="black" points="3977.39,-104.8 3977.39,-135.6 4707.21,-135.6 4707.21,-104.8 3977.39,-104.8"/>
-<text text-anchor="start" x="3984.39" y="-117" font-family="Arial" font-size="14.00">project_type </text>
-<text text-anchor="start" x="4064.55" y="-117" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="4108.11" y="-117" font-family="Arial" font-size="14.00"> Added v12, default &#39;standard&#39;. No SQL CHECK — the legal vocabulary is enforced in Rust only.</text>
-<polygon fill="none" stroke="black" points="3977.39,-74 3977.39,-104.8 4707.21,-104.8 4707.21,-74 3977.39,-74"/>
-<text text-anchor="start" x="3984.39" y="-86.2" font-family="Arial" font-size="14.00">sort_order </text>
-<text text-anchor="start" x="4052.08" y="-86.2" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<text text-anchor="start" x="4122.09" y="-86.2" font-family="Arial" font-size="14.00"> Manual ordering (v14); back&#45;filled as id * 10 to leave gaps for inserts.</text>
-<polygon fill="none" stroke="black" points="3977.39,-43.2 3977.39,-74 4707.21,-74 4707.21,-43.2 3977.39,-43.2"/>
-<text text-anchor="start" x="3984.39" y="-55.4" font-family="Arial" font-size="14.00">auto_sync_enabled </text>
-<text text-anchor="start" x="4109.71" y="-55.4" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<text text-anchor="start" x="4179.72" y="-55.4" font-family="Arial" font-size="14.00"> v28 — 0/1 opt&#45;in for the background auto&#45;sync timer.</text>
+<polygon fill="#efefef" stroke="none" points="3865.39,-258.8 3865.39,-304.8 4595.21,-304.8 4595.21,-258.8 3865.39,-258.8"/>
+<polygon fill="none" stroke="black" points="3865.39,-258.8 3865.39,-304.8 4595.21,-304.8 4595.21,-258.8 3865.39,-258.8"/>
+<text text-anchor="start" x="4167.18" y="-282.6" font-family="Arial Bold" font-size="18.00">projects</text>
+<text text-anchor="start" x="4224.16" y="-282.6" font-family="Arial" font-size="14.00">    </text>
+<text text-anchor="start" x="4255.28" y="-282.6" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
+<text text-anchor="start" x="3941.22" y="-268.2" font-family="Arial" font-size="14.00" fill="#333333">A portfolio project — the unit that groups repositories and can consume microservice projects.</text>
+<polygon fill="none" stroke="black" points="3865.39,-228 3865.39,-258.8 4595.21,-258.8 4595.21,-228 3865.39,-228"/>
+<text text-anchor="start" x="3872.39" y="-240.2" font-family="Arial" font-size="14.00">id </text>
+<text text-anchor="start" x="3887.17" y="-240.2" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="3865.39,-197.2 3865.39,-228 4595.21,-228 4595.21,-197.2 3865.39,-197.2"/>
+<text text-anchor="start" x="3872.39" y="-209.4" font-family="Arial" font-size="14.00">name </text>
+<text text-anchor="start" x="3911.3" y="-209.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="3865.39,-166.4 3865.39,-197.2 4595.21,-197.2 4595.21,-166.4 3865.39,-166.4"/>
+<text text-anchor="start" x="3872.39" y="-178.6" font-family="Arial" font-size="14.00">description </text>
+<text text-anchor="start" x="3943.98" y="-178.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="3865.39,-135.6 3865.39,-166.4 4595.21,-166.4 4595.21,-135.6 3865.39,-135.6"/>
+<text text-anchor="start" x="3872.39" y="-147.8" font-family="Arial" font-size="14.00">created_at </text>
+<text text-anchor="start" x="3942.44" y="-147.8" font-family="Arial" font-size="14.00" fill="#666666">[DATETIME]</text>
+<polygon fill="none" stroke="black" points="3865.39,-104.8 3865.39,-135.6 4595.21,-135.6 4595.21,-104.8 3865.39,-104.8"/>
+<text text-anchor="start" x="3872.39" y="-117" font-family="Arial" font-size="14.00">project_type </text>
+<text text-anchor="start" x="3952.55" y="-117" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="3996.11" y="-117" font-family="Arial" font-size="14.00"> Added v12, default &#39;standard&#39;. No SQL CHECK — the legal vocabulary is enforced in Rust only.</text>
+<polygon fill="none" stroke="black" points="3865.39,-74 3865.39,-104.8 4595.21,-104.8 4595.21,-74 3865.39,-74"/>
+<text text-anchor="start" x="3872.39" y="-86.2" font-family="Arial" font-size="14.00">sort_order </text>
+<text text-anchor="start" x="3940.08" y="-86.2" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<text text-anchor="start" x="4010.09" y="-86.2" font-family="Arial" font-size="14.00"> Manual ordering (v14); back&#45;filled as id * 10 to leave gaps for inserts.</text>
+<polygon fill="none" stroke="black" points="3865.39,-43.2 3865.39,-74 4595.21,-74 4595.21,-43.2 3865.39,-43.2"/>
+<text text-anchor="start" x="3872.39" y="-55.4" font-family="Arial" font-size="14.00">auto_sync_enabled </text>
+<text text-anchor="start" x="3997.71" y="-55.4" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<text text-anchor="start" x="4067.72" y="-55.4" font-family="Arial" font-size="14.00"> v28 — 0/1 opt&#45;in for the background auto&#45;sync timer.</text>
 </g>
 <!-- repositories&#45;&gt;projects -->
 <g id="edge7" class="edge">
 <title>repositories:project_id&#45;&gt;projects:id</title>
-<path fill="none" stroke="black" d="M4969.14,-968.97C5294.95,-954.39 5045.98,-243.4 4708.21,-243.4"/>
-<polygon fill="black" stroke="black" points="4969.16,-968.97 4959.07,-964.69 4963.83,-969.09 4959.5,-969.19 4959.5,-969.19 4959.5,-969.19 4963.83,-969.09 4959.27,-973.69 4969.16,-968.97"/>
-<text text-anchor="start" x="4965.83" y="-979.2" font-family="Arial" font-size="10.00">FOREIGN KEY (project_id) REFERENCES projects (id) ON UPDATE NO ACTION ON DELETE SET NULL MATCH NONE</text>
+<path fill="none" stroke="black" d="M4857.14,-968.97C5182.95,-954.39 4933.98,-243.4 4596.21,-243.4"/>
+<polygon fill="black" stroke="black" points="4857.16,-968.97 4847.07,-964.69 4851.83,-969.09 4847.5,-969.19 4847.5,-969.19 4847.5,-969.19 4851.83,-969.09 4847.27,-973.69 4857.16,-968.97"/>
+<text text-anchor="start" x="4853.83" y="-979.2" font-family="Arial" font-size="10.00">FOREIGN KEY (project_id) REFERENCES projects (id) ON UPDATE NO ACTION ON DELETE SET NULL MATCH NONE</text>
 </g>
 <!-- repo_renames -->
 <g id="node2" class="node">
@@ -155,7 +155,7 @@
 <!-- repo_renames&#45;&gt;repositories -->
 <g id="edge1" class="edge">
 <title>repo_renames:repository_id&#45;&gt;repositories:id</title>
-<path fill="none" stroke="black" d="M1984.57,-1417.32C2088.91,-1406.7 1936.11,-1224.35 2025.3,-1143.6 2165.87,-1016.34 3536.16,-1000 3725.77,-1000"/>
+<path fill="none" stroke="black" d="M1984.57,-1417.32C2088.92,-1406.72 1936.35,-1224.61 2025.3,-1143.6 2156.32,-1024.27 3436.55,-1000 3613.77,-1000"/>
 <polygon fill="black" stroke="black" points="1984.72,-1417.31 1974.52,-1413.29 1979.4,-1417.56 1975.07,-1417.77 1975.07,-1417.77 1975.07,-1417.77 1979.4,-1417.56 1974.95,-1422.28 1984.72,-1417.31"/>
 <text text-anchor="start" x="1685.46" y="-1401.8" font-family="Arial" font-size="10.00">FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE</text>
 </g>
@@ -214,8 +214,8 @@
 <!-- bugs&#45;&gt;repositories -->
 <g id="edge2" class="edge">
 <title>bugs:repository_id&#45;&gt;repositories:id</title>
-<path fill="none" stroke="black" d="M3162.28,-1539.37C3233.63,-1514.36 3147.31,-1208.06 3203.3,-1143.6 3282.26,-1052.69 3605.36,-1000 3725.77,-1000"/>
-<polygon fill="black" stroke="black" points="3162.44,-1539.35 3151.85,-1536.5 3157.18,-1540.2 3152.9,-1540.89 3152.9,-1540.89 3152.9,-1540.89 3157.18,-1540.2 3153.29,-1545.39 3162.44,-1539.35"/>
+<path fill="none" stroke="black" d="M3162.29,-1539.38C3233.82,-1514.51 3149.54,-1209.94 3203.3,-1143.6 3264.14,-1068.52 3517.13,-1000 3613.77,-1000"/>
+<polygon fill="black" stroke="black" points="3162.44,-1539.36 3151.86,-1536.5 3157.18,-1540.21 3152.9,-1540.89 3152.9,-1540.89 3152.9,-1540.89 3157.18,-1540.21 3153.28,-1545.39 3162.44,-1539.36"/>
 <text text-anchor="start" x="3159.24" y="-1551" font-family="Arial" font-size="10.00">FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE</text>
 </g>
 <!-- deploy_environments -->
@@ -265,138 +265,138 @@
 <!-- deploy_environments&#45;&gt;repositories -->
 <g id="edge3" class="edge">
 <title>deploy_environments:repository_id&#45;&gt;repositories:id</title>
-<path fill="none" stroke="black" d="M4207.92,-1508.26C4269.67,-1483.44 4243.31,-1227.94 4196.71,-1174.4 4058.19,-1015.28 3865.79,-1266.28 3726.77,-1107.6 3695.25,-1071.63 3677.95,-1000 3725.77,-1000"/>
-<polygon fill="black" stroke="black" points="4207.86,-1508.27 4197.19,-1505.72 4202.62,-1509.27 4198.36,-1510.08 4198.36,-1510.08 4198.36,-1510.08 4202.62,-1509.27 4198.87,-1514.56 4207.86,-1508.27"/>
+<path fill="none" stroke="black" d="M4207.93,-1508.25C4269.74,-1483.37 4244.03,-1227.3 4196.71,-1174.4 4023.15,-980.36 3788.94,-1301.09 3614.77,-1107.6 3582.77,-1072.06 3565.95,-1000 3613.77,-1000"/>
+<polygon fill="black" stroke="black" points="4207.86,-1508.27 4197.19,-1505.72 4202.62,-1509.27 4198.36,-1510.07 4198.36,-1510.07 4198.36,-1510.07 4202.62,-1509.27 4198.88,-1514.56 4207.86,-1508.27"/>
 <text text-anchor="start" x="4204.71" y="-1520.2" font-family="Arial" font-size="10.00">FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE</text>
 </g>
-<!-- tasks -->
-<g id="node5" class="node">
-<title>tasks</title>
-<polygon fill="#efefef" stroke="none" points="4301.51,-1571.8 4301.51,-1617.8 5615.09,-1617.8 5615.09,-1571.8 4301.51,-1571.8"/>
-<polygon fill="none" stroke="black" points="4301.51,-1571.8 4301.51,-1617.8 5615.09,-1617.8 5615.09,-1571.8 4301.51,-1571.8"/>
-<text text-anchor="start" x="4905.67" y="-1595.6" font-family="Arial Bold" font-size="18.00">tasks</text>
-<text text-anchor="start" x="4941.67" y="-1595.6" font-family="Arial" font-size="14.00">    </text>
-<text text-anchor="start" x="4972.79" y="-1595.6" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
-<text text-anchor="start" x="4308.51" y="-1581.2" font-family="Arial" font-size="14.00" fill="#333333">Mirror of docs/todo.md and docs/done.md. Polarity is the reverse of bugs — here the Markdown is canonical and this table is rebuilt from it on each sync, because tasks are hand&#45;edited far more often than bugs.</text>
-<polygon fill="none" stroke="black" points="4301.51,-1541 4301.51,-1571.8 5615.09,-1571.8 5615.09,-1541 4301.51,-1541"/>
-<text text-anchor="start" x="4308.51" y="-1553.2" font-family="Arial" font-size="14.00">id </text>
-<text text-anchor="start" x="4323.3" y="-1553.2" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="4301.51,-1510.2 4301.51,-1541 5615.09,-1541 5615.09,-1510.2 4301.51,-1510.2"/>
-<text text-anchor="start" x="4308.51" y="-1522.4" font-family="Arial" font-size="14.00">repository_id </text>
-<text text-anchor="start" x="4392.56" y="-1522.4" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="4301.51,-1479.4 4301.51,-1510.2 5615.09,-1510.2 5615.09,-1479.4 4301.51,-1479.4"/>
-<text text-anchor="start" x="4308.51" y="-1491.6" font-family="Arial" font-size="14.00">task_id </text>
-<text text-anchor="start" x="4356.76" y="-1491.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="4400.32" y="-1491.6" font-family="Arial" font-size="14.00"> The display id as written in Markdown (T&#45;000042 / F&#45;000013 / D&#45;000001) — TEXT, not a foreign key. Note task_events.task_id is a different thing: an INTEGER FK to tasks.id.</text>
-<polygon fill="none" stroke="black" points="4301.51,-1448.6 4301.51,-1479.4 5615.09,-1479.4 5615.09,-1448.6 4301.51,-1448.6"/>
-<text text-anchor="start" x="4308.51" y="-1460.8" font-family="Arial" font-size="14.00">prefix </text>
-<text text-anchor="start" x="4346.64" y="-1460.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="4301.51,-1417.8 4301.51,-1448.6 5615.09,-1448.6 5615.09,-1417.8 4301.51,-1417.8"/>
-<text text-anchor="start" x="4308.51" y="-1430" font-family="Arial" font-size="14.00">description </text>
-<text text-anchor="start" x="4380.11" y="-1430" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="4301.51,-1387 4301.51,-1417.8 5615.09,-1417.8 5615.09,-1387 4301.51,-1387"/>
-<text text-anchor="start" x="4308.51" y="-1399.2" font-family="Arial" font-size="14.00">effort </text>
-<text text-anchor="start" x="4344.31" y="-1399.2" font-family="Arial" font-size="14.00" fill="#666666">[REAL]</text>
-<polygon fill="none" stroke="black" points="4301.51,-1356.2 4301.51,-1387 5615.09,-1387 5615.09,-1356.2 4301.51,-1356.2"/>
-<text text-anchor="start" x="4308.51" y="-1368.4" font-family="Arial" font-size="14.00">priority </text>
-<text text-anchor="start" x="4354.41" y="-1368.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="4397.97" y="-1368.4" font-family="Arial" font-size="14.00"> No SQL CHECK — critical / high / medium / low are enforced in Rust.</text>
-<polygon fill="none" stroke="black" points="4301.51,-1325.4 4301.51,-1356.2 5615.09,-1356.2 5615.09,-1325.4 4301.51,-1325.4"/>
-<text text-anchor="start" x="4308.51" y="-1337.6" font-family="Arial" font-size="14.00">status </text>
-<text text-anchor="start" x="4349.76" y="-1337.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="4393.31" y="-1337.6" font-family="Arial" font-size="14.00"> No SQL CHECK — open / in&#45;progress / review are enforced in Rust.</text>
-<polygon fill="none" stroke="black" points="4301.51,-1294.6 4301.51,-1325.4 5615.09,-1325.4 5615.09,-1294.6 4301.51,-1294.6"/>
-<text text-anchor="start" x="4308.51" y="-1306.8" font-family="Arial" font-size="14.00">version </text>
-<text text-anchor="start" x="4357.53" y="-1306.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="4401.09" y="-1306.8" font-family="Arial" font-size="14.00"> Inherited from the nearest preceding &#39;## vX.Y.Z&#39; header in todo.md.</text>
-<polygon fill="none" stroke="black" points="4301.51,-1263.8 4301.51,-1294.6 5615.09,-1294.6 5615.09,-1263.8 4301.51,-1263.8"/>
-<text text-anchor="start" x="4308.51" y="-1276" font-family="Arial" font-size="14.00">source </text>
-<text text-anchor="start" x="4354.42" y="-1276" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="4397.98" y="-1276" font-family="Arial" font-size="14.00"> &#39;todo&#39; or &#39;done&#39;. Part of the uniqueness key, so the same id may exist once per source during a transition.</text>
-<polygon fill="none" stroke="black" points="4301.51,-1233 4301.51,-1263.8 5615.09,-1263.8 5615.09,-1233 4301.51,-1233"/>
-<text text-anchor="start" x="4308.51" y="-1245.2" font-family="Arial" font-size="14.00">created_at </text>
-<text text-anchor="start" x="4378.56" y="-1245.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="4301.51,-1202.2 4301.51,-1233 5615.09,-1233 5615.09,-1202.2 4301.51,-1202.2"/>
-<text text-anchor="start" x="4308.51" y="-1214.4" font-family="Arial" font-size="14.00">updated_at </text>
-<text text-anchor="start" x="4382.47" y="-1214.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-</g>
-<!-- tasks&#45;&gt;repositories -->
-<g id="edge4" class="edge">
-<title>tasks:repository_id&#45;&gt;repositories:id</title>
-<path fill="none" stroke="black" d="M4291.95,-1519.74C4262.06,-1474.86 4275.98,-1186.53 4301.51,-1159 4400.99,-1051.73 4858.01,-1214.55 4957.83,-1107.6 4990.47,-1072.64 5006.66,-1000 4958.83,-1000"/>
-<polygon fill="black" stroke="black" points="4291.99,-1519.76 4297.7,-1529.13 4296.39,-1522.78 4299.96,-1525.22 4299.96,-1525.22 4299.96,-1525.22 4296.39,-1522.78 4302.78,-1521.7 4291.99,-1519.76"/>
-<text text-anchor="start" x="4307.51" y="-1535.6" font-family="Arial" font-size="10.00">FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE</text>
-</g>
 <!-- deploy_events -->
-<g id="node6" class="node">
+<g id="node5" class="node">
 <title>deploy_events</title>
-<polygon fill="#efefef" stroke="none" points="5719.6,-1479.4 5719.6,-1525.4 6585,-1525.4 6585,-1479.4 5719.6,-1479.4"/>
-<polygon fill="none" stroke="black" points="5719.6,-1479.4 5719.6,-1525.4 6585,-1525.4 6585,-1479.4 5719.6,-1479.4"/>
-<text text-anchor="start" x="6065.69" y="-1503.2" font-family="Arial Bold" font-size="18.00">deploy_events</text>
-<text text-anchor="start" x="6169.66" y="-1503.2" font-family="Arial" font-size="14.00">    </text>
-<text text-anchor="start" x="6200.78" y="-1503.2" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
-<text text-anchor="start" x="5726.6" y="-1488.8" font-family="Arial" font-size="14.00" fill="#333333">Log of deploy operations (template render, GitHub secret set/delete). deploy_env_id is nullable so repo&#45;level actions can be recorded too.</text>
-<polygon fill="none" stroke="black" points="5719.6,-1448.6 5719.6,-1479.4 6585,-1479.4 6585,-1448.6 5719.6,-1448.6"/>
-<text text-anchor="start" x="5726.6" y="-1460.8" font-family="Arial" font-size="14.00">id </text>
-<text text-anchor="start" x="5741.39" y="-1460.8" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="5719.6,-1417.8 5719.6,-1448.6 6585,-1448.6 6585,-1417.8 5719.6,-1417.8"/>
-<text text-anchor="start" x="5726.6" y="-1430" font-family="Arial" font-size="14.00">deploy_env_id </text>
-<text text-anchor="start" x="5820.79" y="-1430" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="5719.6,-1387 5719.6,-1417.8 6585,-1417.8 6585,-1387 5719.6,-1387"/>
-<text text-anchor="start" x="5726.6" y="-1399.2" font-family="Arial" font-size="14.00">repository_id </text>
-<text text-anchor="start" x="5810.64" y="-1399.2" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="5719.6,-1356.2 5719.6,-1387 6585,-1387 6585,-1356.2 5719.6,-1356.2"/>
-<text text-anchor="start" x="5726.6" y="-1368.4" font-family="Arial" font-size="14.00">action </text>
-<text text-anchor="start" x="5767.85" y="-1368.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="5719.6,-1325.4 5719.6,-1356.2 6585,-1356.2 6585,-1325.4 5719.6,-1325.4"/>
-<text text-anchor="start" x="5726.6" y="-1337.6" font-family="Arial" font-size="14.00">ts </text>
-<text text-anchor="start" x="5741.38" y="-1337.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="5719.6,-1294.6 5719.6,-1325.4 6585,-1325.4 6585,-1294.6 5719.6,-1294.6"/>
-<text text-anchor="start" x="5726.6" y="-1306.8" font-family="Arial" font-size="14.00">details </text>
-<text text-anchor="start" x="5770.96" y="-1306.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="#efefef" stroke="none" points="4301.6,-1479.4 4301.6,-1525.4 5167,-1525.4 5167,-1479.4 4301.6,-1479.4"/>
+<polygon fill="none" stroke="black" points="4301.6,-1479.4 4301.6,-1525.4 5167,-1525.4 5167,-1479.4 4301.6,-1479.4"/>
+<text text-anchor="start" x="4647.69" y="-1503.2" font-family="Arial Bold" font-size="18.00">deploy_events</text>
+<text text-anchor="start" x="4751.66" y="-1503.2" font-family="Arial" font-size="14.00">    </text>
+<text text-anchor="start" x="4782.78" y="-1503.2" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
+<text text-anchor="start" x="4308.6" y="-1488.8" font-family="Arial" font-size="14.00" fill="#333333">Log of deploy operations (template render, GitHub secret set/delete). deploy_env_id is nullable so repo&#45;level actions can be recorded too.</text>
+<polygon fill="none" stroke="black" points="4301.6,-1448.6 4301.6,-1479.4 5167,-1479.4 5167,-1448.6 4301.6,-1448.6"/>
+<text text-anchor="start" x="4308.6" y="-1460.8" font-family="Arial" font-size="14.00">id </text>
+<text text-anchor="start" x="4323.39" y="-1460.8" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="4301.6,-1417.8 4301.6,-1448.6 5167,-1448.6 5167,-1417.8 4301.6,-1417.8"/>
+<text text-anchor="start" x="4308.6" y="-1430" font-family="Arial" font-size="14.00">deploy_env_id </text>
+<text text-anchor="start" x="4402.79" y="-1430" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="4301.6,-1387 4301.6,-1417.8 5167,-1417.8 5167,-1387 4301.6,-1387"/>
+<text text-anchor="start" x="4308.6" y="-1399.2" font-family="Arial" font-size="14.00">repository_id </text>
+<text text-anchor="start" x="4392.64" y="-1399.2" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="4301.6,-1356.2 4301.6,-1387 5167,-1387 5167,-1356.2 4301.6,-1356.2"/>
+<text text-anchor="start" x="4308.6" y="-1368.4" font-family="Arial" font-size="14.00">action </text>
+<text text-anchor="start" x="4349.85" y="-1368.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="4301.6,-1325.4 4301.6,-1356.2 5167,-1356.2 5167,-1325.4 4301.6,-1325.4"/>
+<text text-anchor="start" x="4308.6" y="-1337.6" font-family="Arial" font-size="14.00">ts </text>
+<text text-anchor="start" x="4323.38" y="-1337.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="4301.6,-1294.6 4301.6,-1325.4 5167,-1325.4 5167,-1294.6 4301.6,-1294.6"/>
+<text text-anchor="start" x="4308.6" y="-1306.8" font-family="Arial" font-size="14.00">details </text>
+<text text-anchor="start" x="4352.96" y="-1306.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
 </g>
 <!-- deploy_events&#45;&gt;repositories -->
-<g id="edge5" class="edge">
+<g id="edge4" class="edge">
 <title>deploy_events:repository_id&#45;&gt;repositories:id</title>
-<path fill="none" stroke="black" d="M5708.37,-1401.89C5610.41,-1391.51 5747.45,-1224.1 5667.3,-1143.6 5553.96,-1029.77 5119.47,-1000 4958.83,-1000"/>
-<polygon fill="black" stroke="black" points="5708.28,-1401.89 5718.05,-1406.88 5713.61,-1402.15 5717.94,-1402.37 5717.94,-1402.37 5717.94,-1402.37 5713.61,-1402.15 5718.49,-1397.89 5708.28,-1401.89"/>
-<text text-anchor="start" x="5725.6" y="-1412.4" font-family="Arial" font-size="10.00">FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE</text>
+<path fill="none" stroke="black" d="M4290.42,-1401.54C4236.48,-1391.82 4262.73,-1301.54 4301.6,-1251.4 4454.9,-1053.69 4692.27,-1305.11 4845.83,-1107.6 4875.19,-1069.85 4894.66,-1000 4846.83,-1000"/>
+<polygon fill="black" stroke="black" points="4290.31,-1401.53 4299.89,-1406.86 4295.62,-1401.98 4299.94,-1402.34 4299.94,-1402.34 4299.94,-1402.34 4295.62,-1401.98 4300.65,-1397.89 4290.31,-1401.53"/>
+<text text-anchor="start" x="4307.6" y="-1412.4" font-family="Arial" font-size="10.00">FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE</text>
 </g>
 <!-- sync_events -->
-<g id="node7" class="node">
+<g id="node6" class="node">
 <title>sync_events</title>
-<polygon fill="#efefef" stroke="none" points="6689.42,-1479.4 6689.42,-1525.4 7703.18,-1525.4 7703.18,-1479.4 6689.42,-1479.4"/>
-<polygon fill="none" stroke="black" points="6689.42,-1479.4 6689.42,-1525.4 7703.18,-1525.4 7703.18,-1479.4 6689.42,-1479.4"/>
-<text text-anchor="start" x="7117.68" y="-1503.2" font-family="Arial Bold" font-size="18.00">sync_events</text>
-<text text-anchor="start" x="7205.66" y="-1503.2" font-family="Arial" font-size="14.00">    </text>
-<text text-anchor="start" x="7236.78" y="-1503.2" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
-<text text-anchor="start" x="6779.19" y="-1488.8" font-family="Arial" font-size="14.00" fill="#333333">Log of sync operations, feeding the timeline. repository_id is nullable — a NULL row is a portfolio&#45;wide sync rather than a per&#45;repo one.</text>
-<polygon fill="none" stroke="black" points="6689.42,-1448.6 6689.42,-1479.4 7703.18,-1479.4 7703.18,-1448.6 6689.42,-1448.6"/>
-<text text-anchor="start" x="6696.42" y="-1460.8" font-family="Arial" font-size="14.00">id </text>
-<text text-anchor="start" x="6711.21" y="-1460.8" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="6689.42,-1417.8 6689.42,-1448.6 7703.18,-1448.6 7703.18,-1417.8 6689.42,-1417.8"/>
-<text text-anchor="start" x="6696.42" y="-1430" font-family="Arial" font-size="14.00">repository_id </text>
-<text text-anchor="start" x="6780.46" y="-1430" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="6689.42,-1387 6689.42,-1417.8 7703.18,-1417.8 7703.18,-1387 6689.42,-1387"/>
-<text text-anchor="start" x="6696.42" y="-1399.2" font-family="Arial" font-size="14.00">sync_type </text>
-<text text-anchor="start" x="6763.34" y="-1399.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="6806.9" y="-1399.2" font-family="Arial" font-size="14.00"> project_sync / tasks / secret / requirements / migration. &#39;migration&#39; was added in v25 to record deploy&#45;config conflicts resolved by first&#45;env&#45;wins.</text>
-<polygon fill="none" stroke="black" points="6689.42,-1356.2 6689.42,-1387 7703.18,-1387 7703.18,-1356.2 6689.42,-1356.2"/>
-<text text-anchor="start" x="6696.42" y="-1368.4" font-family="Arial" font-size="14.00">ts </text>
-<text text-anchor="start" x="6711.2" y="-1368.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<polygon fill="none" stroke="black" points="6689.42,-1325.4 6689.42,-1356.2 7703.18,-1356.2 7703.18,-1325.4 6689.42,-1325.4"/>
-<text text-anchor="start" x="6696.42" y="-1337.6" font-family="Arial" font-size="14.00">change_count </text>
-<text text-anchor="start" x="6788.27" y="-1337.6" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
-<polygon fill="none" stroke="black" points="6689.42,-1294.6 6689.42,-1325.4 7703.18,-1325.4 7703.18,-1294.6 6689.42,-1294.6"/>
-<text text-anchor="start" x="6696.42" y="-1306.8" font-family="Arial" font-size="14.00">details </text>
-<text text-anchor="start" x="6740.78" y="-1306.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="#efefef" stroke="none" points="5271.42,-1479.4 5271.42,-1525.4 6285.18,-1525.4 6285.18,-1479.4 5271.42,-1479.4"/>
+<polygon fill="none" stroke="black" points="5271.42,-1479.4 5271.42,-1525.4 6285.18,-1525.4 6285.18,-1479.4 5271.42,-1479.4"/>
+<text text-anchor="start" x="5699.68" y="-1503.2" font-family="Arial Bold" font-size="18.00">sync_events</text>
+<text text-anchor="start" x="5787.66" y="-1503.2" font-family="Arial" font-size="14.00">    </text>
+<text text-anchor="start" x="5818.78" y="-1503.2" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
+<text text-anchor="start" x="5361.19" y="-1488.8" font-family="Arial" font-size="14.00" fill="#333333">Log of sync operations, feeding the timeline. repository_id is nullable — a NULL row is a portfolio&#45;wide sync rather than a per&#45;repo one.</text>
+<polygon fill="none" stroke="black" points="5271.42,-1448.6 5271.42,-1479.4 6285.18,-1479.4 6285.18,-1448.6 5271.42,-1448.6"/>
+<text text-anchor="start" x="5278.42" y="-1460.8" font-family="Arial" font-size="14.00">id </text>
+<text text-anchor="start" x="5293.21" y="-1460.8" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="5271.42,-1417.8 5271.42,-1448.6 6285.18,-1448.6 6285.18,-1417.8 5271.42,-1417.8"/>
+<text text-anchor="start" x="5278.42" y="-1430" font-family="Arial" font-size="14.00">repository_id </text>
+<text text-anchor="start" x="5362.46" y="-1430" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="5271.42,-1387 5271.42,-1417.8 6285.18,-1417.8 6285.18,-1387 5271.42,-1387"/>
+<text text-anchor="start" x="5278.42" y="-1399.2" font-family="Arial" font-size="14.00">sync_type </text>
+<text text-anchor="start" x="5345.34" y="-1399.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="5388.9" y="-1399.2" font-family="Arial" font-size="14.00"> project_sync / tasks / secret / requirements / migration. &#39;migration&#39; was added in v25 to record deploy&#45;config conflicts resolved by first&#45;env&#45;wins.</text>
+<polygon fill="none" stroke="black" points="5271.42,-1356.2 5271.42,-1387 6285.18,-1387 6285.18,-1356.2 5271.42,-1356.2"/>
+<text text-anchor="start" x="5278.42" y="-1368.4" font-family="Arial" font-size="14.00">ts </text>
+<text text-anchor="start" x="5293.2" y="-1368.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="5271.42,-1325.4 5271.42,-1356.2 6285.18,-1356.2 6285.18,-1325.4 5271.42,-1325.4"/>
+<text text-anchor="start" x="5278.42" y="-1337.6" font-family="Arial" font-size="14.00">change_count </text>
+<text text-anchor="start" x="5370.27" y="-1337.6" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="5271.42,-1294.6 5271.42,-1325.4 6285.18,-1325.4 6285.18,-1294.6 5271.42,-1294.6"/>
+<text text-anchor="start" x="5278.42" y="-1306.8" font-family="Arial" font-size="14.00">details </text>
+<text text-anchor="start" x="5322.78" y="-1306.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
 </g>
 <!-- sync_events&#45;&gt;repositories -->
-<g id="edge6" class="edge">
+<g id="edge5" class="edge">
 <title>sync_events:repository_id&#45;&gt;repositories:id</title>
-<path fill="none" stroke="black" d="M6678.04,-1432.72C6567.47,-1421.88 6731.02,-1229.3 6637.3,-1143.6 6499.17,-1017.29 5146.01,-1000 4958.83,-1000"/>
-<polygon fill="black" stroke="black" points="6678.1,-1432.73 6687.88,-1437.68 6683.43,-1432.97 6687.75,-1433.17 6687.75,-1433.17 6687.75,-1433.17 6683.43,-1432.97 6688.29,-1428.69 6678.1,-1432.73"/>
-<text text-anchor="start" x="6103.54" y="-1443.2" font-family="Arial" font-size="10.00">FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE</text>
+<path fill="none" stroke="black" d="M5260.44,-1430.98C5211.07,-1406.71 5258.48,-1191.19 5219.3,-1143.6 5106.54,-1006.63 5024.25,-1000 4846.83,-1000"/>
+<polygon fill="black" stroke="black" points="5260.33,-1430.95 5269.11,-1437.52 5265.54,-1432.11 5269.77,-1433.05 5269.77,-1433.05 5269.77,-1433.05 5265.54,-1432.11 5271.07,-1428.73 5260.33,-1430.95"/>
+<text text-anchor="start" x="5277.42" y="-1443.2" font-family="Arial" font-size="10.00">FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE</text>
+</g>
+<!-- tasks -->
+<g id="node7" class="node">
+<title>tasks</title>
+<polygon fill="#efefef" stroke="none" points="6389.51,-1571.8 6389.51,-1617.8 7703.09,-1617.8 7703.09,-1571.8 6389.51,-1571.8"/>
+<polygon fill="none" stroke="black" points="6389.51,-1571.8 6389.51,-1617.8 7703.09,-1617.8 7703.09,-1571.8 6389.51,-1571.8"/>
+<text text-anchor="start" x="6993.67" y="-1595.6" font-family="Arial Bold" font-size="18.00">tasks</text>
+<text text-anchor="start" x="7029.67" y="-1595.6" font-family="Arial" font-size="14.00">    </text>
+<text text-anchor="start" x="7060.79" y="-1595.6" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
+<text text-anchor="start" x="6396.51" y="-1581.2" font-family="Arial" font-size="14.00" fill="#333333">Mirror of docs/todo.md and docs/done.md. Polarity is the reverse of bugs — here the Markdown is canonical and this table is rebuilt from it on each sync, because tasks are hand&#45;edited far more often than bugs.</text>
+<polygon fill="none" stroke="black" points="6389.51,-1541 6389.51,-1571.8 7703.09,-1571.8 7703.09,-1541 6389.51,-1541"/>
+<text text-anchor="start" x="6396.51" y="-1553.2" font-family="Arial" font-size="14.00">id </text>
+<text text-anchor="start" x="6411.3" y="-1553.2" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="6389.51,-1510.2 6389.51,-1541 7703.09,-1541 7703.09,-1510.2 6389.51,-1510.2"/>
+<text text-anchor="start" x="6396.51" y="-1522.4" font-family="Arial" font-size="14.00">repository_id </text>
+<text text-anchor="start" x="6480.56" y="-1522.4" font-family="Arial" font-size="14.00" fill="#666666">[INTEGER]</text>
+<polygon fill="none" stroke="black" points="6389.51,-1479.4 6389.51,-1510.2 7703.09,-1510.2 7703.09,-1479.4 6389.51,-1479.4"/>
+<text text-anchor="start" x="6396.51" y="-1491.6" font-family="Arial" font-size="14.00">task_id </text>
+<text text-anchor="start" x="6444.76" y="-1491.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="6488.32" y="-1491.6" font-family="Arial" font-size="14.00"> The display id as written in Markdown (T&#45;000042 / F&#45;000013 / D&#45;000001) — TEXT, not a foreign key. Note task_events.task_id is a different thing: an INTEGER FK to tasks.id.</text>
+<polygon fill="none" stroke="black" points="6389.51,-1448.6 6389.51,-1479.4 7703.09,-1479.4 7703.09,-1448.6 6389.51,-1448.6"/>
+<text text-anchor="start" x="6396.51" y="-1460.8" font-family="Arial" font-size="14.00">prefix </text>
+<text text-anchor="start" x="6434.64" y="-1460.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="6389.51,-1417.8 6389.51,-1448.6 7703.09,-1448.6 7703.09,-1417.8 6389.51,-1417.8"/>
+<text text-anchor="start" x="6396.51" y="-1430" font-family="Arial" font-size="14.00">description </text>
+<text text-anchor="start" x="6468.11" y="-1430" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="6389.51,-1387 6389.51,-1417.8 7703.09,-1417.8 7703.09,-1387 6389.51,-1387"/>
+<text text-anchor="start" x="6396.51" y="-1399.2" font-family="Arial" font-size="14.00">effort </text>
+<text text-anchor="start" x="6432.31" y="-1399.2" font-family="Arial" font-size="14.00" fill="#666666">[REAL]</text>
+<polygon fill="none" stroke="black" points="6389.51,-1356.2 6389.51,-1387 7703.09,-1387 7703.09,-1356.2 6389.51,-1356.2"/>
+<text text-anchor="start" x="6396.51" y="-1368.4" font-family="Arial" font-size="14.00">priority </text>
+<text text-anchor="start" x="6442.41" y="-1368.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="6485.97" y="-1368.4" font-family="Arial" font-size="14.00"> No SQL CHECK — critical / high / medium / low are enforced in Rust.</text>
+<polygon fill="none" stroke="black" points="6389.51,-1325.4 6389.51,-1356.2 7703.09,-1356.2 7703.09,-1325.4 6389.51,-1325.4"/>
+<text text-anchor="start" x="6396.51" y="-1337.6" font-family="Arial" font-size="14.00">status </text>
+<text text-anchor="start" x="6437.76" y="-1337.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="6481.31" y="-1337.6" font-family="Arial" font-size="14.00"> No SQL CHECK — open / in&#45;progress / review are enforced in Rust.</text>
+<polygon fill="none" stroke="black" points="6389.51,-1294.6 6389.51,-1325.4 7703.09,-1325.4 7703.09,-1294.6 6389.51,-1294.6"/>
+<text text-anchor="start" x="6396.51" y="-1306.8" font-family="Arial" font-size="14.00">version </text>
+<text text-anchor="start" x="6445.53" y="-1306.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="6489.09" y="-1306.8" font-family="Arial" font-size="14.00"> Inherited from the nearest preceding &#39;## vX.Y.Z&#39; header in todo.md.</text>
+<polygon fill="none" stroke="black" points="6389.51,-1263.8 6389.51,-1294.6 7703.09,-1294.6 7703.09,-1263.8 6389.51,-1263.8"/>
+<text text-anchor="start" x="6396.51" y="-1276" font-family="Arial" font-size="14.00">source </text>
+<text text-anchor="start" x="6442.42" y="-1276" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="6485.98" y="-1276" font-family="Arial" font-size="14.00"> &#39;todo&#39; or &#39;done&#39;. Part of the uniqueness key, so the same id may exist once per source during a transition.</text>
+<polygon fill="none" stroke="black" points="6389.51,-1233 6389.51,-1263.8 7703.09,-1263.8 7703.09,-1233 6389.51,-1233"/>
+<text text-anchor="start" x="6396.51" y="-1245.2" font-family="Arial" font-size="14.00">created_at </text>
+<text text-anchor="start" x="6466.56" y="-1245.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<polygon fill="none" stroke="black" points="6389.51,-1202.2 6389.51,-1233 7703.09,-1233 7703.09,-1202.2 6389.51,-1202.2"/>
+<text text-anchor="start" x="6396.51" y="-1214.4" font-family="Arial" font-size="14.00">updated_at </text>
+<text text-anchor="start" x="6470.47" y="-1214.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+</g>
+<!-- tasks&#45;&gt;repositories -->
+<g id="edge6" class="edge">
+<title>tasks:repository_id&#45;&gt;repositories:id</title>
+<path fill="none" stroke="black" d="M6378.45,-1523.86C6310.83,-1498.36 6396.33,-1200.47 6337.3,-1143.6 6217.49,-1028.17 5013.21,-1000 4846.83,-1000"/>
+<polygon fill="black" stroke="black" points="6378.33,-1523.84 6387.42,-1529.98 6383.59,-1524.75 6387.86,-1525.49 6387.86,-1525.49 6387.86,-1525.49 6383.59,-1524.75 6388.95,-1521.11 6378.33,-1523.84"/>
+<text text-anchor="start" x="5803.63" y="-1535.6" font-family="Arial" font-size="10.00">FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE</text>
 </g>
 </g>
 </svg>

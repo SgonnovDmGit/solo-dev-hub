@@ -1025,169 +1025,6 @@
       "def": "CREATE TABLE deploy_secrets (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            deploy_env_id INTEGER NOT NULL REFERENCES deploy_environments(id) ON DELETE CASCADE,\n            secret_name TEXT NOT NULL,\n            role TEXT CHECK(role IN ('build','deploy','runtime')),\n            included INTEGER NOT NULL DEFAULT 1,\n            override_enabled INTEGER NOT NULL DEFAULT 0,\n            sort_order INTEGER NOT NULL DEFAULT 0,\n            UNIQUE(deploy_env_id, secret_name)\n         )"
     },
     {
-      "name": "tasks",
-      "type": "table",
-      "comment": "Mirror of docs/todo.md and docs/done.md. Polarity is the reverse of bugs — here the Markdown is canonical and this table is rebuilt from it on each sync, because tasks are hand-edited far more often than bugs.",
-      "columns": [
-        {
-          "name": "id",
-          "type": "INTEGER",
-          "nullable": true
-        },
-        {
-          "name": "repository_id",
-          "type": "INTEGER",
-          "nullable": false
-        },
-        {
-          "name": "task_id",
-          "type": "TEXT",
-          "nullable": false,
-          "comment": "The display id as written in Markdown (T-000042 / F-000013 / D-000001) — TEXT, not a foreign key. Note task_events.task_id is a different thing: an INTEGER FK to tasks.id."
-        },
-        {
-          "name": "prefix",
-          "type": "TEXT",
-          "nullable": false
-        },
-        {
-          "name": "description",
-          "type": "TEXT",
-          "nullable": false
-        },
-        {
-          "name": "effort",
-          "type": "REAL",
-          "nullable": true
-        },
-        {
-          "name": "priority",
-          "type": "TEXT",
-          "nullable": true,
-          "comment": "No SQL CHECK — critical / high / medium / low are enforced in Rust."
-        },
-        {
-          "name": "status",
-          "type": "TEXT",
-          "nullable": true,
-          "comment": "No SQL CHECK — open / in-progress / review are enforced in Rust."
-        },
-        {
-          "name": "version",
-          "type": "TEXT",
-          "nullable": true,
-          "comment": "Inherited from the nearest preceding '## vX.Y.Z' header in todo.md."
-        },
-        {
-          "name": "source",
-          "type": "TEXT",
-          "nullable": false,
-          "comment": "'todo' or 'done'. Part of the uniqueness key, so the same id may exist once per source during a transition."
-        },
-        {
-          "name": "created_at",
-          "type": "TEXT",
-          "nullable": false
-        },
-        {
-          "name": "updated_at",
-          "type": "TEXT",
-          "nullable": false
-        }
-      ],
-      "indexes": [
-        {
-          "name": "idx_tasks_status",
-          "def": "CREATE INDEX idx_tasks_status ON tasks(status) WHERE status IS NOT NULL",
-          "table": "tasks",
-          "columns": [
-            "status"
-          ]
-        },
-        {
-          "name": "idx_tasks_repo_source",
-          "def": "CREATE INDEX idx_tasks_repo_source ON tasks(repository_id, source)",
-          "table": "tasks",
-          "columns": [
-            "repository_id",
-            "source"
-          ]
-        },
-        {
-          "name": "idx_tasks_repo",
-          "def": "CREATE INDEX idx_tasks_repo ON tasks(repository_id)",
-          "table": "tasks",
-          "columns": [
-            "repository_id"
-          ]
-        },
-        {
-          "name": "sqlite_autoindex_tasks_1",
-          "def": "UNIQUE (repository_id, task_id, source)",
-          "table": "tasks",
-          "columns": [
-            "repository_id",
-            "task_id",
-            "source"
-          ]
-        }
-      ],
-      "constraints": [
-        {
-          "name": "id",
-          "type": "PRIMARY KEY",
-          "def": "PRIMARY KEY (id)",
-          "table": "tasks",
-          "columns": [
-            "id"
-          ]
-        },
-        {
-          "name": "- (Foreign key ID: 0)",
-          "type": "FOREIGN KEY",
-          "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
-          "table": "tasks",
-          "referenced_table": "repositories",
-          "columns": [
-            "repository_id"
-          ],
-          "referenced_columns": [
-            "id"
-          ]
-        },
-        {
-          "name": "sqlite_autoindex_tasks_1",
-          "type": "UNIQUE",
-          "def": "UNIQUE (repository_id, task_id, source)",
-          "table": "tasks",
-          "columns": [
-            "repository_id",
-            "task_id",
-            "source"
-          ]
-        },
-        {
-          "name": "-",
-          "type": "CHECK",
-          "def": "CHECK(prefix IN ('T','F','D'))",
-          "table": "tasks",
-          "columns": [
-            "prefix"
-          ]
-        },
-        {
-          "name": "-",
-          "type": "CHECK",
-          "def": "CHECK(source IN ('todo','done'))",
-          "table": "tasks",
-          "columns": [
-            "source"
-          ]
-        }
-      ],
-      "def": "CREATE TABLE tasks (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             task_id TEXT NOT NULL,\n             prefix TEXT NOT NULL CHECK(prefix IN ('T','F','D')),\n             description TEXT NOT NULL,\n             effort REAL,\n             priority TEXT,\n             status TEXT,\n             version TEXT,\n             source TEXT NOT NULL CHECK(source IN ('todo','done')),\n             created_at TEXT NOT NULL,\n             updated_at TEXT NOT NULL,\n             UNIQUE(repository_id, task_id, source)\n         )"
-    },
-    {
       "name": "task_events",
       "type": "table",
       "comment": "Append-only task lifecycle log, the task-side twin of bug_events.",
@@ -1774,6 +1611,169 @@
         }
       ],
       "def": "CREATE TABLE deploy_secret_values (\n            id            INTEGER PRIMARY KEY AUTOINCREMENT,\n            deploy_env_id INTEGER NOT NULL REFERENCES deploy_environments(id) ON DELETE CASCADE,\n            secret_name   TEXT NOT NULL,\n            ciphertext    BLOB NOT NULL,\n            nonce         BLOB NOT NULL,\n            updated_at    TEXT NOT NULL,\n            UNIQUE(deploy_env_id, secret_name)\n        )"
+    },
+    {
+      "name": "tasks",
+      "type": "table",
+      "comment": "Mirror of docs/todo.md and docs/done.md. Polarity is the reverse of bugs — here the Markdown is canonical and this table is rebuilt from it on each sync, because tasks are hand-edited far more often than bugs.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "repository_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "task_id",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "The display id as written in Markdown (T-000042 / F-000013 / D-000001) — TEXT, not a foreign key. Note task_events.task_id is a different thing: an INTEGER FK to tasks.id."
+        },
+        {
+          "name": "prefix",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "effort",
+          "type": "REAL",
+          "nullable": true
+        },
+        {
+          "name": "priority",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "No SQL CHECK — critical / high / medium / low are enforced in Rust."
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "No SQL CHECK — open / in-progress / review are enforced in Rust."
+        },
+        {
+          "name": "version",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "Inherited from the nearest preceding '## vX.Y.Z' header in todo.md."
+        },
+        {
+          "name": "source",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "'todo' or 'done'. Part of the uniqueness key, so the same id may exist once per source during a transition."
+        },
+        {
+          "name": "created_at",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "TEXT",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_tasks_status",
+          "def": "CREATE INDEX idx_tasks_status ON tasks(status) WHERE status IS NOT NULL",
+          "table": "tasks",
+          "columns": [
+            "status"
+          ]
+        },
+        {
+          "name": "idx_tasks_repo_source",
+          "def": "CREATE INDEX idx_tasks_repo_source ON tasks(repository_id, source)",
+          "table": "tasks",
+          "columns": [
+            "repository_id",
+            "source"
+          ]
+        },
+        {
+          "name": "idx_tasks_repo",
+          "def": "CREATE INDEX idx_tasks_repo ON tasks(repository_id)",
+          "table": "tasks",
+          "columns": [
+            "repository_id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_tasks_1",
+          "def": "UNIQUE (repository_id, task_id, source)",
+          "table": "tasks",
+          "columns": [
+            "repository_id",
+            "task_id",
+            "source"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "tasks",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "tasks",
+          "referenced_table": "repositories",
+          "columns": [
+            "repository_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_tasks_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (repository_id, task_id, source)",
+          "table": "tasks",
+          "columns": [
+            "repository_id",
+            "task_id",
+            "source"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(prefix IN ('T','F','D','O','M'))",
+          "table": "tasks",
+          "columns": [
+            "prefix"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK(source IN ('todo','done'))",
+          "table": "tasks",
+          "columns": [
+            "source"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE \"tasks\" (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             task_id TEXT NOT NULL,\n             prefix TEXT NOT NULL CHECK(prefix IN ('T','F','D','O','M')),\n             description TEXT NOT NULL,\n             effort REAL,\n             priority TEXT,\n             status TEXT,\n             version TEXT,\n             source TEXT NOT NULL CHECK(source IN ('todo','done')),\n             created_at TEXT NOT NULL,\n             updated_at TEXT NOT NULL,\n             UNIQUE(repository_id, task_id, source)\n         )"
     }
   ],
   "relations": [
@@ -1882,19 +1882,6 @@
       "def": "FOREIGN KEY (deploy_env_id) REFERENCES deploy_environments (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
     },
     {
-      "table": "tasks",
-      "columns": [
-        "repository_id"
-      ],
-      "cardinality": "zero_or_more",
-      "parent_table": "repositories",
-      "parent_columns": [
-        "id"
-      ],
-      "parent_cardinality": "exactly_one",
-      "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
-    },
-    {
       "table": "task_events",
       "columns": [
         "task_id"
@@ -1984,6 +1971,19 @@
       ],
       "parent_cardinality": "exactly_one",
       "def": "FOREIGN KEY (deploy_env_id) REFERENCES deploy_environments (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "tasks",
+      "columns": [
+        "repository_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
     }
   ],
   "driver": {
