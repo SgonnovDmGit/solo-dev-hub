@@ -4,7 +4,7 @@ description: >
   Use when development work is split across two or more AI agents by role —
   one drafts the spec, another implements it, then the result is reviewed.
   Covers the Architect / Implementer / Reviewer roles (recommended default:
-  Claude specs and reviews, GPT-5.6 implements), the spec-plus-a-note handoff
+  Claude specs and optionally reviews, GPT-5.6 implements and closes), the spec-plus-a-note handoff
   contract, the three-pass review loop with a shared-contract integrity
   check, and how retro ownership works across agents. An overlay on
   sdh-release-lifecycle and sdh-phase-workflow, not a replacement.
@@ -52,15 +52,21 @@ its verification are never the same hands.
    - If the spec is ambiguous, contradicts a test, or has a gap, the Implementer does
      **not** patch the spec silently — it **raises it to the Architect**, and the
      **Architect decides who fixes the spec** (fixes it themselves, or hands it back).
-4. **Reviewer reviews the result** — three passes, in order (below). Findings go
-   **back to the Implementer** for rework, then re-review, until clean.
-5. **Architect closes.** Once the review is clean: Test → Closure docs → next-release
-   plan. The git canon block (tag / master-merge / push) stays **user-only**.
+4. **Architect review — optional.** The Architect may review the result (three passes,
+   in order, below); it is **not a mandatory gate**. Any findings go **back to the
+   Implementer** for rework, then re-review. The **shared-contract integrity** pass is
+   recommended whenever the change touches a contract shared between agents, even when
+   the overall review is skipped.
+5. **Implementer closes.** Once any review is clean, the Implementer runs Test →
+   Closure docs (stages 8–9), then hands the **next-release plan** (stage 10) back to
+   the Architect. The git canon block (tag / master-merge / push) stays **user-only**.
 6. **Retro** — see ownership below.
 
-Stage ownership on the lifecycle: the Architect owns stages 1–6 and 8–11; the
-Implementer owns stage 7 (Implementation). No role runs the tag / master-merge — that
-is always the user's.
+Stage ownership on the lifecycle: the Architect owns stages 1–6 and 10 (next-release
+plan), plus an optional review of the result; the Implementer owns stages 7–9 (build,
+test, closure docs) and leads the release up to the git block. Retro (stage 11) follows
+the closer per Retro ownership below. No role runs the tag / master-merge — that is
+always the user's.
 
 ## Handoff contract — the spec, plus an optional note
 

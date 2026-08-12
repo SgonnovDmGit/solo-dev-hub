@@ -13,6 +13,7 @@ Operations tasks — a class of non-code work items that never block a code rele
 
 ### Changed
 - **Schema migration v30** rebuilds the `tasks` table so `prefix` accepts `O`/`M` alongside `T`/`F`/`D` (foreign-key-safe rebuild — `task_events` preserved).
+- **`sdh-agent-collaboration` — the Implementer now leads closure (T-000182).** The **Test** and **Closure** stages move from the Architect to the Implementer, who holds the full build context (test counts, what actually shipped). The Architect keeps scope/spec and the **next-release plan**, and its result review becomes **optional** (the shared-contract integrity pass stays recommended whenever a shared contract is touched). The tag / master-merge remain user-only. Synced to every managed repo.
 
 ### Tests
 - 509 Rust (+6 over v1.13.0's 503: migration v30 O/M CHECK + `task_events` FK preservation, O/M parser acceptance + forced-empty version, O/M sync prefix detection; 1 ignored: the schema-export generator), 86 vitest, svelte-check clean.
