@@ -8,11 +8,11 @@ Mirror of docs/todo.md and docs/done.md. Polarity is the reverse of bugs — her
 <summary><strong>Table Definition</strong></summary>
 
 ```sql
-CREATE TABLE tasks (
+CREATE TABLE "tasks" (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
              task_id TEXT NOT NULL,
-             prefix TEXT NOT NULL CHECK(prefix IN ('T','F','D')),
+             prefix TEXT NOT NULL CHECK(prefix IN ('T','F','D','O','M')),
              description TEXT NOT NULL,
              effort REAL,
              priority TEXT,
@@ -51,7 +51,7 @@ CREATE TABLE tasks (
 | id                       | PRIMARY KEY | PRIMARY KEY (id)                                                                                          |
 | - (Foreign key ID: 0)    | FOREIGN KEY | FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE |
 | sqlite_autoindex_tasks_1 | UNIQUE      | UNIQUE (repository_id, task_id, source)                                                                   |
-| -                        | CHECK       | CHECK(prefix IN ('T','F','D'))                                                                            |
+| -                        | CHECK       | CHECK(prefix IN ('T','F','D','O','M'))                                                                    |
 | -                        | CHECK       | CHECK(source IN ('todo','done'))                                                                          |
 
 ## Indexes

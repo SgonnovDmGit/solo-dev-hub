@@ -68,6 +68,11 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         mig_v28_workflow_automation_columns,
     ),
     (29, "codex_source_path", mig_v29_codex_source_path),
+    (
+        30,
+        "tasks_prefix_ops_classes",
+        mig_v30_tasks_prefix_ops_classes,
+    ),
 ];
 
 impl AppDb {
@@ -924,6 +929,45 @@ fn mig_v29_codex_source_path(conn: &Connection) -> SqlResult<()> {
     )
 }
 
+fn mig_v30_tasks_prefix_ops_classes(conn: &Connection) -> SqlResult<()> {
+    // T-000178: allow operations task classes 'O' (technical) and 'M'
+    // (marketing) in the tasks.prefix CHECK, alongside 'T','F','D'.
+    //
+    // The prefix CHECK was created in v21 as CHECK(prefix IN ('T','F','D')).
+    // SQLite can't ALTER a CHECK, so the table is rebuilt. All other columns
+    // are copied verbatim from the v21 definition. `task_events.task_id`
+    // REFERENCES tasks(id) ON DELETE CASCADE, and the connection runs with
+    // foreign_keys=ON, so a naive DROP TABLE tasks would cascade-delete every
+    // task_events row — foreign_keys is disabled around the rebuild to prevent
+    // that, then re-enabled.
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         CREATE TABLE tasks_new (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             task_id TEXT NOT NULL,
+             prefix TEXT NOT NULL CHECK(prefix IN ('T','F','D','O','M')),
+             description TEXT NOT NULL,
+             effort REAL,
+             priority TEXT,
+             status TEXT,
+             version TEXT,
+             source TEXT NOT NULL CHECK(source IN ('todo','done')),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             UNIQUE(repository_id, task_id, source)
+         );
+         INSERT INTO tasks_new SELECT * FROM tasks;
+         DROP TABLE tasks;
+         ALTER TABLE tasks_new RENAME TO tasks;
+         CREATE INDEX idx_tasks_repo ON tasks(repository_id);
+         CREATE INDEX idx_tasks_repo_source ON tasks(repository_id, source);
+         CREATE INDEX idx_tasks_status ON tasks(status) WHERE status IS NOT NULL;
+         PRAGMA foreign_keys=ON;
+         PRAGMA user_version = 30;",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,7 +1033,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         // Update this when a new migration is added.
-        assert!(version >= 28);
+        assert!(version >= 30);
     }
 
     #[test]
@@ -1064,6 +1108,115 @@ mod tests {
             [bug.id],
         );
         assert!(bad.is_err(), "garbage event_type must violate CHECK");
+    }
+
+    #[test]
+    fn test_db_migration_v30_tasks_prefix_ops_classes() {
+        // T-000178: after v30 the tasks.prefix CHECK accepts operations
+        // classes 'O' and 'M' in addition to 'T','F','D', while still
+        // rejecting an unknown prefix like 'Z'.
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/r-ops", "r-ops", None, None)
+            .unwrap();
+
+        // 'O' (technical operations) and 'M' (marketing) now insert cleanly.
+        db.insert_task(
+            repo.id,
+            "O-000001",
+            "O",
+            "ops technical task",
+            Some(1.0),
+            Some("medium"),
+            Some("open"),
+            None,
+            "todo",
+            "2026-08-12",
+        )
+        .expect("prefix 'O' must be accepted after v30");
+        db.insert_task(
+            repo.id,
+            "M-000001",
+            "M",
+            "marketing task",
+            Some(2.0),
+            Some("low"),
+            Some("open"),
+            None,
+            "todo",
+            "2026-08-12",
+        )
+        .expect("prefix 'M' must be accepted after v30");
+
+        // The original classes still work.
+        db.insert_task(
+            repo.id,
+            "T-000001",
+            "T",
+            "code task",
+            None,
+            None,
+            None,
+            None,
+            "todo",
+            "2026-08-12",
+        )
+        .expect("prefix 'T' must still be accepted");
+
+        // An unknown prefix still violates the (widened) CHECK.
+        let bad = db.insert_task(
+            repo.id,
+            "Z-000001",
+            "Z",
+            "bogus",
+            None,
+            None,
+            None,
+            None,
+            "todo",
+            "2026-08-12",
+        );
+        assert!(bad.is_err(), "prefix 'Z' must still violate the CHECK");
+    }
+
+    #[test]
+    fn test_db_migration_v30_preserves_task_events_fk() {
+        // T-000178: the FK-safe rebuild must leave tasks + task_events wiring
+        // intact — insert a task, then a task_event referencing it, and read
+        // both back.
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/r-fk", "r-fk", None, None)
+            .unwrap();
+
+        let task = db
+            .insert_task(
+                repo.id,
+                "T-000042",
+                "T",
+                "a task",
+                Some(4.0),
+                Some("high"),
+                Some("open"),
+                None,
+                "todo",
+                "2026-08-12",
+            )
+            .unwrap();
+
+        db.insert_task_event(
+            task.id,
+            "created",
+            "2026-08-12T00:00:00Z",
+            None,
+            Some("open"),
+        )
+        .expect("task_event insert must succeed after v30 rebuild");
+
+        let events = db.list_task_events_by_task(task.id).unwrap();
+        assert_eq!(events.len(), 1, "task_event must be readable back");
+        assert_eq!(events[0].task_id, task.id);
+        assert_eq!(events[0].event_type, "created");
     }
 
     #[test]
@@ -1228,11 +1381,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v29 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v30 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 29);
+        assert_eq!(version, 30);
 
         drop(conn);
         let _ = repo;
@@ -1299,7 +1452,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 29);
+        assert_eq!(version, 30);
     }
 
     #[test]

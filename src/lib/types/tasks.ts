@@ -3,7 +3,7 @@ export interface Task {
   id: number;
   repository_id: number;
   task_id: string;
-  prefix: 'T' | 'F' | 'D';
+  prefix: 'T' | 'F' | 'D' | 'O' | 'M';
   description: string;
   effort: number | null;
   priority: string | null;

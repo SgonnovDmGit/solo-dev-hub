@@ -4,6 +4,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.14.0] — 2026-08-12
+
+Operations tasks — a class of non-code work items that never block a code release.
+
+### Added
+- **Operations task classes `O-` / `M-` (T-000178…181).** Two new task id-classes capture *операционка* — work to be **done**, not **coded**: `O-NNNNNN` (technical — infra, accounts, access, hand-run config) and `M-NNNNNN` (marketing — announcements, copy, publications). They carry execution context for the AI but are **never release blockers**: they never join `## vX.Y.Z` release grouping and their version is always empty. The **Tasks** and **Done** grids gain a first **Type** column — an icon per row (code `‹/›` / ⚙ technical / 📣 marketing) with a hover tooltip and a select filter. Fully localized (ru/en). The format rules are canonized in the global AI rules that sync to every managed repo, so the AI stops mistaking no-code tasks for release blockers.
+
+### Changed
+- **Schema migration v30** rebuilds the `tasks` table so `prefix` accepts `O`/`M` alongside `T`/`F`/`D` (foreign-key-safe rebuild — `task_events` preserved).
+- **`sdh-agent-collaboration` — the Implementer now leads closure (T-000182).** The **Test** and **Closure** stages move from the Architect to the Implementer, who holds the full build context (test counts, what actually shipped). The Architect keeps scope/spec and the **next-release plan**, and its result review becomes **optional** (the shared-contract integrity pass stays recommended whenever a shared contract is touched). The tag / master-merge remain user-only. Synced to every managed repo.
+
+### Tests
+- 509 Rust (+6 over v1.13.0's 503: migration v30 O/M CHECK + `task_events` FK preservation, O/M parser acceptance + forced-empty version, O/M sync prefix detection; 1 ignored: the schema-export generator), 86 vitest, svelte-check clean.
+
 ## [1.13.0] — 2026-08-12
 
 The first slice of the in-app help: a navigable onboarding guide reachable from the titlebar.

@@ -16,8 +16,13 @@
     wrap?: boolean;
     sortWeight?: Record<string, number>;
     labelMap?: Record<string, string>;
+    titleMap?: Record<string, string>;
     sortCompare?: (a: any, b: any) => number;
   }
+
+  // T-000180: grid row = Task plus a derived typeGroup so ops classes (O/M)
+  // are filterable/sortable via a dedicated "Тип" column.
+  type TaskRow = Task & { typeGroup: string };
 
   interface Props { repoId: number; }
   let { repoId }: Props = $props();
@@ -25,13 +30,37 @@
   let tasks = $state<Task[]>([]);
   let loading = $state(true);
 
+  // T-000180: map prefix → type group. O = technical ops, M = marketing ops,
+  // everything else (T/F/D) = code. Recomputes when `tasks` changes.
+  const rows = $derived<TaskRow[]>(
+    tasks.map((t) => ({
+      ...t,
+      typeGroup: t.prefix === 'O' ? 'ops-tech' : t.prefix === 'M' ? 'ops-mktg' : 'code',
+    }))
+  );
+
   // B-000005: $derived — columns rebuild on locale switch (was const, captured
   // initial $tStore values once). sortWeight gives priority/status workflow
   // order instead of alphabetical; labelMap shows localized labels in cells +
   // filter dropdown + chips while raw values stay unchanged for match logic.
   const PRIORITY_WEIGHT: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
   const TASK_STATUS_WEIGHT: Record<string, number> = { open: 0, 'in-progress': 1, review: 2 };
-  const columns = $derived<ColumnDef<Task>[]>([
+  const columns = $derived<ColumnDef<TaskRow>[]>([
+    {
+      key: 'typeGroup',
+      label: $tStore('tasks.col.type' as any),
+      sortable: true,
+      filter: 'select',
+      selectOptions: ['code', 'ops-tech', 'ops-mktg'],
+      flex: 0.5,
+      sortWeight: { code: 0, 'ops-tech': 1, 'ops-mktg': 2 },
+      labelMap: { code: '‹/›', 'ops-tech': '⚙', 'ops-mktg': '📣' },
+      titleMap: {
+        code: $tStore('tasks.type.code' as any),
+        'ops-tech': $tStore('tasks.type.opsTech' as any),
+        'ops-mktg': $tStore('tasks.type.opsMktg' as any),
+      },
+    },
     { key: 'task_id', label: $tStore('tasks.col.id' as any), sortable: true, render: 'monospace', flex: 0.6 },
     { key: 'description', label: $tStore('tasks.col.description' as any), sortable: false, filter: 'text', flex: 4, wrap: true },
     { key: 'effort', label: $tStore('tasks.col.effort' as any), sortable: true, flex: 0.6 },
@@ -116,7 +145,7 @@
     {#key repoId}
       <DataGrid
         {columns}
-        rows={tasks}
+        {rows}
         defaultSort={{ key: 'priority', direction: 'asc' }}
         persistKey={`tasks_grid_state_${repoId}`}
         emptyMessage={$tStore('tasks.empty' as any)}

@@ -161,10 +161,16 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
 
     // ── Process TODO entries ─────────────────────────────────────────────────
     for tt in &todo_tasks {
+        // T-000179: O-/M- operations classes (technical / marketing) sync like
+        // any todo row. Their version is force-emptied by the parser.
         let prefix = if tt.id.starts_with("T-") {
             "T"
         } else if tt.id.starts_with("F-") {
             "F"
+        } else if tt.id.starts_with("O-") {
+            "O"
+        } else if tt.id.starts_with("M-") {
+            "M"
         } else {
             continue; // Skip unknown prefixes
         };
@@ -297,10 +303,15 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
     let _md_todo_ids: HashSet<&str> = todo_tasks.iter().map(|t| t.id.as_str()).collect();
 
     for dt in &done_tasks {
+        // T-000179: O-/M- operations classes also land in done.md when closed.
         let prefix = if dt.id.starts_with("T-") {
             "T"
         } else if dt.id.starts_with("F-") {
             "F"
+        } else if dt.id.starts_with("O-") {
+            "O"
+        } else if dt.id.starts_with("M-") {
+            "M"
         } else if dt.id.starts_with("D-") {
             "D"
         } else {
@@ -622,6 +633,49 @@ mod tests {
 
         let todos = db.list_tasks_by_repo(repo.id, "todo").unwrap();
         assert_eq!(todos[0].status.as_deref(), Some("review"));
+        std::mem::forget(tmp);
+    }
+
+    /// T-000179: O-/M- operations tasks sync into the `tasks` table with the
+    /// correct prefix (`"O"` / `"M"`) and carry no release version (the parser
+    /// force-empties it, and they never sit under a release header anyway).
+    #[test]
+    fn test_sync_tasks_operations_classes_prefix_and_no_version() {
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_path.join("docs")).unwrap();
+        std::fs::write(
+            repo_path.join("docs/todo.md"),
+            "## v1.14.0 — release with ops mixed in\n\n\
+             - [ ] O-000001 | Setup signing | 2 | high | open | 2026-08-12\n\
+             - [ ] M-000001 | Write announcement | 1 | medium | open | 2026-08-12\n\
+             - [ ] T-000200 | Code task | 3 | high | open | 2026-08-12\n",
+        )
+        .unwrap();
+        let repo = db
+            .insert_local_repository(repo_path.to_str().unwrap(), "ops_repo", None, None)
+            .unwrap();
+
+        let report = sync_tasks_for_repo(&db, repo.id).unwrap();
+        assert_eq!(report.imported, 3);
+
+        let todos = db.list_tasks_by_repo(repo.id, "todo").unwrap();
+        assert_eq!(todos.len(), 3);
+
+        let o = todos.iter().find(|t| t.task_id == "O-000001").unwrap();
+        assert_eq!(o.prefix, "O");
+        assert_eq!(o.version, None, "O- task must carry no release version");
+
+        let m = todos.iter().find(|t| t.task_id == "M-000001").unwrap();
+        assert_eq!(m.prefix, "M");
+        assert_eq!(m.version, None, "M- task must carry no release version");
+
+        // Sanity: the normal T- task under the same header still gets the version.
+        let t = todos.iter().find(|t| t.task_id == "T-000200").unwrap();
+        assert_eq!(t.prefix, "T");
+        assert_eq!(t.version.as_deref(), Some("v1.14.0"));
+
         std::mem::forget(tmp);
     }
 

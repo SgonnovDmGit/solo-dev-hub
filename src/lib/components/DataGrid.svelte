@@ -19,6 +19,11 @@
     // B-000005: when set, cell renders the mapped label (e.g. localized) but
     // the underlying value is unchanged for filter/search matching.
     labelMap?: Record<string, string>;
+    // T-000180: per-value custom tooltip + filter-dropdown label. When set,
+    // takes precedence over labelMap for the cell `title` and the filter/chip
+    // display label — lets a column show an icon glyph (via labelMap) while the
+    // tooltip and filter option carry the full human-readable text.
+    titleMap?: Record<string, string>;
     // T-000109: when set, sort uses this comparator instead of localeCompare /
     // sortWeight. Higher-precedence than `sortWeight` (mutually exclusive in
     // practice — set one or the other per column). Used for SemVer-aware
@@ -178,6 +183,9 @@
 
   // B-000005: shared helper for filter dropdown options and chips.
   function displayLabel(col: ColumnDef<T> | undefined, raw: string): string {
+    // T-000180: titleMap wins so the filter dropdown + chips show the full
+    // human-readable text even when labelMap renders an icon glyph in cells.
+    if (col?.titleMap && col.titleMap[raw] != null) return col.titleMap[raw];
     if (col?.labelMap && col.labelMap[raw] != null) return col.labelMap[raw];
     return raw;
   }
@@ -283,7 +291,7 @@
                   class:monospace={col.render === 'monospace' || col.render === 'date'}
                   class:wrap={col.wrap}
                   style="{col.render === 'priority-color' ? `color: ${priorityColor(String(row[col.key]))}` : ''}"
-                  title={String(row[col.key] ?? '').replace(/\\n/g, '\n')}
+                  title={col.titleMap?.[String(row[col.key] ?? '')] ?? String(row[col.key] ?? '').replace(/\\n/g, '\n')}
                 >
                   {cellRender(col, row)}
                 </td>

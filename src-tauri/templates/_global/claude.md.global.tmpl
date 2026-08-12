@@ -71,6 +71,19 @@ Tasks may be grouped under `## vX.Y.Z — <short description>` section headers f
 
 Plain markdown readers treat `## ...` lines as comments — tasks under any header (or no header) read identically as a flat list. Some tools may use these headers as release-grouping signals: Solo Dev Hub, for example, parses `## vX.Y.Z` (must start with `v` followed by a digit) and surfaces the inherited version as a sortable column in the Tasks view; non-version headers like `## Format` or `## Backlog` are ignored. Headers stay optional — use when they help planning, skip for small/single-version projects.
 
+### Operations tasks (`O-` / `M-`) — non-code, never release blockers
+
+Beside the code classes `T-`/`F-`, two classes capture **операционка** — work that has to be *done*, not *coded*, but that the AI still needs to know the execution context of:
+
+- `O-NNNNNN` — **technical** operations (infra, accounts, registrations, access, hand-run config).
+- `M-NNNNNN` — **marketing** operations (announcements, copy, landing, publications).
+
+Rules:
+- **Same line format** as any todo task (`effort` / `priority` / `status` / `created_at` all apply). Independent 6-digit counters per prefix, exactly like `T-`/`F-` — scan for the max within the same prefix, +1, `{prefix}-{:06}`.
+- **Never a release blocker.** Open `O-`/`M-` tasks do **not** gate a code release — do not treat them as blockers when tagging `vX.Y.Z`. They **never participate in `## vX.Y.Z` release grouping**: their `version` is always empty (a tool that inherits version from headers must force it empty for `O-`/`M-`, even under a version header). Group them under a plain non-version header like `## Операционка` if you want, or leave them ungrouped.
+- **In `done.md`** an `O-`/`M-` entry leaves the version slot empty (`- O-000001 | … | `).
+- **Why a separate class:** without it, no-code tasks land inside code releases and get mistaken for release blockers. The class makes their nature explicit and keeps the release gate about code.
+
 ## `docs/done.md`
 
 Structure:
@@ -86,7 +99,7 @@ Structure:
 - No `[x]` checkbox — the file itself is the "done" list.
 - If the `id` slot is empty, the app assigns a synthetic `D-NNNNNN` (6-digit) for display (in-memory only, file is not rewritten). **`D-NNNNNN` exists only inside the app's UI** — when referring to a done entry elsewhere (commit message, conversation, other files), use the description text, not `D-NNNNNN`.
 - Parser is lenient on id format — legacy 3-digit IDs (`T-045`, `D-001`) still read correctly. New entries written by LLM/app use 6-digit padding (`T-000045`).
-- `version` — SemVer tag like `v0.13.9` recommended. Any free-form string accepted. May be empty.
+- `version` — SemVer tag like `v0.13.9` recommended. Any free-form string accepted. May be empty (always empty for `O-`/`M-` operations entries — they're not release-scoped).
 - **Ordering:** new entries are appended at the bottom of the current `## <date>` section (chronological within the day).
 
 LLM/user policy: LLM or user moves completed tasks from `todo.md` here (append under the correct `## YYYY-MM-DD` section). **Historical entries must not be modified or removed** — `done.md` is an append-only log.
