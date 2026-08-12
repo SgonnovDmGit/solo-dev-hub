@@ -29,9 +29,9 @@
 
 | # | Field | Type | Required | Example |
 |---|-------|------|:--------:|---------|
-| 1 | `id` | String (task/feature/done id) | — (may be empty) | `T-042`, `F-022`, `D-001`, or `` |
+| 1 | `id` | String (task/feature/done/operations id) | — (may be empty) | `T-042`, `F-022`, `D-001`, `O-000001`, `M-000001`, or `` |
 | 2 | `description` | String (may contain escaped `\|` and `\n`) | ✓ | `Refactor SecretsPanel` |
-| 3 | `version` | String, SemVer tag or similar | — (may be empty) | `v0.13.9`, `0.13.9`, or `` |
+| 3 | `version` | String, SemVer tag or similar (always empty for `O-`/`M-` operations entries — not release-scoped) | — (may be empty) | `v0.13.9`, `0.13.9`, or `` |
 | — | `date` | Inherited from preceding `## <date>` header | — (empty if no header) | `2026-04-21` |
 
 ### Auto-id `D-NNN`
