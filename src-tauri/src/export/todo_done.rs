@@ -31,10 +31,12 @@ fn is_date_like(s: &str) -> bool {
 }
 
 /// True if the line's first stripped word could be a task ID we want to accept
-/// (`T-…`, `F-…`, `B-…`, `v0…`, or begins with an ASCII digit for generic IDs).
+/// (`T-…`, `F-…`, `O-…`, `M-…`, `B-…`, `v0…`, or begins with an ASCII digit for
+/// generic IDs). T-000179: `O-` (operations/technical) and `M-` (marketing) are
+/// operations classes accepted in the same checkbox-less `- ID | ...` form.
 fn looks_like_task_id_start(r: &str) -> bool {
     r.chars().next().map_or(false, |c| {
-        c == 'T' || c == 'F' || c == 'B' || c == 'v' || c.is_ascii_digit()
+        c == 'T' || c == 'F' || c == 'O' || c == 'M' || c == 'B' || c == 'v' || c.is_ascii_digit()
     })
 }
 
@@ -120,6 +122,14 @@ pub fn parse_todo_tasks(content: &str) -> (Vec<TodoTask>, Vec<String>) {
                 )
             }
         };
+        // T-000179: O-/M- operations classes never participate in release
+        // grouping — force an empty version even if the task sits under a
+        // `## vX.Y.Z` header. They are not release blockers.
+        let version = if id.starts_with("O-") || id.starts_with("M-") {
+            String::new()
+        } else {
+            current_version.clone()
+        };
         tasks.push(TodoTask {
             id,
             description,
@@ -127,7 +137,7 @@ pub fn parse_todo_tasks(content: &str) -> (Vec<TodoTask>, Vec<String>) {
             priority,
             status,
             created_at,
-            version: current_version.clone(),
+            version,
         });
     }
     (tasks, warnings)
@@ -445,6 +455,62 @@ mod tests {
             "task above first version header has no version"
         );
         assert_eq!(tasks[1].version, "v0.32.0");
+    }
+
+    // ── T-000179: O-/M- operations task classes ─────────────────────────────────
+
+    #[test]
+    fn test_parse_todo_operations_classes_parse() {
+        // O- (technical ops) and M- (marketing) parse like any todo line.
+        let md = "- [ ] O-000001 | Setup signing | 2 | high | open | 2026-08-12\n\
+                  - M-000001 | Write announcement | 1 | medium | open | 2026-08-12\n";
+        let (tasks, warnings) = parse_todo_tasks(md);
+        assert!(warnings.is_empty(), "got warnings: {:?}", warnings);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "O-000001");
+        assert_eq!(tasks[0].description, "Setup signing");
+        assert_eq!(tasks[0].effort, "2");
+        assert_eq!(tasks[0].priority, "high");
+        assert_eq!(tasks[0].status, "open");
+        assert_eq!(tasks[1].id, "M-000001");
+        assert_eq!(tasks[1].description, "Write announcement");
+        assert_eq!(tasks[1].effort, "1");
+        assert_eq!(tasks[1].priority, "medium");
+        assert_eq!(tasks[1].status, "open");
+    }
+
+    #[test]
+    fn test_parse_todo_operations_classes_never_inherit_version() {
+        // O-/M- under a `## vX.Y.Z` header must NOT inherit the release version,
+        // while a normal T- task under the same header does. This is the key rule.
+        let md = "## v1.14.0 — some release\n\
+                  - [ ] O-000001 | Ops task | 2 | high | open | 2026-08-12\n\
+                  - [ ] M-000001 | Marketing task | 1 | medium | open | 2026-08-12\n\
+                  - [ ] T-000200 | Code task | 3 | high | open | 2026-08-12\n";
+        let (tasks, warnings) = parse_todo_tasks(md);
+        assert!(warnings.is_empty(), "got warnings: {:?}", warnings);
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].id, "O-000001");
+        assert_eq!(tasks[0].version, "", "O- must not inherit release version");
+        assert_eq!(tasks[1].id, "M-000001");
+        assert_eq!(tasks[1].version, "", "M- must not inherit release version");
+        assert_eq!(tasks[2].id, "T-000200");
+        assert_eq!(
+            tasks[2].version, "v1.14.0",
+            "normal T- task still inherits the header version"
+        );
+    }
+
+    #[test]
+    fn test_parse_todo_operations_checkboxless_form_accepted() {
+        // Regression for `looks_like_task_id_start`: checkbox-less `- O-… | …`
+        // (no `- [ ] ` prefix) is still recognised.
+        let md = "- O-000002 | Rotate token | 1 | low | open | 2026-08-12\n";
+        let (tasks, warnings) = parse_todo_tasks(md);
+        assert!(warnings.is_empty(), "got warnings: {:?}", warnings);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "O-000002");
+        assert_eq!(tasks[0].status, "open");
     }
 
     #[test]
