@@ -27,6 +27,15 @@ export const ru = {
   'sync.codexFiles': '{0} файлов',
   'sync.codexSynced': 'Синхронизировано',
   'sync.codexPending': 'Ожидает синка',
+  // T-000193: peer channels (InOutBox) between equals
+  'sync.peerChannels': 'Каналы равных',
+  'sync.peerOrigin.derived': 'по роли',
+  'sync.peerOrigin.explicit': 'связь вручную',
+  'sync.peerCounts': 'исх. {0} · вх. {1} · пакты {2}',
+  'sync.peerSynced': 'Синхронизировано',
+  'sync.peerPending': 'Ожидает синка',
+  'sync.peerUnresolved': 'Нет на диске',
+  'sync.peerNoRegistry': 'Нет registry.md — реестр обменов заводит агент',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -57,4 +66,13 @@ export const en: Record<keyof typeof ru, string> = {
   'sync.codexFiles': '{0} files',
   'sync.codexSynced': 'Synced',
   'sync.codexPending': 'Pending sync',
+  // T-000193: peer channels (InOutBox) between equals
+  'sync.peerChannels': 'Peer channels',
+  'sync.peerOrigin.derived': 'by role',
+  'sync.peerOrigin.explicit': 'linked manually',
+  'sync.peerCounts': 'out {0} · in {1} · pacts {2}',
+  'sync.peerSynced': 'Synced',
+  'sync.peerPending': 'Pending sync',
+  'sync.peerUnresolved': 'Not on this disk',
+  'sync.peerNoRegistry': 'No registry.md — the agent creates the ledger',
 };

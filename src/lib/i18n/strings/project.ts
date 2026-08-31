@@ -46,6 +46,18 @@ export const ru = {
   'project.codexConsumers': 'Консумеры',
   'project.codexConsumersEmpty': 'Нет консумеров — свод пока никому не вещается',
   'project.codexLanesHint': 'server + admin_client → docs/codex/<имя>/',
+  // T-000193: peer channels (InOutBox) between equals
+  'project.peerChannels': 'Каналы равных',
+  'project.noPeerChannels': 'Нет каналов равных',
+  'project.noPeerChannelsHint': 'Репозитории одного проекта с одинаковой ролью становятся равными сами; с репозиторием другого проекта свяжите вручную ниже',
+  'project.peerDerived': 'по совпадающей роли ({0})',
+  'project.peerExplicit': 'связь заведена вручную',
+  'project.peerAuto': 'выведено автоматически',
+  'project.peerUnlink': 'Развязать',
+  'project.peerLinkSelf': 'Мой репозиторий',
+  'project.peerLinkPeer': 'Выберите равного…',
+  'project.peerLinkAdd': 'Связать',
+  'project.peerLinkHint': 'Связь симметрична. Развязка останавливает синк канала, но ничего не удаляет.',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -95,4 +107,16 @@ export const en: Record<keyof typeof ru, string> = {
   'project.codexConsumers': 'Consumers',
   'project.codexConsumersEmpty': 'No consumers — the svod is not broadcast anywhere yet',
   'project.codexLanesHint': 'server + admin_client → docs/codex/<name>/',
+  // T-000193: peer channels (InOutBox) between equals
+  'project.peerChannels': 'Peer channels',
+  'project.noPeerChannels': 'No peer channels',
+  'project.noPeerChannelsHint': 'Repositories of one project sharing a role pair up on their own; link a repository from another project below',
+  'project.peerDerived': 'by matching role ({0})',
+  'project.peerExplicit': 'linked manually',
+  'project.peerAuto': 'derived automatically',
+  'project.peerUnlink': 'Unlink',
+  'project.peerLinkSelf': 'My repository',
+  'project.peerLinkPeer': 'Pick a peer…',
+  'project.peerLinkAdd': 'Link',
+  'project.peerLinkHint': 'The link is symmetric. Unlinking stops the channel from syncing; it deletes nothing.',
 };

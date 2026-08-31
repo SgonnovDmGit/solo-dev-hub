@@ -83,3 +83,21 @@ export interface PeerOf {
   derived: boolean;
   explicit: boolean;
 }
+
+// T-000193: one peer channel as shown in the sync screen — a pair of repos and
+// the state of the three folders between them.
+export interface PeerChannelInfo {
+  self_repo_id: number;
+  peer_repo_id: number;
+  self_repo: string;
+  peer_repo: string;
+  peer_project: string;
+  origin: 'derived' | 'explicit';
+  role: string;
+  folder: string;
+  outbox_count: number;
+  inbox_count: number;
+  pact_count: number;
+  status: 'synced' | 'pending' | 'unresolved';
+  registry_present: boolean;
+}

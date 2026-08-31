@@ -183,6 +183,7 @@ pub fn run() {
             commands::sync::init_docs_for_repo,
             commands::sync::list_project_requirements,
             commands::sync::list_codex_edges,
+            commands::sync::list_peer_channels,
             commands::sync::confirm_requirement,
             // Rename log (F-033)
             commands::sync::list_rename_history,

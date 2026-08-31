@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo } from '$lib/types';
+import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo } from '$lib/types';
 
 
 // ── Requirements sync commands ──────────────────────────────────────────────
@@ -57,4 +57,9 @@ export async function getAutocommitBranch(repoId: number): Promise<string | null
 
 export async function setAutocommitBranch(repoId: number, branch: string | null): Promise<void> {
   return invoke<void>('set_autocommit_branch', { repoId, branch });
+}
+
+// T-000193: peer channels (InOutBox) touching a project.
+export async function listPeerChannels(projectId: number): Promise<PeerChannelInfo[]> {
+  return invoke<PeerChannelInfo[]>('list_peer_channels', { projectId });
 }

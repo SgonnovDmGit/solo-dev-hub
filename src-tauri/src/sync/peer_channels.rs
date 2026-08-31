@@ -55,6 +55,13 @@ pub fn channel_root(base: &Path) -> PathBuf {
     base.join("docs").join(INOUTBOX_DIR)
 }
 
+/// Path of the channel's number ledger. Exposed so callers can *report* it —
+/// nothing in this module ever writes or deletes it. That abstinence is the
+/// whole guarantee: tearing an exchange down removes its files, never its number.
+pub fn registry_path(base: &Path) -> PathBuf {
+    channel_root(base).join(REGISTRY_FILE)
+}
+
 pub fn outbox_dir(base: &Path, peer: &str) -> PathBuf {
     channel_root(base).join("outbox").join(peer)
 }
@@ -94,6 +101,36 @@ fn scan_md(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// True when two directories hold exactly the same relative files with the same
+/// bytes. Deliberately NOT `sync::dirs_in_sync`, which reports an empty source
+/// as "not synced" — correct for a codex svod (nothing published yet), wrong for
+/// a channel folder, where empty on both sides is the normal resting state.
+pub fn dirs_equal(a: &Path, b: &Path) -> bool {
+    let (Ok(ea), Ok(eb)) = (std::fs::read_dir(a), std::fs::read_dir(b)) else {
+        // A missing folder on either side means the channel is not laid out yet.
+        return false;
+    };
+    let names = |entries: std::fs::ReadDir| -> Vec<String> {
+        let mut v: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let (na, nb) = (names(ea), names(eb));
+    if na != nb {
+        return false;
+    }
+    na.iter().all(|n| {
+        matches!(
+            (std::fs::read(a.join(n)), std::fs::read(b.join(n))),
+            (Ok(x), Ok(y)) if x == y
+        )
+    })
 }
 
 /// Create the three per-peer folders on one side. `registry.md` is deliberately
@@ -406,7 +443,7 @@ mod tests {
     fn registry_is_never_created_or_removed_by_the_app() {
         let (_td, a, b) = pair();
         sync_peer_pair(&a, &b);
-        let reg = channel_root(&base(&a)).join(REGISTRY_FILE);
+        let reg = registry_path(&base(&a));
         assert!(!reg.exists(), "the app must not seed the ledger");
 
         // The agent writes it; teardown of an exchange must leave it alone.

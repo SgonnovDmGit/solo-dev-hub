@@ -130,6 +130,33 @@ pub struct PeerOf {
     /// A `peer_links` row exists for the pair.
     pub explicit: bool,
 }
+/// T-000193: one peer channel as shown in the sync screen — a pair of repos and
+/// the state of the three folders between them. snake_case keys to match the
+/// other sync DTOs the frontend reads.
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct PeerChannelInfo {
+    pub self_repo_id: i64,
+    pub peer_repo_id: i64,
+    pub self_repo: String,
+    pub peer_repo: String,
+    /// Project the peer belongs to; empty when the peer has none.
+    pub peer_project: String,
+    /// "derived" (same project, same role) | "explicit" (a peer_links row).
+    pub origin: String,
+    /// Role shared by the pair; empty when unknown.
+    pub role: String,
+    /// Channel folder on this side, e.g. "docs/InOutBox/.../beta/".
+    pub folder: String,
+    pub outbox_count: usize,
+    pub inbox_count: usize,
+    pub pact_count: usize,
+    /// "synced" | "pending" | "unresolved" (a side is missing from this disk).
+    pub status: String,
+    /// Whether this side's `registry.md` exists. The app never creates it — the
+    /// agent does, on the first exchange — so its absence is worth surfacing.
+    pub registry_present: bool,
+}
+
 /// F-033: history record of a repository rename.
 /// Written when `upsert_repository_with_outcome` detects a `github_name` change
 /// for an existing repo (matched by `github_id`). Used by sync-preamble to
