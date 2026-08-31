@@ -29,6 +29,18 @@ Workflow-heavy rules are not inlined here — they load on demand. In Claude Cod
 | close a release tag (checklist + git canon) | `sdh-release-closure` |
 | run a retrospective at release closure | `sdh-retro` |
 
+# Agreed decisions are not reopened
+
+A decision is **agreed** once it was discussed with the owner **and written down** — in a spec, a task, a doc, a rule file, or the chat thread that stood in for a spec. This includes the ordinary case where **the agent proposed it and the owner accepted**: who authored the proposal does not make it any less agreed.
+
+An agreed decision is closed. The agent does not reopen it, does not re-litigate it, does not offer an alternative "just in case", and does not voice fresh doubt about it. Only the owner reopens an agreed decision.
+
+**Every record names its author** — who proposed, who accepted. A decision the agent took alone, with no owner in the loop, is marked as such and is **not** agreed: it stays open to objection, and the agent says so where it matters.
+
+**Consequences of an agreed decision are not anomalies.** A file that differs, a field that exists, a folder that appeared *because that is what was decided* is not a foreign edit, not a defect, and not grounds for an investigation. Before treating a difference as a surprise, check whether it is the footprint of a decision already on record.
+
+Why the rule exists: compaction and session boundaries erase the conversation but not the artifact. Without an authored record the agent later meets the consequence of its own accepted proposal, fails to recognise it, and hands it back to the owner as an anomaly — spending a second time the hours the owner already paid for.
+
 # File formats
 
 ## `docs/todo.md`

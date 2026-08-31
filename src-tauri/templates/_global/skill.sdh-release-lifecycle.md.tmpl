@@ -68,6 +68,19 @@ The bump class is decided once at Analysis (stage 2) — but a release rarely st
 - Skipping a stage (in the full track) requires explicit permission: *"can I go straight to impl?" / "no retro this time?"* — the assistant proposes the skip with a one-line reason; the user acks or declines. Default — **no skipping**. *(The light track already folds Plan/Plan-review by default — that's not a "skip", it's the track.)*
 - **Loops back to an earlier stage are allowed but not default.** The chain runs forward by default. A loop (impl reveals a gap → back to Spec for an amendment → re-run Spec-review → resume Implementation) happens on user request or when circumstances force it (new constraint, missing endpoint surface, broken assumption, **scope grew → re-evaluate bump class**). The assistant announces loops the same way: *"a gap surfaced, moving from stage 7 back to stage 3, ok?"* — the user acks. Without an explicit loop announcement, the lifecycle is strictly forward.
 
+## The gate has no authority over the owner
+
+Acceptance criteria, verification lists and stage gates are **the agent's instruments**. They bind the agent. They do not bind the owner.
+
+When the owner says **"ship it"**, every unmet criterion closes on the spot:
+
+- do not ask again, do not argue the item's importance, do not finish it "just to be safe", do not delay the tag;
+- name the risk in **one line, once** — not a paragraph, and not again two messages later;
+- file the unmet item as a task recording exactly what did not converge;
+- proceed straight to closure.
+
+This holds even when the owner agreed to that criterion earlier. Agreeing to a checklist is not a promise to be held to it — the owner is entitled to spend the risk, and it is their risk to spend. The failure this prevents is concrete: acceptance protocol agreed up front, fifteen hours of release behind it, one item the owner does not care about fails to converge, the owner says "ship it" — and the release runs five more hours.
+
 ## Anti-loop: don't circle a gate you can't satisfy
 
 A stage — closure especially — can trap an agent in a loop: it hits a check it cannot pass, retries the same sequence, fails the same way, and burns tokens circling. Often the gate is one the agent **imposed on itself** (a self-created precondition, an over-strict clean-tree/verification check, a smoke step that can't succeed in this environment).
