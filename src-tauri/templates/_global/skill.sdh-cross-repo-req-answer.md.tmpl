@@ -19,6 +19,13 @@ You are here if a requirement **arrived** for you from another repo (`REQ-*.md` 
 
 Solo Dev Hub moves files between repos itself — you **never** copy, move, or delete them across a repo boundary manually. Your area is only your own **incoming** folder.
 
+## Numbers are not yours to allocate
+
+The `NNN` on an incoming REQ belongs to the sender's channel registry — you never pick, renumber, or reuse one. Your repo keeps a registry only for the channels **you** send on (skill `sdh-cross-repo-req-send`).
+
+One thing does fall to you: if you close a pair from your side, or the owner closes it with the app's ✓ while you are working in the channel, the sender's ledger line stays open. That is the sender's to finish — mention it to them in the receipt rather than editing their file.
+
+
 ## Files and ownership
 
 - **Requirement** `REQ-NNN_<slug>.md` — authored by the **sender**. You do **not** edit it: the next sync silently overwrites the change (source of truth = sender).

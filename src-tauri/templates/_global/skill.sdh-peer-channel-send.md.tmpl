@@ -1,0 +1,124 @@
+---
+name: sdh-peer-channel-send
+description: >
+  Use when you are INITIATING an exchange with an equal — another client, another
+  server, another microservice, in your project or in a different product. Covers
+  why this is not a REQ, the three InOutBox folders, picking between PACT /
+  HANDOFF / NOTE, numbering from the append-only registry, the mandatory
+  authority line, and what the channel must never be used for. To answer
+  something that ARRIVED for you — skill sdh-peer-channel-answer.
+---
+
+You are here because you want something from, or want to tell something to, a **repo at your own level**: client ↔ client, server ↔ server, microservice ↔ microservice. It may sit in your project or in a different product entirely (a server of one product talking to the server of another).
+
+- A peer sent something and you are **responding** → skill `sdh-peer-channel-answer`.
+- You are asking a repo **above or below** you — your server, your microservice → skill `sdh-cross-repo-req-send`.
+- You are **pushing** an unsolicited announcement down or up the hierarchy → skill `sdh-cross-repo-announce-send`.
+
+## Why this is not a REQ
+
+REQ works because it carries a **direction of debt**: the client asks, the server is obliged to answer because it owns the service. The recipient cannot simply say "no" — it owns the contract. That is what makes `declined` a rare exception there.
+
+Between equals there is no debt: nobody owns the neighbour's roadmap. Copying REQ one-to-one would produce a channel where both sides make demands, both may refuse, and there is no arbiter — two agents politely yielding to each other in a loop. So this channel names a **direction**, not a role, and `declined` is a perfectly normal answer.
+
+## The three folders
+
+| Folder | Holds | Who writes |
+|---|---|---|
+| `docs/InOutBox/outbox/<peer>/` | what I sent this peer | **me** |
+| `docs/InOutBox/inbox/<peer>/` | what this peer sent me | **the app** — never you |
+| `docs/InOutBox/pact/<peer>/` | two-sided agreements | both sides, one file per writer |
+
+`<peer>` is the last segment of the counterpart repo's name (`LenSA_Assist1C`), the same convention the hierarchical channels use.
+
+**You write only inside your own repository** — your `outbox/<peer>/` and your own files in `pact/<peer>/`. You never write into `inbox/` (it is the app's replica folder) and never into another repository. This is the opposite of the vertical announcement channel, which has an explicit carve-out allowing a direct write into the recipient's repo — see `sdh-cross-repo-announce-send`. Do not carry that carve-out over here.
+
+Solo Dev Hub syncs this channel: your `outbox/<peer>/` is mirrored into their `inbox/<you>/`, and the two `pact/` folders are merged. You put the file in place; the app moves it.
+
+## Pick the kind
+
+Three kinds, all of them proven in the field before being written down here:
+
+| Kind | What it is | Answer expected |
+|---|---|---|
+| `PACT-NNN_<slug>.md` | a two-sided agreement you propose | **yes** — an `.ack.md` |
+| `HANDOFF-NNN_<slug>.md` | you hand an area over to the peer | no |
+| `NOTE-NNN_<slug>.md` | an observation or a question | no, but a peer may reply with their own NOTE |
+
+`PACT` goes in `pact/<peer>/`. `HANDOFF` and `NOTE` go in `outbox/<peer>/`.
+
+If you cannot tell whether something is a PACT or a NOTE, ask: **does the other side have to commit to anything?** If yes it is a PACT and needs an ack; if no it is a NOTE.
+
+There is deliberately no form for "a request" — the channel has not needed one yet, and canonising a template nobody has used is how you get an inconvenient canon. When a real request appears, it will show what it needs.
+
+## Numbering — from the registry, not the folder
+
+**`docs/InOutBox/registry.md` is the source of numbers.** The app never writes it and never deletes it; that is the entire reason it exists. Closing an exchange deletes its files, so a number that lived only in a filename would be handed out a second time — and the counterpart would then have two different `PACT-001`s.
+
+Rules:
+- The number is `max over the registry + 1`, **not** max over the folder.
+- The counter is **shared across kinds**: if `PACT-001` exists, the first handoff is `HANDOFF-002`, not `HANDOFF-001`.
+- It is shared **across directions too** — `max` is taken over *every* line in the file, incoming ones included. So a number is used once in this channel, by either side, and can never collide. The `out`/`in` column records who allocated it, it does not split the space in two.
+- One registry **per channel, per repository** — not per counterpart. With three neighbours a per-counterpart counter would give you two different `PACT-001` in one repo, and a number in a commit message would stop being a reference.
+- **Numbers are never reused**, not even after an exchange is closed and its files are gone.
+
+Registry line — eight pipe-separated fields:
+
+```
+- PACT-003 | out | LenSa_Assist1C | shared code: console is the donor | 2026-08-24 | 2026-08-26 | agreed | first merge, manifest v1
+```
+
+`id | direction (out/in) | counterpart | subject | opened | closed | final status | where the result went`
+
+An empty `closed` field means the exchange is in flight. **Write the registry line in the same pass in which you create the file** — the file and its number must never exist without a ledger entry.
+
+If `registry.md` does not exist yet, create it. The app will not do it for you, on purpose.
+
+## The PACT body
+
+```markdown
+# PACT-NNN: <the point, in one line>
+
+**Parties:** <initiator repo> ↔ <counterpart repo>
+**Authority on this subject:** <repo> — and why it
+
+## Subject
+What exactly is being fixed in place, and what for.
+
+## Obligations
+- <repo A>: …
+- <repo B>: …
+
+## How it is verified
+What proves the agreement is being honoured — a gate, a check, an artifact.
+
+## Out of scope
+The boundaries, so the agreement does not creep.
+```
+
+**The authority line is mandatory, and it names a subject, not a repository.** Equals have no default, so it is stated explicitly each time: on shared code the console may be authoritative, on the assistant's chat surface the assistant is. The same pair of repos can hold opposite roles in two different pacts — that is normal, not a contradiction.
+
+## One file, one writer
+
+The triple of a PACT:
+
+| File | Author |
+|---|---|
+| `PACT-NNN_<slug>.md` | initiator — the proposal |
+| `PACT-NNN_<slug>.ack.md` | the other side — the answer |
+| `PACT-NNN_<slug>.impl.md` | initiator — done, the pair can be torn down |
+
+A file edited by both sides diverges on the first exchange. That is the only property this form borrows from REQ, and it is not negotiable. **Never edit the peer's file** — your copy of it is a replica, and the next sync will overwrite whatever you changed.
+
+## Closing
+
+- **PACT** — drop `PACT-NNN_<slug>.impl.md` next to your proposal. The app removes the whole triple on both sides at the next sync.
+- **HANDOFF / NOTE** — drop `<name>.done.md` next to the body in your `outbox/`. The app removes both files on both sides.
+
+In the **same pass**, fill the registry line's `closed` date, final status, and where the result went. Once the files are gone the ledger is the only record — a line you did not finish is a number whose story is lost.
+
+## What this channel must not be used for
+
+**Equals do not agree about what the level above owns.** If a server change is needed, each side sends **its own** REQ up its own vertical channel; a pact may only record which of the two sends it, so the request is not filed twice. Otherwise two clients settle the server's behaviour between themselves and the server finds out last, from two contradicting requests.
+
+**This is not a second task tracker.** A pact fixes an agreement; the work that follows from it lives as a task in each side's own `docs/todo.md`.

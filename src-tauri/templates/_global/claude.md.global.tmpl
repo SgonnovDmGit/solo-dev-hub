@@ -16,6 +16,8 @@ Workflow-heavy rules are not inlined here — they load on demand. In Claude Cod
 | author or close an OUTGOING cross-repo REQ (you're asking) | `sdh-cross-repo-req-send` |
 | answer a REQ that ARRIVED for you (write a receipt) | `sdh-cross-repo-req-answer` |
 | push an unsolicited announcement to a client / parent server | `sdh-cross-repo-announce-send` |
+| start an exchange with an EQUAL (client↔client, server↔server, ms↔ms) | `sdh-peer-channel-send` |
+| answer something an equal sent you (ack / handoff / note) | `sdh-peer-channel-answer` |
 | process announcements that arrived (at session start) | `sdh-cross-repo-announce-read` |
 | add/change/remove an api.md endpoint (maintain your contract) | `sdh-api-contract-maintain` |
 | check another repo's server surface before a spec | `sdh-api-contract-consume` |

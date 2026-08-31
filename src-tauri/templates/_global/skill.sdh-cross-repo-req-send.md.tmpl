@@ -15,7 +15,9 @@ You are here if you are **asking another repo for something** and writing an out
 - A REQ **arrived** for you and you need to answer with a receipt → skill `sdh-cross-repo-req-answer`.
 - You want to **push** something proactively, expecting no answer (server→client, microservice→parent) → skill `sdh-cross-repo-announce-send`.
 
-**Who sends REQs:** client → server; server → microservice; microservice → another microservice (rare edge case). A client is never a recipient of requirements.
+**Who sends REQs:** client → server; server → microservice; microservice → its parent server. REQ runs along the **hierarchy** — every edge here has a direction of debt, which is what obliges the recipient to answer.
+
+Two repos at the **same level** — client ↔ client, server ↔ server, microservice ↔ microservice, in one project or across products — have no such debt and therefore no REQ channel: use the peer channel instead (skill `sdh-peer-channel-send`). Which side of a vertical edge you are on is what decides the direction; a client is a recipient only of a peer's exchange, never of a requirement.
 
 Solo Dev Hub moves files between repos itself — you **never** copy, move, or delete them across a repo boundary manually. Your area is only your own **outgoing** folder.
 
@@ -26,15 +28,35 @@ Solo Dev Hub moves files between repos itself — you **never** copy, move, or d
 
 `NNN` is chosen at creation and **never** renamed or renumbered. `_<slug>` is a short kebab-case readability hint — recommended but optional (the app matches by the globs `REQ-*.md`).
 
-## Step 1. Pick the number `NNN`
+## Step 1. Pick the number `NNN` — from the registry
 
-A monotonic counter **within your own outgoing folder** (not global):
-1. Glob `REQ-*.md` in the outgoing folder.
-2. Max existing `NNN`.
-3. New = `max + 1`, zero-padded to 3 digits (`001`, `047`).
-4. Folder empty — start at `001`.
+The number comes from **`registry.md` in the root of your outgoing channel**, not from the folder listing:
 
-Numbers **grow even after closures** — do not reuse freed slots (keeps the recipient's git history readable).
+| You | Registry |
+|---|---|
+| Client (→ server) | `docs/backend-requirements/registry.md` |
+| Server (→ microservice) | `docs/microservice-requirements/registry.md` |
+
+**Why not just glob the folder.** Closing a pair deletes its files, so a number that lives only in a filename disappears with them: `max + 1` will eventually hand out a number the counterpart already has, and two different `REQ-014`s in one history is a reference that no longer references anything. The registry is append-only and Solo Dev Hub never writes or deletes it, so a closure cannot erase a number.
+
+1. `max` over the **registry** (one counter per channel, across all counterparties in it).
+2. New = `max + 1`, zero-padded to 3 digits (`001`, `047`).
+3. Registry missing or empty — **first seed it** from every `REQ-*.md` currently in the channel, across all counterparty subfolders, one line each, then continue from `max + 1`. Skipping the seed would restart at `001` on top of live pairs.
+4. Nothing anywhere — start at `001`.
+
+**Numbers are never reused**, not even after a pair is closed and its files are gone.
+
+Registry line — eight pipe-separated fields, the same shape in every channel:
+
+```
+- REQ-014 | out | swan_code_server | pagination on /orders | 2026-08-24 | 2026-08-26 | responded | implemented in v1.4.0
+```
+
+`id | direction (out/in) | counterpart | subject | opened | closed | final status | where the result went`
+
+`direction` is always `out` in this channel — you are the only side that allocates a number here. It stays in the format so a registry reads the same everywhere, including the peer channel where both sides allocate.
+
+**Write the opening line in the same pass as the REQ file.** That single line is what makes the number safe; the closing fields are bookkeeping you fill in later. If the pair is closed by the app's ✓ button rather than by you, fill the closing fields the next time you touch the channel.
 
 ## Step 2. Put it in your outgoing folder
 
@@ -110,6 +132,7 @@ Two ways to close (delete) a pair — both remove all files on both sides:
 **`.impl.md` rules:**
 - Authored **only by the sender**, only in the sender's outgoing folder. The file's existence is the signal; empty is fine, any content is ignored by the app.
 - Drop it **only when you are done integrating and satisfied** with the receipt.
+- **Finish the registry line in the same pass.** Fill `closed`, the final status and where the result went in the channel's `registry.md` before the sync tears the files down — after it, the ledger is the only record the exchange ever existed.
 - **Dropping `.impl.md` is the ENTIRE close action — then STOP.** Do not also delete the `REQ-NNN.md`, the `.response.md`, or the `.impl.md` yourself. The app tears down all three, on both sides, at the next sync — let one sync run and do not "tidy up" the files by hand.
 
 > **Failure mode — base-REQ resurrection.** If you delete the `.impl.md` yourself (or delete the `.response.md`) *before* a sync has processed the close, the auto-close never fires — and because the sender's copy of `REQ-NNN.md` is the **source of truth**, the *next* sync re-copies it to the recipient with no receipt attached. The recipient then sees a live "open" requirement that was already implemented, and puzzles over why. So after dropping `.impl.md`: **touch nothing, let a sync run — the app does every deletion.**
