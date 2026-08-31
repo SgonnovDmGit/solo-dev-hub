@@ -294,9 +294,8 @@ pub fn untrack_files(
 
 // ── T-000191: peer links (InOutBox channel between equals) ────────────────────
 
-/// Declare two repositories to be peers. Symmetric and idempotent; only needed
-/// for pairs the resolver cannot derive (different projects) — same-project
-/// same-role repos are peers already.
+/// Declare two repositories to be peers. Symmetric and idempotent. Every pair
+/// is explicit: nothing is inferred from a shared role.
 #[tauri::command]
 pub fn add_peer_link(db: State<AppDb>, repo_a_id: i64, repo_b_id: i64) -> Result<(), String> {
     db.add_peer_link(repo_a_id, repo_b_id)
@@ -316,10 +315,9 @@ pub fn list_peer_links(db: State<AppDb>) -> Result<Vec<PeerLink>, String> {
     db.list_peer_links().map_err(|e| e.to_string())
 }
 
-/// Every peer of one repository — derived (same project, same role) plus
-/// explicit links, deduplicated, each carrying both provenance flags.
+/// Every repository explicitly linked as a peer of this one.
 #[tauri::command]
-pub fn list_repo_peers(db: State<AppDb>, repo_id: i64) -> Result<Vec<PeerOf>, String> {
+pub fn list_repo_peers(db: State<AppDb>, repo_id: i64) -> Result<Vec<Repository>, String> {
     db.peers_of_repo(repo_id).map_err(|e| e.to_string())
 }
 

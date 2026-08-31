@@ -66,22 +66,13 @@ export interface GitignoredListing {
 }
 
 // T-000191: explicit peer link between two repositories — the InOutBox channel
-// between equals. Only cross-project pairs need a row; peers inside one project
-// are derived from a matching role. Stored normalised (repo_a_id < repo_b_id).
+// between equals. Every pair is explicit; nothing is inferred from a shared
+// role. Stored normalised (repo_a_id < repo_b_id).
 export interface PeerLink {
   id: number;
   repo_a_id: number;
   repo_b_id: number;
   created_at: string;
-}
-
-// T-000191: one resolved peer of a repository. `derived` — same project, same
-// role; `explicit` — a peer_links row exists. A pair can be both, so the flags
-// are independent: offer "unlink" only when `explicit`.
-export interface PeerOf {
-  repo: Repository;
-  derived: boolean;
-  explicit: boolean;
 }
 
 // T-000193: one peer channel as shown in the sync screen — a pair of repos and
@@ -92,7 +83,6 @@ export interface PeerChannelInfo {
   self_repo: string;
   peer_repo: string;
   peer_project: string;
-  origin: 'derived' | 'explicit';
   role: string;
   folder: string;
   outbox_count: number;

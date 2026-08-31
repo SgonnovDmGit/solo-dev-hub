@@ -1,26 +1,18 @@
-// T-000191 (v1.15.0): peer links and peer resolution for the InOutBox channel
-// between equals (client<->client, server<->server, microservice<->microservice).
+// T-000191 (v1.15.0): peer links for the InOutBox channel between equals
+// (client<->client, server<->server, microservice<->microservice).
 //
-// A repo's peers come from two sources, unioned:
+// **Every pair is explicit.** A first cut derived pairs automatically from a
+// matching role inside one project; the owner rejected that on sight
+// (2026-08-31), and the arithmetic says why — six test clients in one project
+// derive twenty channels, and everyone ends up able to write to everyone.
+// Connecting a peer is a decision, exactly as connecting a microservice is:
+// you open the channels you actually need and no others.
 //
-//  - *derived* — repositories of the same project that carry the same role.
-//    The role match is strict: `client` and `admin_client` are NOT peers
-//    automatically (precedent: codex lanes, which pair `server<->server` and
-//    `admin_client<->admin_client` and never cross the two). A NULL role and
-//    the role `other` are excluded — they mean "role not set", not a level.
-//
-//  - *explicit* — rows in `peer_links`. This is the only way to pair repos in
-//    different projects (server<->server between two products), which the
-//    derivation cannot see.
-//
-// The two sources overlap freely: a pair may be both derived and explicit, and
-// both flags are reported so the UI can offer "unlink" only where a row exists.
+// A pair is therefore one `peer_links` row and nothing else. Roles are not
+// checked here: the owner decides who is a peer of whom, and a same-project
+// pair is declared exactly the way a cross-product one is.
 
 use super::*;
-
-/// Roles that never form a *derived* peer pair. `other` is "role not set",
-/// which is not a level and must not silently pair two unrelated repos.
-const NON_PEER_ROLES: [&str; 1] = ["other"];
 
 /// Normalise a symmetric pair so one logical link is exactly one row.
 /// Mirrors the `CHECK (repo_a_id < repo_b_id)` constraint from migration v31.
@@ -94,49 +86,18 @@ impl AppDb {
         rows.collect()
     }
 
-    /// Every peer of `repo_id` — derived ∪ explicit, deduplicated by repo id.
-    /// Ordered by repo id so a sync pass is deterministic.
-    pub fn peers_of_repo(&self, repo_id: i64) -> SqlResult<Vec<PeerOf>> {
-        let me = self.get_repository(repo_id)?;
-
-        // Derived: same project, same role, role is set and pairable.
-        let mut derived: Vec<Repository> = Vec::new();
-        if let (Some(pid), Some(role)) = (me.project_id, me.role.as_deref()) {
-            if !NON_PEER_ROLES.contains(&role) {
-                derived = self
-                    .list_repos_by_project(Some(pid))?
-                    .into_iter()
-                    .filter(|r| r.id != me.id && r.role.as_deref() == Some(role))
-                    .collect();
-            }
-        }
-
-        let explicit_ids = self.explicit_peers_of_repo(repo_id)?;
-
-        let mut out: Vec<PeerOf> = Vec::new();
-        for repo in derived {
-            let explicit = explicit_ids.contains(&repo.id);
-            out.push(PeerOf {
-                repo,
-                derived: true,
-                explicit,
-            });
-        }
-        for id in explicit_ids {
-            if out.iter().any(|p| p.repo.id == id) {
-                continue; // already counted as derived
-            }
+    /// Every peer of `repo_id`, ordered by repo id so a sync pass is
+    /// deterministic. Explicit links are the only source — nothing is inferred.
+    pub fn peers_of_repo(&self, repo_id: i64) -> SqlResult<Vec<Repository>> {
+        let mut out: Vec<Repository> = Vec::new();
+        for id in self.explicit_peers_of_repo(repo_id)? {
             // A link whose target row is gone is skipped rather than failing the
             // whole resolve — FK CASCADE normally prevents this.
             if let Ok(repo) = self.get_repository(id) {
-                out.push(PeerOf {
-                    repo,
-                    derived: false,
-                    explicit: true,
-                });
+                out.push(repo);
             }
         }
-        out.sort_by_key(|p| p.repo.id);
+        out.sort_by_key(|r| r.id);
         Ok(out)
     }
 }
@@ -184,37 +145,20 @@ mod tests {
     }
 
     #[test]
-    fn same_project_same_role_pairs_automatically() {
+    fn nothing_is_inferred_from_a_matching_role() {
+        // Two clients in one project are NOT peers until the owner says so.
+        // Without this, six test clients in one project would open twenty
+        // channels nobody asked for.
         let db = make_db();
         let p = db.create_project("P", None, "standard").unwrap();
         let a = repo(&db, "/tmp/c1", "c1", Some(p.id), Some("client"));
         let b = repo(&db, "/tmp/c2", "c2", Some(p.id), Some("client"));
+        assert!(db.peers_of_repo(a).unwrap().is_empty());
 
+        db.add_peer_link(a, b).unwrap();
         let peers = db.peers_of_repo(a).unwrap();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].repo.id, b);
-        assert!(peers[0].derived);
-        assert!(!peers[0].explicit);
-    }
-
-    #[test]
-    fn different_role_and_other_role_do_not_pair() {
-        let db = make_db();
-        let p = db.create_project("P", None, "standard").unwrap();
-        // Strict role match: client vs admin_client are not peers.
-        let c = repo(&db, "/tmp/c", "c", Some(p.id), Some("client"));
-        repo(&db, "/tmp/ac", "ac", Some(p.id), Some("admin_client"));
-        assert!(db.peers_of_repo(c).unwrap().is_empty());
-
-        // `other` is "role not set" — two such repos must not pair.
-        let o1 = repo(&db, "/tmp/o1", "o1", Some(p.id), Some("other"));
-        repo(&db, "/tmp/o2", "o2", Some(p.id), Some("other"));
-        assert!(db.peers_of_repo(o1).unwrap().is_empty());
-
-        // A NULL role likewise pairs with nothing.
-        let n1 = repo(&db, "/tmp/n1", "n1", Some(p.id), None);
-        repo(&db, "/tmp/n2", "n2", Some(p.id), None);
-        assert!(db.peers_of_repo(n1).unwrap().is_empty());
+        assert_eq!(peers[0].id, b);
     }
 
     #[test]
@@ -224,29 +168,23 @@ mod tests {
         let p2 = db.create_project("P2", None, "standard").unwrap();
         let s1 = repo(&db, "/tmp/s1", "s1", Some(p1.id), Some("server"));
         let s2 = repo(&db, "/tmp/s2", "s2", Some(p2.id), Some("server"));
-
-        // Same role but different projects — derivation must not pair them.
         assert!(db.peers_of_repo(s1).unwrap().is_empty());
 
         db.add_peer_link(s1, s2).unwrap();
         let peers = db.peers_of_repo(s1).unwrap();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].repo.id, s2);
-        assert!(!peers[0].derived);
-        assert!(peers[0].explicit);
+        assert_eq!(peers[0].id, s2);
     }
 
     #[test]
-    fn derived_and_explicit_overlap_is_one_peer_with_both_flags() {
+    fn a_link_is_listed_from_both_ends_exactly_once() {
         let db = make_db();
         let p = db.create_project("P", None, "standard").unwrap();
         let a = repo(&db, "/tmp/s1", "s1", Some(p.id), Some("server"));
         let b = repo(&db, "/tmp/s2", "s2", Some(p.id), Some("server"));
         db.add_peer_link(a, b).unwrap();
-
-        let peers = db.peers_of_repo(a).unwrap();
-        assert_eq!(peers.len(), 1, "one peer, not two");
-        assert!(peers[0].derived && peers[0].explicit);
+        assert_eq!(db.peers_of_repo(a).unwrap().len(), 1);
+        assert_eq!(db.peers_of_repo(b).unwrap().len(), 1);
     }
 
     #[test]

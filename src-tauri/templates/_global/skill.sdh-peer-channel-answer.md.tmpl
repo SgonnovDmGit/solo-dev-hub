@@ -16,6 +16,8 @@ You are here because a repo **at your own level** sent you something, or answere
 
 ## The app delivers; you never fetch
 
+Every peer pair is declared by the owner — a shared role opens nothing — so anything sitting in your `inbox/` arrived through a channel that was deliberately opened. Your permitted counterparts are listed in `docs/project.md`, section `## Peer channels`.
+
 Solo Dev Hub mirrors the peer's `outbox/<you>/` into your `inbox/<peer>/` and merges the two `pact/` folders. You never copy anything across a repo boundary by hand, and you never write into `inbox/` — it is a replica folder owned by the app, and anything you put there is overwritten on the next pass.
 
 **The author's copy is the source of truth.** Editing your replica of the peer's file changes nothing and is silently undone. If you disagree with it, answer in **your own** file.

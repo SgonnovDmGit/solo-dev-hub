@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Repository, UntrackReport, GitignoredListing, PeerLink, PeerOf } from '$lib/types';
+import type { Repository, UntrackReport, GitignoredListing, PeerLink } from '$lib/types';
 
 
 // ── Repository commands ───────────────────────────────────────────────────────
@@ -177,6 +177,6 @@ export async function listPeerLinks(): Promise<PeerLink[]> {
   return invoke<PeerLink[]>('list_peer_links');
 }
 
-export async function listRepoPeers(repoId: number): Promise<PeerOf[]> {
-  return invoke<PeerOf[]>('list_repo_peers', { repoId });
+export async function listRepoPeers(repoId: number): Promise<Repository[]> {
+  return invoke<Repository[]>('list_repo_peers', { repoId });
 }

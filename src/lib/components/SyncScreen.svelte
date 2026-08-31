@@ -371,7 +371,6 @@
                     .replace('{1}', String(p.inbox_count))
                     .replace('{2}', String(p.pact_count))}
                 </span>
-                <span class="badge badge-lane">{$tStore(`sync.peerOrigin.${p.origin}` as any)}</span>
                 <span class="badge {peerStatusClass(p.status)}">{peerStatusLabel(p.status)}</span>
               </div>
             </div>

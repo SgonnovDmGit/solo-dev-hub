@@ -341,9 +341,8 @@ pub fn sync_peer_pair(a: &Repository, b: &Repository) -> PeerChannelOutcome {
 }
 
 /// Run every peer channel touching `project_id`: for each repo of the project,
-/// resolve its peers (same-project role match plus explicit links) and sync the
-/// pair. A pair is synced once per pass even when both of its repos belong to
-/// the project.
+/// walk its explicitly linked peers and sync the pair. A pair is synced once per
+/// pass even when both of its repos belong to the project.
 pub fn run_peer_channels(db: &AppDb, project_id: i64) -> PeerChannelOutcome {
     let mut out = PeerChannelOutcome::default();
     let repos = match db.list_repos_by_project(Some(project_id)) {
@@ -367,16 +366,16 @@ pub fn run_peer_channels(db: &AppDb, project_id: i64) -> PeerChannelOutcome {
             }
         };
         for peer in peers {
-            let key = if repo.id < peer.repo.id {
-                (repo.id, peer.repo.id)
+            let key = if repo.id < peer.id {
+                (repo.id, peer.id)
             } else {
-                (peer.repo.id, repo.id)
+                (peer.id, repo.id)
             };
             if done.contains(&key) {
                 continue;
             }
             done.push(key);
-            let o = sync_peer_pair(repo, &peer.repo);
+            let o = sync_peer_pair(repo, &peer);
             out.copied += o.copied;
             out.pruned += o.pruned;
             out.closed.extend(o.closed);

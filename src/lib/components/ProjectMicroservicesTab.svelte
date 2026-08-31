@@ -8,7 +8,8 @@
     listPeerChannels, addPeerLink, removePeerLink,
   } from '$lib/api/tauri-commands';
   import { allRepos } from '$lib/stores/repos';
-  import { getDisplayName, type Project, type Repository, type PeerChannelInfo } from '$lib/types';
+  import PeerLinkDialog from './PeerLinkDialog.svelte';
+  import { type Project, type Repository, type PeerChannelInfo } from '$lib/types';
 
   interface Props {
     project: Project;
@@ -70,11 +71,11 @@
     }
   }
 
-  // T-000193: peer channels of this project — derived pairs (same role, read
-  // only) and explicit links (unlinkable). The same list the sync screen shows.
+  // T-000193: peer channels of this project. Every pair is an explicit link —
+  // sharing a role opens nothing — so every row here can be unlinked, and a new
+  // one is declared through the dialog.
   let peerChannels = $state<PeerChannelInfo[]>([]);
-  let linkSelfId = $state<number | null>(null);
-  let linkPeerId = $state<number | null>(null);
+  let linkDialogOpen = $state(false);
 
   async function loadPeers() {
     if (!project) return;
@@ -86,13 +87,20 @@
   }
 
   const myRepos = $derived($allRepos.filter((r) => r.project_id === project?.id));
-  const linkCandidates = $derived($allRepos.filter((r) => r.id !== linkSelfId));
+  const linkedKeys = $derived(
+    new Set(
+      peerChannels.map((p) =>
+        p.self_repo_id < p.peer_repo_id
+          ? `${p.self_repo_id}::${p.peer_repo_id}`
+          : `${p.peer_repo_id}::${p.self_repo_id}`
+      )
+    )
+  );
 
-  async function createLink() {
-    if (!linkSelfId || !linkPeerId) return;
+  async function createLink(selfId: number, peerId: number) {
     try {
-      await addPeerLink(linkSelfId, linkPeerId);
-      linkPeerId = null;
+      await addPeerLink(selfId, peerId);
+      linkDialogOpen = false;
       await loadPeers();
     } catch (err) {
       addToast(String(err), 'error');
@@ -119,12 +127,6 @@
 
   $effect(() => {
     if (project) { loadMicroservices(); loadCodices(); loadPeers(); }
-  });
-
-  // Default the "my repo" side to this project's first repo so the picker is
-  // usable without a first click.
-  $effect(() => {
-    if (linkSelfId === null && myRepos.length > 0) linkSelfId = myRepos[0].id;
   });
 
   $effect(() => {
@@ -252,42 +254,31 @@
       {#each peerChannels as p (p.self_repo_id + '::' + p.peer_repo_id)}
         <div class="microservice-row">
           <span class="peer-pair">{p.self_repo} ↔ {p.peer_repo}{p.peer_project ? ` (${p.peer_project})` : ''}</span>
-          <span class="ms-server-info">
-            {p.origin === 'explicit'
-              ? $tStore('project.peerExplicit' as any)
-              : $tStore('project.peerDerived' as any).replace('{0}', p.role)}
-          </span>
-          {#if p.origin === 'explicit'}
-            <button class="toggle-btn connected" onclick={() => dropLink(p.self_repo_id, p.peer_repo_id)}>
-              {$tStore('project.peerUnlink' as any)}
-            </button>
-          {:else}
-            <span class="peer-auto">{$tStore('project.peerAuto' as any)}</span>
-          {/if}
+          <span class="ms-server-info">{p.folder}</span>
+          <button class="toggle-btn connected" onclick={() => dropLink(p.self_repo_id, p.peer_repo_id)}>
+            {$tStore('project.peerUnlink' as any)}
+          </button>
         </div>
       {/each}
     </div>
   {/if}
 
   <div class="peer-linker">
-    <select bind:value={linkSelfId} aria-label={$tStore('project.peerLinkSelf' as any)}>
-      {#each myRepos as r (r.id)}
-        <option value={r.id}>{getDisplayName(r)}</option>
-      {/each}
-    </select>
-    <span class="peer-arrow">↔</span>
-    <select bind:value={linkPeerId} aria-label={$tStore('project.peerLinkPeer' as any)}>
-      <option value={null}>{$tStore('project.peerLinkPeer' as any)}</option>
-      {#each linkCandidates as r (r.id)}
-        <option value={r.id}>{getDisplayName(r)}</option>
-      {/each}
-    </select>
-    <button class="toggle-btn" disabled={!linkSelfId || !linkPeerId} onclick={createLink}>
-      {$tStore('project.peerLinkAdd' as any)}
+    <button class="toggle-btn" disabled={myRepos.length === 0} onclick={() => (linkDialogOpen = true)}>
+      {$tStore('project.peerLinkOpen' as any)}
     </button>
   </div>
-  <div class="peer-hint">{$tStore('project.peerLinkHint' as any)}</div>
 </div>
+
+{#if linkDialogOpen}
+  <PeerLinkDialog
+    myRepos={myRepos}
+    allRepos={$allRepos}
+    linkedKeys={linkedKeys}
+    onLink={createLink}
+    onCancel={() => (linkDialogOpen = false)}
+  />
+{/if}
 
 <!-- F-012 / T-000168: microservice → parents ("Connected to"); codex → consumers -->
 {#if project.project_type === 'microservice' || project.project_type === 'codex'}
@@ -320,24 +311,11 @@
   .peer-pair {
     font-weight: 500;
   }
-  .peer-auto {
-    color: var(--text-muted);
-    font-size: 12px;
-  }
   .peer-linker {
     display: flex;
     align-items: center;
     gap: 8px;
     margin-top: 10px;
-    flex-wrap: wrap;
-  }
-  .peer-arrow {
-    color: var(--text-muted);
-  }
-  .peer-hint {
-    margin-top: 6px;
-    color: var(--text-muted);
-    font-size: 12px;
   }
 
   /* Shared rules (duplicated — also used by ProjectDetail's remaining markup) */

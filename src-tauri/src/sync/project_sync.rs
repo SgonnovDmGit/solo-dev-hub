@@ -1548,48 +1548,58 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_channel_derived_pair_end_to_end() {
-        // T-000192: two client repos in one project are peers by role alone.
-        // A full project sync must create the channel on both sides, carry an
-        // outbox file into the peer's inbox, and honour a `.done.md` teardown.
+    fn test_peer_channel_linked_pair_end_to_end() {
+        // T-000192: two linked client repos in one project. A full project sync
+        // must create the channel on both sides, carry an outbox file into the
+        // peer's inbox, and honour a `.done.md` teardown.
         let db = make_db();
         let a_dir = TempDir::new().unwrap();
         let b_dir = TempDir::new().unwrap();
         let other_dir = TempDir::new().unwrap();
 
         let p = db.create_project("Peers", None, "standard").unwrap();
-        db.insert_local_repository(
-            a_dir.path().to_str().unwrap(),
-            "alpha",
-            Some(p.id),
-            Some("client"),
-        )
-        .unwrap();
-        db.insert_local_repository(
-            b_dir.path().to_str().unwrap(),
-            "beta",
-            Some(p.id),
-            Some("client"),
-        )
-        .unwrap();
-        // A repo with role `other` must not be pulled into the channel.
+        let a = db
+            .insert_local_repository(
+                a_dir.path().to_str().unwrap(),
+                "alpha",
+                Some(p.id),
+                Some("client"),
+            )
+            .unwrap();
+        let b = db
+            .insert_local_repository(
+                b_dir.path().to_str().unwrap(),
+                "beta",
+                Some(p.id),
+                Some("client"),
+            )
+            .unwrap();
+        // A third client of the same project stays out of it — sharing a role
+        // is not a link.
         db.insert_local_repository(
             other_dir.path().to_str().unwrap(),
             "gamma",
             Some(p.id),
-            Some("other"),
+            Some("client"),
         )
         .unwrap();
 
         run_project_sync(&db, p.id).unwrap();
+        assert!(
+            !a_dir.path().join("docs/InOutBox").exists(),
+            "a shared role opens no channel on its own"
+        );
+
+        db.add_peer_link(a.id, b.id).unwrap();
+        run_project_sync(&db, p.id).unwrap();
 
         let a_out = a_dir.path().join("docs/InOutBox/outbox/beta");
         let b_in = b_dir.path().join("docs/InOutBox/inbox/alpha");
-        assert!(a_out.is_dir(), "channel folders appear for a derived pair");
+        assert!(a_out.is_dir(), "channel folders appear for a linked pair");
         assert!(b_dir.path().join("docs/InOutBox/pact/alpha").is_dir());
         assert!(
             !other_dir.path().join("docs/InOutBox").exists(),
-            "role `other` means role-not-set and must never pair"
+            "an unlinked repo of the same role is never pulled in"
         );
 
         fs::write(a_out.join("NOTE-001_hi.md"), "observation").unwrap();
@@ -1647,7 +1657,7 @@ mod tests {
         run_project_sync(&db, p1.id).unwrap();
         assert!(
             !a_dir.path().join("docs/InOutBox").exists(),
-            "same role in different projects is not a pair without an explicit link"
+            "no link, no channel"
         );
 
         db.add_peer_link(a.id, b.id).unwrap();

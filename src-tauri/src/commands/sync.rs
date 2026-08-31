@@ -525,8 +525,7 @@ pub fn list_project_requirements(
 
 /// T-000193: peer channels (InOutBox) touching this project — one row per
 /// (repo of this project, peer) pair, with folder counts and a sync badge.
-/// Both derived and explicit pairs are listed; the frontend offers "unlink"
-/// only for explicit ones.
+/// Every pair is an explicit link, so every row can be unlinked.
 #[tauri::command]
 pub fn list_peer_channels(
     db: State<AppDb>,
@@ -543,8 +542,8 @@ fn peer_channels_for(db: &AppDb, project_id: i64) -> Result<Vec<PeerChannelInfo>
     let mut out: Vec<PeerChannelInfo> = Vec::new();
 
     for me in &repos {
-        for peer in db.peers_of_repo(me.id).unwrap_or_default() {
-            let peer_repo = &peer.repo;
+        for peer_repo in db.peers_of_repo(me.id).unwrap_or_default() {
+            let peer_repo = &peer_repo;
             let peer_name = peer_repo.canonical_folder_name();
             let peer_project = peer_repo
                 .project_id
@@ -558,13 +557,6 @@ fn peer_channels_for(db: &AppDb, project_id: i64) -> Result<Vec<PeerChannelInfo>
                 self_repo: me.display_name(),
                 peer_repo: peer_repo.display_name(),
                 peer_project,
-                // A pair that is both derived and explicit is reported as
-                // explicit: that is the half the user can act on (unlink).
-                origin: if peer.explicit {
-                    "explicit".to_string()
-                } else {
-                    "derived".to_string()
-                },
                 role: me.role.clone().unwrap_or_default(),
                 folder: format!("docs/{}/…/{}/", sync::INOUTBOX_DIR, peer_name),
                 status: "unresolved".to_string(),

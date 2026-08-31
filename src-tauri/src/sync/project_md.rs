@@ -136,6 +136,54 @@ pub fn generate_project_md(db: &AppDb, project_id: i64, repo_root: &Path) -> Res
         md.push('\n');
     }
 
+    // T-000193: peer channels. This section is what tells the agent WHO it may
+    // open an InOutBox exchange with — every pair is an explicit link, so an
+    // absent row means the channel does not exist and must not be invented.
+    md.push_str(
+        "## Peer channels
+
+",
+    );
+    let mut peer_rows: Vec<String> = Vec::new();
+    for repo in &repos {
+        for peer in db.peers_of_repo(repo.id).unwrap_or_default() {
+            let peer_project = peer
+                .project_id
+                .and_then(|pid| db.get_project(pid).ok())
+                .map(|p| p.name)
+                .unwrap_or_else(|| "—".to_string());
+            peer_rows.push(format!(
+                "| {} | {} | {} | docs/InOutBox/…/{}/ |
+",
+                repo.display_name(),
+                peer.display_name(),
+                peer_project,
+                peer.canonical_folder_name()
+            ));
+        }
+    }
+    if peer_rows.is_empty() {
+        md.push_str("_No peer channels. Sharing a role opens nothing — a peer is connected deliberately, in Solo Dev Hub._
+
+");
+    } else {
+        md.push_str(
+            "| This repo | Peer repo | Peer project | Channel |
+",
+        );
+        md.push_str(
+            "|-----------|-----------|--------------|---------|
+",
+        );
+        for row in peer_rows {
+            md.push_str(&row);
+        }
+        md.push_str("
+Only the pairs listed here may exchange PACT / HANDOFF / NOTE (skills `sdh-peer-channel-send`, `sdh-peer-channel-answer`). A repo that is absent from this table is not a peer, however similar its role looks.
+
+");
+    }
+
     // Keep the "## Parent projects" heading verbatim — the announce workflow
     // greps that exact string. Only the rows differ by project type.
     md.push_str("## Parent projects\n\n");
@@ -353,6 +401,42 @@ mod tests {
             "should signal missing path explicitly in table row; got:\n{}",
             content
         );
+    }
+
+    /// T-000193: the `## Peer channels` section is what tells the agent whom it
+    /// may exchange with. A shared role must render nothing — only a declared
+    /// link produces a row.
+    #[test]
+    fn test_generate_project_md_peer_channels_section() {
+        let db = make_test_db();
+        let proj = db.create_project("Peers", None, "standard").unwrap();
+        let a = db
+            .insert_local_repository("/tmp/pm-a", "alpha", Some(proj.id), Some("client"))
+            .unwrap();
+        let b = db
+            .insert_local_repository("/tmp/pm-b", "beta", Some(proj.id), Some("client"))
+            .unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        generate_project_md(&db, proj.id, tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
+        assert!(content.contains("## Peer channels"));
+        assert!(
+            content.contains("_No peer channels."),
+            "two clients of one project are not peers until linked; got:\n{}",
+            content
+        );
+
+        db.add_peer_link(a.id, b.id).unwrap();
+        generate_project_md(&db, proj.id, tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("docs/project.md")).unwrap();
+        assert!(
+            content.contains("| alpha | beta | Peers | docs/InOutBox/…/beta/ |"),
+            "a declared link must render a row; got:\n{}",
+            content
+        );
+        // Symmetric: the pair shows from both ends.
+        assert!(content.contains("| beta | alpha | Peers | docs/InOutBox/…/alpha/ |"));
     }
 
     /// T-000166: a project of type `codex` renders the 📚 Codex type label.
