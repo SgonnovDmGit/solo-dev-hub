@@ -15,6 +15,10 @@ This is stage 9 of the broader cycle (skill `sdh-release-lifecycle`). After clos
 
 **Don't loop on a gate you can't satisfy.** Closure is where an agent most often circles — a verification/build/clean-tree check keeps failing and it retries the same pass, burning tokens. If a step fails the same way twice, STOP: question whether the gate is real or self-imposed, and escalate to the user rather than trying a third identical time (see "Anti-loop" in `sdh-release-lifecycle`).
 
+## "Ship it" closes the checklist
+
+The steps below are the agent's instrument, not a contract that binds the owner. If the owner says **ship it** while a step is unmet, that step closes immediately: name the risk in **one line**, file the remainder as a task, and go to the git block. No re-asking, no arguing the item's importance, no finishing it "just to be safe", no delaying the tag. Full rule: *"The gate has no authority over the owner"* in `sdh-release-lifecycle`.
+
 ## Late-catch: a bug found during closure
 
 If a bug surfaces during closure — don't blindly send it to "the next patch". Judge by three criteria:

@@ -78,23 +78,15 @@
     }
   }
 
-  // B-000028: load the saved auto-commit branch + branch list, then default an
-  // empty auto-commit target to `dev` when the repo has one (the integration
-  // branch for this workflow). Persisted so auto-commit is truly enabled, not
-  // just displayed. Guarded against a repo switch mid-load.
+  // B-000028 loaded the saved auto-commit branch and then, when it was empty,
+  // silently persisted `dev` if the repo had such a branch. That turned *opening
+  // a repo card* into opting it into auto-commit: a repo whose working tree sits
+  // on `main` then reports "expected dev" on every sync, for a setting nobody
+  // chose. Auto-commit writes commits — it is opt-in, always. The branch list is
+  // still loaded for the picker; nothing is written.
   async function loadAutocommitState() {
-    const rid = repo?.id ?? null;
     await loadAutocommitBranch();
     await loadBranches();
-    if (repo?.id !== rid || !repo) return;
-    if (autocommitBranch === '' && branches.some((b) => b.name === 'dev')) {
-      autocommitBranch = 'dev';
-      try {
-        await setAutocommitBranch(repo.id, 'dev');
-      } catch (err) {
-        console.warn('autocommit dev-default persist failed', err);
-      }
-    }
   }
 
   $effect(() => {

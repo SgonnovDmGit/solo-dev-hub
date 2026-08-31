@@ -46,6 +46,20 @@ export const ru = {
   'project.codexConsumers': 'Консумеры',
   'project.codexConsumersEmpty': 'Нет консумеров — свод пока никому не вещается',
   'project.codexLanesHint': 'server + admin_client → docs/codex/<имя>/',
+  // T-000193: peer channels (InOutBox) between equals
+  'project.peerChannels': 'Каналы равных',
+  'project.noPeerChannels': 'Нет каналов равных',
+  'project.noPeerChannelsHint': 'Канал не появляется сам: совпадение роли ничего не открывает. Свяжите пару кнопкой ниже — как подключаете микросервис',
+  'project.peerUnlink': 'Развязать',
+  'project.peerLinkSelf': 'Мой репозиторий',
+  'project.peerLinkPeer': 'Равный',
+  'project.peerLinkAdd': 'Связать',
+  'project.peerLinkHint': 'Откроется канал docs/InOutBox/ в обе стороны. Связь симметрична; развязка останавливает синк, но ничего не удаляет.',
+  'project.peerLinkOpen': '+ Связать равных',
+  'project.peerLinkTitle': 'Связать репозитории как равные',
+  'project.peerLinkSearch': 'Поиск по имени или роли…',
+  'project.peerAlreadyLinked': 'уже связан',
+  'project.peerNoCandidates': 'Подходящих репозиториев нет',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -95,4 +109,18 @@ export const en: Record<keyof typeof ru, string> = {
   'project.codexConsumers': 'Consumers',
   'project.codexConsumersEmpty': 'No consumers — the svod is not broadcast anywhere yet',
   'project.codexLanesHint': 'server + admin_client → docs/codex/<name>/',
+  // T-000193: peer channels (InOutBox) between equals
+  'project.peerChannels': 'Peer channels',
+  'project.noPeerChannels': 'No peer channels',
+  'project.noPeerChannelsHint': 'A channel never appears on its own — a shared role opens nothing. Link a pair with the button below, the way you connect a microservice',
+  'project.peerUnlink': 'Unlink',
+  'project.peerLinkSelf': 'My repository',
+  'project.peerLinkPeer': 'Peer',
+  'project.peerLinkAdd': 'Link',
+  'project.peerLinkHint': 'This opens a docs/InOutBox/ channel both ways. The link is symmetric; unlinking stops the sync and deletes nothing.',
+  'project.peerLinkOpen': '+ Link peers',
+  'project.peerLinkTitle': 'Link two repositories as peers',
+  'project.peerLinkSearch': 'Search by name or role…',
+  'project.peerAlreadyLinked': 'already linked',
+  'project.peerNoCandidates': 'No matching repositories',
 };

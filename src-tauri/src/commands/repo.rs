@@ -292,6 +292,35 @@ pub fn untrack_files(
     git_ops::untrack_files(&git, path, &file_bufs)
 }
 
+// ── T-000191: peer links (InOutBox channel between equals) ────────────────────
+
+/// Declare two repositories to be peers. Symmetric and idempotent. Every pair
+/// is explicit: nothing is inferred from a shared role.
+#[tauri::command]
+pub fn add_peer_link(db: State<AppDb>, repo_a_id: i64, repo_b_id: i64) -> Result<(), String> {
+    db.add_peer_link(repo_a_id, repo_b_id)
+}
+
+/// Drop an explicit peer link. Files already exchanged are left untouched —
+/// unlinking only stops future syncing of the channel.
+#[tauri::command]
+pub fn remove_peer_link(db: State<AppDb>, repo_a_id: i64, repo_b_id: i64) -> Result<(), String> {
+    db.remove_peer_link(repo_a_id, repo_b_id)
+        .map_err(|e| e.to_string())
+}
+
+/// All explicit peer links in the portfolio, newest first.
+#[tauri::command]
+pub fn list_peer_links(db: State<AppDb>) -> Result<Vec<PeerLink>, String> {
+    db.list_peer_links().map_err(|e| e.to_string())
+}
+
+/// Every repository explicitly linked as a peer of this one.
+#[tauri::command]
+pub fn list_repo_peers(db: State<AppDb>, repo_id: i64) -> Result<Vec<Repository>, String> {
+    db.peers_of_repo(repo_id).map_err(|e| e.to_string())
+}
+
 // ── Workspace scanner ─────────────────────────────────────────────────────────
 
 #[tauri::command]

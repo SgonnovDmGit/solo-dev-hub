@@ -103,9 +103,13 @@ Internal session-middleware refactor; the cookie name is unified with the mobile
 - backend commit a1b2c3d, docs/api.md → "Access model" section
 ```
 
-## Carve-out from the "no cross-repo writes" rule
+## Carve-out from the "no cross-repo writes" rule — VERTICAL channels only
 
 The Message/Receipt pattern (skill `sdh-cross-repo-req-*`) forbids the LLM/dev from manually copying/moving/deleting files across a repo boundary — Solo Dev Hub owns that. Announcements are the **explicit exception**: the LLM writes directly into the recipient's filesystem, because there is no app-side sync for this channel.
+
+**No registry here, and that is deliberate.** Every other channel keeps an append-only `registry.md` so a closed exchange cannot have its number reissued (skill `sdh-cross-repo-req-send`). An announcement is one-way and terminal: nothing replies to it, nothing refers back to its number, and the recipient deletes it once integrated. A repeated `ANNOUNCE-007` is at worst untidy in a git log — it cannot make two live exchanges ambiguous, which is the failure the ledger exists to prevent.
+
+**The exception belongs to this channel and stops here.** Between equals the model is the opposite — you write only inside your own repo and the app carries it across (skill `sdh-peer-channel-send`). Do not generalise "an announcement may be written into someone else's repo" into "cross-repo writes are fine".
 
 - The sender-LLM **writes** `ANNOUNCE-*.md` into the recipient's repo path.
 - The recipient-LLM **deletes** it after integrating (see `sdh-cross-repo-announce-read`).

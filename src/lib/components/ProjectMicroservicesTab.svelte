@@ -5,8 +5,11 @@
     connectMicroservice, disconnectMicroservice, listProjectMicroservices,
     listMicroserviceProjects, serverRepoOfMicroservice,
     connectCodex, listConnectedCodices, listCodexProjects,
+    listPeerChannels, addPeerLink, removePeerLink,
   } from '$lib/api/tauri-commands';
-  import type { Project, Repository } from '$lib/types';
+  import { allRepos } from '$lib/stores/repos';
+  import PeerLinkDialog from './PeerLinkDialog.svelte';
+  import { type Project, type Repository, type PeerChannelInfo } from '$lib/types';
 
   interface Props {
     project: Project;
@@ -68,6 +71,51 @@
     }
   }
 
+  // T-000193: peer channels of this project. Every pair is an explicit link —
+  // sharing a role opens nothing — so every row here can be unlinked, and a new
+  // one is declared through the dialog.
+  let peerChannels = $state<PeerChannelInfo[]>([]);
+  let linkDialogOpen = $state(false);
+
+  async function loadPeers() {
+    if (!project) return;
+    try {
+      peerChannels = await listPeerChannels(project.id);
+    } catch (err) {
+      addToast(String(err), 'error');
+    }
+  }
+
+  const myRepos = $derived($allRepos.filter((r) => r.project_id === project?.id));
+  const linkedKeys = $derived(
+    new Set(
+      peerChannels.map((p) =>
+        p.self_repo_id < p.peer_repo_id
+          ? `${p.self_repo_id}::${p.peer_repo_id}`
+          : `${p.peer_repo_id}::${p.self_repo_id}`
+      )
+    )
+  );
+
+  async function createLink(selfId: number, peerId: number) {
+    try {
+      await addPeerLink(selfId, peerId);
+      linkDialogOpen = false;
+      await loadPeers();
+    } catch (err) {
+      addToast(String(err), 'error');
+    }
+  }
+
+  async function dropLink(selfId: number, peerId: number) {
+    try {
+      await removePeerLink(selfId, peerId);
+      await loadPeers();
+    } catch (err) {
+      addToast(String(err), 'error');
+    }
+  }
+
   async function loadServerRepoFor(msProjectId: number) {
     try {
       const repo = await serverRepoOfMicroservice(msProjectId);
@@ -78,7 +126,7 @@
   }
 
   $effect(() => {
-    if (project) { loadMicroservices(); loadCodices(); }
+    if (project) { loadMicroservices(); loadCodices(); loadPeers(); }
   });
 
   $effect(() => {
@@ -192,6 +240,46 @@
   {/if}
 </div>
 
+<!-- T-000193: peer channels (InOutBox) — pairs of equals, derived or explicit -->
+<div class="microservices-section">
+  <div class="section-label">🤝 {$tStore('project.peerChannels' as any)} <span class="tab-count">{peerChannels.length}</span></div>
+
+  {#if peerChannels.length === 0}
+    <div class="empty-repos">
+      <div class="empty-title">{$tStore('project.noPeerChannels' as any)}</div>
+      <div class="empty-hint">{$tStore('project.noPeerChannelsHint' as any)}</div>
+    </div>
+  {:else}
+    <div class="microservice-list">
+      {#each peerChannels as p (p.self_repo_id + '::' + p.peer_repo_id)}
+        <div class="microservice-row">
+          <span class="peer-pair">{p.self_repo} ↔ {p.peer_repo}{p.peer_project ? ` (${p.peer_project})` : ''}</span>
+          <span class="ms-server-info">{p.folder}</span>
+          <button class="toggle-btn connected" onclick={() => dropLink(p.self_repo_id, p.peer_repo_id)}>
+            {$tStore('project.peerUnlink' as any)}
+          </button>
+        </div>
+      {/each}
+    </div>
+  {/if}
+
+  <div class="peer-linker">
+    <button class="toggle-btn" disabled={myRepos.length === 0} onclick={() => (linkDialogOpen = true)}>
+      {$tStore('project.peerLinkOpen' as any)}
+    </button>
+  </div>
+</div>
+
+{#if linkDialogOpen}
+  <PeerLinkDialog
+    myRepos={myRepos}
+    allRepos={$allRepos}
+    linkedKeys={linkedKeys}
+    onLink={createLink}
+    onCancel={() => (linkDialogOpen = false)}
+  />
+{/if}
+
 <!-- F-012 / T-000168: microservice → parents ("Connected to"); codex → consumers -->
 {#if project.project_type === 'microservice' || project.project_type === 'codex'}
   {@const isCodex = project.project_type === 'codex'}
@@ -219,6 +307,17 @@
 {/if}
 
 <style>
+  /* T-000193: peer channels */
+  .peer-pair {
+    font-weight: 500;
+  }
+  .peer-linker {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
   /* Shared rules (duplicated — also used by ProjectDetail's remaining markup) */
   .empty-repos {
     display: flex;

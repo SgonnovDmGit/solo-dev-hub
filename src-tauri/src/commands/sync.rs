@@ -523,6 +523,79 @@ pub fn list_project_requirements(
 
 // ── Codex broadcast edges (T-000173) ─────────────────────────────────────────
 
+/// T-000193: peer channels (InOutBox) touching this project — one row per
+/// (repo of this project, peer) pair, with folder counts and a sync badge.
+/// Every pair is an explicit link, so every row can be unlinked.
+#[tauri::command]
+pub fn list_peer_channels(
+    db: State<AppDb>,
+    project_id: i64,
+) -> Result<Vec<PeerChannelInfo>, String> {
+    peer_channels_for(&db, project_id)
+}
+
+/// Body factored out so it can be exercised without a live `State<AppDb>`.
+fn peer_channels_for(db: &AppDb, project_id: i64) -> Result<Vec<PeerChannelInfo>, String> {
+    let repos = db
+        .list_repos_by_project(Some(project_id))
+        .map_err(|e| e.to_string())?;
+    let mut out: Vec<PeerChannelInfo> = Vec::new();
+
+    for me in &repos {
+        for peer_repo in db.peers_of_repo(me.id).unwrap_or_default() {
+            let peer_repo = &peer_repo;
+            let peer_name = peer_repo.canonical_folder_name();
+            let peer_project = peer_repo
+                .project_id
+                .and_then(|pid| db.get_project(pid).ok())
+                .map(|p| p.name)
+                .unwrap_or_default();
+
+            let mut info = PeerChannelInfo {
+                self_repo_id: me.id,
+                peer_repo_id: peer_repo.id,
+                self_repo: me.display_name(),
+                peer_repo: peer_repo.display_name(),
+                peer_project,
+                role: me.role.clone().unwrap_or_default(),
+                folder: format!("docs/{}/…/{}/", sync::INOUTBOX_DIR, peer_name),
+                status: "unresolved".to_string(),
+                ..Default::default()
+            };
+
+            if let (Some(my_local), Some(peer_local)) =
+                (me.local_path.as_deref(), peer_repo.local_path.as_deref())
+            {
+                let my_base = std::path::Path::new(my_local);
+                let peer_base = std::path::Path::new(peer_local);
+                let my_name = me.canonical_folder_name();
+
+                let my_out = sync::outbox_dir(my_base, &peer_name);
+                let my_in = sync::inbox_dir(my_base, &peer_name);
+                let my_pact = sync::pact_dir(my_base, &peer_name);
+                let peer_out = sync::outbox_dir(peer_base, &my_name);
+                let peer_in = sync::inbox_dir(peer_base, &my_name);
+                let peer_pact = sync::pact_dir(peer_base, &my_name);
+
+                info.outbox_count = sync::scan_bodies(&my_out).len();
+                info.inbox_count = sync::scan_bodies(&my_in).len();
+                info.pact_count = sync::scan_bodies(&my_pact).len();
+
+                info.registry_present = sync::registry_path(my_base).is_file();
+
+                if my_base.is_dir() && peer_base.is_dir() {
+                    let synced = sync::dirs_equal(&my_out, &peer_in)
+                        && sync::dirs_equal(&peer_out, &my_in)
+                        && sync::dirs_equal(&my_pact, &peer_pact);
+                    info.status = if synced { "synced" } else { "pending" }.to_string();
+                }
+            }
+            out.push(info);
+        }
+    }
+    Ok(out)
+}
+
 /// Codex BROADCAST edges for a project — separate from REQ pairs. Shows which
 /// codex svod is delivered to which consumer repo, on which lane, to what inbox,
 /// with a file count. Covers both directions: this project's incoming codices

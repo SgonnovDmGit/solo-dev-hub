@@ -153,6 +153,11 @@ pub fn run() {
             commands::project::list_parents_of_microservice,
             commands::project::update_project_type,
             commands::project::server_repo_of_microservice,
+            // T-000191: peer links (InOutBox channel between equals)
+            commands::repo::add_peer_link,
+            commands::repo::remove_peer_link,
+            commands::repo::list_peer_links,
+            commands::repo::list_repo_peers,
             // Codex connections
             commands::project::connect_codex,
             commands::project::list_connected_codices,
@@ -178,6 +183,7 @@ pub fn run() {
             commands::sync::init_docs_for_repo,
             commands::sync::list_project_requirements,
             commands::sync::list_codex_edges,
+            commands::sync::list_peer_channels,
             commands::sync::confirm_requirement,
             // Rename log (F-033)
             commands::sync::list_rename_history,

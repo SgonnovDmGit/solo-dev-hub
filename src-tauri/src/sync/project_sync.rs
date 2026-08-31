@@ -888,6 +888,20 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
 ///
 /// Both orientations keep the consumer as the sender and the codex as the
 /// recipient of a `sync_req_pair` edge.
+/// T-000192: InOutBox channels between equals. For every repo of this project,
+/// sync the channel with each of its peers — same-project same-role pairs plus
+/// explicitly linked cross-project ones. Folds file writes into `copied`,
+/// prunes and marker teardowns into `migrated` (both are structural changes to
+/// the counterpart's folder), and closed exchanges into `auto_closed` alongside
+/// the REQ pairs the same field already carries.
+fn run_peer_channels(db: &AppDb, project_id: i64, c: &mut SyncCounters) {
+    let o = sync::run_peer_channels(db, project_id);
+    c.copied += o.copied;
+    c.migrated += o.pruned;
+    c.auto_closed.extend(o.closed);
+    c.errors.extend(o.errors);
+}
+
 fn run_codex_req_channels(db: &AppDb, project_id: i64, project_type: &str, c: &mut SyncCounters) {
     const LANES: [&str; 2] = ["server", "admin_client"];
 
@@ -1105,6 +1119,11 @@ pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, Strin
     // T-000175: codex REQ channels — per-lane (server↔server, admin↔admin)
     // consumer→codex REQ pairs, so an admin-only codex isn't server-blind.
     run_codex_req_channels(db, project_id, &project_type, &mut c);
+
+    // T-000192: peer channels (InOutBox) — client<->client, server<->server and
+    // explicitly linked cross-project pairs. Role-agnostic and independent of
+    // project topology, so it runs after the hierarchical passes.
+    run_peer_channels(db, project_id, &mut c);
 
     // T-000137: auto-commit synced cross-repo files in opted-in repos (portfolio-wide;
     // pathspec-scoped, so untouched repos and the dev's own WIP are no-ops).
@@ -1525,6 +1544,148 @@ mod tests {
                 .join("REQ-200_admin-rule.md")
                 .exists(),
             "admin-lane REQ must NOT appear in the server repo"
+        );
+    }
+
+    #[test]
+    fn test_peer_channel_linked_pair_end_to_end() {
+        // T-000192: two linked client repos in one project. A full project sync
+        // must create the channel on both sides, carry an outbox file into the
+        // peer's inbox, and honour a `.done.md` teardown.
+        let db = make_db();
+        let a_dir = TempDir::new().unwrap();
+        let b_dir = TempDir::new().unwrap();
+        let other_dir = TempDir::new().unwrap();
+
+        let p = db.create_project("Peers", None, "standard").unwrap();
+        let a = db
+            .insert_local_repository(
+                a_dir.path().to_str().unwrap(),
+                "alpha",
+                Some(p.id),
+                Some("client"),
+            )
+            .unwrap();
+        let b = db
+            .insert_local_repository(
+                b_dir.path().to_str().unwrap(),
+                "beta",
+                Some(p.id),
+                Some("client"),
+            )
+            .unwrap();
+        // A third client of the same project stays out of it — sharing a role
+        // is not a link.
+        db.insert_local_repository(
+            other_dir.path().to_str().unwrap(),
+            "gamma",
+            Some(p.id),
+            Some("client"),
+        )
+        .unwrap();
+
+        run_project_sync(&db, p.id).unwrap();
+        assert!(
+            !a_dir.path().join("docs/InOutBox").exists(),
+            "a shared role opens no channel on its own"
+        );
+
+        db.add_peer_link(a.id, b.id).unwrap();
+        run_project_sync(&db, p.id).unwrap();
+
+        let a_out = a_dir.path().join("docs/InOutBox/outbox/beta");
+        let b_in = b_dir.path().join("docs/InOutBox/inbox/alpha");
+        assert!(a_out.is_dir(), "channel folders appear for a linked pair");
+        assert!(b_dir.path().join("docs/InOutBox/pact/alpha").is_dir());
+        assert!(
+            !other_dir.path().join("docs/InOutBox").exists(),
+            "an unlinked repo of the same role is never pulled in"
+        );
+
+        fs::write(a_out.join("NOTE-001_hi.md"), "observation").unwrap();
+        run_project_sync(&db, p.id).unwrap();
+        assert_eq!(
+            fs::read_to_string(b_in.join("NOTE-001_hi.md")).unwrap(),
+            "observation"
+        );
+
+        fs::write(a_out.join("NOTE-001_hi.done.md"), "closed").unwrap();
+        let r = run_project_sync(&db, p.id).unwrap();
+        assert!(r.auto_closed.contains(&"NOTE-001_hi.md".to_string()));
+        assert!(!b_in.join("NOTE-001_hi.md").exists());
+        assert!(!a_out.join("NOTE-001_hi.md").exists());
+
+        // Idempotent: another pass neither resurrects nor errors. Only the
+        // channel's own errors matter here — a bare test DB has no bundled
+        // templates and no server repo, which the other passes report.
+        let r = run_project_sync(&db, p.id).unwrap();
+        assert!(
+            !r.errors.iter().any(|e| e.starts_with("Peer channel")),
+            "{:?}",
+            r.errors
+        );
+        assert!(!b_in.join("NOTE-001_hi.md").exists());
+    }
+
+    #[test]
+    fn test_peer_channel_explicit_link_across_projects() {
+        // T-000192: two servers in different products pair only via an explicit
+        // link — and the link is what the sync pass walks.
+        let db = make_db();
+        let a_dir = TempDir::new().unwrap();
+        let b_dir = TempDir::new().unwrap();
+
+        let p1 = db.create_project("Lensa", None, "standard").unwrap();
+        let p2 = db.create_project("DLemma", None, "standard").unwrap();
+        let a = db
+            .insert_local_repository(
+                a_dir.path().to_str().unwrap(),
+                "lensa-srv",
+                Some(p1.id),
+                Some("server"),
+            )
+            .unwrap();
+        let b = db
+            .insert_local_repository(
+                b_dir.path().to_str().unwrap(),
+                "dlemma-srv",
+                Some(p2.id),
+                Some("server"),
+            )
+            .unwrap();
+
+        run_project_sync(&db, p1.id).unwrap();
+        assert!(
+            !a_dir.path().join("docs/InOutBox").exists(),
+            "no link, no channel"
+        );
+
+        db.add_peer_link(a.id, b.id).unwrap();
+        run_project_sync(&db, p1.id).unwrap();
+        let a_pact = a_dir.path().join("docs/InOutBox/pact/dlemma-srv");
+        let b_pact = b_dir.path().join("docs/InOutBox/pact/lensa-srv");
+        assert!(a_pact.is_dir() && b_pact.is_dir());
+
+        // Both sides author into the same pact folder; the union must keep both.
+        fs::write(a_pact.join("PACT-001_shared.md"), "proposal").unwrap();
+        fs::write(b_pact.join("PACT-001_shared.ack.md"), "agreed").unwrap();
+        run_project_sync(&db, p1.id).unwrap();
+        for dir in [&a_pact, &b_pact] {
+            assert!(dir.join("PACT-001_shared.md").exists());
+            assert!(dir.join("PACT-001_shared.ack.md").exists());
+        }
+
+        // Unlinking stops future syncing without deleting what was exchanged.
+        db.remove_peer_link(a.id, b.id).unwrap();
+        fs::write(a_pact.join("PACT-002_next.md"), "second").unwrap();
+        run_project_sync(&db, p1.id).unwrap();
+        assert!(
+            !b_pact.join("PACT-002_next.md").exists(),
+            "an unlinked pair must not sync"
+        );
+        assert!(
+            b_pact.join("PACT-001_shared.md").exists(),
+            "unlinking must not delete history"
         );
     }
 }

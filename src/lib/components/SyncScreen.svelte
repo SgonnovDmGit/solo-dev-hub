@@ -4,12 +4,14 @@
   import { allRepos } from '$lib/stores/repos';
   import { projects } from '$lib/stores/projects';
   import { tStore } from '$lib/i18n';
-  import { syncProject, listProjectRequirements, confirmRequirement, listCodexEdges } from '$lib/api/tauri-commands';
+  import { syncProject, listProjectRequirements, confirmRequirement, listCodexEdges, listPeerChannels } from '$lib/api/tauri-commands';
   import { noteManualSync } from '$lib/stores/autosync';
-  import { getDisplayName, type RequirementInfo, type CodexEdgeInfo } from '$lib/types';
+  import { getDisplayName, type RequirementInfo, type CodexEdgeInfo, type PeerChannelInfo } from '$lib/types';
 
   let requirements = $state<RequirementInfo[]>([]);
   let codexEdges = $state<CodexEdgeInfo[]>([]);
+  // T-000192/193: InOutBox channels between equals.
+  let peerChannels = $state<PeerChannelInfo[]>([]);
   let syncing = $state(false);
   let loading = $state(true);
 
@@ -24,10 +26,11 @@
     if (!projectId) return;
     loading = true;
     try {
-      // T-000173: load REQ pairs + codex broadcast edges together.
-      [requirements, codexEdges] = await Promise.all([
+      // T-000173/193: load REQ pairs + codex broadcast edges + peer channels.
+      [requirements, codexEdges, peerChannels] = await Promise.all([
         listProjectRequirements(projectId),
         listCodexEdges(projectId),
+        listPeerChannels(projectId),
       ]);
     } catch (e) {
       addToast(String(e), 'error');
@@ -191,6 +194,19 @@
   function codexStatusClass(status: string): string {
     return status === 'synced' ? 'badge-responded' : 'badge-new';
   }
+
+  // T-000193: peer-channel badge — same three-state vocabulary as the codex rows.
+  function peerStatusLabel(status: string): string {
+    if (status === 'synced') return $tStore('sync.peerSynced');
+    if (status === 'unresolved') return $tStore('sync.peerUnresolved');
+    return $tStore('sync.peerPending');
+  }
+
+  function peerStatusClass(status: string): string {
+    if (status === 'synced') return 'badge-responded';
+    if (status === 'unresolved') return '';
+    return 'badge-new';
+  }
 </script>
 
 <div class="sync-screen">
@@ -208,7 +224,7 @@
 
   {#if loading}
     <div class="loading">{$tStore('sync.syncing')}</div>
-  {:else if requirements.length === 0 && codexEdges.length === 0}
+  {:else if requirements.length === 0 && codexEdges.length === 0 && peerChannels.length === 0}
     <div class="empty">
       <div class="empty-title">{$tStore('sync.noRequirements')}</div>
       <div class="empty-hint">{$tStore('sync.noRequirementsHint')}</div>
@@ -334,6 +350,34 @@
 
     {@render codexSection(codexIncoming, 'sync.codexIncoming')}
     {@render codexSection(codexOutgoing, 'sync.codexOutgoing')}
+
+    {#if peerChannels.length > 0}
+      <div class="section">
+        <div class="section-label"><span class="codex-emoji">&#129309;</span> {$tStore('sync.peerChannels')}</div>
+        <div class="req-list">
+          {#each peerChannels as p (p.self_repo_id + '::' + p.peer_repo_id)}
+            <div class="req-row">
+              <div class="req-info">
+                <span class="req-filename">{p.self_repo} &harr; {p.peer_repo}{p.peer_project ? ` (${p.peer_project})` : ''}</span>
+                <span class="inbox">&#8627; {p.folder}</span>
+                {#if !p.registry_present}
+                  <span class="inbox no-registry">{$tStore('sync.peerNoRegistry')}</span>
+                {/if}
+              </div>
+              <div class="req-actions">
+                <span class="filecount">
+                  {$tStore('sync.peerCounts')
+                    .replace('{0}', String(p.outbox_count))
+                    .replace('{1}', String(p.inbox_count))
+                    .replace('{2}', String(p.pact_count))}
+                </span>
+                <span class="badge {peerStatusClass(p.status)}">{peerStatusLabel(p.status)}</span>
+              </div>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -529,6 +573,11 @@
     font-size: 11px;
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
+  }
+
+  /* T-000193: peer channel hint when the ledger has not been created yet */
+  .no-registry {
+    color: var(--warning, #b8860b);
   }
 
   /* T-000173: codex broadcast section */

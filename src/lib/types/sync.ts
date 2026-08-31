@@ -1,3 +1,5 @@
+import type { Repository } from './core';
+
 export interface SyncResult {
   copied: number;
   responses: number;
@@ -61,4 +63,31 @@ export interface GitignoredListing {
   files: string[];
   repo_state: 'clean' | 'mid_merge' | 'mid_rebase' | string;
   other_staged_count: number;
+}
+
+// T-000191: explicit peer link between two repositories — the InOutBox channel
+// between equals. Every pair is explicit; nothing is inferred from a shared
+// role. Stored normalised (repo_a_id < repo_b_id).
+export interface PeerLink {
+  id: number;
+  repo_a_id: number;
+  repo_b_id: number;
+  created_at: string;
+}
+
+// T-000193: one peer channel as shown in the sync screen — a pair of repos and
+// the state of the three folders between them.
+export interface PeerChannelInfo {
+  self_repo_id: number;
+  peer_repo_id: number;
+  self_repo: string;
+  peer_repo: string;
+  peer_project: string;
+  role: string;
+  folder: string;
+  outbox_count: number;
+  inbox_count: number;
+  pact_count: number;
+  status: 'synced' | 'pending' | 'unresolved';
+  registry_present: boolean;
 }

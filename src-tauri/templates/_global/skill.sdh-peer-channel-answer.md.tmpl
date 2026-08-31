@@ -1,0 +1,72 @@
+---
+name: sdh-peer-channel-answer
+description: >
+  Use when something from an equal has landed in your docs/InOutBox/inbox/ or
+  pact/ — a PACT to acknowledge, a HANDOFF to take over, a NOTE to check, or an
+  ack answering your own proposal. Covers the ack statuses (agreed /
+  agreed-with-limits / declined / clarification-needed), the two-round
+  escalation rule, and closing an exchange with its registry line. To INITIATE
+  an exchange — skill sdh-peer-channel-send.
+---
+
+You are here because a repo **at your own level** sent you something, or answered something you sent. Read your `docs/InOutBox/inbox/<peer>/` and `docs/InOutBox/pact/<peer>/`; a good moment is session start, alongside the announcement sweep.
+
+- You want to **start** an exchange → skill `sdh-peer-channel-send`.
+- A REQ from your server or a client arrived → skill `sdh-cross-repo-req-answer`. Different channel, different rules: there you owe an answer.
+
+## The app delivers; you never fetch
+
+Every peer pair is declared by the owner — a shared role opens nothing — so anything sitting in your `inbox/` arrived through a channel that was deliberately opened. Your permitted counterparts are listed in `docs/project.md`, section `## Peer channels`.
+
+Solo Dev Hub mirrors the peer's `outbox/<you>/` into your `inbox/<peer>/` and merges the two `pact/` folders. You never copy anything across a repo boundary by hand, and you never write into `inbox/` — it is a replica folder owned by the app, and anything you put there is overwritten on the next pass.
+
+**The author's copy is the source of truth.** Editing your replica of the peer's file changes nothing and is silently undone. If you disagree with it, answer in **your own** file.
+
+## What each kind obliges you to
+
+| Arrived | You owe |
+|---|---|
+| `PACT-NNN_<slug>.md` | **an answer** — write `PACT-NNN_<slug>.ack.md` in your `pact/<peer>/` |
+| `HANDOFF-NNN_<slug>.md` | no answer — **remove the handed-over area from your own plan** (`docs/todo.md`), or you will both be doing it |
+| `NOTE-NNN_<slug>.md` | no answer — check whether it applies to you; if it does, file it as your own task |
+| `*.ack.md` on your proposal | read the verdict and act — see "Closing" |
+
+A PACT is the only kind that blocks. Leaving an ack unwritten leaves the peer waiting on an agreement they cannot conclude alone.
+
+## Ack statuses
+
+Write the status on the first line of your `.ack.md`, then the reasoning.
+
+| Status | Meaning |
+|---|---|
+| `agreed` | accepted as written |
+| `agreed-with-limits` | accepted with reservations — **list them**, one per line |
+| `declined` | refused — **a legitimate answer**, not a failure |
+| `clarification-needed` | a question back; the pact stays open |
+
+`declined` is normal here, unlike in REQ: an equal does not own a service on your behalf and owes you nothing. Say plainly why, and if there is an alternative you *would* agree to, propose it — as a new pact of your own, not by editing theirs.
+
+## Two rounds of clarification, then the owner decides
+
+A round is one `clarification-needed` and the answer to it. **Two rounds without `agreed` or `declined` means the two of you will not converge** — mark the pact escalated and put the decision to the owner. There is no third round.
+
+The rule is deliberately hard. Two agents can defer to each other indefinitely, each round costs context, and nobody in this channel outranks anybody.
+
+## Closing an exchange
+
+| Kind | Who closes it | How |
+|---|---|---|
+| PACT | the **initiator** | drops `PACT-NNN_<slug>.impl.md` beside the proposal |
+| HANDOFF / NOTE | the **sender** | drops `<name>.done.md` beside the body in their `outbox/` |
+
+The app then removes the files on both sides at the next sync. If you were the *recipient*, nothing is yours to delete — do not try to clean the folder by hand; the replica will simply come back.
+
+**Log an incoming exchange too.** When something arrives with a number you did not allocate, add its line to your own `docs/InOutBox/registry.md` with direction `in`. The counter is `max` over the whole file, so recording the peer's numbers is what keeps the two of you from ever issuing the same one.
+
+**Whoever drops the marker writes the registry line in the same pass**: the `closed` date, the final status, and where the result went, in `docs/InOutBox/registry.md`. Once the files are gone the ledger is the only surviving record of the exchange, and its number must never be issued again. The app never writes and never deletes that file — if it is missing, create it.
+
+## What you must not do with this channel
+
+**Do not agree with a peer about something the level above owns.** If the fix belongs to your server, each of you sends your own REQ up your own vertical channel; the pact may only record which of you sends it, so the request is not filed twice.
+
+**Do not treat the channel as a task list.** An accepted pact becomes a task in your own `docs/todo.md`; the pact file records the agreement, not the work.
