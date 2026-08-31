@@ -18,6 +18,7 @@ pub mod deploy;
 pub mod deploy_secret_values;
 pub mod graph;
 pub mod migrations;
+pub mod peers;
 pub mod projects;
 pub mod repos;
 pub mod stats;

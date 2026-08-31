@@ -85,6 +85,15 @@ comments:
       rename cross-repo folders on the counterparty's disk. There is deliberately
       no applied_at column — idempotency comes from filesystem checks, not DB state.
 
+  - table: peer_links
+    tableComment: >-
+      Explicit peer pairing between two repositories for the InOutBox channel
+      between equals (v31). Only cross-project pairs need a row — repositories of
+      the same project sharing the same role are peers by derivation. The relation
+      is symmetric, so the pair is stored normalised (repo_a_id < repo_b_id) and a
+      CHECK enforces it; without that one logical pair could be stored twice and
+      the channel would sync twice per pass.
+
   - table: project_renames
     tableComment: >-
       Project-level twin of repo_renames (v24). Needed because

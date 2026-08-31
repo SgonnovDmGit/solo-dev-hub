@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Repository, UntrackReport, GitignoredListing } from '$lib/types';
+import type { Repository, UntrackReport, GitignoredListing, PeerLink, PeerOf } from '$lib/types';
 
 
 // ── Repository commands ───────────────────────────────────────────────────────
@@ -161,4 +161,22 @@ export async function rebalanceProjects(orderedIds: number[]): Promise<void> {
 
 export async function autoSortAll(): Promise<void> {
   return invoke<void>('auto_sort_all');
+}
+
+// ── T-000191: peer links (InOutBox channel between equals) ────────────────────
+
+export async function addPeerLink(repoAId: number, repoBId: number): Promise<void> {
+  return invoke<void>('add_peer_link', { repoAId, repoBId });
+}
+
+export async function removePeerLink(repoAId: number, repoBId: number): Promise<void> {
+  return invoke<void>('remove_peer_link', { repoAId, repoBId });
+}
+
+export async function listPeerLinks(): Promise<PeerLink[]> {
+  return invoke<PeerLink[]>('list_peer_links');
+}
+
+export async function listRepoPeers(repoId: number): Promise<PeerOf[]> {
+  return invoke<PeerOf[]>('list_repo_peers', { repoId });
 }

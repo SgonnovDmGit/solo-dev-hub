@@ -106,6 +106,30 @@ pub struct CodexEdgeInfo {
     pub status: String,        // "synced" (inbox mirrors source) | "pending"
 }
 
+/// T-000191: an explicit peer link between two repositories — the InOutBox
+/// channel between equals. Only cross-project pairs need a row: peers inside
+/// one project are derived from a matching role. Stored normalised
+/// (`repo_a_id < repo_b_id`) because the relation is symmetric.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PeerLink {
+    pub id: i64,
+    pub repo_a_id: i64,
+    pub repo_b_id: i64,
+    pub created_at: String,
+}
+
+/// T-000191: one resolved peer of a repository, with the provenance of the
+/// pairing. Not a DB row — assembled by `peers_of_repo` from both sources
+/// (same-project role match and explicit `peer_links`). A pair can be both,
+/// so the flags are independent: the UI offers "unlink" only when `explicit`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PeerOf {
+    pub repo: Repository,
+    /// Same project, same role.
+    pub derived: bool,
+    /// A `peer_links` row exists for the pair.
+    pub explicit: bool,
+}
 /// F-033: history record of a repository rename.
 /// Written when `upsert_repository_with_outcome` detects a `github_name` change
 /// for an existing repo (matched by `github_id`). Used by sync-preamble to

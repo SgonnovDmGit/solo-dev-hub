@@ -10,11 +10,13 @@
 # of the code, reproducible on any machine and in CI.
 #
 # Requires:
-#   - tbls  — go install github.com/k1LoW/tbls@latest
-#             IMPORTANT: must be built with CGO_ENABLED=1, otherwise its SQLite
-#             driver is a stub ("go-sqlite3 requires cgo to work") and this
-#             script fails at the tbls step. On Windows that means a gcc in PATH
-#             (MinGW-w64) at install time.
+#   - tbls  — install the OFFICIAL RELEASE BINARY, not `go install`:
+#             https://github.com/k1LoW/tbls/releases (tbls_vX.Y.Z_windows_amd64.zip)
+#             `go install` on a machine without a C compiler builds with
+#             CGO_ENABLED=0, and tbls' SQLite driver is then a stub — this script
+#             dies at the tbls step with "go-sqlite3 requires cgo to work".
+#             The published release binaries are built with cgo and just work.
+#             Drop tbls.exe into ~/go/bin (this script puts that on PATH).
 #   - dot   — Graphviz, for the SVG diagrams
 
 set -euo pipefail

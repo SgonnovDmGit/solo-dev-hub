@@ -1774,6 +1774,130 @@
         }
       ],
       "def": "CREATE TABLE \"tasks\" (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             task_id TEXT NOT NULL,\n             prefix TEXT NOT NULL CHECK(prefix IN ('T','F','D','O','M')),\n             description TEXT NOT NULL,\n             effort REAL,\n             priority TEXT,\n             status TEXT,\n             version TEXT,\n             source TEXT NOT NULL CHECK(source IN ('todo','done')),\n             created_at TEXT NOT NULL,\n             updated_at TEXT NOT NULL,\n             UNIQUE(repository_id, task_id, source)\n         )"
+    },
+    {
+      "name": "peer_links",
+      "type": "table",
+      "comment": "Explicit peer pairing between two repositories for the InOutBox channel between equals (v31). Only cross-project pairs need a row — repositories of the same project sharing the same role are peers by derivation. The relation is symmetric, so the pair is stored normalised (repo_a_id \u003c repo_b_id) and a CHECK enforces it; without that one logical pair could be stored twice and the channel would sync twice per pass.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "repo_a_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "repo_b_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "TEXT",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_peer_links_b",
+          "def": "CREATE INDEX idx_peer_links_b ON peer_links(repo_b_id)",
+          "table": "peer_links",
+          "columns": [
+            "repo_b_id"
+          ]
+        },
+        {
+          "name": "idx_peer_links_a",
+          "def": "CREATE INDEX idx_peer_links_a ON peer_links(repo_a_id)",
+          "table": "peer_links",
+          "columns": [
+            "repo_a_id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_peer_links_1",
+          "def": "UNIQUE (repo_a_id, repo_b_id)",
+          "table": "peer_links",
+          "columns": [
+            "repo_a_id",
+            "repo_b_id"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "peer_links",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repo_b_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "peer_links",
+          "referenced_table": "repositories",
+          "columns": [
+            "repo_b_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 1)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repo_a_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "peer_links",
+          "referenced_table": "repositories",
+          "columns": [
+            "repo_a_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_peer_links_1",
+          "type": "UNIQUE",
+          "def": "UNIQUE (repo_a_id, repo_b_id)",
+          "table": "peer_links",
+          "columns": [
+            "repo_a_id",
+            "repo_b_id"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK (repo_a_id \u003c\u003e repo_b_id)",
+          "table": "peer_links",
+          "columns": [
+            "id",
+            "repo_a_id",
+            "repo_b_id"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK (repo_a_id \u003c repo_b_id)",
+          "table": "peer_links",
+          "columns": [
+            "id",
+            "repo_a_id",
+            "repo_b_id"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE peer_links (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             repo_a_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             repo_b_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             created_at TEXT NOT NULL,\n             CHECK (repo_a_id \u003c\u003e repo_b_id),\n             CHECK (repo_a_id \u003c repo_b_id),\n             UNIQUE (repo_a_id, repo_b_id)\n         )"
     }
   ],
   "relations": [
@@ -1984,6 +2108,32 @@
       ],
       "parent_cardinality": "exactly_one",
       "def": "FOREIGN KEY (repository_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "peer_links",
+      "columns": [
+        "repo_b_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repo_b_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "peer_links",
+      "columns": [
+        "repo_a_id"
+      ],
+      "cardinality": "zero_or_more",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repo_a_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
     }
   ],
   "driver": {

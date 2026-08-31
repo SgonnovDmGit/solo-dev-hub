@@ -73,6 +73,7 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         "tasks_prefix_ops_classes",
         mig_v30_tasks_prefix_ops_classes,
     ),
+    (31, "peer_links", mig_v31_peer_links),
 ];
 
 impl AppDb {
@@ -968,6 +969,33 @@ fn mig_v30_tasks_prefix_ops_classes(conn: &Connection) -> SqlResult<()> {
     )
 }
 
+fn mig_v31_peer_links(conn: &Connection) -> SqlResult<()> {
+    // T-000191 (v1.15.0): explicit peer link between two repositories, for the
+    // InOutBox channel between equals (client<->client, server<->server, ...).
+    //
+    // Peers inside one project are *derived* from a matching role and need no
+    // row here. This table carries only the pairs derivation cannot see — the
+    // cross-project ones (server<->server between two products).
+    //
+    // The relation is symmetric, so a pair is normalised on write to
+    // (min(id), max(id)) and the CHECK enforces it. Without normalisation one
+    // logical pair could be stored as (a,b) and (b,a) and the channel would be
+    // synced twice per pass.
+    conn.execute_batch(
+        "CREATE TABLE peer_links (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             repo_a_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             repo_b_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             created_at TEXT NOT NULL,
+             CHECK (repo_a_id <> repo_b_id),
+             CHECK (repo_a_id < repo_b_id),
+             UNIQUE (repo_a_id, repo_b_id)
+         );
+         CREATE INDEX idx_peer_links_a ON peer_links(repo_a_id);
+         CREATE INDEX idx_peer_links_b ON peer_links(repo_b_id);
+         PRAGMA user_version = 31;",
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,7 +1061,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         // Update this when a new migration is added.
-        assert!(version >= 30);
+        assert!(version >= 31);
     }
 
     #[test]
@@ -1381,11 +1409,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v30 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v31 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 30);
+        assert_eq!(version, 31);
 
         drop(conn);
         let _ = repo;
@@ -1452,7 +1480,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 30);
+        assert_eq!(version, 31);
     }
 
     #[test]
@@ -2016,5 +2044,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_db_migration_v31_peer_links() {
+        // T-000191: peer_links exists after v31, and the normalisation CHECK
+        // makes it impossible to store one logical pair in both orders.
+        let db = make_db();
+        let a = db
+            .insert_local_repository("/tmp/pa", "pa", None, None)
+            .unwrap();
+        let b = db
+            .insert_local_repository("/tmp/pb", "pb", None, None)
+            .unwrap();
+        let (lo, hi) = if a.id < b.id {
+            (a.id, b.id)
+        } else {
+            (b.id, a.id)
+        };
+
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO peer_links (repo_a_id, repo_b_id, created_at) VALUES (?1, ?2, '2026-08-31')",
+            rusqlite::params![lo, hi],
+        )
+        .expect("normalised pair inserts");
+
+        // Reverse order violates CHECK(repo_a_id < repo_b_id).
+        assert!(
+            conn.execute(
+                "INSERT INTO peer_links (repo_a_id, repo_b_id, created_at) VALUES (?1, ?2, '2026-08-31')",
+                rusqlite::params![hi, lo],
+            )
+            .is_err(),
+            "reverse pair must be rejected by the normalisation CHECK"
+        );
+
+        // Self-link violates CHECK(repo_a_id <> repo_b_id).
+        assert!(
+            conn.execute(
+                "INSERT INTO peer_links (repo_a_id, repo_b_id, created_at) VALUES (?1, ?1, '2026-08-31')",
+                rusqlite::params![lo],
+            )
+            .is_err(),
+            "self-link must be rejected"
+        );
+
+        // Duplicate violates UNIQUE(repo_a_id, repo_b_id).
+        assert!(
+            conn.execute(
+                "INSERT INTO peer_links (repo_a_id, repo_b_id, created_at) VALUES (?1, ?2, '2026-09-01')",
+                rusqlite::params![lo, hi],
+            )
+            .is_err(),
+            "duplicate pair must be rejected"
+        );
     }
 }

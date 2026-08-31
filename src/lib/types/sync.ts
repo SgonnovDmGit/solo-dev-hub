@@ -1,3 +1,5 @@
+import type { Repository } from './core';
+
 export interface SyncResult {
   copied: number;
   responses: number;
@@ -61,4 +63,23 @@ export interface GitignoredListing {
   files: string[];
   repo_state: 'clean' | 'mid_merge' | 'mid_rebase' | string;
   other_staged_count: number;
+}
+
+// T-000191: explicit peer link between two repositories — the InOutBox channel
+// between equals. Only cross-project pairs need a row; peers inside one project
+// are derived from a matching role. Stored normalised (repo_a_id < repo_b_id).
+export interface PeerLink {
+  id: number;
+  repo_a_id: number;
+  repo_b_id: number;
+  created_at: string;
+}
+
+// T-000191: one resolved peer of a repository. `derived` — same project, same
+// role; `explicit` — a peer_links row exists. A pair can be both, so the flags
+// are independent: offer "unlink" only when `explicit`.
+export interface PeerOf {
+  repo: Repository;
+  derived: boolean;
+  explicit: boolean;
 }
