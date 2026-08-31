@@ -196,11 +196,18 @@
   }
 
   .candidate:hover:not(:disabled) {
-    background-color: var(--hover);
+    background-color: var(--surface-hover);
   }
 
+  /* The selected row needs to read as chosen before the button is pressed:
+     an accent bar plus accent text, not just a tinted background. Both this
+     rule and the hover above previously named `--hover` / `--accent-soft`,
+     which app.css does not define — an undefined CSS variable silently
+     resolves to nothing, so neither state showed at all. */
   .candidate.selected {
-    background-color: var(--accent-soft, var(--hover));
+    background-color: var(--surface-hover);
+    box-shadow: inset 3px 0 0 var(--accent);
+    color: var(--accent);
     font-weight: 500;
   }
 
@@ -217,6 +224,10 @@
   .cand-flag {
     color: var(--text-muted);
     font-size: 12px;
+  }
+
+  .candidate.selected .cand-meta {
+    color: var(--accent);
   }
 
   .no-candidates {

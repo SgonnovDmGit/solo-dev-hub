@@ -4,6 +4,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.15.0] — 2026-09-01
+
+Channels between equals: two repos at the same level can now exchange with each other, and the app carries the files.
+
+### Added
+- **Peer channels — `docs/InOutBox/` (T-000191…194, T-000184…187).** Until now every cross-repo channel encoded a hierarchy in its folder name: a client asks its server, a server asks its microservice. Two repos at the *same* level — client ↔ client, server ↔ server, or two servers in different products — had no channel at all, because REQ only works where there is a **direction of debt** obliging the recipient to answer. The new channel names a direction instead of a role: `outbox/<peer>/` for what you sent, `inbox/<peer>/` for what arrived, `pact/<peer>/` for two-sided agreements. Three kinds of exchange, all proven in the field before being canonised: **PACT** (an agreement, answered with an `.ack.md`, where `declined` is a legitimate answer), **HANDOFF** (an area handed over), **NOTE** (an observation or question). Two new skills — `sdh-peer-channel-send` and `sdh-peer-channel-answer` — carry the rules, including the mandatory per-subject authority line and the hard two-rounds-then-escalate limit. Full contract: `docs/flows/peer-channels.md`.
+- **Peers are connected deliberately, in the project's Links tab.** A shared role opens nothing — a channel exists only where you linked the pair, exactly as a microservice is connected. Linking is done in a dialog (pick your repo, search the whole portfolio, already-linked entries marked); unlinking stops the sync and deletes nothing. The **sync screen** gains a "Peer channels" section with per-folder counts and a synced/pending badge, and the generated `docs/project.md` gains a **`## Peer channels`** table — that table is what tells an AI agent whom it may exchange with.
+- **Number registries in every outgoing channel (T-000194).** An exchange number lived only in a filename, so closing a pair erased it and `max + 1` would eventually reissue a number the counterpart already had. Each outgoing channel now keeps an append-only `registry.md` — `docs/backend-requirements/`, `docs/microservice-requirements/`, `docs/InOutBox/`. The app never writes or deletes it, which is the entire guarantee: tearing an exchange down removes its files and never its number. Announcements are excluded on purpose — one-way and terminal, nothing refers back to their number.
+
+### Changed
+- **Schema migration v31** adds `peer_links`, storing each symmetric pair once (`CHECK repo_a_id < repo_b_id` + `UNIQUE`) so a channel cannot be synced twice per pass.
+- **Two live rules corrected under the new channel (T-000186).** `sdh-cross-repo-req-send` no longer claims "a client is never a recipient of requirements" and drops its `microservice → microservice` clause, which the engine never routed; `sdh-cross-repo-announce-send` now marks its cross-repo-write carve-out as a rule of the **vertical** channels, since between equals the model is the opposite — you write only in your own repo and the app carries it.
+- **Three working rules from owner-named pain (T-000197).** *Agreed decisions are not reopened* — a decision discussed with the owner and recorded is closed, including when the agent proposed it and the owner accepted; every record names its author, and the consequences of an agreed decision are not anomalies to investigate. *The gate has no authority over the owner* — "ship it" closes any unmet acceptance criterion on the spot, with the risk named in one line and the remainder filed as a task. *The retro records indignation* — a fifth mandatory point captures what irritated the owner, in their own words, and it sets the queue for the process fixes.
+
+### Fixed
+- **Auto-commit no longer switches itself on (B-000028, reopened).** The earlier fix persisted `dev` as the auto-commit branch whenever a repo card was opened and the repo had such a branch — so a repo whose working tree sits on `main` reported "expected dev" on every sync, for a setting nobody had chosen. Auto-commit writes commits; it is opt-in, always.
+- **Schema documentation could not be regenerated** on a machine where `tbls` was installed via `go install` without a C compiler — its SQLite driver is a stub there. The script header now points at the official release binary.
+
+### Tests
+- 528 Rust (+19 over v1.14.0's 509: migration v31 constraints, peer-link CRUD and resolution, the channel engine's mirror / union / teardown / idempotency, two end-to-end sync round-trips, the `project.md` peer section; 1 ignored: the schema-export generator), 86 vitest, svelte-check clean.
+
 ## [1.14.0] — 2026-08-12
 
 Operations tasks — a class of non-code work items that never block a code release.
