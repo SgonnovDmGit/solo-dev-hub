@@ -41,6 +41,12 @@ A skill reaches **every repo in the portfolio**, so a careless edit travels furt
 - **Delivery does not wait for a release.** The per-repo copies are rendered from the database row on every sync, so the same agreed text applied through Settings → App defaults reaches every repo immediately. That row is marked `is_custom=1`; once the next build carries the same text into the bundle, the flag is cleared automatically and the fork heals.
 - **It is операционка, not a release task.** No `todo.md` entry and no per-edit ceremony — but accumulated rule changes are listed as **one** Changelog line at the next closure, so the version step stays explained.
 
+- **A gate is designed together with its delivery and ownership constraints.** When
+  proposing a rule about who edits the canon and how, answer two questions in the same
+  breath: how fast does an edit reach the people it concerns, and who is even allowed to
+  write into that repository. A gate that depends on frequent releases, or on access
+  people do not have, looks tidy and does not work.
+
 The boundary with the Codex: a practice tied to a role's subject area belongs in the svod, not in a skill. A skill carries method that does not depend on role.
 
 Four rules about the rules themselves:
