@@ -5,6 +5,9 @@
   import HelpQuickStart from './help/HelpQuickStart.svelte';
   import HelpProjectSetup from './help/HelpProjectSetup.svelte';
   import HelpBugWorkflow from './help/HelpBugWorkflow.svelte';
+  import HelpCrossRepo from './help/HelpCrossRepo.svelte';
+  import HelpDeploy from './help/HelpDeploy.svelte';
+  import HelpAgentContract from './help/HelpAgentContract.svelte';
 
   let search = $state('');
   let current = $state(helpNav[0].items[0].anchor);
@@ -73,6 +76,9 @@
     <HelpQuickStart />
     <HelpProjectSetup />
     <HelpBugWorkflow />
+    <HelpCrossRepo />
+    <HelpDeploy />
+    <HelpAgentContract />
   </div>
 </div>
 
