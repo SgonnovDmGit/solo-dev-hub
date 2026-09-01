@@ -140,6 +140,29 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
     let todo_tasks = dedupe_by_id(todo_tasks, |t| t.id.as_str(), "todo.md", repo_id);
     let done_tasks = dedupe_by_id(done_tasks, |t| t.id.as_str(), "done.md", repo_id);
 
+    // T-000183: a task standing in the id slot of BOTH files used to flap between
+    // sources forever, one phantom event per sync. The TODO loop saw the DB row as
+    // done and emitted `reopened`; on the next pass the DONE loop saw it as todo and
+    // emitted `done`. The H6 block at the end of this function already resolves the
+    // split state - but only after the events have been written, so it never stopped
+    // the leak. Done is the more recent intent (the same rule H6 applies), so subtract
+    // ids present in done.md from the todo side *before* the loops run: the todo
+    // branch then never touches such a row at all.
+    let done_ids_in_md: HashSet<&str> = done_tasks.iter().map(|t| t.id.as_str()).collect();
+    let todo_tasks: Vec<_> = todo_tasks
+        .into_iter()
+        .filter(|t| {
+            let in_done = done_ids_in_md.contains(t.id.as_str());
+            if in_done {
+                eprintln!(
+                    "[sync_tasks repo={}] {} is in both todo.md and done.md - done wins, skipping the todo side",
+                    repo_id, t.id
+                );
+            }
+            !in_done
+        })
+        .collect();
+
     // Load existing DB rows keyed by task_id string
     let db_todos = db
         .list_tasks_by_repo(repo_id, "todo")
@@ -456,6 +479,91 @@ mod tests {
         assert_eq!(todos.len(), 2);
         let events = db.list_task_events_by_task(todos[0].id).unwrap();
         assert!(events.is_empty());
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn test_sync_tasks_same_id_in_both_files_emits_no_events_ever() {
+        // T-000183 regression: the id sits in the slot of both todo.md and done.md.
+        // Before the fix each sync wrote one phantom event (reopened, then done, then
+        // reopened...), forever. Three consecutive syncs must produce zero.
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_path.join("docs")).unwrap();
+        std::fs::write(
+            repo_path.join("docs/todo.md"),
+            "- [ ] T-000086 | Ghost task | 2 | high | open | 2026-08-01\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_path.join("docs/done.md"),
+            "## 2026-08-01\n- T-000086 | Ghost task | v1.0.0\n",
+        )
+        .unwrap();
+        let repo = db
+            .insert_local_repository(repo_path.to_str().unwrap(), "flap_repo", None, None)
+            .unwrap();
+
+        sync_tasks_for_repo(&db, repo.id).unwrap();
+        for pass in 2..=3 {
+            let r = sync_tasks_for_repo(&db, repo.id).unwrap();
+            assert_eq!(
+                r.events_emitted, 0,
+                "sync pass {} emitted phantom events for a task listed in both files",
+                pass
+            );
+        }
+
+        // The task lives on the done side only - never both, never flapping back.
+        let todos = db.list_tasks_by_repo(repo.id, "todo").unwrap();
+        let dones = db.list_tasks_by_repo(repo.id, "done").unwrap();
+        assert!(
+            todos.iter().all(|t| t.task_id != "T-000086"),
+            "todo side must not carry a task that done.md already claims"
+        );
+        assert_eq!(dones.len(), 1);
+        assert_eq!(dones[0].task_id, "T-000086");
+
+        let events = db.list_task_events_by_task(dones[0].id).unwrap();
+        assert!(
+            events.is_empty(),
+            "no events at all: the task was imported as done on the first pass"
+        );
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn test_sync_tasks_dedupes_duplicate_ids_within_done_md() {
+        // T-000157 covered duplicate ids inside todo.md; done.md had no such test.
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_path.join("docs")).unwrap();
+        std::fs::write(
+            repo_path.join("docs/done.md"),
+            "## 2026-08-01\n- T-000010 | First wording | v1.0.0\n\n## 2026-08-02\n- T-000010 | Later wording | v1.1.0\n",
+        )
+        .unwrap();
+        let repo = db
+            .insert_local_repository(repo_path.to_str().unwrap(), "dup_done_repo", None, None)
+            .unwrap();
+
+        sync_tasks_for_repo(&db, repo.id).unwrap();
+
+        let dones = db.list_tasks_by_repo(repo.id, "done").unwrap();
+        assert_eq!(
+            dones.len(),
+            1,
+            "duplicate id inside done.md must collapse to one row"
+        );
+        assert_eq!(
+            dones[0].description, "Later wording",
+            "last occurrence wins, mirroring the todo.md rule"
+        );
+
+        let r = sync_tasks_for_repo(&db, repo.id).unwrap();
+        assert_eq!(r.events_emitted, 0, "a re-sync must stay quiet");
         std::mem::forget(tmp);
     }
 

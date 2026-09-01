@@ -74,6 +74,11 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         mig_v30_tasks_prefix_ops_classes,
     ),
     (31, "peer_links", mig_v31_peer_links),
+    (
+        32,
+        "collapse_phantom_task_events",
+        mig_v32_collapse_phantom_task_events,
+    ),
 ];
 
 impl AppDb {
@@ -996,6 +1001,32 @@ fn mig_v31_peer_links(conn: &Connection) -> SqlResult<()> {
          PRAGMA user_version = 31;",
     )
 }
+
+fn mig_v32_collapse_phantom_task_events(conn: &Connection) -> SqlResult<()> {
+    // T-000183 (v1.16.0): a task standing in the id slot of BOTH todo.md and
+    // done.md flapped between sources on every sync, writing one phantom event
+    // per pass. The engine fix stops new ones; this collapses what accumulated.
+    //
+    // Measured on the author's portfolio before the fix: 2689 phantom rows =
+    // 21% of task_events, 76 tasks across 16 repositories, with one task at 90
+    // `done` + 89 `reopened`. Timeline and Stats were showing mostly noise.
+    //
+    // A task has at most one real `done` and at most one real `reopened`, and
+    // the earliest of each is the true one - it was written at import or at
+    // completion, before the flapping started. Keep MIN(id) per
+    // (task_id, event_type) and drop the rest. Every other event type is
+    // untouched.
+    conn.execute_batch(
+        "DELETE FROM task_events
+          WHERE event_type IN ('done','reopened')
+            AND id NOT IN (
+                SELECT MIN(id) FROM task_events
+                 WHERE event_type IN ('done','reopened')
+                 GROUP BY task_id, event_type
+            );
+         PRAGMA user_version = 32;",
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1054,6 +1085,99 @@ mod tests {
     }
 
     #[test]
+    fn test_db_migration_v32_collapses_phantom_task_events() {
+        // T-000183: before the engine fix a task listed in both todo.md and done.md
+        // wrote one phantom done/reopened per sync. The migration keeps the earliest
+        // of each type per task and drops the repeats, leaving other kinds untouched.
+        let db = make_db();
+        let conn = db.conn.lock().unwrap();
+
+        conn.execute(
+            "INSERT INTO repositories (github_name, role) VALUES ('acme/flap', 'tool')",
+            [],
+        )
+        .unwrap();
+        let repo_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO tasks (repository_id, task_id, prefix, description, effort, \
+             priority, status, version, source, created_at, updated_at) \
+             VALUES (?1, 'T-000086', 'T', 'Ghost', 0, 'medium', 'open', '', 'done', \
+             '2026-08-01', '2026-08-01')",
+            [repo_id],
+        )
+        .unwrap();
+        let task_row = conn.last_insert_rowid();
+
+        // One real completion, then 40 phantom pairs, plus one unrelated kind.
+        for i in 0..41 {
+            conn.execute(
+                "INSERT INTO task_events (task_id, event_type, ts) VALUES (?1, 'done', ?2)",
+                rusqlite::params![task_row, format!("2026-08-{:02}T00:00:00Z", (i % 28) + 1)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_events (task_id, event_type, ts) VALUES (?1, 'reopened', ?2)",
+                rusqlite::params![task_row, format!("2026-08-{:02}T01:00:00Z", (i % 28) + 1)],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO task_events (task_id, event_type, ts) VALUES (?1, 'created', '2026-08-01T00:00:00Z')",
+            [task_row],
+        )
+        .unwrap();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 83);
+
+        mig_v32_collapse_phantom_task_events(&conn).unwrap();
+
+        let done: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events WHERE event_type='done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let reopened: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events WHERE event_type='reopened'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let created: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events WHERE event_type='created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, 1, "exactly one done survives");
+        assert_eq!(reopened, 1, "exactly one reopened survives");
+        assert_eq!(created, 1, "other event kinds are untouched");
+
+        // The survivor is the earliest one written, not an arbitrary row.
+        let kept_ts: String = conn
+            .query_row(
+                "SELECT ts FROM task_events WHERE event_type='done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept_ts, "2026-08-01T00:00:00Z");
+
+        // Idempotent: running it again changes nothing.
+        mig_v32_collapse_phantom_task_events(&conn).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 3);
+    }
+
+    #[test]
     fn test_db_migration_version() {
         let db = make_db();
         let conn = db.conn.lock().unwrap();
@@ -1061,7 +1185,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         // Update this when a new migration is added.
-        assert!(version >= 31);
+        assert!(version >= 32);
     }
 
     #[test]
@@ -1409,11 +1533,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v31 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v32 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 31);
+        assert_eq!(version, 32);
 
         drop(conn);
         let _ = repo;
@@ -1480,7 +1604,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 31);
+        assert_eq!(version, 32);
     }
 
     #[test]
