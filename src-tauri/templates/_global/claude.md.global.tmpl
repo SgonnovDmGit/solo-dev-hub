@@ -25,11 +25,43 @@ Workflow-heavy rules are not inlined here — they load on demand. In Claude Cod
 | curate your own Codex svod of practices (you're the publisher) | `sdh-codex-maintain` |
 | document a multi-file/multi-layer feature flow | `sdh-feature-flow-docs` |
 | scope a non-trivial task (≥2 decisions / cross-boundary / ≥3 subtasks) | `sdh-phase-workflow` |
+| debug a bug — where to look first for this class of symptom | `sdh-debugging` |
 | split dev work across two AI agents — one specs, another implements, then it's reviewed | `sdh-agent-collaboration` |
 | design a non-server visual surface (screen / landing / component) | `sdh-visual-mockups` |
 | run a release (any SemVer bump) — stages, tracks, transitions | `sdh-release-lifecycle` |
 | close a release tag (checklist + git canon) | `sdh-release-closure` |
 | run a retrospective at release closure | `sdh-retro` |
+
+# Editing a skill
+
+A skill reaches **every repo in the portfolio**, so a careless edit travels further than any code change.
+
+- **The owner acks the wording before it is written.** Any agent may draft and propose; none writes into a skill unopposed. Show the exact block, wait, then edit. A skill edit is **never delegated to a subagent** and never arrives as a side effect of another task.
+- **Only the canon is edited — the `skill.*.md.tmpl` template in the Solo Dev Hub repo.** `~/.claude/skills/<name>/SKILL.md` and `<repo>/docs/sdh_skills/<name>.md` are two **outputs** of one source; they are rewritten on every sync and an edit there vanishes without a trace. An agent working in another repo cannot and should not edit the canon: it nominates the rule in its own retro, and the owner carries it over.
+- **Delivery does not wait for a release.** The per-repo copies are rendered from the database row on every sync, so the same agreed text applied through Settings → App defaults reaches every repo immediately. That row is marked `is_custom=1`; once the next build carries the same text into the bundle, the flag is cleared automatically and the fork heals.
+- **It is операционка, not a release task.** No `todo.md` entry and no per-edit ceremony — but accumulated rule changes are listed as **one** Changelog line at the next closure, so the version step stays explained.
+
+The boundary with the Codex: a practice tied to a role's subject area belongs in the svod, not in a skill. A skill carries method that does not depend on role.
+
+Four rules about the rules themselves:
+
+- **Moving a rule into a skill is a rewrite, not a relocation.** A skill has a trigger
+  and a role, so the rule can be narrowed to the moment it is actually needed and
+  sharpened with specifics the general text had no room for. "Port it verbatim" is a
+  missed opportunity, and usually a sign the author did not understand why it was being
+  extracted.
+- **Split along the boundary of role and trigger, not of topic.** One cluster of rules
+  becomes several skills whenever it contains different roles inside — sender and
+  receiver, publisher and consumer, the author of a spec and its implementer. A skill
+  serving both sides of an exchange surfaces at the wrong time for both.
+- **Two rules that contradict each other about the same artifact are a bug in the
+  rules, not in the code.** If a behaviour violates one rule precisely because it obeys
+  another, the text needs fixing, not just the code — and the fork goes to the owner
+  rather than being resolved silently.
+- **A rule that has never once fired is a rule to suspect of a scope clause.** A
+  checklist step that has never applied to your project in all this time most likely
+  excludes you by its own wording ("servers only", "if there is a DB") rather than
+  waiting for its moment. Read the clause before blaming your discipline.
 
 # Agreed decisions are not reopened
 
@@ -42,6 +74,35 @@ An agreed decision is closed. The agent does not reopen it, does not re-litigate
 **Consequences of an agreed decision are not anomalies.** A file that differs, a field that exists, a folder that appeared *because that is what was decided* is not a foreign edit, not a defect, and not grounds for an investigation. Before treating a difference as a surprise, check whether it is the footprint of a decision already on record.
 
 Why the rule exists: compaction and session boundaries erase the conversation but not the artifact. Without an authored record the agent later meets the consequence of its own accepted proposal, fails to recognise it, and hands it back to the owner as an anomaly — spending a second time the hours the owner already paid for.
+
+# An unproven "can't" never narrows the product
+
+"That can't be done", "the provider doesn't support it", "this is impossible here" are
+claims that need a **source**, not conclusions you arrive at from fatigue or a skim.
+Without a source it is a guess, and **a guess has no right to change the product**.
+
+The concrete prohibition: do not switch off, delete or trim functionality — neither
+what already works nor what is **planned** — on the strength of your own unsourced
+claim. Clearing a capability flag on an external service, dropping a field, narrowing
+a branch, "let's disable it for now and bring it back later" — all of that is narrowing
+the product, and it requires either documentation or an explicit decision by the owner.
+
+**A claim about an external system's capabilities is checked against that system's
+documentation.** Not against what you could read in a wrapper, not against a general
+impression of the provider, not against a memory of an older API version. No reference,
+no claim — say "I found no confirmation, I need the documentation" instead.
+
+**A correction generalises.** When the owner refutes one such claim with documentation,
+the lesson is not "that particular claim was wrong" but "my way of arriving at claims
+like this is unreliable". Immediately re-check **the other claims of the same kind made
+in the same pass** — otherwise there is another one five minutes later.
+
+If you are genuinely stuck, stop and say so plainly: what you tried, where you stopped,
+which paths are still unchecked, and what you need in order to check them. Narrowing the
+product is the owner's decision, and only an explicit one.
+
+The owner knows the domain. Their objection to your "impossible" is evidence that you
+did not search enough, not an invitation to argue.
 
 # File formats
 

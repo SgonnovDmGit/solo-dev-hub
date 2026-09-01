@@ -47,6 +47,23 @@ The bump class is decided once at Analysis (stage 2) — but a release rarely st
 
 1. **Request** — the user's kickoff for a release scope, feature batch, or non-trivial task.
 2. **Analysis** — the assistant estimates scope, classifies fast-lane vs phase and light vs full track, surfaces blockers/dependencies, and for features needing server endpoints runs the pre-flight surface check (skill `sdh-api-contract-consume`). **The bump class (PATCH/MINOR/MAJOR) and version number are decided here** — not deferred to closure: the `## vX.Y.Z` header in the Plan must be right from the start. MAJOR/MINOR is confirmed with the user here (the "ask before MAJOR/MINOR" rule fires at Analysis). Output: a one-message scope picture + class + version the user confirms or redirects.
+   - **First action of Analysis: check which roadmap slots are taken.** Before naming a
+     version, look at the `## vX.Y.Z` headers already used in `docs/todo.md` and in the
+     roadmap. A number produced from memory has to be replayed after tasks are already
+     filed under it.
+   - **Grep the schema before announcing the class.** If the work touches the DB, read
+     the migrations: a new `CHECK`, `UNIQUE`, `FK` or column lifts PATCH to MINOR — it
+     changes the storage contract, not just behaviour.
+   - **The bump class is decided by whether the user gains a new affordance**, not by
+     the volume of edits: a new user-facing surface is MINOR even at three changed
+     lines.
+   - **The owner picked the riskier option → name a concrete risk, not a general
+     unease.** One line on what exactly can go wrong and at which step. **If the risk is
+     real** — irreversible data loss, breakage at a counterparty, a failure users will
+     notice — **asking for confirmation again is right and proper.** What is not proper
+     is talking them out of it, listing anxieties with no mechanism behind them, or
+     coming back to a settled decision for a second round (see "Agreed decisions are not
+     reopened"). Name it, get the answer, move on.
 3. **Spec** — a written spec per the spec step of `sdh-phase-workflow` (or thread-as-spec). Includes context, scope, files-to-modify, decisions, and a `## Verification` section. *(Light track: the chat itself serves as the spec.)* **For non-server features with a visual surface — do mockups first (skill `sdh-visual-mockups`); the accepted mockup carries the design decisions, the spec text can be thin.**
 4. **Spec review** — three-step procedure:
    - (a) **Assistant self-review** — an explicit pass: ambiguities, contradictions, logical gaps, missing files-to-modify, mismatched symbol names, missing i18n cleanup, missing test updates. Report to chat (or *"no issues"*).

@@ -33,6 +33,31 @@ Use this when scoping a user request, before starting implementation. For any re
 
 This sequence is one task-level cycle. It runs inside the broader release lifecycle (skill `sdh-release-lifecycle`): that skill's "Implementation" stage is where these five steps execute per task, and its own Spec / Spec-review stages mirror steps 2–4 at the release level.
 
+## Grounding the spec
+
+Nine checks that belong to the Chat and Spec steps above. Each one was paid for by a spec that had to be rewritten.
+
+**Check the premise, not just the wording.**
+
+- The request leans on an outside model ("like X does it") or on a roadmap label ("secrets vault") → verify the **root premise** before designing: does the referenced thing exist, and is it what the owner actually means? A spec built on a wrong premise burns whole, mockup included.
+- The task description is narrow but the domain underneath is murky → ask "what does this task actually solve" **before** writing code. The same one-line phrasing has been implemented two different ways.
+- Declared in a schema, a config or a `meta.json` **does not mean executed**. Grep the consumer before asserting in a spec that a behaviour exists — a field can sit dead for a feature's entire lifetime.
+
+**Name the numbers before the spec, not at acceptance.**
+
+- Any feature that creates, derives or links something **automatically** must state the size of the set **on the owner's live data**: "on your portfolio this yields N of them". The database is right there; one query is cheaper than reworking after the release build.
+- A design point carrying a numeric ratio (weights, thresholds, timeouts) goes to chat as its own edge-case question, instead of hiding in a paragraph of the spec.
+
+**How to talk at this stage.**
+
+- An absolute claim about the project's behaviour ("X doesn't do Y", "for the first time") is either fact-checked with a grep or hedged in tone. It is checkable, and the owner will check it.
+- Every multiple-choice question ends with an explicit **"let's discuss this in chat"** option. Without it the fork forces a choice where a conversation was needed — and the frame itself is what most often turns out to be wrong.
+- Chat with visible options for a non-trivial task is required **even under a "work without stopping" directive**: that directive removes confirmations on mechanics, not on design choices.
+
+**A bug with no stated target.**
+
+- The report names a symptom ("X doesn't update right") but not the desired end state, and there are two or more plausible fixes → confirm the end state with the owner **before** coding. Otherwise a fix that is correct to the letter comes back rejected as "not that".
+
 ## Project bindings (per-project `CLAUDE.md` defines)
 
 - **Spec location:** path and naming convention for spec files (e.g. `docs/specs/<YYYY-MM-DD>-<phase-name>.md`). Spec files are gitignored unless the project says otherwise.

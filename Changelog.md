@@ -4,6 +4,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.16.0] — 2026-09-01
+
+A revision of the working rules and the second half of the in-app help; along the way, a leak of task events that had been accumulating since sync first existed.
+
+### Added
+- **Operating-contract sections in the help screen (T-000160).** The second slice on top of the v1.13.0 frame — three groups, thirteen subsections, ru/en. **Cross-repo links**: how the app carries files between repositories, requirements down the hierarchy with their message/receipt pair, channels between equals with pacts, handoffs and notes, one-way broadcast for announcements and codex svods, and why the number registry exists. **Deploy**: environments, the `build` / `deploy` / `runtime` secret roles, reusable encrypted bundles, the portfolio report. **The AI agent contract**: which files the agent reads and which of them are the source of truth, what it may touch in bugs and what the app silently restores, where the rules come from and why editing them in place does nothing — and the honest part, that the contract is opt-in and only the checkable half is checked.
+- **The `sdh-debugging` skill (T-000195).** Seven diagnostic lessons that had no home in any skill: reproduce before theorising, narrow the axes for what won't reproduce, a symptom→first-move table for five classes, the operation-order oracle for partial state with no repro, and a reverting own write as the bug surfacing. The skill count is now 18.
+- **An always-on rule: an unproven "can't" never narrows the product.** Switching off, deleting or trimming functionality — working or merely planned — on the strength of an unsourced claim is prohibited. An external service's capabilities are checked against its documentation rather than a general impression, and a correction from the owner generalises to the other claims made in the same pass instead of closing just one.
+
+### Changed
+- **Retro lessons got four homes instead of one (T-000196).** The "lessons → memory" point in `sdh-retro` named exactly two destinations, both memory, so by the letter of the rule everything went there: a portfolio measurement found 3039 files across 56 per-project silos, none older than five months. The destination is now chosen by reach — the Codex svod, a skill, the repository's `CLAUDE.md`, or memory — and a retro nominates a skill edit rather than making it. All 60 accumulated memories of this repository were sorted: 15 deleted as verbatim duplicates, 11 promoted into a "stack traps" section, 28 moved into skills, 6 deliberately left as memory.
+- **37 revisions to the existing skills (T-000188).** `sdh-phase-workflow` gained a "Grounding the spec" section; `sdh-agent-collaboration` gained a broader grounding requirement, the rule that a spec disagreeing with the code is a factual error rather than a fork, parallel per-domain reviewers, and verification of a cited location before reporting a critical finding; `sdh-release-lifecycle` gained four checks in the Analysis stage; `sdh-release-closure` four points of quiet drift; `sdh-visual-mockups` a self-check of the rendered mockup and a terminology check against the app's own i18n. Plus an "Editing a skill" section in the global rules: the owner acks the wording, it is never delegated to a subagent, and only the canonical template counts.
+
+### Fixed
+- **A task listed in both files no longer flaps between sources (T-000183).** A row occupying the id slot of both `todo.md` and `done.md` flapped on every sync: the TODO loop saw it in the database as done and wrote "reopened", the next pass the DONE loop saw it as a task and wrote "done" — one phantom event per refresh, forever. The split-state resolution at the end of the function ran only after the events had been written and never stopped the leak. Ids present in `done.md` are now subtracted on the todo side **before** the loops. **Migration v32** collapses what accumulated: on the author's live database 2616 rows were removed — a fifth of the events table, 76 tasks across 16 repositories, one of them holding 90 "done" and 89 "reopened".
+- **Editing a template from the UI no longer forks a skill from the canon forever (T-000200).** Saving marked the row as user-owned, and the seeder never touched such a row again — even once its content had become byte-equal to the bundled one. Matching the bundle now clears the mark: an urgent rule change reaches every repository on the next sync, and the following build returns the row to the canon without the owner doing anything.
+
+### Tests
+- 533 Rust (+5 over the 528 of v1.15.0: template fork healing and preservation of a real fork, three consecutive syncs with no phantom events, duplicate-id collapse inside `done.md`, migration v32; 1 ignored: the schema-export generator), 86 vitest, svelte-check clean.
+
 ## [1.15.0] — 2026-09-01
 
 Channels between equals: two repos at the same level can now exchange with each other, and the app carries the files.

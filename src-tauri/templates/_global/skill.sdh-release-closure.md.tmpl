@@ -40,6 +40,23 @@ Skipping a step leads to documentation rot, lost traceability, or merge pain in 
 9. **Closure commit.** Stage Changelog + manifest (if any) + `done.md` (if tracked) + `docs/schema/` (if regenerated) + release-only docs in one commit: `chore: vX.Y.Z release closure`. Files unrelated to the release stay outside this commit.
 10. **Tag.** The canonical git block below. **The master/tag commands are run by the user, not the assistant** — show the block and wait.
 
+## Four things that quietly rot at closure
+
+- **A release task that fixes a filed bug moves that bug to `testing` in the same
+  pass.** Not "I'll mark it later": a bug fixed by this release's code but left at
+  `created` hangs for months and later surfaces as an investigation that finds nothing.
+- **Harness notes about files reverting during the git block are a transient.** While
+  the owner runs the block, the tree sits on another branch for a while and the harness
+  honestly reports "the file changed". Check `git status` after the return — clean means
+  nothing was rolled back and there is nothing to fix.
+- **Marketing-facing docs drift independently of the code.** At closure, grep the README
+  (both locales), its Roadmap section and the header of `docs/roadmap.md` separately for
+  stale counts and versions: they are not updated per task and diverge quietly.
+- **Distinguish architectural support from current build scope.** In outward-facing copy
+  do not write "a Windows application" when the constraint is only that Windows is what
+  currently gets built. Say it as it is: builds are Windows for now, the platform
+  supports more.
+
 ## Closure git commands: exact and terminal-safe
 
 A frequent failure — git commands are improvised differently each session and in a format that breaks in the VS Code terminal. To avoid that:

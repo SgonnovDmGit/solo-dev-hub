@@ -49,6 +49,12 @@ its verification are never the same hands.
    - The Implementer **stops for the user only at a fork the spec does not cover**. A
      question it can answer itself → it answers and continues; no "let me ask myself
      out loud and pause" stops.
+   - **A spec that disagrees with the code is not a fork.** The spec says `A`, the code
+     actually has `B` → that is a factual error in the spec, and it needs no
+     permission: correct to what the code says, continue, and name the correction in
+     the report. Stop only if the correction implies a design choice — semantics
+     changed, a shared contract is touched, the behaviour became different — never for
+     a changed name, path or call signature.
    - If the spec is ambiguous, contradicts a test, or has a gap, the Implementer does
      **not** patch the spec silently — it **raises it to the Architect**, and the
      **Architect decides who fixes the spec** (fixes it themselves, or hands it back).
@@ -79,11 +85,19 @@ substitute** for a self-sufficient spec. The spec itself must stand alone:
 - Full file paths, not "the sync module."
 - Every decision with its rationale — the Implementer follows the spec **literally**,
   so an unstated assumption becomes a wrong build.
-- A `## Verification` section it can run itself.
+- A `## Verification` section it can run itself, written with **checking, not
+  applying** commands (`cargo fmt --check`, never `cargo fmt`). An applying formatter
+  masks its own diff, and review then sees a clean tree where the work did not match
+  the convention.
 - **Grounded in the actual codebase.** Before writing the spec, the Architect greps a
   neighbour file for the real conventions (serde/naming/API shape) and writes those
   into the spec — the Implementer matches the spec, not the surrounding code it never
-  reads.
+  reads. The same grounding applies to **any claim about what already exists** — "this
+  function does X", "covered by N tests", "the field is already read" — and it is
+  written concretely: full path, real symbol name, line number. The spec is the only
+  artifact that survives both a handoff to another agent **and** a compaction of its
+  own author: after one, the codebase is gone from context and a grounded spec is what
+  makes re-reading unnecessary, while a vague one ("the sync module") forces it.
 - No aspirational claims. "Handle all the lanes" that a test contradicts is a spec
   bug; assert only what is true and testable.
 
@@ -91,6 +105,15 @@ If the context won't fit into spec + a short note, the task isn't specced enough
 hand off yet — that's the signal, not a reason to backchannel it.
 
 ## Reviewer mandate — three passes
+
+**Scale the reviewers to the scope.** Whole-project or multi-domain review → dispatch
+**3-4 reviewers in parallel, one per domain**, not a single general one. Measured on
+the same code: 32 findings against 9. The three passes below stay — each reviewer runs
+them inside its own domain.
+
+**Verify a critical finding before it reaches the owner.** Open the location the
+reviewer cited and confirm it exists and says what was claimed. The false-positive rate
+is not zero, and a critical finding spends the owner's attention first.
 
 Review the **result**, in this order:
 
@@ -118,3 +141,8 @@ vantage into its own memory — but it **does not have to**: **one agent writing
 whole retro is enough, and is the default.** Who writes it (one agent or both) is the
 user's call; absent a request, the agent that closes the release writes it. A solo run
 keeps `sdh-retro` unchanged.
+
+Memory is ordinary Markdown on disk, not one agent's privilege: whoever closes writes
+the whole retro, project memory included, into that project's memory directory. Skill
+lessons it does not edit but **nominates** — the "Editing a skill" gate in the global
+rules applies identically to every role.
