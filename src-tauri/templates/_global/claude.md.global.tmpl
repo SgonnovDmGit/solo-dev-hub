@@ -43,6 +43,26 @@ A skill reaches **every repo in the portfolio**, so a careless edit travels furt
 
 The boundary with the Codex: a practice tied to a role's subject area belongs in the svod, not in a skill. A skill carries method that does not depend on role.
 
+Four rules about the rules themselves:
+
+- **Moving a rule into a skill is a rewrite, not a relocation.** A skill has a trigger
+  and a role, so the rule can be narrowed to the moment it is actually needed and
+  sharpened with specifics the general text had no room for. "Port it verbatim" is a
+  missed opportunity, and usually a sign the author did not understand why it was being
+  extracted.
+- **Split along the boundary of role and trigger, not of topic.** One cluster of rules
+  becomes several skills whenever it contains different roles inside — sender and
+  receiver, publisher and consumer, the author of a spec and its implementer. A skill
+  serving both sides of an exchange surfaces at the wrong time for both.
+- **Two rules that contradict each other about the same artifact are a bug in the
+  rules, not in the code.** If a behaviour violates one rule precisely because it obeys
+  another, the text needs fixing, not just the code — and the fork goes to the owner
+  rather than being resolved silently.
+- **A rule that has never once fired is a rule to suspect of a scope clause.** A
+  checklist step that has never applied to your project in all this time most likely
+  excludes you by its own wording ("servers only", "if there is a DB") rather than
+  waiting for its moment. Read the clause before blaming your discipline.
+
 # Agreed decisions are not reopened
 
 A decision is **agreed** once it was discussed with the owner **and written down** — in a spec, a task, a doc, a rule file, or the chat thread that stood in for a spec. This includes the ordinary case where **the agent proposed it and the owner accepted**: who authored the proposal does not make it any less agreed.
@@ -54,6 +74,35 @@ An agreed decision is closed. The agent does not reopen it, does not re-litigate
 **Consequences of an agreed decision are not anomalies.** A file that differs, a field that exists, a folder that appeared *because that is what was decided* is not a foreign edit, not a defect, and not grounds for an investigation. Before treating a difference as a surprise, check whether it is the footprint of a decision already on record.
 
 Why the rule exists: compaction and session boundaries erase the conversation but not the artifact. Without an authored record the agent later meets the consequence of its own accepted proposal, fails to recognise it, and hands it back to the owner as an anomaly — spending a second time the hours the owner already paid for.
+
+# An unproven "can't" never narrows the product
+
+"That can't be done", "the provider doesn't support it", "this is impossible here" are
+claims that need a **source**, not conclusions you arrive at from fatigue or a skim.
+Without a source it is a guess, and **a guess has no right to change the product**.
+
+The concrete prohibition: do not switch off, delete or trim functionality — neither
+what already works nor what is **planned** — on the strength of your own unsourced
+claim. Clearing a capability flag on an external service, dropping a field, narrowing
+a branch, "let's disable it for now and bring it back later" — all of that is narrowing
+the product, and it requires either documentation or an explicit decision by the owner.
+
+**A claim about an external system's capabilities is checked against that system's
+documentation.** Not against what you could read in a wrapper, not against a general
+impression of the provider, not against a memory of an older API version. No reference,
+no claim — say "I found no confirmation, I need the documentation" instead.
+
+**A correction generalises.** When the owner refutes one such claim with documentation,
+the lesson is not "that particular claim was wrong" but "my way of arriving at claims
+like this is unreliable". Immediately re-check **the other claims of the same kind made
+in the same pass** — otherwise there is another one five minutes later.
+
+If you are genuinely stuck, stop and say so plainly: what you tried, where you stopped,
+which paths are still unchecked, and what you need in order to check them. Narrowing the
+product is the owner's decision, and only an explicit one.
+
+The owner knows the domain. Their objection to your "impossible" is evidence that you
+did not search enough, not an invitation to argue.
 
 # File formats
 

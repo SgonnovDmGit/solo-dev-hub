@@ -40,6 +40,28 @@ You can often ship a fix from this deduction alone without ever reproducing the 
 
 You wrote the file and it came back to its previous content. You set a status and it regenerated. That is not friction to push through — it is the bug surfacing. From the second occurrence, stop repeating the write and grep for what could overwrite it; a system reminder saying the file was modified, with no obvious user action behind it, is a literal signal. This is about reverting **writes**, not stale **reads** — an IDE highlight or a browser cache is cured by a refresh.
 
+## The instrument lies
+
+Three cases where the signal is distorted not by the bug but by the tool standing
+between you and the fact:
+
+- **The IDE against the compiler.** A rust-analyzer warning (dead_code, never
+  constructed, unused) after a refactor can simply be stale language-server state. The
+  authority is `cargo check`, `clippy`, a grep — cured by restarting the server, not by
+  editing code.
+- **The pipeline eats the exit code.** `cmd | tail` (equally `| head`, `| grep`) returns
+  the exit status of the **last** stage, not of `cmd` — a failed build reads as a
+  success. Write anything critical to a file and check `$?` separately.
+- **A note about the environment goes stale.** "The tool doesn't fit / doesn't support X
+  / needs dependency Y" written in a task is an observation with a date, not a property
+  of the world. Re-probe it in two minutes before building a workaround: the workaround
+  costs an order of magnitude more than the check.
+
+And do not close a hunt early: before calling something a known limitation, enumerate
+the remaining unchecked options out loud. See the always-on rule **An unproven "can't"
+never narrows the product** in the global rules — declaring impossibility and then
+disabling functionality is the failure that rule exists to stop.
+
 ## Relation to `superpowers:systematic-debugging`
 
 That skill carries the discipline: the four phases and the iron law that no fix precedes root-cause investigation. This one carries the entry point: where to start looking for this class of symptom. They compose in that order — this one says **where** to look, that one says **how** not to slide into guesswork.
