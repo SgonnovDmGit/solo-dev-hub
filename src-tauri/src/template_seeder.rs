@@ -201,7 +201,10 @@ mod tests {
             .get_template_file("_global", "skill.sdh-retro.md.tmpl")
             .unwrap()
             .unwrap();
-        assert!(!post.is_custom, "custom flag must be cleared once content matches");
+        assert!(
+            !post.is_custom,
+            "custom flag must be cleared once content matches"
+        );
         assert_eq!(post.content, bundled, "content must stay the bundled text");
 
         // Idempotent: a second pass has nothing left to heal.
