@@ -222,11 +222,11 @@ mod tests {
     }
 
     /// End-to-end guard: the REAL bundle (via seed_bundled_templates) must carry
-    /// exactly the seventeen sdh-* workflow skills, each with valid frontmatter, and
+    /// exactly the eighteen sdh-* workflow skills, each with valid frontmatter, and
     /// they must render to a repo's docs/sdh_skills/. Catches a missing/renamed
     /// or malformed skill template at test time instead of at app runtime.
     #[test]
-    fn test_real_bundle_renders_all_seventeen_skills() {
+    fn test_real_bundle_renders_all_eighteen_skills() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.db");
         std::mem::forget(tmp);
@@ -260,8 +260,8 @@ mod tests {
         }
         assert_eq!(
             skills.len(),
-            17,
-            "exactly seventeen sdh-* skills in the bundle"
+            18,
+            "exactly eighteen sdh-* skills in the bundle"
         );
 
         for (name, content) in &skills {
@@ -284,7 +284,7 @@ mod tests {
 
         let repo = TempDir::new().unwrap();
         let n = render_skills_to_repo(&db, repo.path()).unwrap();
-        assert_eq!(n, 17);
+        assert_eq!(n, 18);
         assert!(repo
             .path()
             .join("docs/sdh_skills/sdh-cross-repo-req-send.md")

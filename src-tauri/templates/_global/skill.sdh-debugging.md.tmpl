@@ -1,0 +1,45 @@
+---
+name: sdh-debugging
+description: >
+  Use when a bug is in hand and you are about to form a hypothesis or reach for a
+  fix — it tells you where to look FIRST for a given class of symptom. Covers
+  reproduce-before-theorizing, narrowing the axes, the symptom→first-move table,
+  the operation-order oracle, and what it means when your own write reverts.
+  Complements superpowers:systematic-debugging: that one gives the phases and the
+  discipline, this one gives the entry point.
+---
+
+You are here with a bug in hand, about to decide where to look. This skill is about the **first move** — the place a given class of symptom actually hides, as opposed to the place it appears. Every rule below was paid for by a real incident in this portfolio.
+
+## Two rules before any hypothesis
+
+**1. Reproducible → reproduce, then speak.** If the report is "X won't start / hangs / doesn't work" and X runs locally (dev server, build, CLI command), **run it and read the actual output before naming a cause**. A hypothesis offered without a log is labelled a guess, not stated as fact. And do not anchor on the first warning you see: if the same warning appears in a successful run too, it is not the cause.
+
+**2. Hard to reproduce → narrow the axes, then fix.** Order: **when** (under which conditions) → **where** (which screens or components) → **what** (the state at that moment) → and only then the fix. For UI bugs on Windows, "another monitor / another zoom level / another DPI" belongs in the first two or three questions, not the tenth.
+
+## Symptom → where to look first
+
+| Symptom | First move | Where NOT to start |
+|---|---|---|
+| Blank where data should be | Read the render function and trace **backwards**: source, filters, defaults for unset fields | Template syntax, adding placeholders |
+| "X stays selected / active / dirty when it shouldn't" | Grep **every** write to that state and audit each one | Fixing only the path the user happened to hit |
+| Partial state — some artifacts gone, others survived, no repro | Read the **order of steps** in the code; the survivor is an oracle (below) | Guessing where the code aborted |
+| Your own write reverts, state regenerates | Stop and grep the write / regen / sync / refresh paths for that file | Repeating the write |
+| Render or runtime misbehaves while a sibling app on the same stack works | Diff manifest, lockfile, config and binary assets against the working sibling | Iterating design or config variants |
+
+## The operation-order oracle
+
+When a bug leaves **partial state** and you cannot reproduce it, the sequence of steps in the code is a free oracle. Find the code that would perform that deletion or write, and read the **order**, not just the fact that it does the work.
+
+- The survivor is what the code touches **first** → the code is exonerated: had it run, that artifact would have been the first to go. Hunt an **external actor** — a human, another agent, a hook, another process. The fix is likely behavioural, not in this code path.
+- The survivor is what the code touches **last** → consistent with aborting midway: look for the error, lock or early return on an earlier step. On Windows a file lock during delete is the classic mid-teardown abort.
+
+You can often ship a fix from this deduction alone without ever reproducing the bug — but then say so: deduced, not reproduced.
+
+## When your own edit reverts
+
+You wrote the file and it came back to its previous content. You set a status and it regenerated. That is not friction to push through — it is the bug surfacing. From the second occurrence, stop repeating the write and grep for what could overwrite it; a system reminder saying the file was modified, with no obvious user action behind it, is a literal signal. This is about reverting **writes**, not stale **reads** — an IDE highlight or a browser cache is cured by a refresh.
+
+## Relation to `superpowers:systematic-debugging`
+
+That skill carries the discipline: the four phases and the iron law that no fix precedes root-cause investigation. This one carries the entry point: where to start looking for this class of symptom. They compose in that order — this one says **where** to look, that one says **how** not to slide into guesswork.
