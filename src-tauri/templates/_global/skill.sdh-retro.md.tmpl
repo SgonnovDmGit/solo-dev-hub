@@ -3,7 +3,7 @@ name: sdh-retro
 description: >
   Use at release closure (or when the user asks for a retro) to run a
   structured retrospective — 5 actionable-first points (what worked / didn't,
-  readiness, what made the owner indignant, what to change, lessons → memory)
+  readiness, what made the owner indignant, what to change, lessons → a home)
   saved to auto-memory as a project memory. No user scoring (that lives in the informal
   session-reflection). Delivered as one block, saved immediately.
 ---
@@ -32,10 +32,29 @@ Actionable-first: the retro exists to *change how the next release goes*, not to
    - **Project readiness overall** — technical debt, stability, distance to upcoming milestones, known holes.
 3. **What made the owner indignant.** A different sensor from point 1: point 1 is the agent's read of its own machinery, this one is the owner's pain, and the two rarely coincide. Record **what irritated, frustrated or angered the owner during this release — in the owner's own words, unsoftened** — together with what triggered it. Quote, do not paraphrase into neutral prose: *"but he proposed it himself and I agreed!"* survives the session, *"there was some friction around file selection"* does not. This point **sets the queue for point 4**: a rule that caused indignation gets fixed before a rule that merely looked untidy to the agent. If nothing caused indignation, write that down too — an empty entry is a reading, silence is not. Without this point the owner's pains never enter the retro at all, and by the next session they are gone.
 4. **What to change in the process.** The actionable core. Concrete edits to the workflow itself — a skill, a gate, a repo-internal process step — surfaced by how *this* session actually went. **Explicitly flag any loop, stuck state, self-made impossible gate, or token burn**, and name the process change that prevents a repeat. "The process bit us, here's the fix" becomes a real edit here, not a lament — usually paired with a memory (point 5) or a direct skill/gate change in the same pass.
-5. **Lessons → durable memory.** Observations worth promoting:
-   - New working-style rules → a `feedback` memory (with **Why:** and **How to apply:** lines per the memory format).
-   - New project facts → a `project` memory.
-   - If yes — write the memory file(s) in the same retro pass and link from `MEMORY.md`.
+5. **Lessons → a home.** Every lesson gets exactly one home, and the retro is not finished until each one has it. Choose by the nature of the lesson, not by what is convenient to write:
+
+   | Home | What goes there | How far it reaches | How it is written |
+   |---|---|---|---|
+   | **Codex** (practices svod) | domain practice tied to a role's subject area: retries and idempotency on a server, error normalisation in an admin client, key boundaries | the Codex's consumers, matched by role lane | from the Codex repo directly; from any other repo only via REQ — the `docs/codex/` inbox is read-only and is overwritten by sync |
+   | **Skill `sdh-*`** | method of work that does not depend on role: how to debug, how to review, how to run a release, how to hand a task to another agent | every managed repo | only through the owner — see **Editing a skill** in the global rules |
+   | **This repo's `CLAUDE.md`** | a statement that would be **false** in another repo: stack, tooling, a local convention | this repository | the retro writes it directly |
+   | **Auto-memory** (`feedback` / `project`) | the harness, the owner's phrasing and judgment, this session's own history | this project's memory directory, on this machine | the retro writes it directly |
+
+   **Take the widest home the lesson has actually earned.** Memory directories are bound to a project path: a general working-style rule filed as a memory is invisible in every other repo — including to the same assistant working there. That is exactly how a portfolio ends up with thousands of siloed lessons and no shared canon.
+
+   **A retro never edits a skill.** It *nominates*: it names the target skill and writes the exact wording. The edit itself is операционка and goes through the owner. The same holds for the Codex when you are not in its repo — the nomination becomes a REQ, not an edit of the inbox.
+
+   A lesson may split across homes; the memory file goes away once every part of it has one.
+
+## One-time: sorting an existing memory silo
+
+A memory directory that grew under the old rule — where everything defaulted to memory — is sorted with the same four-home test, one silo at a time, by the agent working in that repo: judging "is this still true?" needs that repo's code in context.
+
+- **Sort `feedback` memories only.** Retros, snapshots and `user` memories stay where they are: they are memory by nature, and a bulk sweep that eats them destroys the only record of what the owner actually said.
+- **Verify before promoting.** A memory is a point-in-time observation; if it names a file, a flag or a symbol, check that it still exists before the lesson becomes a rule for the whole portfolio.
+- **Promote, then delete the source** — the file goes once every part of it has a home.
+- Skill nominations accumulate in a batch for the owner, like any other skill edit.
 
 ## How to deliver
 
