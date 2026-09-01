@@ -978,9 +978,9 @@ fn mig_v31_peer_links(conn: &Connection) -> SqlResult<()> {
     // T-000191 (v1.15.0): explicit peer link between two repositories, for the
     // InOutBox channel between equals (client<->client, server<->server, ...).
     //
-    // Peers inside one project are *derived* from a matching role and need no
-    // row here. This table carries only the pairs derivation cannot see — the
-    // cross-project ones (server<->server between two products).
+    // Every pair is explicit: a row here is the only thing that opens a channel.
+    // Deriving peers from a matching role was cut at acceptance — in a project
+    // with six clients it produced twenty uninvited channels.
     //
     // The relation is symmetric, so a pair is normalised on write to
     // (min(id), max(id)) and the CHECK enforces it. Without normalisation one

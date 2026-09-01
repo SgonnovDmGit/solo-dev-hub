@@ -110,7 +110,7 @@ npm run tauri dev          # local dev with hot reload
 ### Tests
 
 ```bash
-cd src-tauri && cargo test --lib   # ~452 Rust tests
+cd src-tauri && cargo test --lib   # ~533 Rust tests
 npm test                            # vitest frontend (~86 tests)
 npm run check                       # svelte-check
 ```
@@ -138,7 +138,13 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Shipped**
 
-- **v1.10.0** *(current — 2026-07-19)* — contributor documentation: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and a generated SQLite schema reference ([`docs/schema/`](docs/schema/), tbls — ER diagram plus a page per table).
+- **v1.16.0** *(current — 2026-09-01)* — the second half of the help screen: cross-repo links, deploy, and the AI agent contract; a revision of the working rules (18 role-scoped skills, a new one on debugging); the task-event leak stopped.
+- **v1.15.0** — channels between equals: two repositories on the same level exchange through `docs/InOutBox/`, links created explicitly; number registries in every outgoing channel.
+- **v1.14.0** — operations tasks: classes of no-code work that never block a release, and a Type column in the task lists.
+- **v1.13.0** — the in-app help screen: the onboarding core (quick start, project setup, bug workflow), ru/en.
+- **v1.12.0** — a skill for splitting development across several AI agents by role, plus release-workflow fixes.
+- **v1.11.x** — the Codex: a publishing project type that broadcasts a svod of practices to consumers along role lanes.
+- **v1.10.0** — contributor documentation: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and a generated SQLite schema reference ([`docs/schema/`](docs/schema/), tbls — ER diagram plus a page per table).
 - **v1.9.x** — the AI rule set moved from always-on instructions to 12 role-scoped on-demand skills; auto-commit now respects `.gitignore`; sync moved off the UI thread; cross-repo requirement teardown hardened.
 - **v1.8.0** — Reports section: portfolio deploy report and secret-push audit, with CSV export.
 - **v1.7.0** — workflow automation: auto-sync on a timer, auto-commit of synced cross-repo files, requirement auto-close via `.impl.md`.
@@ -152,9 +158,8 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Next**
 
-- **v1.11.0** — in-app multilingual help screen: onboarding core (quick start, project setup, bug workflow).
-- **v1.12.0** — help screen part two: the cross-repo and LLM operating contract sections.
-- **v1.13.0** — cross-platform builds (macOS / Linux).
+- **v1.17.0** — sync errors in the interface language; a rules viewer in the app; an equality check when linking peers.
+- **v1.18.0** — cross-platform builds (macOS / Linux).
 - **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix.
 
 Per-release detail lives in the [Changelog](Changelog.md); the day-to-day task list is kept locally and is not part of the repository.

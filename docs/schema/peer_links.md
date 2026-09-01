@@ -2,7 +2,7 @@
 
 ## Description
 
-Explicit peer pairing between two repositories for the InOutBox channel between equals (v31). Only cross-project pairs need a row — repositories of the same project sharing the same role are peers by derivation. The relation is symmetric, so the pair is stored normalised (repo_a_id < repo_b_id) and a CHECK enforces it; without that one logical pair could be stored twice and the channel would sync twice per pass.
+Explicit peer pairing between two repositories for the InOutBox channel between equals (v31). Every pair is explicit: a row here is the only thing that opens a channel, exactly the way a microservice is connected. The relation is symmetric, so the pair is stored normalised (repo_a_id < repo_b_id) and a CHECK enforces it; without that one logical pair could be stored twice and the channel would sync twice per pass.
 
 <details>
 <summary><strong>Table Definition</strong></summary>
