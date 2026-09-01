@@ -8,9 +8,11 @@ pub static TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/templates");
 
 /// On app startup, seed & auto-migrate the `templates` table from the bundle.
 ///
-/// Invariant: all `is_custom=0` rows in the DB are byte-equal to the current bundle.
+/// Invariant: all `is_custom=0` rows in the DB are byte-equal to the current bundle,
+/// and no `is_custom=1` row is byte-equal to it (such a row is not a fork any more).
 /// - Not in DB → INSERT with `is_custom=0`
-/// - `is_custom=1` (user-edited) → left alone
+/// - `is_custom=1` (user-edited) and content differs from bundle → left alone
+/// - `is_custom=1` and content equals bundle → flag cleared, the fork heals (T-000200)
 /// - `is_custom=0` and content differs from bundle → UPDATE to bundle (picks up app upgrades)
 ///
 /// Returns the count of rows touched (inserted or updated).
@@ -53,6 +55,17 @@ pub fn seed_bundled_templates(db: &AppDb) -> Result<usize, String> {
                     touched += 1;
                 }
                 Some(row) if !row.is_custom && row.content != bundle_content => {
+                    db.upsert_template_file(lang_key, file_name, bundle_content, false)
+                        .map_err(|e| e.to_string())?;
+                    touched += 1;
+                }
+                // T-000200: a row marked custom whose content has become byte-equal to
+                // the bundle is no longer a fork — clear the flag so it starts picking
+                // up upstream changes again. This is what lets an urgent rule edit be
+                // applied through the template editor (which reaches every repo on the
+                // next sync, without waiting for a release) and then re-attach to the
+                // canon by itself once the next build carries the same text.
+                Some(row) if row.is_custom && row.content == bundle_content => {
                     db.upsert_template_file(lang_key, file_name, bundle_content, false)
                         .map_err(|e| e.to_string())?;
                     touched += 1;
@@ -162,6 +175,56 @@ mod tests {
             .unwrap();
         assert_eq!(f.content, "CUSTOM");
         assert!(f.is_custom);
+    }
+
+    #[test]
+    fn test_seed_clears_custom_flag_when_content_matches_bundle() {
+        // T-000200: an urgent rule edit is applied through the template editor, which
+        // marks the row custom. When a later build carries the same text in the bundle,
+        // the row is no longer a fork and must re-attach to the canon on its own.
+        let db = make_db();
+        seed_bundled_templates(&db).unwrap();
+
+        let bundled = bundled_file_content("_global", "skill.sdh-retro.md.tmpl").unwrap();
+        db.upsert_template_file("_global", "skill.sdh-retro.md.tmpl", &bundled, true)
+            .unwrap();
+        let pre = db
+            .get_template_file("_global", "skill.sdh-retro.md.tmpl")
+            .unwrap()
+            .unwrap();
+        assert!(pre.is_custom, "precondition: row is marked custom");
+
+        let n = seed_bundled_templates(&db).unwrap();
+        assert!(n >= 1, "the healing arm must touch the row");
+
+        let post = db
+            .get_template_file("_global", "skill.sdh-retro.md.tmpl")
+            .unwrap()
+            .unwrap();
+        assert!(!post.is_custom, "custom flag must be cleared once content matches");
+        assert_eq!(post.content, bundled, "content must stay the bundled text");
+
+        // Idempotent: a second pass has nothing left to heal.
+        let n2 = seed_bundled_templates(&db).unwrap();
+        assert_eq!(n2, 0, "re-seed after healing must touch nothing");
+    }
+
+    #[test]
+    fn test_seed_keeps_custom_flag_when_content_differs() {
+        // The healing arm must not swallow a genuine fork.
+        let db = make_db();
+        seed_bundled_templates(&db).unwrap();
+
+        db.upsert_template_file("_global", "skill.sdh-retro.md.tmpl", "MY OWN RULES", true)
+            .unwrap();
+        seed_bundled_templates(&db).unwrap();
+
+        let f = db
+            .get_template_file("_global", "skill.sdh-retro.md.tmpl")
+            .unwrap()
+            .unwrap();
+        assert!(f.is_custom, "a diverged custom row keeps its flag");
+        assert_eq!(f.content, "MY OWN RULES", "and keeps its content");
     }
 
     #[test]
