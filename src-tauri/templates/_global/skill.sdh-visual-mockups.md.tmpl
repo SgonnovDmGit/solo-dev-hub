@@ -27,6 +27,19 @@ The medium is **any visual preview available to the current agent**: artifacts, 
 - **Don't bail to "known limitation / won't fix"** before explicitly listing the remaining options. "So it can't be done?" from the user = a signal you bailed early.
 - **A failed CSS experiment — revert it immediately**, don't hoard it as "defense in depth".
 
+## Before you hand it over
+
+- **Look at the rendered mockup yourself first.** Open what you are about to hand over
+  and view it. This rule has existed since v1.12.0 and has twice fired for nothing —
+  both times the owner caught by eye what no tool could see.
+- **A simplification in the mockup is flagged explicitly in the spec.** Drew a stub
+  instead of the real layout, skipped a state, showed three items where there will be
+  twenty — say so, or the mockup gets read as a settled decision.
+- **Check terms against the app's i18n instead of inventing them.** Before deciding a
+  word stays English in the UI, grep the existing keys: help screens and new surfaces
+  mirror terminology that is already agreed, and a mismatch costs an extra round of
+  translation.
+
 ## Output: the accepted mockup is the design gate
 
 The accepted mockup carries the design decisions — the spec text after it can be thin (see the spec step of `sdh-phase-workflow`). And this is usually where all the judgment is settled and the rest is mechanical → the cycle's **autonomous mode** naturally kicks in (see `sdh-release-lifecycle`): the user grants a carry-forward OK at mockup acceptance, and Implementation → Test → the documentation part of Closure roll on without per-stage approvals.
