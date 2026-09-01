@@ -40,6 +40,13 @@ Nine checks that belong to the Chat and Spec steps above. Each one was paid for 
 **Check the premise, not just the wording.**
 
 - The request leans on an outside model ("like X does it") or on a roadmap label ("secrets vault") → verify the **root premise** before designing: does the referenced thing exist, and is it what the owner actually means? A spec built on a wrong premise burns whole, mockup included.
+- **Before designing a new mechanism, check whether a working one already exists.**
+  Before proposing where something will be stored and how it will be delivered, list the
+  portfolio subsystems that already solve that job: the exchange channels, the published
+  svod, the templates, the sync. One grep through `docs/flows/` is cheaper than a whole
+  detour. The signal to stop and look: you are explaining to the owner "where this will
+  land and how it reaches the other repositories" — the delivery mechanism already
+  exists, the only question is which one.
 - The task description is narrow but the domain underneath is murky → ask "what does this task actually solve" **before** writing code. The same one-line phrasing has been implemented two different ways.
 - Declared in a schema, a config or a `meta.json` **does not mean executed**. Grep the consumer before asserting in a spec that a behaviour exists — a field can sit dead for a feature's entire lifetime.
 
