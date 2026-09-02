@@ -976,6 +976,20 @@ fn run_codex_req_channels(db: &AppDb, project_id: i64, project_type: &str, c: &m
 /// `sync_project` Tauri command. Writes Phase-0 skeletons to every repo, then
 /// runs the directional REQ / api / handlers copies based on project topology.
 pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, String> {
+    run_project_sync_in(db, project_id, dirs::home_dir())
+}
+
+/// The body of `run_project_sync`, with the home directory injected.
+///
+/// T-000205 made a sync able to write into `~/.claude/skills/`, which a test
+/// must never do against the real one. The seam exists so the ordering that
+/// matters — collect the handed-back rules *before* anything renders over them —
+/// can be exercised end to end in a sandbox.
+fn run_project_sync_in(
+    db: &AppDb,
+    project_id: i64,
+    home: Option<PathBuf>,
+) -> Result<SyncResult, String> {
     let all_repos = db
         .list_repos_by_project(Some(project_id))
         .map_err(|e| e.to_string())?;
@@ -1007,7 +1021,7 @@ pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, Strin
     if !rules_taken.is_empty() {
         // A rule belongs to the whole portfolio, not to the project that
         // happened to hand it back — push it everywhere before continuing.
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = home.as_ref() {
             let (_, _, errors) = sync::render_skills_everywhere(db, &home.join(".claude"));
             c.errors.extend(errors);
         }
@@ -1209,6 +1223,78 @@ mod tests {
     // the folder name used in the REQ paths.
     fn make_db() -> AppDb {
         AppDb::new(PathBuf::from(":memory:")).unwrap()
+    }
+
+    /// T-000205 end-to-end, through the real orchestrator: an agent hands a rule
+    /// back in its own copy, and one sync turns that into portfolio canon.
+    ///
+    /// The ordering is the point. `write_repo_skeletons` re-renders
+    /// `docs/sdh_skills/` unconditionally later in this very pass, so if the
+    /// collection ran anywhere after it, the edit would be gone before anyone
+    /// looked at it — and the failure would be silent, which is why this is
+    /// tested against the orchestrator rather than against the collector alone.
+    #[test]
+    fn test_approved_rule_is_collected_before_the_render_overwrites_it() {
+        let db_dir = TempDir::new().unwrap();
+        let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let project = db.create_project("P", None, "standard").unwrap();
+        db.insert_local_repository(
+            &repo_dir.path().to_string_lossy(),
+            "handback",
+            Some(project.id),
+            Some("tool"),
+        )
+        .unwrap();
+
+        // The repo already carries its rendered copies, as any synced repo does.
+        sync::render_skills_to_repo(&db, repo_dir.path()).unwrap();
+        let skills = repo_dir.path().join("docs").join("sdh_skills");
+        let name = "sdh-debugging";
+        let copy = skills.join(format!("{}.md", name));
+        let marker = skills.join(format!("{}.md.approved", name));
+        let edited = format!(
+            "{}\n\nHANDED BACK BY THE AGENT\n",
+            fs::read_to_string(&copy).unwrap()
+        );
+        fs::write(&copy, &edited).unwrap();
+        fs::write(&marker, "approved by the owner 2026-09-02").unwrap();
+
+        let result = run_project_sync_in(&db, project.id, Some(home.path().to_path_buf())).unwrap();
+
+        assert_eq!(result.rules_taken, vec![name.to_string()]);
+        assert_eq!(
+            db.get_template_file("_global", &format!("skill.{}.md.tmpl", name))
+                .unwrap()
+                .unwrap()
+                .content,
+            edited,
+            "the handed-back text became the rule"
+        );
+        assert_eq!(
+            fs::read_to_string(&copy).unwrap(),
+            edited,
+            "the later render in the same pass must not have clobbered it"
+        );
+        assert!(
+            !marker.exists(),
+            "marker cleared, so the next sync does not take the same text up again"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                home.path()
+                    .join(".claude")
+                    .join("skills")
+                    .join(name)
+                    .join("SKILL.md")
+            )
+            .unwrap(),
+            edited,
+            "and the user-level skills were refreshed in the same pass"
+        );
     }
 
     /// T-000172: a REQ raised on a consumer for a connected codex is delivered to
