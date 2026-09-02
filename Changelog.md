@@ -4,6 +4,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.17.0] — 2026-09-02
+
+Rules stop depending on someone remembering to press a button: an applied rule reaches every agent by itself, and an agent's edit travels back the same way.
+
+### Added
+- **A rule edit travels back out of the repo that wrote it (T-000205).** Until now delivery ran one way only. An agent that wanted a rule changed had to put its proposal into memory bound to its own project path and wait for the owner to carry the text over by hand — which is how five approved nominations sat for two days in another repository while its implementer went on working from the old rule. An agent now edits the skill **where it already reads it**, in its own `docs/sdh_skills/<name>.md`, and drops an empty `<name>.md.approved` beside it. The next sync takes that text as the new rule, stores it, clears the marker and pushes it everywhere. The marker stands for an approval the owner gave in chat before the file was written; nothing verifies it, so every uptake is reported by name. A copy without a marker stays an output and is overwritten as before, a name the bundle does not know is refused so a stray file cannot become canon, and two repositories handing the same skill back with different text are refused as a conflict rather than resolved by silently keeping the last one. Collection runs **before** anything renders over those files — the other order would destroy the edit at the exact moment it was about to be collected.
+
+### Changed
+- **Peers can only be linked to peers (T-000201).** The link dialog listed the whole portfolio unfiltered, so a client could be paired with a server — an exchange that means nothing, since the channel exists precisely where neither side owes the other an answer. Equality is now an exact role match plus a matching project type: role families are not collapsed (an admin client is not the equal of a plain client), and a server inside a microservice project is not the equal of one heading an ordinary product even though both are spelled `server`. Non-equals are no longer listed at all. The check lives in the store as well as the dialog, because a UI filter can be bypassed, and it runs on linking only — revalidating stored pairs would one day sever a live exchange nobody asked it to touch. Nothing is inferred or auto-linked.
+
+### Fixed
+- **An applied rule now actually reaches the agents (T-000203).** Saving a skill template wrote a database row and stopped there. The two render targets had unrelated triggers — `~/.claude/skills/` moved only on the global-rules button, each repository's copy only inside a project sync, which runs by itself solely where auto-sync is opted into — so an agreed rule could sit undelivered for days. Saving a skill now renders both, and so does startup when new rule text arrives with a build, which was the same hole for edits that come by upgrade. An unchanged bundle renders nothing and identical files are not rewritten, so a normal launch does no filesystem work.
+- **A release header without the `v` prefix is recognised (T-000204).** The grouping parser accepted only `v` followed by a digit, so `## v2026.09.01` grouped its tasks and `## 2026.09.01` silently did not, although both forms are in use. A bare token is now accepted when it carries at least one dot or dash — the separator is what distinguishes a version from prose, so `## 3 things this week` still is not one.
+
+### Tests
+- 551 Rust (+18 over the 533 of v1.16.0: rule delivery across the portfolio and the skip-identical-content guard, the hand-back collector with its conflict / unknown-name / no-marker cases, the end-to-end ordering proof through the orchestrator, and the peer-equality rules including a microservice server against an ordinary one; 1 ignored: the schema-export generator), 86 vitest, svelte-check clean.
+
 ## [1.16.0] — 2026-09-01
 
 A revision of the working rules and the second half of the in-app help; along the way, a leak of task events that had been accumulating since sync first existed.
