@@ -65,6 +65,39 @@ Nine checks that belong to the Chat and Spec steps above. Each one was paid for 
 
 - The report names a symptom ("X doesn't update right") but not the desired end state, and there are two or more plausible fixes → confirm the end state with the owner **before** coding. Otherwise a fix that is correct to the letter comes back rejected as "not that".
 
+## The spec owns the addresses and the priorities
+
+**Change a value something decides on, and list everyone who reads it.** A
+threshold, a compatibility constant, a flag — any number a verdict rests on: the
+spec must walk every place the value is read and say what each one does with that
+verdict. Establishing that the value is correct is not yet establishing that the
+gate fires. The failure class is specific — editing a value **wakes branches that
+used to be dead**, and while the threshold was low the miss cost nothing.
+
+Search for the **condition by meaning, not for the name of the symbol**: the same
+predicate lives as a second copy under a different name, and a grep by name will
+not find it. Check separately the paths where the verdict is **computed but not
+used** — they look covered, because the call to the check is visible in the code.
+Require tests not on how the value is derived but on every path that applies it.
+
+**An instruction addressed to one task lives in that task's section** — even at
+the cost of repeating it verbatim. The preamble is for what holds for the whole
+release: the bump class, the order of tasks, cross-cutting rules. An instruction
+placed in the preamble reads as context rather than as an assignment, and the
+implementer does not break it — they never find it: their own section they read
+whole, the preamble they skim, and that is normal reading of a long document.
+Re-reading a finished spec, ask of every imperative: **who does this, and in
+which task?** If the addressee is one task and the sentence sits outside its
+section, duplicate it inside.
+
+**A task the owner has called expected cannot be a bullet in the list of what the
+release does not contain.** It is raised as a decision: one line at the top — "X
+is deferred for this reason, confirm". The list of what is not included is for
+what nobody was waiting for. And check that the reason for deferring is not your
+own invention: "do not start before the REQ is answered" is sometimes the
+architect's call rather than the owner's, and then it is you who narrowed the
+release with an unproven "can't".
+
 ## Project bindings (per-project `CLAUDE.md` defines)
 
 - **Spec location:** path and naming convention for spec files (e.g. `docs/specs/<YYYY-MM-DD>-<phase-name>.md`). Spec files are gitignored unless the project says otherwise.
