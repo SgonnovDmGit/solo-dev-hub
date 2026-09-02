@@ -35,9 +35,11 @@ This sequence is one task-level cycle. It runs inside the broader release lifecy
 
 ## Grounding the spec
 
-Nine checks that belong to the Chat and Spec steps above. Each one was paid for by a spec that had to be rewritten.
+Twelve checks that belong to the Chat and Spec steps above. Each one was paid for by a spec that had to be rewritten.
 
 **Check the premise, not just the wording.**
+
+- **Before designing from the owner's own phrasing, say it back in your own words and get a yes.** A short, precise sentence is the easy one to misread: it carries a whole design and gives you nothing to catch yourself on. One line of confirmation — "so the agent edits its own copy rather than writing a separate document, right?" — costs a message. Getting it wrong costs the entire design round, and you will not notice, because your version is coherent too.
 
 - The request leans on an outside model ("like X does it") or on a roadmap label ("secrets vault") → verify the **root premise** before designing: does the referenced thing exist, and is it what the owner actually means? A spec built on a wrong premise burns whole, mockup included.
 - **Before designing a new mechanism, check whether a working one already exists.**
@@ -60,6 +62,10 @@ Nine checks that belong to the Chat and Spec steps above. Each one was paid for 
 - An absolute claim about the project's behaviour ("X doesn't do Y", "for the first time") is either fact-checked with a grep or hedged in tone. It is checkable, and the owner will check it.
 - Every multiple-choice question ends with an explicit **"let's discuss this in chat"** option. Without it the fork forces a choice where a conversation was needed — and the frame itself is what most often turns out to be wrong.
 - Chat with visible options for a non-trivial task is required **even under a "work without stopping" directive**: that directive removes confirmations on mechanics, not on design choices.
+
+**Decisions you took alone.**
+
+- A spec that says "decided without asking, object if you disagree" has to **list** those decisions, and the ones with a visual surface go to acceptance as something the owner *looks at*, not as a line he reads. Agreement on paper is not agreement on screen: a choice he waved through in the list can be rejected within a minute of seeing it rendered. Listing them is also what keeps them honest — a decision nobody can find is not a decision taken alone, it is a decision hidden.
 
 **A bug with no stated target.**
 
