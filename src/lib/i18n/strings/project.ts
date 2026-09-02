@@ -59,12 +59,7 @@ export const ru = {
   'project.peerLinkTitle': 'Связать репозитории как равные',
   'project.peerLinkSearch': 'Поиск по имени или роли…',
   'project.peerAlreadyLinked': 'уже связан',
-  'project.peerLinkEqualityHint': 'Равные — это одинаковая роль в проекте одного типа. Остальные показаны серым: сервер микросервиса не равен обычному серверу, админ-клиент — обычному клиенту.',
-  'project.peerNeedsRole': 'нужна роль',
-  'project.peerRoleOther': 'роль «прочее»',
-  'project.peerRoleMismatch': 'другая роль',
-  'project.peerNeedsProject': 'вне проекта',
-  'project.peerTypeMismatch': 'другой тип проекта',
+  'project.peerLinkEqualityHint': 'Равные — это одинаковая роль в проекте одного типа. Остальные в список не попадают: сервер микросервиса не равен обычному серверу, админ-клиент — обычному клиенту.',
   'project.peerNoCandidates': 'Подходящих репозиториев нет',
 } as const;
 
@@ -128,11 +123,6 @@ export const en: Record<keyof typeof ru, string> = {
   'project.peerLinkTitle': 'Link two repositories as peers',
   'project.peerLinkSearch': 'Search by name or role…',
   'project.peerAlreadyLinked': 'already linked',
-  'project.peerLinkEqualityHint': 'Peers share a role and sit in the same kind of project. The rest are greyed out: a microservice server is not the equal of an ordinary one, nor an admin client of a plain client.',
-  'project.peerNeedsRole': 'role required',
-  'project.peerRoleOther': 'role “other”',
-  'project.peerRoleMismatch': 'different role',
-  'project.peerNeedsProject': 'no project',
-  'project.peerTypeMismatch': 'different project type',
+  'project.peerLinkEqualityHint': 'Peers share a role and sit in the same kind of project. The rest are not listed: a microservice server is not the equal of an ordinary one, nor an admin client of a plain client.',
   'project.peerNoCandidates': 'No matching repositories',
 };

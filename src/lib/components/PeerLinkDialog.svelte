@@ -27,24 +27,25 @@
   const projectTypeById = $derived(new Map(projects.map((p) => [p.id, p.project_type])));
   const selfRepo = $derived(myRepos.find((r) => r.id === selfId));
 
-  // T-000201: why these two are not equals, or null when they are. Mirrors
+  // T-000201: are these two actually equals? Mirrors
   // `AppDb::check_peers_are_equal` in src-tauri/src/db/peers.rs — that one
-  // enforces, this one explains. Change both together.
-  function inequalityReason(a: Repository | undefined, b: Repository): string | null {
-    if (!a) return null;
-    if (!a.role || !b.role) return $tStore('project.peerNeedsRole' as any);
-    if (a.role === 'other' || b.role === 'other') return $tStore('project.peerRoleOther' as any);
-    if (a.role !== b.role) return $tStore('project.peerRoleMismatch' as any);
+  // enforces and explains, this one filters. Change both together.
+  function arePeers(a: Repository | undefined, b: Repository): boolean {
+    if (!a) return false;
+    if (!a.role || !b.role) return false;
+    if (a.role === 'other' || b.role === 'other') return false;
+    if (a.role !== b.role) return false;
     const ta = a.project_id === null ? undefined : projectTypeById.get(a.project_id);
     const tb = b.project_id === null ? undefined : projectTypeById.get(b.project_id);
-    if (ta === undefined || tb === undefined) return $tStore('project.peerNeedsProject' as any);
-    if (ta !== tb) return $tStore('project.peerTypeMismatch' as any);
-    return null;
+    if (ta === undefined || tb === undefined) return false;
+    return ta === tb;
   }
 
-  const selectedReason = $derived.by(() => {
+  // Kept as a guard even though non-equals are never listed: changing "my
+  // repository" after picking a peer can invalidate the pair.
+  const selectionIsPeer = $derived.by(() => {
     const b = peerId === null ? undefined : allRepos.find((r) => r.id === peerId);
-    return b ? inequalityReason(selfRepo, b) : null;
+    return b ? arePeers(selfRepo, b) : true;
   });
 
   // Preselect this project's first repo so the dialog is usable without a first
@@ -56,6 +57,8 @@
   const candidates = $derived(
     allRepos
       .filter((r) => r.id !== selfId)
+      // T-000201: a repo that cannot be picked has no business being listed.
+      .filter((r) => arePeers(selfRepo, r))
       .filter((r) => {
         const q = filter.trim().toLowerCase();
         if (!q) return true;
@@ -75,7 +78,7 @@
   );
 
   function submit() {
-    if (selfId === null || peerId === null || alreadyLinked || selectedReason !== null) return;
+    if (selfId === null || peerId === null || alreadyLinked || !selectionIsPeer) return;
     onLink(selfId, peerId);
   }
 </script>
@@ -118,21 +121,18 @@
       <div class="candidates">
         {#each candidates as r (r.id)}
           {@const linked = selfId !== null && linkedKeys.has(pairKey(selfId, r.id))}
-          {@const reason = inequalityReason(selfRepo, r)}
           <button
             type="button"
             class="candidate"
             class:selected={peerId === r.id}
             class:linked
-            disabled={linked || reason !== null}
+            disabled={linked}
             onclick={() => (peerId = r.id)}
           >
             <span class="cand-name">{getDisplayName(r)}</span>
             <span class="cand-meta">{r.role ?? '—'}</span>
             {#if linked}
               <span class="cand-flag">{$tStore('project.peerAlreadyLinked' as any)}</span>
-            {:else if reason}
-              <span class="cand-flag">{reason}</span>
             {/if}
           </button>
         {:else}
@@ -143,7 +143,7 @@
 
     <div class="actions">
       <button onclick={onCancel}>{$tStore('dialog.cancel')}</button>
-      <button class="primary" disabled={selfId === null || peerId === null || alreadyLinked || selectedReason !== null} onclick={submit}>
+      <button class="primary" disabled={selfId === null || peerId === null || alreadyLinked || !selectionIsPeer} onclick={submit}>
         {$tStore('project.peerLinkAdd' as any)}
       </button>
     </div>
