@@ -150,7 +150,7 @@ Tasks may be grouped under `## vX.Y.Z — <short description>` section headers f
 - [ ] T-000064 | Public flip | 3 | high | open | 2026-04-26
 ```
 
-Plain markdown readers treat `## ...` lines as comments — tasks under any header (or no header) read identically as a flat list. Some tools may use these headers as release-grouping signals: Solo Dev Hub, for example, parses `## vX.Y.Z` (must start with `v` followed by a digit) and surfaces the inherited version as a sortable column in the Tasks view; non-version headers like `## Format` or `## Backlog` are ignored. Headers stay optional — use when they help planning, skip for small/single-version projects.
+Plain markdown readers treat `## ...` lines as comments — tasks under any header (or no header) read identically as a flat list. Some tools may use these headers as release-grouping signals: Solo Dev Hub, for example, parses `## vX.Y.Z` and surfaces the inherited version as a sortable column in the Tasks view. Two shapes count as a version — `v` followed by a digit (`## v1.16.1`), or a bare number carrying at least one dot or dash (`## 2026.09.01`, `## 1.16.1`); the separator is what tells a version from prose, so a header like `## 3 things this week` is not one. The token is inherited exactly as written. Word headers such as `## Format`, `## Backlog` or `## Операционка` are ignored and neither set nor clear the current version. Headers stay optional — use when they help planning, skip for small/single-version projects.
 
 ### Operations tasks (`O-` / `M-`) — non-code, never release blockers
 
@@ -161,7 +161,8 @@ Beside the code classes `T-`/`F-`, two classes capture **операционка*
 
 Rules:
 - **Same line format** as any todo task (`effort` / `priority` / `status` / `created_at` all apply). Independent 6-digit counters per prefix, exactly like `T-`/`F-` — scan for the max within the same prefix, +1, `{prefix}-{:06}`.
-- **Never a release blocker.** Open `O-`/`M-` tasks do **not** gate a code release — do not treat them as blockers when tagging `vX.Y.Z`. They **never participate in `## vX.Y.Z` release grouping**: their `version` is always empty (a tool that inherits version from headers must force it empty for `O-`/`M-`, even under a version header). Group them under a plain non-version header like `## Операционка` if you want, or leave them ungrouped.
+- **Never a release blocker.** Open `O-`/`M-` tasks do **not** gate a code release — do not treat them as blockers when tagging `vX.Y.Z`. They **never participate in `## vX.Y.Z` release grouping**: their `version` is always empty (a tool that inherits version from headers must force it empty for `O-`/`M-`, even under a version header).
+- **The operations section goes first, above every version section.** Group them under a plain non-version header — `## Операционка` or its local-language equivalent. It belongs to no release, so at the bottom of the file it ends up below everything planned and stops catching the eye — and these are the only tasks nobody but the owner will ever recall. File order: the format notes, then operations, then the version sections nearest-first.
 - **In `done.md`** an `O-`/`M-` entry leaves the version slot empty (`- O-000001 | … | `).
 - **Why a separate class:** without it, no-code tasks land inside code releases and get mistaken for release blockers. The class makes their nature explicit and keeps the release gate about code.
 
