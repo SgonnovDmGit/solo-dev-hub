@@ -9,6 +9,8 @@ export interface SyncResult {
   auto_closed: string[];
   /** T-000137: display names of repos that received an SDH auto-commit of synced cross-repo files. */
   committed: string[];
+  /** T-000205: skills whose text was taken back out of a repo's own flagged copy. */
+  rules_taken: string[];
 }
 
 export interface RequirementInfo {

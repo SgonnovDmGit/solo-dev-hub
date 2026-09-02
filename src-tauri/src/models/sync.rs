@@ -35,6 +35,12 @@ pub struct SyncResult {
     /// `autocommit_branch`, on the correct branch, with actual changes).
     #[serde(default)]
     pub committed: Vec<String>,
+    /// T-000205: names of skills whose text was taken back out of a repo's own
+    /// copy this sync, because an agent edited it and flagged it approved.
+    /// Reported on purpose: nothing verifies the approval, so the uptake has to
+    /// at least be visible after the fact.
+    #[serde(default)]
+    pub rules_taken: Vec<String>,
 }
 
 /// F-000041: report from `untrack_files`. `untracked` = total file count

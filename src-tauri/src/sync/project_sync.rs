@@ -27,6 +27,8 @@ struct SyncCounters {
     responses: usize,
     migrated: usize,
     errors: Vec<String>,
+    /// T-000205: skills whose text was taken back out of a flagged repo copy.
+    rules_taken: Vec<String>,
     /// F-000039: base REQ filenames whose pair was auto-closed via `.impl.md`.
     auto_closed: Vec<String>,
     /// T-000137: display names of repos that received an SDH auto-commit of
@@ -41,6 +43,7 @@ impl SyncCounters {
             responses: 0,
             migrated: 0,
             errors: Vec::new(),
+            rules_taken: Vec::new(),
             auto_closed: Vec::new(),
             committed: Vec::new(),
         }
@@ -52,6 +55,7 @@ impl SyncCounters {
             responses: self.responses,
             migrated: self.migrated,
             errors: self.errors,
+            rules_taken: self.rules_taken,
             auto_closed: self.auto_closed,
             committed: self.committed,
         }
@@ -993,6 +997,22 @@ pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, Strin
         .collect();
 
     let mut c = SyncCounters::new();
+
+    // T-000205: collect approved rule edits handed back in a repo's own copy —
+    // FIRST, before anything renders into these repos. `write_repo_skeletons`
+    // below overwrites `docs/sdh_skills/` unconditionally, so any other ordering
+    // destroys the edit at the exact moment it was about to be collected.
+    let (rules_taken, uptake_errors) = sync::collect_approved_skill_edits(db, &all_repos);
+    c.errors.extend(uptake_errors);
+    if !rules_taken.is_empty() {
+        // A rule belongs to the whole portfolio, not to the project that
+        // happened to hand it back — push it everywhere before continuing.
+        if let Some(home) = dirs::home_dir() {
+            let (_, _, errors) = sync::render_skills_everywhere(db, &home.join(".claude"));
+            c.errors.extend(errors);
+        }
+        c.rules_taken = rules_taken;
+    }
 
     // 0.10.0 pre-phase: write project.md + CLAUDE.md section + .gitignore + .gitattributes to all repos.
     // 0.11.0 extends with todo.md + bug-reports.md skeletons.
