@@ -24,10 +24,11 @@ Parser is enum-agnostic (accepts any string values) — the enums above are the 
 
 ## Operations classes (`O-` / `M-`) — non-code, not release blockers
 
-`O-NNNNNN` (technical) and `M-NNNNNN` (marketing) capture **операционка** — work to be *done*, not *coded*, that the AI still needs execution context for. Same line format and independent per-prefix counters as `T-`/`F-`. Two rules set them apart:
+`O-NNNNNN` (technical) and `M-NNNNNN` (marketing) capture **операционка** — work to be *done*, not *coded*, that the AI still needs execution context for. Same line format and independent per-prefix counters as `T-`/`F-`. Three rules set them apart:
 
 - **Never a release blocker** — open `O-`/`M-` tasks do not gate a code release tag.
 - **Never release-scoped** — their `version` is always empty; they don't inherit a `## vX.Y.Z` header (the app force-empties it even under one). In the Tasks/Done grids they show a distinct **Тип** icon (⚙ technical / 📣 marketing).
+- **Placed first in the file** — under a plain `## Операционка` header above every version section. Belonging to no release, at the bottom they sit below everything planned and stop catching the eye, and these are the tasks nobody but the owner will recall.
 
 ## LLM / AI policy
 

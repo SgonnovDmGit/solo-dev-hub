@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { TemplateFile, TemplateLanguage } from '$lib/types';
+import type { TemplateFile, TemplateLanguage, TemplateSaveOutcome } from '$lib/types';
 
 
 // ── Templates (0.6.0) ─────────────────────────────────────────────────────────
@@ -16,8 +16,8 @@ export async function getTemplateFile(languageKey: string, fileName: string): Pr
   return invoke<TemplateFile | null>('get_template_file', { languageKey, fileName });
 }
 
-export async function saveTemplateFile(languageKey: string, fileName: string, content: string): Promise<void> {
-  return invoke<void>('save_template_file', { languageKey, fileName, content });
+export async function saveTemplateFile(languageKey: string, fileName: string, content: string): Promise<TemplateSaveOutcome> {
+  return invoke<TemplateSaveOutcome>('save_template_file', { languageKey, fileName, content });
 }
 
 export async function resetTemplateFile(languageKey: string, fileName: string): Promise<void> {

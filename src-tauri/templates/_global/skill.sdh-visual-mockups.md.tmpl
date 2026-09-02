@@ -21,6 +21,24 @@ The medium is **any visual preview available to the current agent**: artifacts, 
 - **Pixel-precise** — iterate on concrete edits ("smaller gap", "chip further left"), not on vague words.
 - **Full-width adaptive** — no artificial `max-width` constraint if the product is full-width.
 
+## Ground the fork in what the project already does
+
+Before drawing layout variants, grep for how this class of element is **already
+drawn in the project**, and put that existing variant among the ones you show,
+labelled "this is how it looks today". Grounding a mockup is the same discipline
+as grounding a spec: the spec greps a neighbouring file for the real idioms, the
+mockup greps for the real widgets.
+
+A fork that omits what the system already does is not a choice — it is a poll
+about your sketches. The owner ends up picking between two of your inventions
+while a third, live one exists, and the answer comes back as that third one. If
+there genuinely is no existing variant, say so out loud: "the project has no such
+element yet, both of these are new." Then the choice is honest.
+
+The tell, after the fact: at implementation it turns out the accepted mockup is
+built by changing the contents of a widget that was already there. The variant
+was in the project from the start and should have been shown.
+
 ## Iteration discipline
 
 - **After 2 consecutive "not quite"** — don't run a third blind iteration. Bring in the ui-ux skill + show variants **side by side** (variant/theme/width toggles), let the user point pixel-precisely.

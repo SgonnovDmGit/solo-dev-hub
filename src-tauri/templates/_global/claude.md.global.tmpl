@@ -37,9 +37,16 @@ Workflow-heavy rules are not inlined here — they load on demand. In Claude Cod
 A skill reaches **every repo in the portfolio**, so a careless edit travels further than any code change.
 
 - **The owner acks the wording before it is written.** Any agent may draft and propose; none writes into a skill unopposed. Show the exact block, wait, then edit. A skill edit is **never delegated to a subagent** and never arrives as a side effect of another task.
-- **Only the canon is edited — the `skill.*.md.tmpl` template in the Solo Dev Hub repo.** `~/.claude/skills/<name>/SKILL.md` and `<repo>/docs/sdh_skills/<name>.md` are two **outputs** of one source; they are rewritten on every sync and an edit there vanishes without a trace. An agent working in another repo cannot and should not edit the canon: it nominates the rule in its own retro, and the owner carries it over.
+- **Only the canon is edited — the `skill.*.md.tmpl` template in the Solo Dev Hub repo.** `~/.claude/skills/<name>/SKILL.md` and `<repo>/docs/sdh_skills/<name>.md` are two **outputs** of one source; they are rewritten on every sync, and an unmarked edit there vanishes without a trace.
+- **The one way to hand a rule back from another repo: edit your own `docs/sdh_skills/<name>.md` and drop an empty `<name>.md.approved` beside it.** The next sync takes that text as the new rule and pushes it to every repository. **The marker means the owner has already approved this exact wording, in chat, before you wrote the file.** It is not a request and not a nomination, so never create it on your own initiative. Without the marker the copy stays an output and your edit is overwritten. A name the bundle does not know is refused: a rule cannot be invented in a copy. Two repositories handing the same skill back with different text are refused as a conflict — agree first, then flag one of them. The sync names every rule it takes up.
 - **Delivery does not wait for a release.** The per-repo copies are rendered from the database row on every sync, so the same agreed text applied through Settings → App defaults reaches every repo immediately. That row is marked `is_custom=1`; once the next build carries the same text into the bundle, the flag is cleared automatically and the fork heals.
 - **It is операционка, not a release task.** No `todo.md` entry and no per-edit ceremony — but accumulated rule changes are listed as **one** Changelog line at the next closure, so the version step stays explained.
+
+- **A gate is designed together with its delivery and ownership constraints.** When
+  proposing a rule about who edits the canon and how, answer two questions in the same
+  breath: how fast does an edit reach the people it concerns, and who is even allowed to
+  write into that repository. A gate that depends on frequent releases, or on access
+  people do not have, looks tidy and does not work.
 
 The boundary with the Codex: a practice tied to a role's subject area belongs in the svod, not in a skill. A skill carries method that does not depend on role.
 
@@ -144,7 +151,7 @@ Tasks may be grouped under `## vX.Y.Z — <short description>` section headers f
 - [ ] T-000064 | Public flip | 3 | high | open | 2026-04-26
 ```
 
-Plain markdown readers treat `## ...` lines as comments — tasks under any header (or no header) read identically as a flat list. Some tools may use these headers as release-grouping signals: Solo Dev Hub, for example, parses `## vX.Y.Z` (must start with `v` followed by a digit) and surfaces the inherited version as a sortable column in the Tasks view; non-version headers like `## Format` or `## Backlog` are ignored. Headers stay optional — use when they help planning, skip for small/single-version projects.
+Plain markdown readers treat `## ...` lines as comments — tasks under any header (or no header) read identically as a flat list. Some tools may use these headers as release-grouping signals: Solo Dev Hub, for example, parses `## vX.Y.Z` and surfaces the inherited version as a sortable column in the Tasks view. Two shapes count as a version — `v` followed by a digit (`## v1.16.1`), or a bare number carrying at least one dot or dash (`## 2026.09.01`, `## 1.16.1`); the separator is what tells a version from prose, so a header like `## 3 things this week` is not one. The token is inherited exactly as written. Word headers such as `## Format`, `## Backlog` or `## Операционка` are ignored and neither set nor clear the current version. Headers stay optional — use when they help planning, skip for small/single-version projects.
 
 ### Operations tasks (`O-` / `M-`) — non-code, never release blockers
 
@@ -155,7 +162,8 @@ Beside the code classes `T-`/`F-`, two classes capture **операционка*
 
 Rules:
 - **Same line format** as any todo task (`effort` / `priority` / `status` / `created_at` all apply). Independent 6-digit counters per prefix, exactly like `T-`/`F-` — scan for the max within the same prefix, +1, `{prefix}-{:06}`.
-- **Never a release blocker.** Open `O-`/`M-` tasks do **not** gate a code release — do not treat them as blockers when tagging `vX.Y.Z`. They **never participate in `## vX.Y.Z` release grouping**: their `version` is always empty (a tool that inherits version from headers must force it empty for `O-`/`M-`, even under a version header). Group them under a plain non-version header like `## Операционка` if you want, or leave them ungrouped.
+- **Never a release blocker.** Open `O-`/`M-` tasks do **not** gate a code release — do not treat them as blockers when tagging `vX.Y.Z`. They **never participate in `## vX.Y.Z` release grouping**: their `version` is always empty (a tool that inherits version from headers must force it empty for `O-`/`M-`, even under a version header).
+- **The operations section goes first, above every version section.** Group them under a plain non-version header — `## Операционка` or its local-language equivalent. It belongs to no release, so at the bottom of the file it ends up below everything planned and stops catching the eye — and these are the only tasks nobody but the owner will ever recall. File order: the format notes, then operations, then the version sections nearest-first.
 - **In `done.md`** an `O-`/`M-` entry leaves the version slot empty (`- O-000001 | … | `).
 - **Why a separate class:** without it, no-code tasks land inside code releases and get mistaken for release blockers. The class makes their nature explicit and keeps the release gate about code.
 

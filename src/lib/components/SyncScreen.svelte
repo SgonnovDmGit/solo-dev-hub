@@ -74,6 +74,15 @@
       if (result.committed.length > 0) {
         addToast($tStore('sync.committed').replace('{0}', String(result.committed.length)), 'info');
       }
+      // T-000205: a rule taken back out of a repo's flagged copy now applies to
+      // the whole portfolio. Nothing verifies the approval behind the flag, so
+      // naming what was picked up is the only trace there is — always shown.
+      if (result.rules_taken.length > 0) {
+        addToast(
+          $tStore('sync.rulesTaken' as any).replace('{0}', result.rules_taken.join(', ')),
+          'info'
+        );
+      }
       await loadRequirements();
     } catch (e) {
       addToast(String(e), 'error');

@@ -54,8 +54,29 @@ pub fn run() {
     keyring_store::migrate_legacy_pat();
 
     // Seed bundled templates (e.g. flutter_web) if language is missing in DB.
-    if let Err(e) = template_seeder::seed_bundled_templates(&db) {
-        eprintln!("Warning: template seeding failed: {}", e);
+    //
+    // T-000203: a build can carry new rule text into the bundle, and the seeder
+    // writes it into the database right here — but nothing used to render it
+    // outwards, so the agents went on reading the previous text until someone
+    // happened to press the global-rules button or sync a project. Deliver it on
+    // the launch that actually changed something; an unchanged bundle renders
+    // nothing, and the render itself skips files that already match.
+    match template_seeder::seed_bundled_templates(&db) {
+        Ok(0) => {}
+        Ok(_) => {
+            if let Some(home) = dirs::home_dir() {
+                let (skills, repos, errors) =
+                    sync::render_skills_everywhere(&db, &home.join(".claude"));
+                if !errors.is_empty() {
+                    eprintln!("Warning: rule delivery after seeding: {:?}", errors);
+                }
+                eprintln!(
+                    "[startup] rules delivered: {} skills, {} repositories",
+                    skills, repos
+                );
+            }
+        }
+        Err(e) => eprintln!("Warning: template seeding failed: {}", e),
     }
 
     tauri::Builder::default()

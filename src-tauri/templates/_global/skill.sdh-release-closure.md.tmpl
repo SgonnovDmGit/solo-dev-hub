@@ -40,6 +40,28 @@ Skipping a step leads to documentation rot, lost traceability, or merge pain in 
 9. **Closure commit.** Stage Changelog + manifest (if any) + `done.md` (if tracked) + `docs/schema/` (if regenerated) + release-only docs in one commit: `chore: vX.Y.Z release closure`. Files unrelated to the release stay outside this commit.
 10. **Tag.** The canonical git block below. **The master/tag commands are run by the user, not the assistant** — show the block and wait.
 
+## Evidence binds to the code, not to the closure commit
+
+The long checks — the full test suite, static analysis, the release build — run
+**once**, on the last commit that changed what they check: tests and analysis on
+the last change to code or tests, the build SHA on the last change to anything
+that lands in the artifact (code, the manifest version, assets).
+
+The documentation commit of closure — Changelog, `done.md`, `todo.md` — does not
+touch the code tree, so it **carries the evidence forward rather than voiding
+it**. Re-running on it checks exactly the same thing at exactly the same price:
+that is a ritual, not a proof.
+
+Hence the order of steps in any closure checklist: the long checks go **before**
+the documentation edits, and the wording is "once", never "again". State the
+binding explicitly — "the numbers are from commit X" — so nobody has to infer it
+from the order of the lines. Bumping the manifest version is an executable input
+to the **build**, but not a reason to re-run the tests.
+
+The tell that a rule is badly written: the implementer does work that is correct
+to the letter and checks nothing new in substance. Fix the wording, not the
+implementer.
+
 ## Four things that quietly rot at closure
 
 - **A release task that fixes a filed bug moves that bug to `testing` in the same

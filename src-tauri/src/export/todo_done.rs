@@ -46,6 +46,31 @@ fn looks_like_task_id_start(r: &str) -> bool {
 /// With 3 fields: id | description | status (effort and priority empty).
 /// With 6+ fields: description = middle slots joined by ` | ` (e.g. when a feature-id prefix
 /// widens the line like `T-037 | F-019 | desc | L | must | open`).
+/// Is this header token a release-grouping marker? Two shapes are accepted,
+/// both in active use: the canonical `v1.16.1` and a bare `2026.09.01`.
+///
+/// T-000204: the bare form must carry at least one separator, otherwise an
+/// ordinary prose header like `## 3 вещи на неделю` would be read as version
+/// "3". The token is stored exactly as written — no `v` is prepended.
+fn is_version_token(tok: &str) -> bool {
+    let body = tok.strip_prefix('v').unwrap_or(tok);
+    if body.is_empty() || !body.as_bytes()[0].is_ascii_digit() {
+        return false;
+    }
+    // `v<digit>…` keeps its historical leniency: anything after the digit goes.
+    if tok.starts_with('v') {
+        return true;
+    }
+    let mut groups = 0;
+    for part in body.split(['.', '-']) {
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        groups += 1;
+    }
+    groups >= 2
+}
+
 pub fn parse_todo_tasks(content: &str) -> (Vec<TodoTask>, Vec<String>) {
     let mut tasks = Vec::new();
     let mut warnings = Vec::new();
@@ -57,9 +82,8 @@ pub fn parse_todo_tasks(content: &str) -> (Vec<TodoTask>, Vec<String>) {
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("## ") {
-            // First whitespace-separated token. Accept `v<digit>...` only.
             if let Some(tok) = rest.split_whitespace().next() {
-                if tok.starts_with('v') && tok.len() > 1 && tok.as_bytes()[1].is_ascii_digit() {
+                if is_version_token(tok) {
                     current_version = tok.to_string();
                 }
             }
@@ -413,6 +437,42 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].version, "v0.32.0");
         assert_eq!(tasks[1].version, "v0.32.0");
+    }
+
+    #[test]
+    fn test_parse_todo_bare_version_header_is_accepted() {
+        // T-000204: the owner groups by date as well as by SemVer, writing the
+        // header both ways. `v2026.09.01` was read and `2026.09.01` was not.
+        let md = "## 2026.09.01 — операционный заход\n\
+                  - [ ] T-000300 | Bare dotted header | 1 | low | open | 2026-09-02\n\
+                  ## 2026-09-02\n\
+                  - [ ] T-000301 | Bare dashed header | 1 | low | open | 2026-09-02\n";
+        let (tasks, warnings) = parse_todo_tasks(md);
+        assert!(warnings.is_empty(), "warnings: {:?}", warnings);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].version, "2026.09.01", "stored exactly as written");
+        assert_eq!(tasks[1].version, "2026-09-02");
+    }
+
+    #[test]
+    fn test_parse_todo_plain_numeric_header_is_not_a_version() {
+        // The separator is what separates a version from prose: without it a
+        // header like `## 3 вещи на неделю` would group tasks under "3".
+        let md = "## v1.16.1 — patch\n\
+                  - [ ] T-000302 | Under a real version | 1 | low | open | 2026-09-02\n\
+                  ## 3 вещи на неделю\n\
+                  - [ ] T-000303 | Under prose | 1 | low | open | 2026-09-02\n\
+                  ## Операционка\n\
+                  - [ ] T-000304 | Under a word header | 1 | low | open | 2026-09-02\n";
+        let (tasks, warnings) = parse_todo_tasks(md);
+        assert!(warnings.is_empty(), "warnings: {:?}", warnings);
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].version, "v1.16.1");
+        assert_eq!(
+            tasks[1].version, "v1.16.1",
+            "a prose header neither sets nor clears the current version"
+        );
+        assert_eq!(tasks[2].version, "v1.16.1");
     }
 
     #[test]

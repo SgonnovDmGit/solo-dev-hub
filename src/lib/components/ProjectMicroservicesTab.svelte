@@ -8,6 +8,8 @@
     listPeerChannels, addPeerLink, removePeerLink,
   } from '$lib/api/tauri-commands';
   import { allRepos } from '$lib/stores/repos';
+  // T-000201: the dialog compares project types, so it needs the project list.
+  import { projects } from '$lib/stores/projects';
   import PeerLinkDialog from './PeerLinkDialog.svelte';
   import { type Project, type Repository, type PeerChannelInfo } from '$lib/types';
 
@@ -274,6 +276,7 @@
   <PeerLinkDialog
     myRepos={myRepos}
     allRepos={$allRepos}
+    projects={$projects}
     linkedKeys={linkedKeys}
     onLink={createLink}
     onCancel={() => (linkDialogOpen = false)}

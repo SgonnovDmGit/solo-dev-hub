@@ -3,24 +3,50 @@
   // nothing is inferred from a shared role — so this dialog is the only way a
   // channel between equals comes into existence.
   import { tStore } from '$lib/i18n';
-  import { getDisplayName, type Repository } from '$lib/types';
+  import { getDisplayName, type Project, type Repository } from '$lib/types';
 
   interface Props {
     /** Repos of the current project — the left-hand side of the pair. */
     myRepos: Repository[];
     /** Every repo in the portfolio — the right-hand side. */
     allRepos: Repository[];
+    /** Every project, so a candidate's project type can be compared. */
+    projects: Project[];
     /** Already-linked pairs as "a::b" keys, so they can be marked. */
     linkedKeys: Set<string>;
     onLink: (selfId: number, peerId: number) => void;
     onCancel: () => void;
   }
 
-  let { myRepos, allRepos, linkedKeys, onLink, onCancel }: Props = $props();
+  let { myRepos, allRepos, projects, linkedKeys, onLink, onCancel }: Props = $props();
 
   let selfId = $state<number | null>(null);
   let peerId = $state<number | null>(null);
   let filter = $state('');
+
+  const projectTypeById = $derived(new Map(projects.map((p) => [p.id, p.project_type])));
+  const selfRepo = $derived(myRepos.find((r) => r.id === selfId));
+
+  // T-000201: are these two actually equals? Mirrors
+  // `AppDb::check_peers_are_equal` in src-tauri/src/db/peers.rs — that one
+  // enforces and explains, this one filters. Change both together.
+  function arePeers(a: Repository | undefined, b: Repository): boolean {
+    if (!a) return false;
+    if (!a.role || !b.role) return false;
+    if (a.role === 'other' || b.role === 'other') return false;
+    if (a.role !== b.role) return false;
+    const ta = a.project_id === null ? undefined : projectTypeById.get(a.project_id);
+    const tb = b.project_id === null ? undefined : projectTypeById.get(b.project_id);
+    if (ta === undefined || tb === undefined) return false;
+    return ta === tb;
+  }
+
+  // Kept as a guard even though non-equals are never listed: changing "my
+  // repository" after picking a peer can invalidate the pair.
+  const selectionIsPeer = $derived.by(() => {
+    const b = peerId === null ? undefined : allRepos.find((r) => r.id === peerId);
+    return b ? arePeers(selfRepo, b) : true;
+  });
 
   // Preselect this project's first repo so the dialog is usable without a first
   // click, without capturing the prop's initial value at construction time.
@@ -31,6 +57,8 @@
   const candidates = $derived(
     allRepos
       .filter((r) => r.id !== selfId)
+      // T-000201: a repo that cannot be picked has no business being listed.
+      .filter((r) => arePeers(selfRepo, r))
       .filter((r) => {
         const q = filter.trim().toLowerCase();
         if (!q) return true;
@@ -50,7 +78,7 @@
   );
 
   function submit() {
-    if (selfId === null || peerId === null || alreadyLinked) return;
+    if (selfId === null || peerId === null || alreadyLinked || !selectionIsPeer) return;
     onLink(selfId, peerId);
   }
 </script>
@@ -72,6 +100,7 @@
   >
     <h3 id="peer-link-title" class="title">{$tStore('project.peerLinkTitle' as any)}</h3>
     <p class="hint">{$tStore('project.peerLinkHint' as any)}</p>
+    <p class="hint">{$tStore('project.peerLinkEqualityHint' as any)}</p>
 
     <label class="field">
       <span class="label">{$tStore('project.peerLinkSelf' as any)}</span>
@@ -114,7 +143,7 @@
 
     <div class="actions">
       <button onclick={onCancel}>{$tStore('dialog.cancel')}</button>
-      <button class="primary" disabled={selfId === null || peerId === null || alreadyLinked} onclick={submit}>
+      <button class="primary" disabled={selfId === null || peerId === null || alreadyLinked || !selectionIsPeer} onclick={submit}>
         {$tStore('project.peerLinkAdd' as any)}
       </button>
     </div>
