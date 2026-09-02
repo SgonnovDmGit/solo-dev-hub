@@ -55,8 +55,26 @@
       return;
     }
     try {
-      await saveTemplateFile(languageKey, selectedFileName, editedContent);
-      addToast($tStore('toast.templateSaved' as any), 'success');
+      const outcome = await saveTemplateFile(languageKey, selectedFileName, editedContent);
+      // T-000203: saving a rule also delivers it. Report where it landed —
+      // "saved" alone left the owner unable to tell an applied rule from one
+      // still sitting in the database.
+      if (outcome.rendered) {
+        addToast(
+          $tStore('toast.ruleApplied' as any)
+            .replace('{0}', String(outcome.skills))
+            .replace('{1}', String(outcome.repos)),
+          'success'
+        );
+        if (outcome.errors.length > 0) {
+          addToast(
+            $tStore('toast.ruleApplyErrors' as any).replace('{0}', outcome.errors.join('; ')),
+            'error'
+          );
+        }
+      } else {
+        addToast($tStore('toast.templateSaved' as any), 'success');
+      }
       await loadFiles(languageKey);
     } catch (err) {
       addToast(String(err), 'error');

@@ -34,6 +34,19 @@ pub fn list_skill_templates(db: &AppDb) -> Result<Vec<(String, String)>, String>
     Ok(out)
 }
 
+/// Write `content` to `path` only when it differs from what is already there.
+/// T-000203: both render passes now run on every rule save, not only during a
+/// project sync, so an unconditional write would rewrite eighteen files per repo
+/// across the whole portfolio on each save and churn mtimes for nothing.
+fn write_if_changed(path: &Path, content: &str) -> Result<(), String> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing == content {
+            return Ok(());
+        }
+    }
+    fs::write(path, content).map_err(|e| e.to_string())
+}
+
 /// Render each skill to `<claude_dir>/skills/<name>/SKILL.md` (Claude Code
 /// user-level layout: one folder per skill). Returns count written.
 pub fn render_skills_global(db: &AppDb, claude_dir: &Path) -> Result<usize, String> {
@@ -43,7 +56,7 @@ pub fn render_skills_global(db: &AppDb, claude_dir: &Path) -> Result<usize, Stri
     for (name, content) in &skills {
         let dir = claude_dir.join("skills").join(name);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        fs::write(dir.join("SKILL.md"), content).map_err(|e| e.to_string())?;
+        write_if_changed(&dir.join("SKILL.md"), content)?;
         n += 1;
     }
     // T-000149: drop stale `sdh-*` skill folders no longer in the bundle (e.g.
@@ -61,12 +74,63 @@ pub fn render_skills_to_repo(db: &AppDb, repo_base: &Path) -> Result<usize, Stri
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut n = 0;
     for (name, content) in &skills {
-        fs::write(dir.join(format!("{}.md", name)), content).map_err(|e| e.to_string())?;
+        write_if_changed(&dir.join(format!("{}.md", name)), content)?;
         n += 1;
     }
     // T-000149: drop stale `sdh-*.md` reference copies no longer in the bundle.
     prune_stale_repo_skills(&dir, &keep)?;
     Ok(n)
+}
+
+/// T-000203: apply the current rule text everywhere an agent reads it from —
+/// the user-level Claude Code skills plus every repo with a local checkout.
+///
+/// Until this existed the two targets had unrelated triggers: `~/.claude/skills/`
+/// only on the global-rules button, `docs/sdh_skills/` only on a project sync
+/// (automatic solely for projects opted into auto-sync). An agreed rule could
+/// therefore sit undelivered for days while agents kept working off the old text.
+///
+/// Returns `(skills, repos, errors)`. Errors are per-target and non-fatal: one
+/// unwritable repo must not stop the rest of the portfolio from being updated.
+pub fn render_skills_everywhere(db: &AppDb, claude_dir: &Path) -> (usize, usize, Vec<String>) {
+    let mut errors = Vec::new();
+    let skills = match render_skills_global(db, claude_dir) {
+        Ok(n) => n,
+        Err(e) => {
+            errors.push(format!("~/.claude/skills: {}", e));
+            0
+        }
+    };
+    let repos = match db.list_repos_with_local_path(None) {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(format!("repository list: {}", e));
+            Vec::new()
+        }
+    };
+    let mut touched = 0;
+    for repo in repos {
+        let Some(path) = repo.local_path.as_deref() else {
+            continue;
+        };
+        let base = Path::new(path);
+        // A stored local_path can point at a checkout that only exists on
+        // another machine. That is normal portfolio state, not a failure —
+        // skip it silently rather than drowning the real errors.
+        if !base.is_dir() {
+            continue;
+        }
+        match render_skills_to_repo(db, base) {
+            Ok(_) => touched += 1,
+            Err(e) => {
+                // A local-only repo has no github_name — fall back to its path
+                // so the message still points at something the owner can find.
+                let label = repo.github_name.as_deref().unwrap_or(path);
+                errors.push(format!("{}: {}", label, e));
+            }
+        }
+    }
+    (skills, touched, errors)
 }
 
 /// Remove `<claude_dir>/skills/sdh-*` folders that are not in `keep` (the current
@@ -219,6 +283,85 @@ mod tests {
         render_skills_to_repo(&db, tmp.path()).unwrap();
         let n = render_skills_to_repo(&db, tmp.path()).unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn test_render_skips_write_when_content_is_identical() {
+        // T-000203: a rule save now renders across the whole portfolio, so an
+        // unchanged skill must not be rewritten. Proven the strongest way
+        // available: make the rendered file read-only and render again — a real
+        // write would fail there, so a clean Ok means none was attempted.
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        render_skills_to_repo(&db, tmp.path()).unwrap();
+
+        let f = tmp.path().join("docs/sdh_skills/sdh-alpha.md");
+        let mut perms = fs::metadata(&f).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&f, perms).unwrap();
+
+        let result = render_skills_to_repo(&db, tmp.path());
+
+        // Restore write access before asserting, so the TempDir can be removed
+        // even when the assertion below fails.
+        let mut perms = fs::metadata(&f).unwrap().permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(&f, perms).unwrap();
+
+        assert_eq!(
+            result.unwrap(),
+            2,
+            "identical content must not be rewritten"
+        );
+    }
+
+    fn insert_repo(db: &AppDb, name: &str, local_path: &str) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO repositories (github_name, local_path) VALUES (?1, ?2)",
+            rusqlite::params![name, local_path],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_render_everywhere_covers_global_and_every_local_repo() {
+        let db = db_with_skill();
+        let home = TempDir::new().unwrap();
+        let repo_a = TempDir::new().unwrap();
+        let repo_b = TempDir::new().unwrap();
+        insert_repo(&db, "acme/one", &repo_a.path().to_string_lossy());
+        insert_repo(&db, "acme/two", &repo_b.path().to_string_lossy());
+
+        let (skills, repos, errors) = render_skills_everywhere(&db, home.path());
+
+        assert_eq!(skills, 2);
+        assert_eq!(repos, 2);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        assert!(home.path().join("skills/sdh-alpha/SKILL.md").exists());
+        assert!(repo_a.path().join("docs/sdh_skills/sdh-beta.md").exists());
+        assert!(repo_b.path().join("docs/sdh_skills/sdh-beta.md").exists());
+    }
+
+    #[test]
+    fn test_render_everywhere_skips_checkout_missing_on_this_machine() {
+        // A stored local_path can name a clone that exists only on another
+        // machine. That is normal portfolio state, not a failure: it must be
+        // skipped silently instead of burying the real errors.
+        let db = db_with_skill();
+        let home = TempDir::new().unwrap();
+        let live = TempDir::new().unwrap();
+        insert_repo(&db, "acme/live", &live.path().to_string_lossy());
+        insert_repo(&db, "acme/ghost", "F:/definitely/not/cloned/here");
+
+        let (_, repos, errors) = render_skills_everywhere(&db, home.path());
+
+        assert_eq!(repos, 1, "only the checkout that exists is rendered");
+        assert!(
+            errors.is_empty(),
+            "a missing checkout is not an error: {:?}",
+            errors
+        );
     }
 
     /// End-to-end guard: the REAL bundle (via seed_bundled_templates) must carry

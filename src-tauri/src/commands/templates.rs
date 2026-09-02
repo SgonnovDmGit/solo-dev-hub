@@ -1,5 +1,6 @@
 use crate::db::AppDb;
 use crate::models::*;
+use crate::sync;
 use crate::template_seeder;
 use tauri::State;
 
@@ -50,15 +51,50 @@ pub fn get_template_file(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+/// A `_global` file named `skill.<name>.md.tmpl` is a workflow rule, not an
+/// ordinary template — see `sync::skills`.
+const SKILL_PREFIX: &str = "skill.";
+const SKILL_SUFFIX: &str = ".md.tmpl";
+
+/// Async because a rule save now walks the whole portfolio: a synchronous
+/// command would do that filesystem work on the UI thread and freeze the window.
+#[tauri::command(async)]
 pub fn save_template_file(
     db: State<AppDb>,
     language_key: String,
     file_name: String,
     content: String,
-) -> Result<(), String> {
+) -> Result<TemplateSaveOutcome, String> {
+    // The DB write goes first and is the only fatal failure here: a rule the
+    // owner has just agreed on must never be lost because a render target
+    // happened to be unwritable.
     db.upsert_template_file(&language_key, &file_name, &content, true)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let is_skill = language_key == "_global"
+        && file_name.starts_with(SKILL_PREFIX)
+        && file_name.ends_with(SKILL_SUFFIX);
+    if !is_skill {
+        return Ok(TemplateSaveOutcome::default());
+    }
+
+    // T-000203: a rule is only agreed once it reaches the agents. Render both
+    // targets now rather than waiting for the separate global-rules button and
+    // for a project sync that auto-runs only where auto-sync is opted into.
+    let Some(home) = dirs::home_dir() else {
+        return Ok(TemplateSaveOutcome {
+            rendered: false,
+            errors: vec!["Cannot determine home directory".to_string()],
+            ..Default::default()
+        });
+    };
+    let (skills, repos, errors) = sync::render_skills_everywhere(&db, &home.join(".claude"));
+    Ok(TemplateSaveOutcome {
+        rendered: true,
+        skills,
+        repos,
+        errors,
+    })
 }
 
 #[tauri::command]
