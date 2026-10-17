@@ -1094,6 +1094,7 @@ mod tests {
             "sdh-codex-consume",
             "sdh-codex-maintain",
             "sdh-agent-collaboration",
+            "sdh-project-start",
         ] {
             assert!(
                 names.contains(&expected),
@@ -1103,8 +1104,8 @@ mod tests {
         }
         assert_eq!(
             skills.len(),
-            18,
-            "exactly eighteen sdh-* skills in the bundle"
+            19,
+            "exactly nineteen sdh-* skills in the bundle"
         );
 
         for (name, content) in &skills {
@@ -1127,7 +1128,7 @@ mod tests {
 
         let repo = TempDir::new().unwrap();
         let n = render_skills_to_repo(&db, repo.path()).unwrap().written;
-        assert_eq!(n, 18);
+        assert_eq!(n, 19);
         assert!(repo
             .path()
             .join("docs/sdh_skills/sdh-cross-repo-req-send.md")
