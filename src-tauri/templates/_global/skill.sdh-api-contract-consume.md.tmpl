@@ -9,41 +9,16 @@ description: >
   YOUR OWN contract — skill sdh-api-contract-maintain.
 ---
 
-You are here if you are about to draft a phase spec for a feature that needs endpoints owned by **another** repo. Before designing — confirm the surface actually exists in the synced contract. The check is read-only and costs one grep; the failure without it surfaces at implementation time after hours of design.
+The first read-only step before the chat of `sdh-phase-workflow` for a feature that needs another repo's endpoints. Maintaining your own contract → `sdh-api-contract-maintain`.
 
-- You **maintain your own** contract (server/MS, changing an endpoint) → skill `sdh-api-contract-maintain`.
-
-**Where the synced contract lives:**
-- **A client** reads the server → the `docs/server-api/*.md` set. The contract is partitioned by audience: `client-api.md` (+ `client-api-<topic>.md`) for normal client endpoints, `admin-api.md` only for preprod diagnostics. Grep the whole set — a not-yet-partitioned server still has a single `api.md`.
-- **A parent server** reads a microservice → the `docs/microservice-api/<ms-project-name>/*.md` set.
-
-## When it fires
-
-Trigger — the start of phase-level work touching another server: *"let's plan feature X"*, *"design phase Y"*, *"start implementation of Z"* — and the feature needs endpoints. This is the **first read-only action** before entering the chat phase of skill `sdh-phase-workflow`.
+Where the synced contract is:
+- a client reads its server in `docs/server-api/*.md` — `client-api*.md` for normal use, `admin-api.md` only for preprod diagnostics, or a single `api.md`;
+- a parent server reads a microservice in `docs/microservice-api/<ms-project-name>/*.md`.
 
 ## Procedure
 
-1. **List the required endpoints** from the feature description (method + path + access level).
-2. **Grep the synced contract** for each endpoint × HTTP method — across the whole set (`grep -rn "..." docs/server-api/`), since it may be partitioned into `client-api.md` / `admin-api.md` / topic files.
-3. **Report to the user** in plain text — what matched (with line refs) / what's missing.
-4. **If there are gaps** — identify the work that depends on them and open or reference the relevant server-side REQ (skill `sdh-cross-repo-req-send`). Apply the scope rule below instead of blocking the whole task or release.
-5. **For the supported slice** — proceed to the chat phase of `sdh-phase-workflow` as usual; leave dependent work with its own release task and unblocking REQ.
-
-Серверная зависимость блокирует только зависящую от неё часть задачи. Полезную часть, поддержанную контрактом, внедряем в рамках согласованных полномочий. Остаток оформляем отдельной задачей следующего или тематически подходящего релиза с указанием разблокирующего REQ. Отсутствующие данные не выдумываем, ограничения называем явно.
-
-## Example
-
-The "avatar upload" feature needs `POST /profile/avatar`.
-
-```
-$ grep -rn "POST /profile/avatar" docs/server-api/
-(empty)
-```
-
-Not found → **avatar upload remains blocked**. Open a REQ to the server (see `sdh-cross-repo-req-send`):
-
-> `docs/backend-requirements/REQ-007_avatar-upload.md` — asking to implement/document `POST /profile/avatar`.
-
-Resume the dependent avatar-upload work after the endpoint appears in the synced contract. Useful, independent work supported by the current contract can proceed within the agreed scope.
-
-**Why isolate the dependency:** a spec must not target an imagined surface, but a missing endpoint is not a reason to hold unrelated, supported work.
+1. List the required endpoints: method, path, access level.
+2. Grep the whole set for each endpoint × method (`grep -rn "POST /profile/avatar" docs/server-api/`).
+3. Tell the user what matched (with line refs) and what is missing.
+4. A gap blocks only the work that depends on it: open or reference a REQ (`sdh-cross-repo-req-send`), file the dependent remainder as a task in a later or thematically fitting release naming that REQ.
+5. Continue the supported part through the normal spec flow. Never design against an endpoint that is not in the contract; never invent missing data — state the limit.

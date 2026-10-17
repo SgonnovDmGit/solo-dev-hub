@@ -12,35 +12,17 @@ description: >
   before a spec — skill sdh-api-contract-consume.
 ---
 
-You are here if you are a **server or microservice** changing your endpoint surface (added/removed a route, changed request/response shape or access level). Your **public contract** — partitioned by consumer audience into `docs/my_api/*.md`, not one monolithic `api.md` (see **Partition the contract** below) — is read cross-repo by clients and parent servers via sync. Anything documented is a promise; anything not in the contract **does not exist** for consumers, even if live in code.
+You are a server or microservice changing your endpoint surface. Your contract is what consumers see through sync: what is in it is a promise, what is not in it does not exist for them. Reading someone else's contract → `sdh-api-contract-consume`.
 
-- You need to **read another repo's** contract before a spec (you are a client/parent) → skill `sdh-api-contract-consume`.
+## Partition
 
-## Partition the contract — by audience, then by volume
+- **By audience**, one file per consumer in `docs/my_api/`, never mixed: `client-api.md`, `admin-api.md`, `public-api.md`, `<name>-api.md`. One consumer only → a single `api.md`.
+- **By volume:** a file over ~12 endpoints or ~400 lines splits by domain: `client-api-auth.md`, `client-api-orders.md`.
+- `Server version` and `## Access model` live once per audience in `<audience>-api.md`; when split, that file is the index (topic list + access matrix) and topic files back-link to it.
+- **After a split, delete the old monolithic `api.md`** (and a root `docs/api.md` when moving to `my_api/`) in the same commit.
+- Sync copies every `docs/my_api/*.md` to every consumer: server → client into `docs/server-api/`, microservice → parent into `docs/microservice-api/<ms-project-name>/`. Admin files reaching the client is intended (preprod diagnostics). The legacy root `docs/api.md` + `docs/handlers.md` still works for a single consumer — never both layouts at once. Non-`.md` files are ignored.
 
-`api.md` is **not one monolithic file**. The contract is partitioned, and splitting it is a **requirement, not an option**.
-
-**Axis 1 — consumer audience (always, when there is more than one consumer).** One file per consumer under `docs/my_api/`; audiences are **never mixed** in a file:
-- `client-api.md` — endpoints the client app consumes
-- `admin-api.md` — endpoints the admin panel consumes
-- `public-api.md` — public / unauthenticated
-- `<name>-api.md` — any other consumer (service-to-service, partner), named per project
-
-Exactly one consumer → a single `api.md` is enough.
-
-**Axis 2 — topic, by volume (a hard trigger).** Keep every contract file within budget: **≤ ~12 endpoints OR ~400 lines** (whichever comes first). Over budget → split the audience file by domain: `client-api-auth.md`, `client-api-orders.md`, `client-api-profile.md`. The threshold is mechanical: "one api.md for the whole server" fails it the moment the surface is non-trivial — without a number the agent sees no trigger and never splits "by eye".
-
-**Header and index.** The server version + `## Access model` live once per audience, in `<audience>-api.md`. When topic-split, that file is the **index** — a list of the topic files + the access matrix; the topic files carry only their endpoints + a back-link. When not topic-split, `<audience>-api.md` holds everything.
-
-**After a split the old `api.md` must be gone.** Split into `client-api.md` / `admin-api.md` (/ …) → **delete** the former monolithic `api.md` (and a root `docs/api.md` if you are moving to `my_api/`) in the same commit. Two contracts = drift, and sync would deliver the stale blob to consumers too. One source per audience — no leftover monolith.
-
-**Sync is flat-to-all, by design.** The app copies `docs/my_api/*.md` to **every** consumer, so `admin-api.md` lands in the client repo too. That is **a capability, not a cost**: it enables preprod diagnostics from the client side (in normal use the client simply does not open the admin contract). No per-consumer routing needed.
-
-## Part A — the `docs/api.md` format
-
-The contract is synced: it lands on the client side at `docs/server-api/api.md`, on the parent-server side at `docs/microservice-api/<ms-project-name>/api.md`.
-
-### File header
+## File header
 
 ```markdown
 # API Documentation
@@ -48,124 +30,58 @@ The contract is synced: it lands on the client side at `docs/server-api/api.md`,
 Server version: X.Y.Z
 
 ## Access model
-
-(Access levels — admin / auth / public — and the access matrix per role.
-Project-specific — write out the concrete shape for this project's roles.)
+(levels — admin / auth / public — and the access matrix for this project's roles;
+shared infrastructure error codes live here)
 ```
 
-### Per-endpoint format (5 blocks)
-
-Up to 5 blocks per endpoint. Omit inapplicable ones (**Side effects** if none, **Partial update semantics** for non-PATCH).
+## Endpoint — up to 5 blocks
 
 ````markdown
 #### `METHOD /path`
-One sentence — what the endpoint does.
+One sentence.
 
 **Request:**
 ```json
-{
-  "fieldName": "type, required|optional, validation rules"
-}
+{ "fieldName": "type, required|optional, validation" }
 ```
 
 **Response (200):**
 ```json
-{
-  "serviceInfo": "(standard)",
-  "fieldName": "type, optional notes"
-}
+{ "serviceInfo": "(standard)", "fieldName": "type, notes" }
 ```
 
 **Errors:**
-- `ERROR_CODE` (HTTP status) — cause description
+- `ERROR_CODE` (HTTP status) — cause
 
 **Partial update semantics:** *(PATCH only)*
-- Field **absent from body** → value in DB unchanged
-- Field passed as **`null`** → behavior described
-- Field passed as **`""`** → behavior described
+- field absent → unchanged; `null` → …; `""` / `[]` → …
 
 **Side effects:**
-- DB writes beyond the obvious (cascades, triggers), webhooks, cache invalidation,
-  broadcast events, background jobs
+- writes beyond the primary table, webhooks, cache invalidation, events, jobs
 ````
 
-### Filled example
+- Types: `string`, `int`, `bool`, `float`, `uuid`, `RFC3339 timestamp`, `[Type]`, `Type | null`; validators in free text (`min N chars`, `enum [a, b]`).
+- `"serviceInfo": "(standard)"` = the standard envelope; expand only when non-standard.
+- Errors: endpoint-specific codes only.
+- Partial update semantics: required for every PATCH with a nullable field.
+- Omit Side effects when there are none.
+- Each endpoint row in the per-section tables (admin-read / admin-write / auth-read / auth-write / public) carries a status: `implemented` / `planned` / `deprecated`.
+- Existing contract in an older format: expand an endpoint to the full format the next time you touch it; admin sections first.
 
-````markdown
-#### `POST /profile/avatar`
-Uploads the current user's avatar.
+## Contract in the same commit as the handler
 
-**Request:** `multipart/form-data`, field `file` (jpg/png, ≤ 2 MB).
+When a handler is added, removed, or changes shape or access level, in the **same commit**:
+1. Update its row and blocks in the contract file of its audience and access section.
+2. Update `docs/handlers.md` if the project keeps one.
+3. Re-check file/line references in `docs/flows/` that mention it; drop `(planned)` markers that became implemented.
+4. Stage the contract with the handler. Never push the handler ahead of the contract.
 
-**Response (200):**
-```json
-{
-  "serviceInfo": "(standard)",
-  "avatarUrl": "string, public link to the uploaded file"
-}
-```
+A breaking change (removed endpoint, changed response field, changed access) also bumps MINOR/MAJOR and adds a `[Unreleased]` Changelog entry in the same commit. A handler without its contract entry counts as not shipped.
 
-**Errors:**
-- `AVATAR_TOO_LARGE` (413) — file over 2 MB
-- `AVATAR_BAD_TYPE` (415) — type not jpg/png
+## `docs/handlers.md` (optional, internal)
 
-**Side effects:**
-- The old avatar is deleted from blob storage
-````
+Next to the contract: handler-to-handler flows, transaction boundaries, error and rollback chains, middleware order, locking, idempotency. Not the public contract, not a symbol map, not a copy of request/response shapes.
 
-### Block-by-block conventions
+## Never in README
 
-- **Request body** — JSON with inline annotations. Types: `string`, `int`, `bool`, `float`, `uuid`, `RFC3339 timestamp`, `[Type]`, `Type | null`. Validators in free text (`min N chars`, `regex /.../`, `enum [a, b, c]`).
-- **Response body** — same notation. `"serviceInfo": "(standard)"` is a shorthand for the standard envelope; expand it only when the endpoint puts something non-standard into it.
-- **Errors** — **only endpoint-specific** codes. Infrastructure-wide ones (`INVALID_PRODUCT_KEY`, `INTERNAL_ERROR`, etc.) are shared, live in the header's "Access model", not duplicated per endpoint.
-- **Partial update semantics** — required for every PATCH with at least one nullable field. Explicitly: (a) absent field, (b) `null`, (c) `""` / `[]`. Without the block, client devs guess from source → silent bugs (`{field: null}` vs `{field: ""}` may differ).
-- **Side effects** — anything beyond writing the obvious primary table. No effects — omit the block.
-
-### Status taxonomy
-
-Each endpoint row in the per-section tables (admin-read / admin-write / auth-read / auth-write / public) carries a status: `implemented` (live and tested) / `planned` (specified, not shipped) / `deprecated` (works, removal in next MAJOR).
-
-### Adoption (extending an existing api.md)
-
-Don't rewrite the whole file at once. Rule: "next time you touch an endpoint, expand it to the full 5-block format", drift toward the format incrementally. Admin sections first (downstream admin-clients are usually written first and benefit most from explicit schemas).
-
-## Part B — the contract-sync rule
-
-### Contract in the same commit as the handler
-
-**Rule:** as soon as a handler is added/removed or its request/response shape changes — the corresponding entry in `docs/api.md` (plus `docs/handlers.md` / per-handler doc if the project keeps one) is updated in the **same commit**. A handler shipped without its `api.md` entry is treated as **not yet shipped** for synced consumers, even if live in code.
-
-**Why:** clients grep the synced contract before a spec (skill `sdh-api-contract-consume`). A handler live in code but absent from `api.md` makes a consumer either ask for something that exists or chase a doc gap. Avoidable cross-repo round-trips.
-
-**How to apply** (any handler-layer change affecting the surface):
-1. Open `docs/api.md`, locate the section by access level (`admin-read` / `admin-write` / `auth-read` / `auth-write` / `public`).
-2. Add/update/remove the row: method, path, description, status, body schemas (see "Per-endpoint format").
-3. Update `docs/handlers.md` / per-handler docs the same way, if any.
-4. If the handler is referenced by a flow doc in `docs/flows/` — re-verify file-path/line refs (they may have shifted) and drop `(planned)` markers that became implemented in this commit.
-5. **Stage `docs/api.md` (and other touched contract/flow files) in the same commit.** Never split contract and handler across two commits — at minimum never push the handler ahead of the contract.
-
-For **breaking** changes (removed endpoint, changed response field, changed access level) — bump MINOR/MAJOR per SemVer and add a `## [Unreleased]` entry to `Changelog.md` in the same commit.
-
-### How `docs/my_api/` syncs
-
-The partitioned contract (see **Partition the contract** above) lives in **`docs/my_api/`**. Solo Dev Hub copies **every `*.md`** from there into the recipient's existing inbox on each sync:
-- **Server → Client:** `docs/my_api/*.md` → `docs/server-api/*.md` (flat).
-- **Microservice → Parent:** `docs/my_api/*.md` → `docs/microservice-api/<ms-project-name>/*.md` (flat).
-
-Backward-compatible: the legacy single-file layout (a root `docs/api.md` + `docs/handlers.md`) still works for a **single-consumer** server. But **don't run both layouts at once** — once you partition into `docs/my_api/`, delete the root `docs/api.md` (see "After a split the old `api.md` must be gone"), or consumers receive two overlapping contracts. Non-`.md` files in `my_api/` are ignored.
-
-### `docs/handlers.md` — internal implementation notes
-
-Optional, server-side only, lives **next to `docs/api.md`**. Documents **internal** notes complementing `api.md`:
-- Handler-to-handler logic flows (*"POST /orders fans out to webhook X then enqueues job Y"*)
-- Transaction boundaries (what is atomic, what spans statements)
-- Error/side-effect chains (rollback, partial-failure, retry)
-- Handler-layer cross-cutting concerns: auth-middleware order, request-scoped cache, lock ordering, idempotency
-
-What `handlers.md` is **not**: not a public contract (that's `api.md` — anything a consumer reads must be there); not a symbol map (paths/lines/signatures rot too fast — grep for the handler); not a duplicate of `api.md` (restating request/response shapes belongs in `api.md`).
-
-### Hard rule — README is forbidden for handler docs
-
-Handler documentation must **NOT** be written to `README.md`. README is a human-facing project overview (what it is, how to run it, where the docs are). Handler content goes in `docs/api.md` (public surface) or `docs/handlers.md` (internal notes). Neither exists — **create the right file**, do not extend README sideways.
-
-This is a routing rule, not style: cross-repo sync only propagates `docs/api.md` and `docs/handlers.md` (or the `docs/my_api/*.md` set); whatever is in `README.md` stays on your side and is invisible to consumers.
+Handler docs go in the contract or `docs/handlers.md`, never in `README.md` — sync does not carry README, so consumers never see it. Missing file → create it.
