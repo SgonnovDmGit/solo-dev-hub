@@ -59,6 +59,7 @@ Also at closure:
 - One standing script per repo, version as a parameter: `& ".\scripts\release.ps1" -Version 1.9.0`. Do not generate, prove or test a script per release. A repo without one writes it once.
 - The script owns the order: clean tree → `switch` → `pull --ff-only` → `merge --no-ff -m` → push → annotated tag → push tag → back. It checks exit codes, never force-pushes or replaces a tag.
 - Before handing it over: stop every process you started (dev servers, watchers, background builds), push `dev`, and run `git status --porcelain` — it must print nothing. A line you think is "not yours" still fails; commit it, remove it, or say exactly what remains. A gitignored file that is still tracked stays dirty until `git rm --cached`.
+- Stray processes outlive sessions — preview servers, per-editor MCP bridges, watchers — and hold ports and file handles. At closure also list the project's own strays from earlier sessions, name each to the owner with its start time, and stop them only on the owner's word.
 - Real values, not `X.Y.Z`. Branches from the project `CLAUDE.md` (`$MAIN` is `master` or `main`). `switch`, not `checkout`.
 - One line in the handoff: the IDE may show phantom errors while branches switch; restart the language server afterwards.
 - In a no-ff flow, `master` not being an ancestor of `dev` does not block the release.
