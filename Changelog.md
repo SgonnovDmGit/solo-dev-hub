@@ -4,6 +4,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.18.0] — 2026-10-17
+
+Rules and sync tell the truth: an approved rule edit is never lost without a word, a sync problem is reported in the interface language, and the rules themselves got less than half as long.
+
+### Added
+- **The `sdh-project-start` skill (T-000209).** The new-project checklist and the `README.md` / `CLAUDE.md` / `benchmarks.md` skeletons, together with the tbls setup, sat in the always-on global rules and loaded into every session of every repo. They now surface only when a project or repo is being started. The skill count is now 19.
+
+### Changed
+- **Sync problems are reported in the interface language (T-000198).** Sync built its warnings as free English strings in Rust, so a Russian interface showed English toasts, and the same problem could repeat several times in one toast. Each problem is now a code with a subject and an optional target, carried from Rust to the toast and translated in the interface (ru/en), one line per problem, duplicates dropped. A compile-time check and a test keep every code translated. An auto-commit branch that differs from the checkout is no longer a portfolio-wide warning on every sync: it is a state of the repository's settings, and the repository card now says "Auto-commit paused: the repo is on `dev`, configured for `master`".
+- **The rules are less than half as long (T-000208).** The rendered text had grown to 203 KB of skills and a 28.6 KB global section, much of it case stories and "paid for by" paragraphs that explain a rule's history instead of stating it. Approved hand-backs were first absorbed into the bundle so the forked rows heal. The texts were then compressed to a dry instruction: 78 KB for 19 skills, 10.1 KB for the global section. Each skill was approved by the owner from a before → after page. Skill descriptions are unchanged, so skills trigger as before.
+- **Conditional rules read as conditional (T-000209).** A new "How the rules apply" section in the global rules covers four points:
+  - a repo's own `CLAUDE.md` wins over a skill;
+  - a step that has a skill starts by invoking it fresh, not from a compaction summary, memory or the previous release's artifact;
+  - a procedure the owner can choose — who fixes review findings, who closes, how much ceremony — is a default;
+  - an agent stops the processes it started.
+
+  Approving a skill's wording takes a separate reply to the shown block. A retro lesson's default home is the repo or nowhere. Closure lists stray processes left from earlier sessions.
+
+### Fixed
+- **An approved rule edit is no longer lost between projects (T-000207).** Hand-backs were collected only from the syncing project's repositories, while the render rewrote rule copies further afield. That included a connected microservice's server repo in another project, the startup, a Settings save, the global-rules button, init docs and auto-sync. A text approved in project B could be overwritten by a sync of project A before anyone collected it. Every path that renders rule copies now goes through one entry point that first collects across the whole portfolio, one pass at a time. Startup collects before the bundle seed. A marker beside a copy that already equals the canon is reported as lost and cleared, with the rule unchanged. A Settings save of a skill supersedes a pending hand-back of the same skill, and both outcomes are named in a toast. A hand-back that stays unresolved (conflict, failed store) keeps its copy through the same pass. Auto-sync reports what it took up.
+
+### Tests
+- 574 Rust (+23 over the 551 of v1.17.0, among them portfolio-wide collection before every render, startup ordering against the seed, lost and superseded hand-backs, the rule lock, and sync issue codes; 1 ignored: the schema-export generator), 99 vitest (+13: issue formatting and the translation guard), svelte-check clean. Numbers from `d4efd39`.
+
 ## [1.17.0] — 2026-09-02
 
 Rules stop depending on someone remembering to press a button: an applied rule reaches every agent by itself, and an agent's edit travels back the same way.
