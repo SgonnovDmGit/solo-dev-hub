@@ -7,13 +7,25 @@ use crate::db::AppDb;
 use crate::models::{Repository, RulesRefresh};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const SKILL_PREFIX: &str = "skill.";
 const SKILL_SUFFIX: &str = ".md.tmpl";
 /// Namespace prefix for skills this app owns. Only `sdh-*` entries are ever
 /// pruned — user-authored skills sharing the directory are never touched.
 const SKILL_NAMESPACE: &str = "sdh-";
+
+/// The skill a template file name stands for: `skill.<name>.md.tmpl` → `<name>`.
+/// `None` for any other file, including the degenerate `skill.md.tmpl` whose
+/// prefix and suffix overlap and which therefore names no skill at all.
+pub fn skill_name_of(file_name: &str) -> Option<&str> {
+    file_name
+        .strip_prefix(SKILL_PREFIX)?
+        .strip_suffix(SKILL_SUFFIX)
+        .filter(|name| !name.is_empty())
+}
 
 /// Enumerate bundled skill templates as (skill_name, content).
 /// A skill template is a `_global` file named `skill.<name>.md.tmpl`;
@@ -25,10 +37,8 @@ pub fn list_skill_templates(db: &AppDb) -> Result<Vec<(String, String)>, String>
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for f in files {
-        if let Some(rest) = f.file_name.strip_prefix(SKILL_PREFIX) {
-            if let Some(name) = rest.strip_suffix(SKILL_SUFFIX) {
-                out.push((name.to_string(), f.content));
-            }
+        if let Some(name) = skill_name_of(&f.file_name) {
+            out.push((name.to_string(), f.content));
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -66,21 +76,83 @@ pub fn render_skills_global(db: &AppDb, claude_dir: &Path) -> Result<usize, Stri
     Ok(n)
 }
 
+/// Outcome of rendering one repo's `docs/sdh_skills/`.
+#[derive(Debug, Default)]
+pub struct RepoRender {
+    /// Skills rendered (written, or already identical).
+    pub written: usize,
+    /// Skills whose copy was left as is because an approval marker still sits
+    /// beside it — an unresolved hand-back.
+    pub held: Vec<String>,
+}
+
+impl RepoRender {
+    /// The held copies as report lines, keyed by `label` (the repo).
+    pub fn held_errors(&self, label: &str) -> Vec<String> {
+        self.held
+            .iter()
+            .map(|name| {
+                format!(
+                    "{}: {}.md copy left as is: unresolved hand-back",
+                    label, name
+                )
+            })
+            .collect()
+    }
+}
+
 /// Render each skill to `<repo_base>/docs/sdh_skills/<name>.md` (flat reference
-/// copy for non-Claude-Code agents). Returns count written.
-pub fn render_skills_to_repo(db: &AppDb, repo_base: &Path) -> Result<usize, String> {
+/// copy for non-Claude-Code agents).
+///
+/// T-000207: a copy with `<name>.md.approved` beside it is NOT written (nor
+/// pruned). Every render runs after the collection, so a marker that survived
+/// it is unresolved — a conflict, or a text that could not be stored — and its
+/// copy is the only place the agent's edit still exists. Overwriting it would
+/// make the next pass report the edit "lost". The skip is returned in `held`.
+pub fn render_skills_to_repo(db: &AppDb, repo_base: &Path) -> Result<RepoRender, String> {
     let skills = list_skill_templates(db)?;
     let keep: HashSet<String> = skills.iter().map(|(name, _)| name.clone()).collect();
     let dir = repo_base.join("docs").join("sdh_skills");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let mut n = 0;
+    let mut out = RepoRender::default();
     for (name, content) in &skills {
+        if has_marker(&dir, name) {
+            out.held.push(name.clone());
+            continue;
+        }
         write_if_changed(&dir.join(format!("{}.md", name)), content)?;
-        n += 1;
+        out.written += 1;
     }
     // T-000149: drop stale `sdh-*.md` reference copies no longer in the bundle.
     prune_stale_repo_skills(&dir, &keep)?;
-    Ok(n)
+    Ok(out)
+}
+
+/// Whether `<dir>/<name>.md.approved` exists.
+fn has_marker(dir: &Path, name: &str) -> bool {
+    dir.join(format!("{}.md{}", name, APPROVED_SUFFIX)).exists()
+}
+
+/// Remove an approval marker. Already gone counts as removed: a concurrent pass
+/// (or the owner) may have cleared it, and the outcome is the same.
+fn clear_marker(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Serialises every collect-then-render pass in the process. The auto-sync
+/// timer, a manual sync and a Settings save can otherwise interleave: one pass
+/// stores a hand-back and is about to clear its marker while another already
+/// sees a copy equal to the new rule and reports the edit "lost".
+static RULES_LOCK: Mutex<()> = Mutex::new(());
+
+fn rules_guard() -> std::sync::MutexGuard<'static, ()> {
+    // A panic in another pass leaves no state behind this lock worth refusing over.
+    RULES_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Marker dropped beside a rendered skill copy: this copy was edited on purpose
@@ -172,7 +244,7 @@ fn collect_approved_skill_edits(
                 continue;
             };
             if settings_edit == Some(name) {
-                match fs::remove_file(entry.path()) {
+                match clear_marker(&entry.path()) {
                     Ok(()) => out.superseded.push(format!("{} ({})", name, label)),
                     Err(e) => out
                         .errors
@@ -182,7 +254,7 @@ fn collect_approved_skill_edits(
             }
             let copy = dir.join(stem);
             match fs::read_to_string(&copy) {
-                Ok(content) if content == *current => match fs::remove_file(entry.path()) {
+                Ok(content) if content == *current => match clear_marker(&entry.path()) {
                     Ok(()) => out.lost.push(format!("{} ({})", name, label)),
                     Err(e) => out
                         .errors
@@ -226,7 +298,7 @@ fn collect_approved_skill_edits(
             continue;
         }
         for (_, _, marker) in &copies {
-            if let Err(e) = fs::remove_file(marker) {
+            if let Err(e) = clear_marker(marker) {
                 // The text is already stored; a surviving marker now sits beside
                 // a copy equal to the rule, so the next pass reports it as lost
                 // instead of taking it up again.
@@ -276,6 +348,7 @@ pub fn refresh_rules(
     scope: RenderScope,
     settings_edit: Option<&str>,
 ) -> RulesRefresh {
+    let _guard = rules_guard();
     let mut report = RulesRefresh::default();
     let repos = match db.list_repos_with_local_path(None) {
         Ok(v) => v,
@@ -318,8 +391,15 @@ fn render_scope(
             // Rendered even after an everywhere pass: the target may not be among
             // the stored checkouts, and an unchanged file is not rewritten anyway.
             match render_skills_to_repo(db, base) {
+                // Already rendered (and its held copies reported) by the
+                // everywhere pass when the target is a stored checkout.
                 Ok(_) if everywhere => {}
-                Ok(_) => report.repos = 1,
+                Ok(r) => {
+                    report.repos = 1;
+                    report
+                        .errors
+                        .extend(r.held_errors(&base.display().to_string()));
+                }
                 Err(e) => report.errors.push(format!("{}: {}", base.display(), e)),
             }
         }
@@ -380,14 +460,15 @@ fn render_skills_everywhere(
         if !base.is_dir() {
             continue;
         }
+        // A local-only repo has no github_name — fall back to its path so the
+        // message still points at something the owner can find.
+        let label = repo.github_name.as_deref().unwrap_or(path);
         match render_skills_to_repo(db, base) {
-            Ok(_) => touched += 1,
-            Err(e) => {
-                // A local-only repo has no github_name — fall back to its path
-                // so the message still points at something the owner can find.
-                let label = repo.github_name.as_deref().unwrap_or(path);
-                errors.push(format!("{}: {}", label, e));
+            Ok(r) => {
+                touched += 1;
+                errors.extend(r.held_errors(label));
             }
+            Err(e) => errors.push(format!("{}: {}", label, e)),
         }
     }
     (skills, touched, errors)
@@ -406,6 +487,7 @@ fn render_skills_everywhere(
 ///
 /// Returns `None` when there is nothing to tell and nothing was rendered.
 pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option<RulesRefresh> {
+    let _guard = rules_guard();
     let mut report = RulesRefresh::default();
     let repos = match db.list_repos_with_local_path(None) {
         Ok(v) => v,
@@ -477,7 +559,9 @@ fn prune_stale_repo_skills(dir: &Path, keep: &HashSet<String>) -> Result<usize, 
         let entry = entry.map_err(|e| e.to_string())?;
         let fname = entry.file_name().to_string_lossy().to_string();
         if let Some(stem) = fname.strip_suffix(".md") {
-            if stem.starts_with(SKILL_NAMESPACE) && !keep.contains(stem) {
+            // A flagged copy is an unresolved hand-back (here: of a name the
+            // bundle does not know) — the agent's text, not a stale output.
+            if stem.starts_with(SKILL_NAMESPACE) && !keep.contains(stem) && !has_marker(dir, stem) {
                 fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
                 pruned += 1;
             }
@@ -486,8 +570,39 @@ fn prune_stale_repo_skills(dir: &Path, keep: &HashSet<String>) -> Result<usize, 
     Ok(pruned)
 }
 
+/// Test support shared by every module that exercises a hand-back.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::APPROVED_SUFFIX;
+    use std::fs;
+    use std::path::Path;
+
+    /// Overwrite the copy of `name` in `skills_dir` with `text` and drop the
+    /// approval marker beside it, carrying `note` — what a handing-back agent does.
+    pub(crate) fn hand_back(skills_dir: &Path, name: &str, text: &str, note: &str) {
+        fs::write(skills_dir.join(format!("{}.md", name)), text).unwrap();
+        fs::write(
+            skills_dir.join(format!("{}.md{}", name, APPROVED_SUFFIX)),
+            note,
+        )
+        .unwrap();
+    }
+
+    /// Append a line naming `repo` to its rendered copy of `name` and hand it
+    /// back. Returns the edited text — distinct per repo, so two repos handing
+    /// back the same skill this way conflict.
+    pub(crate) fn hand_back_edit(repo: &Path, name: &str) -> String {
+        let skills = repo.join("docs").join("sdh_skills");
+        let current = fs::read_to_string(skills.join(format!("{}.md", name))).unwrap();
+        let edited = format!("{}\n\nHANDED BACK FROM {}\n", current, repo.display());
+        hand_back(&skills, name, &edited, "");
+        edited
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
     use tempfile::TempDir;
 
@@ -506,6 +621,20 @@ mod tests {
         db.upsert_template_file("_global", ".gitignore.tmpl", "ignore", false)
             .unwrap();
         db
+    }
+
+    #[test]
+    fn test_skill_name_of() {
+        assert_eq!(skill_name_of("skill.sdh-retro.md.tmpl"), Some("sdh-retro"));
+        assert_eq!(skill_name_of("skill.md.tmpl"), None, "affixes overlap");
+        assert_eq!(skill_name_of("skill..md.tmpl"), None, "empty name");
+        assert_eq!(skill_name_of(".gitignore.tmpl"), None);
+    }
+
+    #[test]
+    fn test_clearing_a_marker_that_is_already_gone_is_not_an_error() {
+        let tmp = TempDir::new().unwrap();
+        assert!(clear_marker(&tmp.path().join("sdh-alpha.md.approved")).is_ok());
     }
 
     #[test]
@@ -533,7 +662,7 @@ mod tests {
     fn test_render_repo_layout() {
         let db = db_with_skill();
         let tmp = TempDir::new().unwrap();
-        let n = render_skills_to_repo(&db, tmp.path()).unwrap();
+        let n = render_skills_to_repo(&db, tmp.path()).unwrap().written;
         assert_eq!(n, 2);
         let f = tmp.path().join("docs/sdh_skills/sdh-beta.md");
         assert!(f.exists(), "flat <name>.md under docs/sdh_skills");
@@ -589,7 +718,7 @@ mod tests {
         let db = db_with_skill();
         let tmp = TempDir::new().unwrap();
         render_skills_to_repo(&db, tmp.path()).unwrap();
-        let n = render_skills_to_repo(&db, tmp.path()).unwrap();
+        let n = render_skills_to_repo(&db, tmp.path()).unwrap().written;
         assert_eq!(n, 2);
     }
 
@@ -617,7 +746,7 @@ mod tests {
         fs::set_permissions(&f, perms).unwrap();
 
         assert_eq!(
-            result.unwrap(),
+            result.unwrap().written,
             2,
             "identical content must not be rewritten"
         );
@@ -642,15 +771,6 @@ mod tests {
             .insert_local_repository(&dir.path().to_string_lossy(), name, None, None)
             .unwrap();
         (repo, dir.path().join("docs/sdh_skills"))
-    }
-
-    fn hand_back(skills_dir: &Path, name: &str, text: &str, note: &str) {
-        fs::write(skills_dir.join(format!("{}.md", name)), text).unwrap();
-        fs::write(
-            skills_dir.join(format!("{}.md{}", name, APPROVED_SUFFIX)),
-            note,
-        )
-        .unwrap();
     }
 
     #[test]
@@ -828,8 +948,7 @@ mod tests {
         let repo_dir = TempDir::new().unwrap();
         let (_, skills) = rendered_repo(&db, &repo_dir, "pending");
         let copy = skills.join("sdh-debugging.md");
-        let edited = format!("{}\n\nHANDED BACK\n", fs::read_to_string(&copy).unwrap());
-        hand_back(&skills, "sdh-debugging", &edited, "");
+        let edited = hand_back_edit(repo_dir.path(), "sdh-debugging");
         // A new build: one bundled file is missing from the DB, so the seed
         // reports a change and the startup delivery runs.
         db.conn
@@ -916,9 +1035,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let repo_dir = TempDir::new().unwrap();
         let (_, skills) = rendered_repo(&db, &repo_dir, "pending");
-        let copy = skills.join("sdh-retro.md");
-        let edited = format!("{}\n\nHANDED BACK\n", fs::read_to_string(&copy).unwrap());
-        hand_back(&skills, "sdh-retro", &edited, "");
+        let edited = hand_back_edit(repo_dir.path(), "sdh-retro");
 
         let report = deliver_rules_at_startup(&db, Some(home.path()));
 
@@ -1009,7 +1126,7 @@ mod tests {
         }
 
         let repo = TempDir::new().unwrap();
-        let n = render_skills_to_repo(&db, repo.path()).unwrap();
+        let n = render_skills_to_repo(&db, repo.path()).unwrap().written;
         assert_eq!(n, 18);
         assert!(repo
             .path()

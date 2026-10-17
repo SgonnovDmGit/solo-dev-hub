@@ -52,11 +52,6 @@ pub fn get_template_file(
         .map_err(|e| e.to_string())
 }
 
-/// A `_global` file named `skill.<name>.md.tmpl` is a workflow rule, not an
-/// ordinary template — see `sync::skills`.
-const SKILL_PREFIX: &str = "skill.";
-const SKILL_SUFFIX: &str = ".md.tmpl";
-
 /// Async because a rule save now walks the whole portfolio: a synchronous
 /// command would do that filesystem work on the UI thread and freeze the window.
 #[tauri::command(async)]
@@ -84,12 +79,12 @@ fn save_template_file_in(
     db.upsert_template_file(language_key, file_name, content, true)
         .map_err(|e| e.to_string())?;
 
-    let is_skill = language_key == "_global"
-        && file_name.starts_with(SKILL_PREFIX)
-        && file_name.ends_with(SKILL_SUFFIX);
-    if !is_skill {
-        return Ok(TemplateSaveOutcome::default());
-    }
+    // A `_global` file named `skill.<name>.md.tmpl` is a workflow rule, not an
+    // ordinary template — see `sync::skills`.
+    let skill_name = match sync::skill_name_of(file_name) {
+        Some(name) if language_key == "_global" => name,
+        _ => return Ok(TemplateSaveOutcome::default()),
+    };
 
     // T-000203: a rule is only agreed once it reaches the agents. Render both
     // targets now rather than waiting for the separate global-rules button and
@@ -98,7 +93,6 @@ fn save_template_file_in(
     // T-000207: through `refresh_rules`, so hand-backs pending anywhere in the
     // portfolio are collected before this render overwrites them. A pending
     // hand-back of THIS skill is superseded: the owner's explicit edit wins.
-    let skill_name = &file_name[SKILL_PREFIX.len()..file_name.len() - SKILL_SUFFIX.len()];
     let claude_dir = home.map(|h| h.join(".claude"));
     let rules = sync::refresh_rules(
         db,
@@ -148,17 +142,105 @@ pub fn reset_template_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::skills::test_support::hand_back_edit;
     use std::fs;
-    use std::path::Path;
     use tempfile::TempDir;
 
-    fn hand_back_edit(repo: &Path, name: &str) -> String {
-        let skills = repo.join("docs").join("sdh_skills");
-        let copy = skills.join(format!("{}.md", name));
-        let edited = format!("{}\n\nHANDED BACK\n", fs::read_to_string(&copy).unwrap());
-        fs::write(&copy, &edited).unwrap();
-        fs::write(skills.join(format!("{}.md.approved", name)), "").unwrap();
-        edited
+    fn seeded() -> (AppDb, TempDir) {
+        let db_dir = TempDir::new().unwrap();
+        let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
+        template_seeder::seed_bundled_templates(&db).unwrap();
+        (db, db_dir)
+    }
+
+    /// T-000207 review: a conflict (or a failed store) leaves the marker and the
+    /// edited copy in place on purpose — so the render in that same pass must
+    /// leave the copy alone too, or the next pass reports it "lost" and the
+    /// agent's text is gone. Proven across the two renders that hit it hardest:
+    /// a Settings save (everywhere) and a project sync (`write_repo_skeletons`).
+    #[test]
+    fn test_unresolved_handback_copies_survive_a_settings_save_and_a_project_sync() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let one = TempDir::new().unwrap();
+        let two = TempDir::new().unwrap();
+        let p = db.create_project("P", None, "standard").unwrap();
+        for (dir, label) in [(&one, "one"), (&two, "two")] {
+            db.insert_local_repository(
+                &dir.path().to_string_lossy(),
+                label,
+                Some(p.id),
+                Some("tool"),
+            )
+            .unwrap();
+            sync::render_skills_to_repo(&db, dir.path()).unwrap();
+        }
+        let text_one = hand_back_edit(one.path(), "sdh-debugging");
+        let text_two = hand_back_edit(two.path(), "sdh-debugging");
+        let copy = |dir: &TempDir| {
+            fs::read_to_string(dir.path().join("docs/sdh_skills/sdh-debugging.md")).unwrap()
+        };
+        let marker = |dir: &TempDir| dir.path().join("docs/sdh_skills/sdh-debugging.md.approved");
+
+        let outcome = save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "skill.sdh-retro.md.tmpl",
+            "OWNER TEXT FOR ANOTHER SKILL",
+        )
+        .unwrap();
+
+        assert_eq!(
+            copy(&one),
+            text_one,
+            "the Settings render left the copy alone"
+        );
+        assert_eq!(copy(&two), text_two);
+        assert!(marker(&one).exists() && marker(&two).exists());
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("unresolved hand-back")),
+            "the skipped copy is reported: {:?}",
+            outcome.errors
+        );
+
+        let result = crate::sync::project_sync::run_project_sync_in(
+            &db,
+            p.id,
+            Some(home.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            copy(&one),
+            text_one,
+            "the project-sync render left it alone too"
+        );
+        assert_eq!(copy(&two), text_two);
+        assert!(marker(&one).exists() && marker(&two).exists());
+        assert!(result.rules_lost.is_empty(), "{:?}", result.rules_lost);
+    }
+
+    /// `skill.md.tmpl` has the prefix and the suffix overlapping: it names no
+    /// skill. Saving it is an ordinary template save, never a panic.
+    #[test]
+    fn test_saving_a_file_named_like_a_bare_skill_affix_does_not_panic() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+
+        let outcome = save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "skill.md.tmpl",
+            "x",
+        )
+        .unwrap();
+
+        assert!(!outcome.rendered);
     }
 
     /// T-000207 (R3): a Settings save re-renders the portfolio. Hand-backs of
@@ -166,9 +248,7 @@ mod tests {
     /// just edited loses to that explicit edit, and says so.
     #[test]
     fn test_settings_save_takes_other_handbacks_and_supersedes_the_same_skill() {
-        let db_dir = TempDir::new().unwrap();
-        let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
-        template_seeder::seed_bundled_templates(&db).unwrap();
+        let (db, _db_dir) = seeded();
         let home = TempDir::new().unwrap();
         let repo_dir = TempDir::new().unwrap();
         db.insert_local_repository(&repo_dir.path().to_string_lossy(), "agentrepo", None, None)

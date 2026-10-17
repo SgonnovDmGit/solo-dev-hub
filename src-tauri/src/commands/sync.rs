@@ -50,7 +50,9 @@ fn sync_global_claude_md_in(db: &AppDb, home: &Path) -> Result<SyncGlobalClaudeR
 /// Init skeletons for a single repo — F-016 manual trigger.
 /// Copies-if-missing: docs/todo.md, docs/bug-reports.md; section-merges .gitignore + .gitattributes.
 /// Returns list of filenames actually created (empty list = all already exist).
-#[tauri::command]
+// T-000207: async — the rule refresh scans the whole portfolio and, after an
+// uptake, renders into every repo; not work for the UI thread.
+#[tauri::command(async)]
 pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<InitDocsOutcome, String> {
     init_docs_for_repo_in(&db, dirs::home_dir(), repo_id)
 }
@@ -789,6 +791,7 @@ pub fn list_renames_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<RepoR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::skills::test_support::hand_back_edit;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -815,11 +818,7 @@ mod tests {
         let mut edits = Vec::new();
         for (dir, name) in [(&target, "sdh-debugging"), (&elsewhere, "sdh-retro")] {
             crate::sync::render_skills_to_repo(&db, dir.path()).unwrap();
-            let skills = dir.path().join("docs").join("sdh_skills");
-            let copy = skills.join(format!("{}.md", name));
-            let edited = format!("{}\n\nHANDED BACK\n", fs::read_to_string(&copy).unwrap());
-            fs::write(&copy, &edited).unwrap();
-            fs::write(skills.join(format!("{}.md.approved", name)), "").unwrap();
+            let edited = hand_back_edit(dir.path(), name);
             edits.push((dir.path().to_path_buf(), name, edited));
         }
 
@@ -861,10 +860,7 @@ mod tests {
             .unwrap();
         crate::sync::render_skills_to_repo(&db, repo_dir.path()).unwrap();
         let skills = repo_dir.path().join("docs").join("sdh_skills");
-        let copy = skills.join("sdh-retro.md");
-        let edited = format!("{}\n\nHANDED BACK\n", fs::read_to_string(&copy).unwrap());
-        fs::write(&copy, &edited).unwrap();
-        fs::write(skills.join("sdh-retro.md.approved"), "").unwrap();
+        let edited = hand_back_edit(repo_dir.path(), "sdh-retro");
 
         let result = sync_global_claude_md_in(&db, home.path()).unwrap();
         assert_eq!(result.rules.taken, vec!["sdh-retro".to_string()]);

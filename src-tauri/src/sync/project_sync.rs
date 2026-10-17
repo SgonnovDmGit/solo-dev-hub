@@ -114,8 +114,11 @@ fn write_repo_skeletons(
     {
         c.errors.push(format!("CLAUDE.md for {}: {}", label, e));
     }
-    if let Err(e) = sync::render_skills_to_repo(db, base) {
-        c.errors.push(format!("sdh_skills for {}: {}", label, e));
+    // Runs only after `refresh_rules` collected across the portfolio (see
+    // `run_project_sync_in`); a copy still flagged after that is held, not written.
+    match sync::render_skills_to_repo(db, base) {
+        Ok(r) => c.errors.extend(r.held_errors(label)),
+        Err(e) => c.errors.push(format!("sdh_skills for {}: {}", label, e)),
     }
     if let Err(e) = sync::sync_gitignore_section(&tpl.gitignore, base) {
         c.errors.push(format!(".gitignore for {}: {}", label, e));
@@ -989,7 +992,7 @@ pub fn run_project_sync(db: &AppDb, project_id: i64) -> Result<SyncResult, Strin
 /// must never do against the real one. The seam exists so the ordering that
 /// matters — collect the handed-back rules *before* anything renders over them —
 /// can be exercised end to end in a sandbox.
-fn run_project_sync_in(
+pub(crate) fn run_project_sync_in(
     db: &AppDb,
     project_id: i64,
     home: Option<PathBuf>,
@@ -1221,6 +1224,7 @@ fn run_project_sync_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::skills::test_support::hand_back_edit;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -1263,12 +1267,7 @@ mod tests {
         let name = "sdh-debugging";
         let copy = skills.join(format!("{}.md", name));
         let marker = skills.join(format!("{}.md.approved", name));
-        let edited = format!(
-            "{}\n\nHANDED BACK BY THE AGENT\n",
-            fs::read_to_string(&copy).unwrap()
-        );
-        fs::write(&copy, &edited).unwrap();
-        fs::write(&marker, "approved by the owner 2026-09-02").unwrap();
+        let edited = hand_back_edit(repo_dir.path(), name);
 
         let result = run_project_sync_in(&db, project.id, Some(home.path().to_path_buf())).unwrap();
 
@@ -1313,24 +1312,6 @@ mod tests {
         let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
         crate::template_seeder::seed_bundled_templates(&db).unwrap();
         (db, db_dir, TempDir::new().unwrap())
-    }
-
-    /// Edit the rendered copy of `name` in `repo` and flag it approved, exactly
-    /// as an agent handing a rule back does. Returns the edited text.
-    fn hand_back_edit(repo: &Path, name: &str) -> String {
-        let skills = repo.join("docs").join("sdh_skills");
-        let copy = skills.join(format!("{}.md", name));
-        let edited = format!(
-            "{}
-
-HANDED BACK FROM {}
-",
-            fs::read_to_string(&copy).unwrap(),
-            repo.display()
-        );
-        fs::write(&copy, &edited).unwrap();
-        fs::write(skills.join(format!("{}.md.approved", name)), "").unwrap();
-        edited
     }
 
     fn rule_row(db: &AppDb, name: &str) -> crate::models::TemplateFile {

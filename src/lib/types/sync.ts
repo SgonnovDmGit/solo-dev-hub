@@ -16,6 +16,15 @@ export interface SyncResult {
   rules_lost: string[];
 }
 
+/** Result of `sync_global_claude_md` (the global-rules button). Mirrors
+ *  `SyncGlobalClaudeResult` in `commands/sync.rs`. */
+export interface SyncGlobalClaudeResult {
+  path: string;
+  synced_at: string;
+  /** T-000207: the button collects pending hand-backs before rendering `~/.claude/skills/`. */
+  rules: RulesRefresh;
+}
+
 /** T-000207: result of `init_docs_for_repo` — files written plus the rule refresh report. */
 export interface InitDocsOutcome {
   updated: string[];

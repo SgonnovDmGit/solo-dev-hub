@@ -1,15 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, RulesRefresh } from '$lib/types';
+import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult } from '$lib/types';
 
 
 // ── Requirements sync commands ──────────────────────────────────────────────
-
-export interface SyncGlobalClaudeResult {
-  path: string;
-  synced_at: string;
-  /** T-000207: the button collects pending hand-backs before rendering `~/.claude/skills/`. */
-  rules: RulesRefresh;
-}
 
 export async function syncGlobalClaudeMd(): Promise<SyncGlobalClaudeResult> {
   return await invoke<SyncGlobalClaudeResult>('sync_global_claude_md');

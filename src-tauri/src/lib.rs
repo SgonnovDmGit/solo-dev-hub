@@ -62,19 +62,24 @@ pub fn run() {
     // the launch that actually changed something; an unchanged bundle renders
     // nothing, and the render itself skips files that already match.
     //
-    // T-000207: through `refresh_rules`, which collects pending hand-backs across
-    // the portfolio before rendering over them. What it found is held in managed
-    // state until the frontend asks for it once (`take_startup_rules_report`).
+    // T-000207: `deliver_rules_at_startup` collects pending hand-backs across the
+    // portfolio on every launch, before the seed and before rendering over them.
+    // What it found is held in managed state until the frontend asks for it once
+    // (`take_startup_rules_report`).
     let claude_dir = dirs::home_dir().map(|h| h.join(".claude"));
     let startup_rules =
         sync::deliver_rules_at_startup(&db, claude_dir.as_deref()).and_then(|report| {
             if !report.errors.is_empty() {
                 eprintln!("Warning: rule delivery at startup: {:?}", report.errors);
             }
-            eprintln!(
-                "[startup] rules delivered: {} skills, {} repositories",
-                report.skills, report.repos
-            );
+            // Only when something was actually rendered — a report can carry
+            // collection findings alone.
+            if report.skills > 0 || report.repos > 0 {
+                eprintln!(
+                    "[startup] rules delivered: {} skills, {} repositories",
+                    report.skills, report.repos
+                );
+            }
             Some(report).filter(|r| !r.is_quiet())
         });
 
