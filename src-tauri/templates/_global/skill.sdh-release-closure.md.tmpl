@@ -9,221 +9,57 @@ description: >
   sdh-release-lifecycle; the retrospective — skill sdh-retro.
 ---
 
-You are here when a release is ready to **close** — the user signals *"ready to release"*, *"finalize the docs"*, *"shipping vX.Y"*, or the last task in scope is done. Surface the full checklist (numbered, with the project's actual paths) and walk it interactively. Do not declare the release "done" until every step is verified.
+Stage 9 of `sdh-release-lifecycle`; the retro (`sdh-retro`) follows. Show the checklist with the project's real paths and walk it. The release is not done until every step is verified.
 
-This is stage 9 of the broader cycle (skill `sdh-release-lifecycle`). After closure — the retro (skill `sdh-retro`).
+## The owner outranks the checklist
 
-**Don't loop on a gate you can't satisfy.** Closure is where an agent most often circles — a verification/build/clean-tree check keeps failing and it retries the same pass, burning tokens. If a step fails the same way twice, STOP: question whether the gate is real or self-imposed, and escalate to the user rather than trying a third identical time (see "Anti-loop" in `sdh-release-lifecycle`).
+- **"Ship it" closes any unmet step:** name the risk in one line, file the remainder as a task, go to the git block. No re-asking, no finishing it "to be safe".
+- After the owner's smoke, add no new gate on the same scenario.
+- A gate that never caught a user-visible defect is a cost: name the case it caught, or drop it. Two rounds in a row without a product finding — stop the approach.
+- A step failing the same way twice: stop, question the gate, escalate. No third identical try.
 
-## "Ship it" closes the checklist
+## Late catches
 
-The steps below are the agent's instrument, not a contract that binds the owner. If the owner says **ship it** while a step is unmet, that step closes immediately: name the risk in **one line**, file the remainder as a task, and go to the git block. No re-asking, no arguing the item's importance, no finishing it "just to be safe", no delaying the tag. Full rule: *"The gate has no authority over the owner"* in `sdh-release-lifecycle`.
+- A bug found at closure joins this release only if: fix ≤ ~2 h, cause certain, on the release's theme. Otherwise a task for the next release.
+- A counterparty's request arriving at closure: same three criteria, decision marked as yours; otherwise a card under a version, and no receipt before the deploy.
+- A check blocked only by a counterparty's action (grant, key, receipt) does not hold the tag when the path is unreachable without them: one `### Notes` line in the Changelog (what was not probed, which REQ), the probe task keeps the written smoke and the request date, a PATCH the day it turns red.
 
-**После owner smoke не добавлять новый гейт на тот же сценарий.**
+## Checklist
 
-**Гейт, ни разу не поймавший продуктового дефекта, — это стоимость.** Прежде чем
-красный гейт задержит принятый продукт, назови случай, когда он поймал то, что
-видит пользователь. Не называется — гейт снимается, а не удовлетворяется: цену
-круга платит владелец, а написание гейта не стоило ничего. Второй круг подряд
-без продуктовой находки — стоп подходу.
+Long checks (tests, analysis, release build) run **once**, on the last commit that changed what they check — before the documentation steps. The closure docs commit carries that evidence forward; do not re-run on it. Say which commit the numbers are from.
 
-## Late-catch: a bug found during closure
+0. **Format gate, if CI has one.** On the accepted HEAD run the formatter exactly as the CI workflow does (same paths, flags). Exit 0 and a clean tree before step 1; record SHA, command, result.
+1. **Version bump** — in the manifest (`package.json`, `Cargo.toml`, `pubspec.yaml`, `*.csproj`, `tauri.conf.json`), or where the project `CLAUDE.md` says. The class was decided at Analysis; if scope changed it, re-confirm with the user. If the repo's release script expects the bump earlier, the script's order wins.
+2. **Changelog** — `[Unreleased]` → `[X.Y.Z] — YYYY-MM-DD`, Keep-a-Changelog categories, empty ones dropped. Test counts only from the real Test-stage run. Update every release-facing doc the project keeps (e.g. "What's new", other locales).
+3. **`docs/done.md`** — each closed task under `## YYYY-MM-DD`.
+4. **`docs/todo.md`** — delete every shipped task; demote unshipped `in-progress` to `open`. Before deleting a release section, carry any owner decision in its header to the successor section with author and date. Validate the whole file: six fields per line, id `[TFOM]-\d{6}`, numeric effort, closed lists for priority/status, ISO date, no duplicate ids, section totals match their headers. Read cards created during this release twice — nobody reviewed them. Blockedness goes in the description, not the status.
+5. **REQ receipts and pairs** *(cross-repo projects)* — for every REQ pair closed in this window: confirm ✓ (SDH button or the sender's `.impl.md`, see `sdh-cross-repo-req-send`), then check both halves are gone (source file and `.response.md`) and the registry line is closed. A receipt claims only what was verified; grep the smoke and tests before claiming coverage. Re-read announcements sent during this release against this release's receipts and fix the announcement itself where they disagree. Receipts deferred to the deploy take that re-read with them.
+6. **Verification** — CI green; golden path of each changed feature; changed endpoints exercised; adjacent features, empty states, error paths.
+   - Smoke at closure only what was not run on the accepted candidate. Items needing no live upstream run against the locally restarted build first.
+   - Before the first deployed run, read the contour's gates for every key the smoke uses (paid tier, feature flag, catalog lock); the script opens and restores them by record — snapshot to a file, open, run, restore in `finally`, verify. A failed snapshot read opens nothing.
+   - Lint with the exact command CI runs, never a subset of packages.
+   - A check for a rule the deployed server does not have yet guards itself on that rule being present, so a dry run against the old stand stops at "not exercised" and never reaches a paid path.
+   - The smoke covers this release's surface — at least one check per changed surface, including commits you did not write — written before the first release act.
+   - A red on your own new check: suspect the check first; call the endpoint and compare the shape. A green that found no data is not coverage: a row-counting check fails on an empty answer; read field names off one live response; assert `Count -ge N` first (PowerShell 5.1 turns `@($null | …)` into one item).
+7. **Build artifact** *(projects shipping a binary)* — the accepted candidate built with the release version is the proof; CI builds the tag. None exists → build once, before the closure commit. Read the verdict from the build's output, not its exit code (some builds and `gh run watch` return 0 on failure): look for the result line with the artifact path and for `error` / `fatal` / `failed` in the tail. A write failure on the artifact means a running instance holds it — ask the owner before closing it, close it normally.
+8. **Schema docs** *(any project with a database, embedded included)* — if the schema changed, regenerate `docs/schema/` and stage it with the closure commit.
+9. **Closure commit** — Changelog, manifest, tracked `done.md`, `docs/schema/`, release docs: `chore: vX.Y.Z release closure`. Nothing unrelated. No transient wording ("preparing for publication") in a tree that will be tagged.
+10. **Tag** — the git block below; the owner runs it.
 
-If a bug surfaces during closure — don't blindly send it to "the next patch". Judge by three criteria:
-- **≤ ~2h fix** AND **high confidence in the cause** AND **within the current release's theme** → **fold it into the current release** (add to scope, fix, record in done.md + the Changelog of this same tag). Don't spin a phantom `vX.Y.Z+1` for a small confident fix.
-- Otherwise (deep/unclear/off-theme) → a task or bug for the next release.
-- **Заявку контрагента, пришедшую на closure, вкладывай в релиз только по трём критериям late-catch и пометь решение своим; иначе заводи карточку под версией и не пиши квитанцию до выката.**
+Also at closure:
+- A task that fixes a filed bug moves that bug to `testing` in the same pass.
+- Grep the README (all locales), its roadmap section and `docs/roadmap.md` for stale counts and versions. Say "builds are Windows for now" rather than "a Windows application" when only the build is the limit.
+- Anything left to do by hand becomes an `O-` task now, written to be run: where (screen, path), which field or key by exact name, what value in what format with a literal example, how to confirm it took. Find out what you don't know before filing.
+- Harness notes about files changing while the owner runs the git block are transient; `git status` clean afterwards means nothing was rolled back.
 
-## A check that waits on a counterparty does not hold the tag
+## Git block
 
-If the only thing blocking a verification step is a counterparty's action (a
-grant, a receipt, a key, a row in a downstream catalogue), the step does not
-hold the release: the task moves to the project's "unblocked by
-counterparties" section and the release closes.
+"Go", "можно выполнять", "отправил", "закрываем релиз" do not delegate the git block. Give the one release-script command and stop. Only an explicit one-time instruction naming merge/tag/push lets you run them.
 
-1. The path must be unreachable without the counterparty (closed gate,
-   capability flag no row carries). Reachable today → ordinary red gate.
-2. Changelog `### Notes`, one line: what was not probed and which REQ it
-   waits on.
-3. The probe task carries the smoke already written and the request date.
-4. Fallback: a PATCH the day the probe turns red.
-
-## Closure checklist (10 steps)
-
-Skipping a step leads to documentation rot, lost traceability, or merge pain in the next release.
-
-0. **Flutter CI format gate (before version bump).** On the accepted product HEAD,
-   capture `git rev-parse HEAD` and run the formatting command exactly as the
-   repository's CI workflow invokes it, including its paths and flags. Require
-   exit code 0 and a clean working tree before step 1; record the SHA, literal
-   command and result alongside the analyze, test and build evidence. Green
-   analyze, tests or a release build do not prove formatting. If the workflow
-   has no formatting step, this gate is not applicable.
-
-1. **Version bump.** Projects with a manifest version field (`pubspec.yaml` / `package.json` / `Cargo.toml` / `*.csproj` / `tauri.conf.json`) — bump there. Without one (e.g. a Go server) — in the locations from the project `CLAUDE.md` (typically `Changelog.md`, the version header in `docs/api.md`, hard-coded constants). **The bump class was already decided at the Analysis stage** (see `sdh-release-lifecycle`) — here you just execute it. If the class changed mid-release (scope grew) — re-evaluate and confirm with the user before bumping.
-2. **Changelog.** Move `## [Unreleased]` to `## [X.Y.Z] — YYYY-MM-DD`. Entries by Keep-a-Changelog categories (Added/Changed/Deprecated/Removed/Fixed/Security). Drop empty categories. **Test counts come only from the real smoke run of the Test stage, not from intuition/progress notes.**
-3. **`docs/done.md`.** Append a `## YYYY-MM-DD` section (or extend it) with each closed task: id + short description + version.
-4. **`docs/todo.md` cleanup.** Every task that shipped is **deleted outright** from todo.md — its only record is the `## YYYY-MM-DD` entry in done.md (step 3). Do **not** leave `done`/`✓`/`shipped` annotations, struck-through rows, lingering `review`-status leftovers, or prose describing what-and-how — todo.md holds only *not-yet-done* work, and done.md is the single record of completion. Demote stale `in-progress` entries that didn't ship back to `open` (or drop them). (todo.md has no "done" state by design.) Шапка секции релиза в `todo.md` может нести решение владельца (условие, срок, связь с другим релизом). Перед удалением секции на закрытии перечитай её шапку и перенеси каждое решение в секцию-преемника с автором и датой — иначе оно исчезнет вместе с выполненными задачами. **Validate the file, don't just tidy it.** Before the closure commit, run the format check over the whole of todo.md: six pipe-separated fields per line, id matching `[TFOM]-\d{6}`, effort numeric, priority and status each from its closed list, date ISO — plus no duplicate ids and each section's effort total matching the number stated in its `## vX.Y.Z` header. Read the cards **created during this release** with particular care: filed at smoke or at closure, they passed neither the spec review nor the code review, and they are the only text the release ships without a second reader. `status` is not a place for blockedness — the list is exactly `open` / `in-progress` / `review`, and a blocked task says so in its description. A plan neither compiles nor fails a test; a malformed line is silently wrong for as long as nobody reads it.
-5. **REQ receipts** *(only projects with cross-repo dependencies)* — for each Message/Receipt pair the counterparty closed in this release window, confirm ✓ (the Solo Dev Hub button — deletes the pair on both sides — or the sender's `.impl.md`; skill `sdh-cross-repo-req-send`). A receipt states only what was verified; a claim of smoke or test coverage is grepped in the smoke script and the tests before it is written.
-   - Для каждой закрытой исходящей REQ явно проверить отсутствие обеих половин пары — исходного файла и `.response.md`; закрытая строка реестра сама по себе не доказывает, что файловая пара удалена.
-   - **Расписки, отложенные до выката, уносят перечитывание анонсов с собой.**
-     Оно выполняется там, где пишутся расписки, а не на закрытии. Расхождение
-     правится в самом анонсе, а не только в расписке.
-   - **Announcements sent during this release are re-read against this release's receipts.** An announcement usually goes out before the cause is measured, so it carries a working hypothesis; the receipt written at closure is written from the fact and can contradict it. Nothing else brings those two documents together — and the counterpart reads both, with no way to tell which one is current.
-6. **Verification.** Automated tests / CI green. UI projects: walk the golden path of each changed feature in dev. Backend: exercise the changed endpoints (curl / integration). Verify no regressions in adjacent features, cover empty states and error paths.
-   - **At closure, smoke only what was not run on the accepted candidate.** Items that passed on
-     the candidate are not repeated. Every smoke item that needs no live upstream turn — reads, config keys, admin
-     endpoints, local scripts — runs against the locally restarted build with local credentials.
-     The smoke script is a program too: a wrong parameter name or response shape found on the
-     deployed contour costs a deploy cycle and, when it hides a real defect, an act replay.
-     LenSA Code v1.38.0 paid three such bugs on preprod; v1.39.0 probed the read-only items
-     locally and passed 60/60 on the first preprod run.
-     A local probe proves the script, not the contour: it runs with local keys against a build
-     whose products carry no paid tier, no feature flags, no catalog locks. Before the first
-     deployed run, read the contour's gates on every key the smoke uses (a paid tier, a feature
-     flag, a catalog lock) and make the script open and restore them **by record** — snapshot to
-     a file, open, run, restore in `finally`, verify.
-     A failed snapshot read is not an empty state: when the read does not succeed, the script
-     neither opens nor restores the gate.
-   - **Lint with the exact command CI runs (`golangci-lint run ./...` and its equivalents),
-     never a per-package subset.** A run scoped to "the packages I touched" is green while the
-     new packages it did not name go red on CI — and the red shows up only when the act-1 gate
-     reads the check history.
-   - **A smoke check written for a rule the currently deployed server does not have yet must
-     fail safe, not just fail.** Guard it on the rule being present in this run's own catalog
-     (or on the deployed version), so the dry run against the old stand stops at "not
-     exercised" instead of reaching a paid path through the old code. A check that is red on
-     the old server is expected; a check that spends money there is a defect of the check.
-   - **The smoke covers the surface of THIS release — at least one check per changed or added
-     surface, including commits you did not write — and it is written before the first release
-     act.** A cumulative script stays green about the previous release and feels like coverage.
-   - **A red on your own new check presumes the check guilty; a green that found no data is not
-     coverage.** Call the endpoint directly and compare the real shape with what the check reads
-     before touching the server; after the run, grep your new checks and read what they did.
-   - **A check that counts rows must fail on an empty answer, and the throwaway probe most of
-     all.** A green that found no data is not coverage (above) — but the way it usually happens
-     is not a wrong server, it is a wrong key: the payload key was taken from memory, from a
-     neighbouring endpoint, and the count silently became zero. Some shells then hide it —
-     PowerShell 5.1 turns `@($null | Where-Object {...})` into a one-item array, so the check
-     prints `rows=1` and passes. Two rules: read the field names off one live response before
-     writing the check, and assert `Count -ge N` before comparing anything. This binds hardest
-     to the one-off probe written at closure: the repository's smoke has run history and a
-     reviewer behind it, the throwaway script has neither, and it is the one the release leans
-     on the hour before the act.
-7. **Build / release artifact** *(projects that ship a binary)* — the accepted candidate, built
-   with the release version, is the artifact proof. Do not rebuild at closure; CI builds the tag.
-   No accepted candidate with the release version — build once, before the closure commit.
-
-   **Вердикт сборки читается из её вывода, а не из кода возврата.** Проверено
-   дважды: `flutter build windows --release` печатает `LINK : fatal error` и
-   `Build process failed.`, возвращая при этом **0**; `gh run watch
-   --exit-status` возвращает **0** на красном прогоне. Признак успеха — явная
-   строка результата с путём артефакта; признак провала — любая `error` /
-   `fatal` / `failed` в хвосте. Печатать и перечитывать последние строки —
-   часть шага, а не диагностика на случай проблем.
-
-   Отдельно про блокировку файла: если сборка падает на невозможности записать
-   артефакт, его держит запущенный экземпляр. Спросить владельца, прежде чем
-   снимать процесс — на staged-поверхностях могут висеть несохранённые правки, —
-   и закрывать штатно, а не убивать.
-8. **Schema docs regen** *(any project with a DB — the trigger is the database, not the project type)*. If this release touched the schema (a migration added, a table/column/index/constraint changed), regenerate `docs/schema/` via the project command (typically `bash scripts/schema-docs.sh` or an `npm run schema:docs` wrapper) and stage it with the closure commit. **A desktop app, CLI or tool with an embedded database (SQLite and friends) counts** — the only projects this skips are the ones with no database at all. Generated schema docs are committed documentation: a release that ships a migration without regenerating them leaves the ER diagram and per-table pages lying about the current schema.
-9. **Closure commit.** Stage Changelog + manifest (if any) + `done.md` (if tracked) + `docs/schema/` (if regenerated) + release-only docs in one commit: `chore: vX.Y.Z release closure`. Files unrelated to the release stay outside this commit.
-   Do not commit transient release copy such as "preparing for publication" into a tree that will be tagged: it becomes false as soon as the owner publishes. Use version-only wording that remains true after the tag.
-10. **Tag.** The canonical git block below. **The master/tag commands are run by the user, not the assistant** — show the block and wait.
-
-**Фразы “можно выполнять”, “го”, “отправил” и “закрываем релиз” не являются делегированием owner-only git-блока. Ассистент отдаёт одну команду запуска скрипта выпуска и останавливается. Исключение возможно только по прямой разовой команде владельца самому выполнить merge/tag/push с перечислением этих действий.**
-
-Проверка отправленного тега не подразумевает обязательного ожидания CI.
-
-## Evidence binds to the code, not to the closure commit
-
-The long checks — the full test suite, static analysis, the release build — run
-**once**, on the last commit that changed what they check: tests and analysis on
-the last change to code or tests, the build SHA on the last change to anything
-that lands in the artifact (code, the manifest version, assets).
-
-The documentation commit of closure — Changelog, `done.md`, `todo.md` — does not
-touch the code tree, so it **carries the evidence forward rather than voiding
-it**. Re-running on it checks exactly the same thing at exactly the same price:
-that is a ritual, not a proof.
-
-Hence the order of steps in any closure checklist: the long checks go **before**
-the documentation edits, and the wording is "once", never "again". State the
-binding explicitly — "the numbers are from commit X" — so nobody has to infer it
-from the order of the lines. A candidate already built with the release version needs no rebuild at closure; the version
-bump is not a reason to re-run anything.
-
-The tell that a rule is badly written: the implementer does work that is correct
-to the letter and checks nothing new in substance. Fix the wording, not the
-implementer.
-
-После опубликованного owner-тега не повторять полный check для docs-only правок
-и не опрашивать CI без отдельной просьбы; proof-клоны держать вне test-discovery
-дерева.
-
-## Five things that quietly rot at closure
-
-- **A release task that fixes a filed bug moves that bug to `testing` in the same
-  pass.** Not "I'll mark it later": a bug fixed by this release's code but left at
-  `created` hangs for months and later surfaces as an investigation that finds nothing.
-- **Harness notes about files reverting during the git block are a transient.** While
-  the owner runs the block, the tree sits on another branch for a while and the harness
-  honestly reports "the file changed". Check `git status` after the return — clean means
-  nothing was rolled back and there is nothing to fix.
-- **Marketing-facing docs drift independently of the code.** At closure, grep the README
-  (both locales), its Roadmap section and the header of `docs/roadmap.md` separately for
-  stale counts and versions: they are not updated per task and diverge quietly.
-- **Distinguish architectural support from current build scope.** In outward-facing copy
-  do not write "a Windows application" when the constraint is only that Windows is what
-  currently gets built. Say it as it is: builds are Windows for now, the platform
-  supports more.
-
-- **Anything still to be done by hand becomes an `O-` task in the same pass, not a
-  sentence in the handoff.** A pending step named only in chat — the first remote CI
-  dispatch, a registration, a manual check that was blocked until the merge — dies
-  with the session, and the owner inherits work nobody recorded. If it outlives the
-  release, it gets an id.
-
-  **The `O-` task is written to be run, not decoded.** Its text carries the four things
-  the owner needs at the keyboard: **where** — the screen, path or file; **which field
-  or key** — by its exact name; **what value, in what format** — with a literal example,
-  and whether quotes, a prefix or a trailing path belong in it; **how to confirm it
-  took** — the endpoint or line to read and the value expected there. An id plus a bare
-  address is a pointer, not a handoff: the owner opens the screen and has to ask
-  «where?». Whatever of the four the agent does not know, it finds out before filing
-  the task — not the owner after.
-
-## Closure git commands: exact and terminal-safe
-
-A frequent failure — git commands are improvised differently each session and in a format that breaks in the VS Code terminal. To avoid that:
-
-- **One standing script, one invocation.** The repo keeps one release script with the version
-  as a parameter: `& ".\scripts\release.ps1" -Version 1.9.0`. Do not generate a script per
-  release; do not prove or test it per release.
-- **PowerShell (the VS Code default terminal).** No `&&` (PowerShell 5.1 doesn't understand it).
-- **Clean-tree guard — step 0.** Never emit merge/tag without a prior check: a dirty tree (uncommitted sync, doc edits) breaks `switch`/`merge`. `pull --ff-only` saves you from a non-ff push rejection.
-- **Quiet background processes first.** Before you emit the block, stop any dev/build server you spawned (`npm run tauri dev`, `cargo watch`, `vite`, a `run_in_background` build). Their writes to `target/` / build output dirty the working tree and trip the clean-tree guard — which then reads as a bug in the *script* rather than a stray process you left running. Kill them, confirm `git status` is clean, then show the block.
-- **"Working tree is clean" is the command's output, not your reading of it.** Before handing over the block, run `git status --porcelain` and require it to be **empty**. A line you judge to be "not mine" — an app-synced file, a generated artifact, an editor's leftover — still fails the guard, because the guard knows nothing about authorship. Never report the tree as clean while any line remains: commit it, remove it, or say plainly what is still there and why you are handing the block over anyway. A false "clean" is worse than a dirty tree, because the user acts on it and the refusal lands on them. Watch for one trap in particular: **a file listed in `.gitignore` but still tracked stays dirty forever** — ignore rules do not apply to tracked files — and it will block every release until it is committed or removed from the index with `git rm --cached`.
-- **Warn about the IDE before the act, not after.** While the release script switches branches
-  (integration → release → back), the language server's cache goes stale and the Problems pane
-  fills with `undefined: <symbol>` for every file the release added — eight of them on LenSA
-  Code v1.39.0, and the owner spent attention on it mid-act. The handoff message carries one
-  line: "the IDE will show phantom errors during the act; the compile step is clean, CI is green,
-  restart the language server afterwards". The verdict on the code is the compiler's, never the
-  pane's.
-- **Real values, not placeholders.** Substitute the actual number (`1.9.0`), not `X.Y.Z`.
-- **Branches/flow — from the git-flow section of the project `CLAUDE.md`.** Don't reassemble the sequence. `$MAIN` = the repo's release branch (`master` or `main` — differs by repo). The merge source is the integration branch (usually `dev`).
-- В no-ff процессе отсутствие master среди предков dev само по себе не блокирует выпуск; проверять дерево пробного слияния относительно принятого кандидата.
-- **`switch`, not `checkout`** (safer: won't clobber a file by accident). **Annotated tag** `-a -m` (not lightweight — `release.yml` reads the merge commit as ground truth). **`-m` on merge** (otherwise the editor opens and hangs).
-
-### Release script
-
-- After the owner's approval: closure docs, `git status --porcelain` empty, `dev` pushed,
-  then the owner gets the one command — within 5 minutes.
-- Do not repeat tests, builds or artifact inspection at closure: they ran on the accepted
-  candidate. CI builds the tag.
-- The script owns the order: clean tree → `switch` → `pull --ff-only` → `--no-ff` merge →
-  push → annotated tag → push the tag → back. It checks git exit codes, writes a receipt and
-  resumes; it never force-pushes or replaces a tag. A repo without the script writes it once.
-
-Why `--no-ff`: `$MAIN` gets both the granular dev commits (for blame/bisect/attribution) and an explicit release marker on top; the tag lands on the merge commit. `git log $MAIN --first-parent` shows only release boundaries.
+- One standing script per repo, version as a parameter: `& ".\scripts\release.ps1" -Version 1.9.0`. Do not generate, prove or test a script per release. A repo without one writes it once.
+- The script owns the order: clean tree → `switch` → `pull --ff-only` → `merge --no-ff -m` → push → annotated tag → push tag → back. It checks exit codes, never force-pushes or replaces a tag.
+- Before handing it over: stop every process you started (dev servers, watchers, background builds), push `dev`, and run `git status --porcelain` — it must print nothing. A line you think is "not yours" still fails; commit it, remove it, or say exactly what remains. A gitignored file that is still tracked stays dirty until `git rm --cached`.
+- Real values, not `X.Y.Z`. Branches from the project `CLAUDE.md` (`$MAIN` is `master` or `main`). `switch`, not `checkout`.
+- One line in the handoff: the IDE may show phantom errors while branches switch; restart the language server afterwards.
+- In a no-ff flow, `master` not being an ancestor of `dev` does not block the release.
+- After the tag: do not wait on CI or re-run checks for docs-only edits unless asked; keep proof clones outside the test-discovery tree.
