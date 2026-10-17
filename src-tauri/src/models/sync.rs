@@ -41,6 +41,19 @@ pub struct SyncResult {
     /// at least be visible after the fact.
     #[serde(default)]
     pub rules_taken: Vec<String>,
+    /// T-000207: `<skill> (<repo>)` — markers found beside a copy already equal
+    /// to the rule. The edit they stood for was lost before it was collected;
+    /// the marker is cleared and the rule left as it was.
+    #[serde(default)]
+    pub rules_lost: Vec<String>,
+}
+
+/// T-000207: result of `init_docs_for_repo` — the files written plus what the
+/// rule refresh found, since that command renders the repo's rule copies too.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InitDocsOutcome {
+    pub updated: Vec<String>,
+    pub rules: super::RulesRefresh,
 }
 
 /// F-000041: report from `untrack_files`. `untracked` = total file count

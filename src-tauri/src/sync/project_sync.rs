@@ -29,6 +29,8 @@ struct SyncCounters {
     errors: Vec<String>,
     /// T-000205: skills whose text was taken back out of a flagged repo copy.
     rules_taken: Vec<String>,
+    /// T-000207: `<skill> (<repo>)` markers found beside an already-canonical copy.
+    rules_lost: Vec<String>,
     /// F-000039: base REQ filenames whose pair was auto-closed via `.impl.md`.
     auto_closed: Vec<String>,
     /// T-000137: display names of repos that received an SDH auto-commit of
@@ -44,6 +46,7 @@ impl SyncCounters {
             migrated: 0,
             errors: Vec::new(),
             rules_taken: Vec::new(),
+            rules_lost: Vec::new(),
             auto_closed: Vec::new(),
             committed: Vec::new(),
         }
@@ -56,6 +59,7 @@ impl SyncCounters {
             migrated: self.migrated,
             errors: self.errors,
             rules_taken: self.rules_taken,
+            rules_lost: self.rules_lost,
             auto_closed: self.auto_closed,
             committed: self.committed,
         }
@@ -1012,21 +1016,24 @@ fn run_project_sync_in(
 
     let mut c = SyncCounters::new();
 
-    // T-000205: collect approved rule edits handed back in a repo's own copy —
-    // FIRST, before anything renders into these repos. `write_repo_skeletons`
-    // below overwrites `docs/sdh_skills/` unconditionally, so any other ordering
-    // destroys the edit at the exact moment it was about to be collected.
-    let (rules_taken, uptake_errors) = sync::collect_approved_skill_edits(db, &all_repos);
-    c.errors.extend(uptake_errors);
-    if !rules_taken.is_empty() {
-        // A rule belongs to the whole portfolio, not to the project that
-        // happened to hand it back — push it everywhere before continuing.
-        if let Some(home) = home.as_ref() {
-            let (_, _, errors) = sync::render_skills_everywhere(db, &home.join(".claude"));
-            c.errors.extend(errors);
-        }
-        c.rules_taken = rules_taken;
-    }
+    // T-000205 / T-000207: collect approved rule edits handed back in a repo's
+    // own copy — FIRST, before anything renders, and across the WHOLE portfolio,
+    // not just this project. `write_repo_skeletons` below overwrites
+    // `docs/sdh_skills/` in this project's repos AND in every connected
+    // microservice's server repo (another project), so a collection limited to
+    // `all_repos`, or run any later, destroys an edit at the exact moment it was
+    // about to be collected. An uptake is rendered everywhere by `refresh_rules`
+    // itself: a rule belongs to the whole portfolio.
+    let claude_dir = home.as_ref().map(|h| h.join(".claude"));
+    let rules = sync::refresh_rules(
+        db,
+        claude_dir.as_deref(),
+        sync::RenderScope::UptakeOnly,
+        None,
+    );
+    c.errors.extend(rules.errors);
+    c.rules_taken = rules.taken;
+    c.rules_lost = rules.lost;
 
     // 0.10.0 pre-phase: write project.md + CLAUDE.md section + .gitignore + .gitattributes to all repos.
     // 0.11.0 extends with todo.md + bug-reports.md skeletons.
@@ -1294,6 +1301,169 @@ mod tests {
             .unwrap(),
             edited,
             "and the user-level skills were refreshed in the same pass"
+        );
+    }
+
+    // ── T-000207: hand-backs are collected across the whole portfolio ───────
+
+    /// A seeded, file-backed DB plus a sandbox home. The TempDir guards are
+    /// returned so the files live as long as the test.
+    fn seeded_db() -> (AppDb, TempDir, TempDir) {
+        let db_dir = TempDir::new().unwrap();
+        let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        (db, db_dir, TempDir::new().unwrap())
+    }
+
+    /// Edit the rendered copy of `name` in `repo` and flag it approved, exactly
+    /// as an agent handing a rule back does. Returns the edited text.
+    fn hand_back_edit(repo: &Path, name: &str) -> String {
+        let skills = repo.join("docs").join("sdh_skills");
+        let copy = skills.join(format!("{}.md", name));
+        let edited = format!(
+            "{}
+
+HANDED BACK FROM {}
+",
+            fs::read_to_string(&copy).unwrap(),
+            repo.display()
+        );
+        fs::write(&copy, &edited).unwrap();
+        fs::write(skills.join(format!("{}.md.approved", name)), "").unwrap();
+        edited
+    }
+
+    fn rule_row(db: &AppDb, name: &str) -> crate::models::TemplateFile {
+        db.get_template_file("_global", &format!("skill.{}.md.tmpl", name))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn copy_of(repo: &Path, name: &str) -> String {
+        fs::read_to_string(
+            repo.join("docs")
+                .join("sdh_skills")
+                .join(format!("{}.md", name)),
+        )
+        .unwrap()
+    }
+
+    fn marker_of(repo: &Path, name: &str) -> PathBuf {
+        repo.join("docs")
+            .join("sdh_skills")
+            .join(format!("{}.md.approved", name))
+    }
+
+    /// The live failure behind T-000207: project A's uptake re-rendered every
+    /// repo in the portfolio, wiping an edit still pending in project B, while
+    /// B's marker survived to "take up" the canonical text on B's next sync.
+    #[test]
+    fn test_uptake_in_one_project_keeps_a_pending_edit_in_another() {
+        let (db, _db_dir, home) = seeded_db();
+        let a_dir = TempDir::new().unwrap();
+        let b_dir = TempDir::new().unwrap();
+        let pa = db.create_project("A", None, "standard").unwrap();
+        let pb = db.create_project("B", None, "standard").unwrap();
+        db.insert_local_repository(
+            &a_dir.path().to_string_lossy(),
+            "alpha",
+            Some(pa.id),
+            Some("tool"),
+        )
+        .unwrap();
+        db.insert_local_repository(
+            &b_dir.path().to_string_lossy(),
+            "beta",
+            Some(pb.id),
+            Some("tool"),
+        )
+        .unwrap();
+        sync::render_skills_to_repo(&db, a_dir.path()).unwrap();
+        sync::render_skills_to_repo(&db, b_dir.path()).unwrap();
+        let a_text = hand_back_edit(a_dir.path(), "sdh-debugging");
+        let b_text = hand_back_edit(b_dir.path(), "sdh-retro");
+
+        let result = run_project_sync_in(&db, pa.id, Some(home.path().to_path_buf())).unwrap();
+
+        assert_eq!(rule_row(&db, "sdh-debugging").content, a_text);
+        assert_eq!(
+            rule_row(&db, "sdh-retro").content,
+            b_text,
+            "project B's pending edit became the rule instead of being wiped"
+        );
+        assert_eq!(copy_of(b_dir.path(), "sdh-retro"), b_text);
+        assert!(!marker_of(b_dir.path(), "sdh-retro").exists());
+        assert_eq!(
+            result.rules_taken,
+            vec!["sdh-debugging".to_string(), "sdh-retro".to_string()]
+        );
+    }
+
+    /// `write_repo_skeletons` also renders the server repo of every connected
+    /// microservice — a repo of ANOTHER project. The portfolio collection has
+    /// to run before it, or a hand-back pending there is overwritten in place.
+    #[test]
+    fn test_collection_runs_before_the_skeleton_render_of_a_connected_microservice() {
+        let (db, _db_dir, home) = seeded_db();
+        let srv_dir = TempDir::new().unwrap();
+        let ms_dir = TempDir::new().unwrap();
+        let p = db.create_project("P", None, "standard").unwrap();
+        let ms = db.create_project("M", None, "microservice").unwrap();
+        db.insert_local_repository(
+            &srv_dir.path().to_string_lossy(),
+            "srv",
+            Some(p.id),
+            Some("server"),
+        )
+        .unwrap();
+        db.insert_local_repository(
+            &ms_dir.path().to_string_lossy(),
+            "ms-srv",
+            Some(ms.id),
+            Some("server"),
+        )
+        .unwrap();
+        db.connect_microservice(p.id, ms.id).unwrap();
+        sync::render_skills_to_repo(&db, ms_dir.path()).unwrap();
+        let edited = hand_back_edit(ms_dir.path(), "sdh-debugging");
+
+        let result = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
+
+        assert_eq!(rule_row(&db, "sdh-debugging").content, edited);
+        assert_eq!(copy_of(ms_dir.path(), "sdh-debugging"), edited);
+        assert!(!marker_of(ms_dir.path(), "sdh-debugging").exists());
+        assert_eq!(result.rules_taken, vec!["sdh-debugging".to_string()]);
+    }
+
+    /// A marker beside a copy that already equals the rule means the edit it
+    /// stood for was lost before anyone collected it. Taking that up would
+    /// report a success and mark an untouched rule as a fork.
+    #[test]
+    fn test_marker_beside_a_canonical_copy_is_reported_lost_not_taken() {
+        let (db, _db_dir, home) = seeded_db();
+        let dir = TempDir::new().unwrap();
+        let p = db.create_project("P", None, "standard").unwrap();
+        db.insert_local_repository(
+            &dir.path().to_string_lossy(),
+            "lostrepo",
+            Some(p.id),
+            Some("tool"),
+        )
+        .unwrap();
+        sync::render_skills_to_repo(&db, dir.path()).unwrap();
+        fs::write(marker_of(dir.path(), "sdh-debugging"), "").unwrap();
+
+        let result = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
+
+        assert!(result.rules_taken.is_empty(), "{:?}", result.rules_taken);
+        assert!(
+            !rule_row(&db, "sdh-debugging").is_custom,
+            "an untouched rule must not be marked as a fork"
+        );
+        assert!(!marker_of(dir.path(), "sdh-debugging").exists());
+        assert_eq!(
+            result.rules_lost,
+            vec!["sdh-debugging (lostrepo)".to_string()]
         );
     }
 

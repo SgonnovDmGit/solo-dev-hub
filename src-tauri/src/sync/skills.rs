@@ -4,7 +4,7 @@
 // (`<repo>/docs/sdh_skills/<name>.md`). Single source -> two render targets.
 
 use crate::db::AppDb;
-use crate::models::Repository;
+use crate::models::{Repository, RulesRefresh};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -89,6 +89,15 @@ pub fn render_skills_to_repo(db: &AppDb, repo_base: &Path) -> Result<usize, Stri
 /// touches `sdh-*.md` — leaves it alone.
 const APPROVED_SUFFIX: &str = ".approved";
 
+/// What one collection pass found beside the repo copies.
+#[derive(Debug, Default)]
+struct Collected {
+    taken: Vec<String>,
+    lost: Vec<String>,
+    superseded: Vec<String>,
+    errors: Vec<String>,
+}
+
 /// T-000205: take an approved rule edit back out of a repo's own copy.
 ///
 /// The copies under `docs/sdh_skills/` are normally outputs, rewritten on every
@@ -101,22 +110,34 @@ const APPROVED_SUFFIX: &str = ".approved";
 /// **Order matters and is the whole trap.** This must run before any render pass
 /// touches these repos: the render overwrites unconditionally, so rendering
 /// first destroys the edit at the exact moment it was about to be collected.
+/// That is why it is private and reached only through `refresh_rules`.
 ///
 /// Two repos handing back the same skill with *different* text in one pass is a
 /// conflict: both are refused and their markers left in place. Taking the last
 /// one silently would lose somebody's rule without a trace.
 ///
-/// Returns `(names taken up, errors)`.
-pub fn collect_approved_skill_edits(
+/// T-000207 adds two outcomes that are not an uptake:
+/// - **lost** — the copy beside the marker is byte-equal to the current rule.
+///   The edit the marker stood for was overwritten before anyone collected it;
+///   taking the copy up would report a success and flag an untouched rule as a
+///   fork. The marker is cleared and the loss reported, the rule left alone.
+/// - **superseded** — `settings_edit` names the skill the owner has just saved
+///   in Settings. That explicit edit wins over a pending hand-back of the same
+///   skill: the hand-back is not taken, its marker is cleared, and it is
+///   reported so the owner knows an agent's text was set aside.
+///
+/// Lost and superseded entries read `<skill> (<repo>)`.
+fn collect_approved_skill_edits(
     db: &AppDb,
     repos: &[Repository],
-) -> (Vec<String>, Vec<String>) {
-    let mut errors = Vec::new();
-    let known: HashSet<String> = match list_skill_templates(db) {
-        Ok(v) => v.into_iter().map(|(name, _)| name).collect(),
+    settings_edit: Option<&str>,
+) -> Collected {
+    let mut out = Collected::default();
+    let known: HashMap<String, String> = match list_skill_templates(db) {
+        Ok(v) => v.into_iter().collect(),
         Err(e) => {
-            errors.push(format!("skill list: {}", e));
-            return (Vec::new(), errors);
+            out.errors.push(format!("skill list: {}", e));
+            return out;
         }
     };
 
@@ -143,15 +164,30 @@ pub fn collect_approved_skill_edits(
             let Some(name) = stem.strip_suffix(".md") else {
                 continue;
             };
-            if !known.contains(name) {
-                errors.push(format!(
+            let Some(current) = known.get(name) else {
+                out.errors.push(format!(
                     "{}: {} is flagged but is not a known skill — a rule cannot be invented in a repo copy",
                     label, marker
                 ));
                 continue;
+            };
+            if settings_edit == Some(name) {
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => out.superseded.push(format!("{} ({})", name, label)),
+                    Err(e) => out
+                        .errors
+                        .push(format!("{}: marker not cleared: {}", name, e)),
+                }
+                continue;
             }
             let copy = dir.join(stem);
             match fs::read_to_string(&copy) {
+                Ok(content) if content == *current => match fs::remove_file(entry.path()) {
+                    Ok(()) => out.lost.push(format!("{} ({})", name, label)),
+                    Err(e) => out
+                        .errors
+                        .push(format!("{}: marker not cleared: {}", name, e)),
+                },
                 Ok(content) => {
                     // The marker may carry the approval line. Empty is allowed;
                     // when present it is worth having in the log.
@@ -167,16 +203,17 @@ pub fn collect_approved_skill_edits(
                         entry.path(),
                     ));
                 }
-                Err(e) => errors.push(format!("{}: cannot read {}: {}", label, stem, e)),
+                Err(e) => out
+                    .errors
+                    .push(format!("{}: cannot read {}: {}", label, stem, e)),
             }
         }
     }
 
-    let mut taken = Vec::new();
     for (name, copies) in handed {
         let first = &copies[0].1;
         if let Some(other) = copies.iter().find(|(_, content, _)| content != first) {
-            errors.push(format!(
+            out.errors.push(format!(
                 "{} was handed back with different text by {} and {} — resolve it and re-flag one of them",
                 name, copies[0].0, other.0
             ));
@@ -184,20 +221,91 @@ pub fn collect_approved_skill_edits(
         }
         let file_name = format!("{}{}{}", SKILL_PREFIX, name, SKILL_SUFFIX);
         if let Err(e) = db.upsert_template_file("_global", &file_name, first, true) {
-            errors.push(format!("{}: cannot store the new text: {}", name, e));
+            out.errors
+                .push(format!("{}: cannot store the new text: {}", name, e));
             continue;
         }
         for (_, _, marker) in &copies {
             if let Err(e) = fs::remove_file(marker) {
-                // The text is already stored; a surviving marker would only make
-                // the next sync take up the same text again, which is harmless.
-                errors.push(format!("{}: marker not cleared: {}", name, e));
+                // The text is already stored; a surviving marker now sits beside
+                // a copy equal to the rule, so the next pass reports it as lost
+                // instead of taking it up again.
+                out.errors
+                    .push(format!("{}: marker not cleared: {}", name, e));
             }
         }
-        taken.push(name);
+        out.taken.push(name);
     }
-    taken.sort();
-    (taken, errors)
+    out.taken.sort();
+    out.lost.sort();
+    out.superseded.sort();
+    out
+}
+
+/// What a `refresh_rules` pass renders when nothing was taken up. An uptake
+/// always renders everywhere on top of this — a rule belongs to the whole
+/// portfolio, not to the repo that happened to hand it back.
+pub enum RenderScope<'a> {
+    /// `~/.claude/skills/` plus every repo with a local checkout.
+    Everywhere,
+    /// One checkout only (init docs). `~/.claude/skills/` is left alone.
+    Repo(&'a Path),
+    /// Nothing of its own: the caller renders the repos it owns afterwards
+    /// (a project sync, through `write_repo_skeletons`).
+    UptakeOnly,
+}
+
+/// T-000207: the one entry point that writes rule copies — collect the
+/// hand-backs across the WHOLE portfolio, then render.
+///
+/// Before this, four paths re-rendered copies in every repo without collecting
+/// first (an uptake in another project, startup after a seed, a Settings save,
+/// init docs), so a pending edit anywhere outside the synced project was
+/// overwritten and its surviving marker later "took up" the canonical text.
+/// Collection therefore always covers every repo with a local path, whatever
+/// `scope` renders.
+///
+/// `claude_dir` is `~/.claude`; `None` skips the user-level target only.
+/// `settings_edit` names the skill the owner has just saved in Settings, whose
+/// pending hand-backs are superseded rather than taken.
+pub fn refresh_rules(
+    db: &AppDb,
+    claude_dir: Option<&Path>,
+    scope: RenderScope,
+    settings_edit: Option<&str>,
+) -> RulesRefresh {
+    let mut report = RulesRefresh::default();
+    let repos = match db.list_repos_with_local_path(None) {
+        Ok(v) => v,
+        Err(e) => {
+            report.errors.push(format!("repository list: {}", e));
+            Vec::new()
+        }
+    };
+
+    let collected = collect_approved_skill_edits(db, &repos, settings_edit);
+    report.taken = collected.taken;
+    report.lost = collected.lost;
+    report.superseded = collected.superseded;
+    report.errors.extend(collected.errors);
+
+    let everywhere = !report.taken.is_empty() || matches!(scope, RenderScope::Everywhere);
+    if everywhere {
+        let (skills, touched, errors) = render_skills_everywhere(db, claude_dir, &repos);
+        report.skills = skills;
+        report.repos = touched;
+        report.errors.extend(errors);
+    }
+    if let RenderScope::Repo(base) = scope {
+        // Rendered even after an everywhere pass: the target may not be among
+        // the stored checkouts, and an unchanged file is not rewritten anyway.
+        match render_skills_to_repo(db, base) {
+            Ok(_) if everywhere => {}
+            Ok(_) => report.repos = 1,
+            Err(e) => report.errors.push(format!("{}: {}", base.display(), e)),
+        }
+    }
+    report
 }
 
 /// T-000203: apply the current rule text everywhere an agent reads it from —
@@ -208,23 +316,24 @@ pub fn collect_approved_skill_edits(
 /// (automatic solely for projects opted into auto-sync). An agreed rule could
 /// therefore sit undelivered for days while agents kept working off the old text.
 ///
+/// Private since T-000207: reached only through `refresh_rules`, which collects
+/// the hand-backs in `repos` before this overwrites them.
+///
 /// Returns `(skills, repos, errors)`. Errors are per-target and non-fatal: one
 /// unwritable repo must not stop the rest of the portfolio from being updated.
-pub fn render_skills_everywhere(db: &AppDb, claude_dir: &Path) -> (usize, usize, Vec<String>) {
+fn render_skills_everywhere(
+    db: &AppDb,
+    claude_dir: Option<&Path>,
+    repos: &[Repository],
+) -> (usize, usize, Vec<String>) {
     let mut errors = Vec::new();
-    let skills = match render_skills_global(db, claude_dir) {
-        Ok(n) => n,
-        Err(e) => {
+    let skills = match claude_dir.map(|dir| render_skills_global(db, dir)) {
+        Some(Ok(n)) => n,
+        Some(Err(e)) => {
             errors.push(format!("~/.claude/skills: {}", e));
             0
         }
-    };
-    let repos = match db.list_repos_with_local_path(None) {
-        Ok(v) => v,
-        Err(e) => {
-            errors.push(format!("repository list: {}", e));
-            Vec::new()
-        }
+        None => 0,
     };
     let mut touched = 0;
     for repo in repos {
@@ -249,6 +358,24 @@ pub fn render_skills_everywhere(db: &AppDb, claude_dir: &Path) -> (usize, usize,
         }
     }
     (skills, touched, errors)
+}
+
+/// Startup: seed the bundled templates and, when the seed changed anything,
+/// deliver the rules outwards — collecting first, like every other render.
+/// Returns `None` when the bundle was unchanged and nothing was rendered.
+pub fn deliver_rules_after_seed(
+    db: &AppDb,
+    claude_dir: Option<&Path>,
+) -> Result<Option<RulesRefresh>, String> {
+    match crate::template_seeder::seed_bundled_templates(db)? {
+        0 => Ok(None),
+        _ => Ok(Some(refresh_rules(
+            db,
+            claude_dir,
+            RenderScope::Everywhere,
+            None,
+        ))),
+    }
 }
 
 /// Remove `<claude_dir>/skills/sdh-*` folders that are not in `keep` (the current
@@ -470,7 +597,7 @@ mod tests {
         let (repo, skills) = rendered_repo(&db, &tmp, "a");
         hand_back(&skills, "sdh-alpha", "ALPHA REVISED", "approved 2026-09-02");
 
-        let (taken, errors) = collect_approved_skill_edits(&db, &[repo]);
+        let Collected { taken, errors, .. } = collect_approved_skill_edits(&db, &[repo], None);
 
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
         assert_eq!(taken, vec!["sdh-alpha".to_string()]);
@@ -505,7 +632,7 @@ mod tests {
         let (repo, skills) = rendered_repo(&db, &tmp, "a");
         fs::write(skills.join("sdh-alpha.md"), "SCRIBBLE").unwrap();
 
-        let (taken, errors) = collect_approved_skill_edits(&db, &[repo]);
+        let Collected { taken, errors, .. } = collect_approved_skill_edits(&db, &[repo], None);
 
         assert!(taken.is_empty());
         assert!(errors.is_empty());
@@ -528,7 +655,7 @@ mod tests {
         hand_back(&s1, "sdh-alpha", "VERSION ONE", "");
         hand_back(&s2, "sdh-alpha", "VERSION TWO", "");
 
-        let (taken, errors) = collect_approved_skill_edits(&db, &[r1, r2]);
+        let Collected { taken, errors, .. } = collect_approved_skill_edits(&db, &[r1, r2], None);
 
         assert!(taken.is_empty(), "nothing is taken up on a conflict");
         assert_eq!(errors.len(), 1);
@@ -555,7 +682,7 @@ mod tests {
         hand_back(&s1, "sdh-beta", "AGREED TEXT", "");
         hand_back(&s2, "sdh-beta", "AGREED TEXT", "");
 
-        let (taken, errors) = collect_approved_skill_edits(&db, &[r1, r2]);
+        let Collected { taken, errors, .. } = collect_approved_skill_edits(&db, &[r1, r2], None);
 
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
         assert_eq!(taken, vec!["sdh-beta".to_string()]);
@@ -572,7 +699,7 @@ mod tests {
         let (repo, skills) = rendered_repo(&db, &tmp, "a");
         hand_back(&skills, "sdh-invented", "BRAND NEW RULE", "");
 
-        let (taken, errors) = collect_approved_skill_edits(&db, &[repo]);
+        let Collected { taken, errors, .. } = collect_approved_skill_edits(&db, &[repo], None);
 
         assert!(taken.is_empty());
         assert_eq!(errors.len(), 1);
@@ -588,7 +715,12 @@ mod tests {
         insert_repo(&db, "acme/one", &repo_a.path().to_string_lossy());
         insert_repo(&db, "acme/two", &repo_b.path().to_string_lossy());
 
-        let (skills, repos, errors) = render_skills_everywhere(&db, home.path());
+        let RulesRefresh {
+            skills,
+            repos,
+            errors,
+            ..
+        } = refresh_rules(&db, Some(home.path()), RenderScope::Everywhere, None);
 
         assert_eq!(skills, 2);
         assert_eq!(repos, 2);
@@ -609,7 +741,8 @@ mod tests {
         insert_repo(&db, "acme/live", &live.path().to_string_lossy());
         insert_repo(&db, "acme/ghost", "F:/definitely/not/cloned/here");
 
-        let (_, repos, errors) = render_skills_everywhere(&db, home.path());
+        let RulesRefresh { repos, errors, .. } =
+            refresh_rules(&db, Some(home.path()), RenderScope::Everywhere, None);
 
         assert_eq!(repos, 1, "only the checkout that exists is rendered");
         assert!(
@@ -617,6 +750,50 @@ mod tests {
             "a missing checkout is not an error: {:?}",
             errors
         );
+    }
+
+    // ── T-000207: every render collects across the portfolio first ───────────
+
+    /// Startup re-renders the whole portfolio after a seed that changed
+    /// something. A hand-back waiting in any repo must be taken up first.
+    #[test]
+    fn test_startup_after_seed_collects_before_it_renders() {
+        let tmp = TempDir::new().unwrap();
+        let db = AppDb::new(tmp.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let (_, skills) = rendered_repo(&db, &repo_dir, "pending");
+        let copy = skills.join("sdh-debugging.md");
+        let edited = format!("{}\n\nHANDED BACK\n", fs::read_to_string(&copy).unwrap());
+        hand_back(&skills, "sdh-debugging", &edited, "");
+        // A new build: one bundled file is missing from the DB, so the seed
+        // reports a change and the startup delivery runs.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM templates WHERE language_key = '_global' AND file_name = 'todo.md.tmpl'",
+                [],
+            )
+            .unwrap();
+
+        let report = deliver_rules_after_seed(&db, Some(home.path())).unwrap();
+
+        assert!(
+            report.is_some(),
+            "the seed changed something, so delivery ran"
+        );
+        assert_eq!(
+            db.get_template_file("_global", "skill.sdh-debugging.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            edited,
+            "the pending edit became the rule"
+        );
+        assert_eq!(fs::read_to_string(&copy).unwrap(), edited);
+        assert!(!skills.join("sdh-debugging.md.approved").exists());
     }
 
     /// End-to-end guard: the REAL bundle (via seed_bundled_templates) must carry

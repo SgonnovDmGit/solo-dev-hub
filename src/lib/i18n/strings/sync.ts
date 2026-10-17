@@ -21,6 +21,7 @@ export const ru = {
   'sync.autoClosed': 'Авто-закрыто пар: {0}',
   'sync.committed': 'Авто-коммит в репозиториях: {0}',
   'sync.rulesTaken': 'Правила подобраны из копий агентов и разосланы всем: {0}',
+  'sync.rulesLost': 'Правка правила потеряна до подбора — метка снята, правило не изменено: {0}',
   'sync.willAutoClose': 'Будет авто-закрыт при следующей синхронизации (есть .impl.md)',
   // T-000173: codex broadcast visibility
   'sync.codexIncoming': 'Своды — входящие',
@@ -60,6 +61,7 @@ export const en: Record<keyof typeof ru, string> = {
   'sync.autoClosed': 'Auto-closed pairs: {0}',
   'sync.committed': 'Auto-committed in repos: {0}',
   'sync.rulesTaken': 'Rules taken up from agent copies and pushed to everyone: {0}',
+  'sync.rulesLost': 'A rule edit was lost before it could be taken up — marker cleared, rule unchanged: {0}',
   'sync.willAutoClose': 'Will auto-close on next sync (.impl.md present)',
   'sync.codexIncoming': 'Codices — incoming',
   'sync.codexOutgoing': 'Codex — outgoing',

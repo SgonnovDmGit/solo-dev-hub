@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo } from '$lib/types';
+import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome } from '$lib/types';
 
 
 // ── Requirements sync commands ──────────────────────────────────────────────
@@ -13,8 +13,8 @@ export async function syncGlobalClaudeMd(): Promise<SyncGlobalClaudeResult> {
   return await invoke<SyncGlobalClaudeResult>('sync_global_claude_md');
 }
 
-export async function initDocsForRepo(repoId: number): Promise<string[]> {
-  return invoke<string[]>('init_docs_for_repo', { repoId });
+export async function initDocsForRepo(repoId: number): Promise<InitDocsOutcome> {
+  return invoke<InitDocsOutcome>('init_docs_for_repo', { repoId });
 }
 
 export async function syncProject(projectId: number): Promise<SyncResult> {

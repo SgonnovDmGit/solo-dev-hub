@@ -32,7 +32,17 @@ pub fn sync_global_claude_md(db: State<AppDb>) -> Result<SyncGlobalClaudeResult,
 /// Copies-if-missing: docs/todo.md, docs/bug-reports.md; section-merges .gitignore + .gitattributes.
 /// Returns list of filenames actually created (empty list = all already exist).
 #[tauri::command]
-pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>, String> {
+pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<InitDocsOutcome, String> {
+    init_docs_for_repo_in(&db, dirs::home_dir(), repo_id)
+}
+
+/// The body of `init_docs_for_repo`, with the home directory injected so a test
+/// can run it against a sandbox instead of the real `~/.claude/`.
+fn init_docs_for_repo_in(
+    db: &AppDb,
+    home: Option<std::path::PathBuf>,
+    repo_id: i64,
+) -> Result<InitDocsOutcome, String> {
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
     let path = repo
         .local_path
@@ -78,13 +88,22 @@ pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>,
     // App-owned files (project.md + CLAUDE.md section) — always overwritten when
     // the repo is attached to a project. Orphan repos (project_id=None) skip this
     // since project-context wouldn't render meaningfully.
-    sync::render_skills_to_repo(&db, base)?;
+    // T-000207: through `refresh_rules`, so a hand-back pending in this repo —
+    // or anywhere else in the portfolio — is collected before the render
+    // overwrites it. Failures are reported in `rules.errors`, not fatal.
+    let claude_dir = home.map(|h| h.join(".claude"));
+    let rules = sync::refresh_rules(
+        db,
+        claude_dir.as_deref(),
+        sync::RenderScope::Repo(base),
+        None,
+    );
     updated.push("docs/sdh_skills/".to_string());
     if let Some(pid) = repo.project_id {
-        sync::generate_project_md(&db, pid, base)?;
+        sync::generate_project_md(db, pid, base)?;
         updated.push("docs/project.md".to_string());
         sync::update_claude_md_section(
-            &db,
+            db,
             Some(pid),
             repo.role.as_deref(),
             &base.join("CLAUDE.md"),
@@ -97,7 +116,7 @@ pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>,
         // why project.md / CLAUDE.md weren't updated.
         updated.push("(project.md + CLAUDE.md skipped — repo has no project assigned)".to_string());
     }
-    Ok(updated)
+    Ok(InitDocsOutcome { updated, rules })
 }
 
 // T-000154: runs off the main thread. `run_project_sync` does heavy synchronous
@@ -757,6 +776,57 @@ mod tests {
 
     fn make_db() -> AppDb {
         AppDb::new(PathBuf::from(":memory:")).unwrap()
+    }
+
+    /// T-000207: init docs re-renders one repo's copies. A hand-back pending
+    /// there -- or anywhere else in the portfolio -- is collected first.
+    #[test]
+    fn test_init_docs_collects_before_it_renders() {
+        let db_dir = TempDir::new().unwrap();
+        let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        let home = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let repo = db
+            .insert_local_repository(&target.path().to_string_lossy(), "target", None, None)
+            .unwrap();
+        db.insert_local_repository(&elsewhere.path().to_string_lossy(), "elsewhere", None, None)
+            .unwrap();
+        let mut edits = Vec::new();
+        for (dir, name) in [(&target, "sdh-debugging"), (&elsewhere, "sdh-retro")] {
+            crate::sync::render_skills_to_repo(&db, dir.path()).unwrap();
+            let skills = dir.path().join("docs").join("sdh_skills");
+            let copy = skills.join(format!("{}.md", name));
+            let edited = format!("{}\n\nHANDED BACK\n", fs::read_to_string(&copy).unwrap());
+            fs::write(&copy, &edited).unwrap();
+            fs::write(skills.join(format!("{}.md.approved", name)), "").unwrap();
+            edits.push((dir.path().to_path_buf(), name, edited));
+        }
+
+        let outcome = init_docs_for_repo_in(&db, Some(home.path().to_path_buf()), repo.id).unwrap();
+        assert_eq!(
+            outcome.rules.taken,
+            vec!["sdh-debugging".to_string(), "sdh-retro".to_string()]
+        );
+
+        for (dir, name, edited) in &edits {
+            let skills = dir.join("docs").join("sdh_skills");
+            assert_eq!(
+                db.get_template_file("_global", &format!("skill.{}.md.tmpl", name))
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                *edited,
+                "{} became the rule",
+                name
+            );
+            assert_eq!(
+                fs::read_to_string(skills.join(format!("{}.md", name))).unwrap(),
+                *edited
+            );
+            assert!(!skills.join(format!("{}.md.approved", name)).exists());
+        }
     }
 
     // T-000173: a consumer connected to a codex sees one incoming edge per

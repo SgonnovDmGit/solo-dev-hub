@@ -83,6 +83,14 @@
           'info'
         );
       }
+      // T-000207: a marker beside a copy already equal to the rule — the edit it
+      // stood for was overwritten before anyone collected it. Never silent.
+      if (result.rules_lost.length > 0) {
+        addToast(
+          $tStore('sync.rulesLost' as any).replace('{0}', result.rules_lost.join(', ')),
+          'warning'
+        );
+      }
       await loadRequirements();
     } catch (e) {
       addToast(String(e), 'error');

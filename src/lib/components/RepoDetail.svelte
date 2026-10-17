@@ -24,6 +24,7 @@
   import RepoChangelogTab from './RepoChangelogTab.svelte';
   import DeployScreen from './DeployScreen.svelte';
   import UntrackGitignoredDialog from './UntrackGitignoredDialog.svelte';
+  import { toastRulesFindings } from '$lib/utils/rules-report';
 
   const roleKeys: Role[] = ['server', 'admin_client', 'client', 'test_client', 'landing', 'tool', 'other'];
   const roles = roleKeys.map((key) => [key, getRoleLabel(key)] as [Role, string]);
@@ -263,13 +264,23 @@
   async function handleInitDocs() {
     if (!repo) return;
     try {
-      const created = await initDocsForRepo(repo.id);
+      const outcome = await initDocsForRepo(repo.id);
+      const created = outcome.updated;
       if (created.length === 0) {
         addToast($tStore('toast.docsAlreadyExist' as any), 'info');
       } else {
         addToast(
           $tStore('toast.docsInitialized' as any).replace('{0}', created.join(', ')),
           'success'
+        );
+      }
+      // T-000207: init docs re-renders this repo's rule copies, collecting
+      // pending hand-backs across the portfolio first.
+      toastRulesFindings(outcome.rules);
+      if (outcome.rules.errors.length > 0) {
+        addToast(
+          $tStore('toast.ruleApplyErrors' as any).replace('{0}', outcome.rules.errors.join('; ')),
+          'error'
         );
       }
     } catch (err) {

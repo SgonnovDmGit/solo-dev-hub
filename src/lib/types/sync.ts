@@ -1,4 +1,5 @@
 import type { Repository } from './core';
+import type { RulesRefresh } from './templates';
 
 export interface SyncResult {
   copied: number;
@@ -11,6 +12,14 @@ export interface SyncResult {
   committed: string[];
   /** T-000205: skills whose text was taken back out of a repo's own flagged copy. */
   rules_taken: string[];
+  /** T-000207: `<skill> (<repo>)` — marker beside a copy already equal to the rule; the edit was lost. */
+  rules_lost: string[];
+}
+
+/** T-000207: result of `init_docs_for_repo` — files written plus the rule refresh report. */
+export interface InitDocsOutcome {
+  updated: string[];
+  rules: RulesRefresh;
 }
 
 export interface RequirementInfo {
