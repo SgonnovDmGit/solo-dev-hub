@@ -10,171 +10,55 @@ description: >
   sdh-release-lifecycle and sdh-phase-workflow, not a replacement.
 ---
 
-Use this when a task or release is worked by **more than one AI agent**, each in a
-distinct role, rather than a single agent doing everything. It maps the roles onto
-the existing flow — it does **not** replace it: scoping still follows
-`sdh-phase-workflow`, the release still runs through `sdh-release-lifecycle`, the
-retro still follows `sdh-retro`. This skill only says **who does which part, and how
-the handoff between agents works.**
+An overlay for a release worked by more than one AI agent. Scoping still follows `sdh-phase-workflow`, the release `sdh-release-lifecycle`, the retro `sdh-retro`; this skill says who does which part and how the handoff works. A solo run needs none of it.
 
-Solo (one agent in all roles) is the default and needs none of this. Reach for it the
-moment a second agent enters the loop.
+**Everything below is a default. The owner picks the procedure per release** — who reviews, who fixes review findings, who closes, whether the Implementer runs with full ceremony or a dry run. Follow the owner's choice; use the default only where they said nothing.
 
-## The three roles
+## Roles (default)
 
-Roles are abstract — assign them to whatever models you run. The **recommended
-default mapping**:
-
-| Role | Default agent | Owns |
+| Role | Default | Owns |
 |---|---|---|
-| **Architect** | Claude | Scoping, the written spec, closing the release |
-| **Implementer** | GPT-5.6 | Writing the code/content to the spec |
-| **Reviewer** | by default the Architect — but either agent, or both, may review | Verifying the result against the spec + contracts |
+| Architect | Claude | analysis, spec, stage 10 |
+| Implementer | GPT-5.6 | the build, test, closure docs (stages 7–9) |
+| Reviewer | the Architect; either or both may review | the result against spec and contracts |
 
-Review is done by the spec's author by default (it holds the design intent), but this
-is **not fixed**: both agents may review (cross-review), or either one. The
-**Implementer is always a separate agent** from the spec's author, so the build and
-its verification are never the same hands.
+The Implementer is never the spec's author. The tag / merge / push is always the owner's.
 
-## The loop (flow)
+## Flow
 
-1. **Architect scopes + specs** (with the user), through Analysis → Spec → Spec-review
-   of `sdh-release-lifecycle` / `sdh-phase-workflow`, and gets the user's OK **on the
-   spec**. Nothing goes to the Implementer before the spec is approved.
-2. **Handoff.** The Architect hands over the **approved spec, optionally plus a short
-   pointer note** for the next side (see the handoff contract below).
-3. **Implementer builds.** Task by task, tests first, a commit per task, to the spec.
-   - The **breakdown into tasks/steps is the Implementer's own working artifact** — it
-     needs no user sign-off. The user's single gate was the spec.
-   - The Implementer **stops for the user only at a fork the spec does not cover**. A
-     question it can answer itself → it answers and continues; no "let me ask myself
-     out loud and pause" stops.
-   - **A spec that disagrees with the code is not a fork.** The spec says `A`, the code
-     actually has `B` → that is a factual error in the spec, and it needs no
-     permission: correct to what the code says, continue, and name the correction in
-     the report. Stop only if the correction implies a design choice — semantics
-     changed, a shared contract is touched, the behaviour became different — never for
-     a changed name, path or call signature.
-   - **The report lists every behavioural change made on a shared path as its own
-     numbered deviation** — including changes that look mechanical (a changed
-     condition, a widened guard). The Reviewer reads the report as a map only if it
-     is complete; an unlisted change is a finding.
-   - If the spec is ambiguous, contradicts a test, or has a gap, the Implementer does
-     **not** patch the spec silently — it **raises it to the Architect**, and the
-     **Architect decides who fixes the spec** (fixes it themselves, or hands it back).
-4. **Architect review — optional.** The Architect may review the result (three passes,
-   in order, below); it is **not a mandatory gate**. Any findings go **back to the
-   Implementer** for rework, then re-review. The **shared-contract integrity** pass is
-   recommended whenever the change touches a contract shared between agents, even when
-   the overall review is skipped.
-5. **Implementer closes.** Once any review is clean, the Implementer runs Test →
-   Closure docs (stages 8–9), then hands the **next-release plan** (stage 10) back to
-   the Architect. The git canon block (tag / master-merge / push) stays **user-only**.
-   - **Cleanup after the tag.** The Architect removes the Implementers' worktrees and
-     branches at closure, after the tag (`git worktree remove --force`,
-     `git branch -D`). A squash merge means `git cherry` still lists their commits as
-     `+` — expected, not unmerged work. A worktree found after a compaction is the
-     footprint of the run, not an anomaly.
-6. **Retro** — see ownership below.
+1. The Architect specs with the owner and gets the owner's OK on the spec. Nothing goes to the Implementer before it.
+2. Handoff: the approved spec, optionally with a short pointer note.
+3. The Implementer builds task by task, tests first, a commit per task. Its task breakdown needs no sign-off.
+   - It stops only at a fork the spec does not cover; questions it can answer, it answers.
+   - Spec says A, the code has B → a factual error: correct to the code, continue, name it in the report. Stop only if the correction changes semantics, a shared contract or behaviour.
+   - Every behavioural change on a shared path is its own numbered deviation in the report, mechanical-looking ones included.
+   - Ambiguity, a contradiction with a test, a gap → raise it to the Architect, who decides who fixes the spec. Never patch the spec silently.
+4. Review (optional unless the owner wants it; the shared-contract pass is recommended whenever a shared contract is touched). Default: findings go back to the Implementer, then re-review. If the owner lets the Reviewer fix, the report lists every fix it made.
+5. Closing: by default the Implementer runs Test and the closure docs, then hands stage 10 to the Architect. Whoever does not close: if the release script needs the version commit before the first act, the note says who makes it.
+6. After the tag the Architect removes the Implementers' worktrees and branches (`git worktree remove --force`, `git branch -D`). After a squash merge `git cherry` still shows their commits as `+` — expected.
 
-Stage ownership on the lifecycle: the Architect owns stages 1–6 and 10 (next-release
-plan), plus an optional review of the result; the Implementer owns stages 7–9 (build,
-test, closure docs) and leads the release up to the git block. Retro (stage 11) follows
-the closer per Retro ownership below. No role runs the tag / master-merge — that is
-always the user's.
+## The spec must stand alone
 
-## Handoff contract — the spec, plus an optional note
+The Implementer gets no session, memory or chat — only the spec and an optional note. If it does not fit, the task is not specced enough to hand off.
 
-The Implementer does **not** inherit the Architect's session, memory, or chat. Its
-context is the **spec**, optionally with a **short handoff note** — a focused pointer
-("watch X", "start with Y", context the spec doesn't carry). That's "spec + an
-optional pointer," never "spec and nothing else" — but the note is a pointer, **not a
-substitute** for a self-sufficient spec. The spec itself must stand alone:
+- Full file paths; every decision with its rationale (the Implementer follows the spec literally).
+- `## Verification` the Implementer can run, with checking commands (`cargo fmt --check`, never `cargo fmt`).
+- A case asserting several conditions splits per condition, or prints the state it saw on failure.
+- A task pointing at a model file names the model's known defects not to copy.
+- Grounded: the real conventions from a neighbour file; every claim about what exists (function, test count, field read) with full path, symbol and line; every claim about the runtime, a contract limit or a reachable setting verified at its source and cited. Consumers of a value are found by its constant name **and** by the number itself.
+- No aspirational claims a test would contradict.
 
-- Full file paths, not "the sync module."
-- Every decision with its rationale — the Implementer follows the spec **literally**,
-  so an unstated assumption becomes a wrong build.
-- A `## Verification` section it can run itself, written with **checking, not
-  applying** commands (`cargo fmt --check`, never `cargo fmt`). An applying formatter
-  masks its own diff, and review then sees a clean tree where the work did not match
-  the convention.
-- A case that asserts several conditions either splits into one case per condition
-  or, on failure, prints the state it saw (status, tool errors, rows, values) — the
-  run names the failed condition, nobody guesses it from the code.
-- **Задание, указывающее на образец, называет известные дефекты образца и то,
-  какие из них воспроизводить не надо.** Заведённая на такой дефект карточка
-  этого не заменяет: исполнитель её не читает.
-- **Grounded in the actual codebase.** Before writing the spec, the Architect greps a
-  neighbour file for the real conventions (serde/naming/API shape) and writes those
-  into the spec — the Implementer matches the spec, not the surrounding code it never
-  reads. The same grounding applies to **any claim about what already exists** — "this
-  function does X", "covered by N tests", "the field is already read" — and it is
-  written concretely: full path, real symbol name, line number. The same applies to a
-  claim about what surrounds the code — the runtime's lifecycle (what is loaded when,
-  in which event), a limit in a contract file, that a user can actually reach the
-  setting the spec says they will feel: verified at its source — the platform
-  documentation, the contract, the surface code — and cited in the spec before
-  handoff. The Implementer builds exactly what is written; a wish written as a fact
-  becomes a faithful build of the wish. The spec is the only
-  artifact that survives both a handoff to another agent **and** a compaction of its
-  own author: after one, the codebase is gone from context and a grounded spec is what
-  makes re-reading unnecessary, while a vague one ("the sync module") forces it.
-  Список потребителей значения строится поиском и по имени константы, и по самому числу.
-- No aspirational claims. "Handle all the lanes" that a test contradicts is a spec
-  bug; assert only what is true and testable.
-- Записка называет, кто делает коммит версии до первого выката. Если исполнитель
-  закрытие не ведёт, бамп и Changelog — за архитектором до вручения акта, иначе
-  гвард выката упадёт на константе.
+## Review — three passes, in order
 
-If the context won't fit into spec + a short note, the task isn't specced enough to
-hand off yet — that's the signal, not a reason to backchannel it.
+Large scope → 3–4 reviewers in parallel, one per domain. Verify a critical finding at its location before it reaches the owner.
 
-## Reviewer mandate — three passes
+1. **Spec compliance** — no more, no less. "Kept the existing separate behaviour of X" is a finding until spec or code says why X is separate.
+2. **Shared-contract integrity** — for every shared accessor, cross-repo contract or broadcast edge touched: grep all its consumers and confirm the promise still holds.
+3. **Code quality** — correctness, clarity, behaviour-level tests; test data actually meets the operation's prerequisites.
 
-**Scale the reviewers to the scope.** Whole-project or multi-domain review → dispatch
-**3-4 reviewers in parallel, one per domain**, not a single general one. Measured on
-the same code: 32 findings against 9. The three passes below stay — each reviewer runs
-them inside its own domain.
+- Out-of-scope finding → a `T-` task, never a silent fold.
+- A fix that widens or narrows a predicate names every reader of the same meaning (found by meaning, not by symbol).
 
-**Verify a critical finding before it reaches the owner.** Open the location the
-reviewer cited and confirm it exists and says what was claimed. The false-positive rate
-is not zero, and a critical finding spends the owner's attention first.
+## Retro
 
-Review the **result**, in this order:
-
-1. **Spec compliance** — does it do what the spec said, no more, no less? Extra
-   unrequested work is a finding too. A deviation the Implementer words as "kept the
-   existing separate behaviour/geometry of X" is a finding until the Reviewer has
-   asked why X is separate and got an answer from the spec or the code — the wording
-   makes a divergence look deliberate (an artist composer shipped without voice on
-   the phone behind exactly that sentence).
-2. **Shared-contract integrity** — the highest-value pass. For every shared accessor,
-   cross-repo contract, or broadcast edge the change touched: **grep ALL its consumers
-   and confirm the design promise still holds.** The most-repeated escape in this
-   project is a narrowing done for one consumer that silently dropped another — and it
-   kept reaching the user instead of being caught in review. This pass exists for
-   exactly that.
-3. **Code quality** — correctness, clarity, tests that test behaviour not
-   implementation.
-
-Verify that test data satisfies the operation’s prerequisites and can reach the expected outcome. Do not check only field names and response shapes.
-
-On a finding:
-- **In-scope defect** → back to the Implementer for rework, then re-review. The
-  Reviewer does **not** silently fix it — that erases attribution and hides the gap.
-- **Out-of-scope** finding → a `T-NNNNNN` in `docs/todo.md`, never a silent fold.
-- A finding whose fix widens or narrows a predicate names, in its fix, every reader of that same meaning (send and retry, list and card button) found by searching for the meaning, not the symbol — a fix aimed at one reader opens one door of two.
-
-## Retro ownership
-
-The retro follows `sdh-retro` and is **expected at closure unless the user explicitly
-skips it**. In a multi-agent run it **may** split by role — each agent from its own
-vantage into its own memory — but it **does not have to**: **one agent writing the
-whole retro is enough, and is the default.** Who writes it (one agent or both) is the
-user's call; absent a request, the agent that closes the release writes it. A solo run
-keeps `sdh-retro` unchanged.
-
-Memory is ordinary Markdown on disk, not one agent's privilege: whoever closes writes
-the whole retro, project memory included, into that project's memory directory. Skill
-lessons it does not edit but **nominates** — the "Editing a skill" gate in the global
-rules applies identically to every role.
+Expected at closure unless the owner skips it. One agent writes the whole retro — by default the one that closed; the owner may ask both. Memory is plain files any agent can write. Skill lessons are nominated, never edited (global rules, "Editing a skill").
