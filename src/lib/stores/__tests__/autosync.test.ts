@@ -73,7 +73,7 @@ describe('auto-sync rule findings', () => {
   });
 
   it('stays quiet on ordinary errors and when no rule changed', async () => {
-    syncProject.mockResolvedValue(result({ errors: ['No server found in project'] }));
+    syncProject.mockResolvedValue(result({ errors: [{ code: 'missing_counterpart', subject: 'P', target: 'server' }] }));
     await runOneTick();
     expect(syncProject).toHaveBeenCalledWith(7);
     expect(addToast).not.toHaveBeenCalled();

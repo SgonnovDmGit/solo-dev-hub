@@ -1,3 +1,5 @@
+import type { SyncIssue } from './sync';
+
 export interface TemplateFile {
   language_key: string;
   file_name: string;
@@ -12,7 +14,7 @@ export interface TemplateSaveOutcome {
   rendered: boolean;
   skills: number;
   repos: number;
-  errors: string[];
+  errors: SyncIssue[];
   /** T-000207: hand-backs of other skills taken up before the render. */
   taken: string[];
   /** T-000207: `<skill> (<repo>)` — marker beside a copy already equal to the rule. */
@@ -27,7 +29,7 @@ export interface RulesRefresh {
   taken: string[];
   lost: string[];
   superseded: string[];
-  errors: string[];
+  errors: SyncIssue[];
   skills: number;
   repos: number;
 }

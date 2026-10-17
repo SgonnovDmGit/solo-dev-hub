@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { onMount } from 'svelte';
   import '../app.css';
   import { currentScreen, navigateTo, goBack } from '$lib/stores/ui';
@@ -57,7 +58,7 @@
       if (!report) return;
       toastRulesFindings(report);
       if (report.errors.length > 0) {
-        addToast(tf('toast.rulesStartupErrors', report.errors.join('; ')), 'warning');
+        addToast(tf('toast.rulesStartupErrors', formatSyncIssues(report.errors)), 'warning');
       }
     } catch (e) {
       console.warn('startup rules report unavailable', e);

@@ -22,7 +22,7 @@ pub struct TemplateSaveOutcome {
     pub repos: usize,
     /// Per-target render failures. The DB write already succeeded — an edit is
     /// never lost because one render target was unwritable.
-    pub errors: Vec<String>,
+    pub errors: Vec<super::SyncIssue>,
     /// T-000207: hand-backs of OTHER skills taken up before the render.
     #[serde(default)]
     pub taken: Vec<String>,
@@ -51,7 +51,7 @@ pub struct RulesRefresh {
     /// saved in Settings — not taken, marker cleared.
     pub superseded: Vec<String>,
     /// Non-fatal per-item failures (collection and render).
-    pub errors: Vec<String>,
+    pub errors: Vec<super::SyncIssue>,
     /// Skills written to `~/.claude/skills/` (0 when that target was not rendered).
     pub skills: usize,
     /// Repos whose `docs/sdh_skills/` was rendered.

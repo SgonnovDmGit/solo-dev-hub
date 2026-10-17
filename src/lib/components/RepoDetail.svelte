@@ -1,10 +1,11 @@
 <script lang="ts">
+  import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { open } from '@tauri-apps/plugin-dialog';
   import { allRepos, assignRepo, loadAllRepos } from '$lib/stores/repos';
   import { projects } from '$lib/stores/projects';
   import { currentScreen, selectedRepoId, deployDrillTarget } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
-  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch } from '$lib/api/tauri-commands';
+  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch } from '$lib/api/tauri-commands';
   import type { RepoRename } from '$lib/types';
   import { deleteRepoOnGitHub, splitRepoFullName, listBranches, type BranchInfo } from '$lib/api/github';
   import { addToast } from '$lib/stores/ui';
@@ -42,6 +43,18 @@
   // from GitHub — needs a PAT and a full `owner/repo` name; the field stays a
   // free-text input, so an empty list just means no autocomplete (offline / no PAT).
   let branches = $state<BranchInfo[]>([]);
+  // T-000198: the branch the checkout is on now — read live on open, never
+  // stored. A mismatch with the configured branch pauses auto-commit; that is
+  // repo state, shown here, not a sync error repeated on every sync.
+  let currentBranch = $state<string | null>(null);
+  const autocommitPaused = $derived(
+    autocommitBranch !== '' && currentBranch !== null && currentBranch !== autocommitBranch,
+  );
+  // The paused-line template split around its {0} / {1} placeholders, so the
+  // branch names can be rendered as code.
+  const autocommitPausedParts = $derived(
+    $tStore('repoDetail.autocommitPaused' as any).split(/(\{[01]\})/),
+  );
 
   async function loadRenames() {
     if (!repo) { renames = []; return; }
@@ -85,9 +98,22 @@
   // on `main` then reports "expected dev" on every sync, for a setting nobody
   // chose. Auto-commit writes commits — it is opt-in, always. The branch list is
   // still loaded for the picker; nothing is written.
+  async function loadCurrentBranch() {
+    currentBranch = null;
+    const id = repo?.id;
+    if (id === undefined || !repo?.local_path) return;
+    try {
+      const branch = await getRepoCurrentBranch(id);
+      // The repo may have changed while git ran.
+      if (repo?.id === id) currentBranch = branch;
+    } catch {
+      currentBranch = null;
+    }
+  }
+
   async function loadAutocommitState() {
     await loadAutocommitBranch();
-    await loadBranches();
+    await Promise.all([loadCurrentBranch(), loadBranches()]);
   }
 
   $effect(() => {
@@ -279,7 +305,7 @@
       toastRulesFindings(outcome.rules);
       if (outcome.rules.errors.length > 0) {
         addToast(
-          $tStore('toast.ruleApplyErrors' as any).replace('{0}', outcome.rules.errors.join('; ')),
+          $tStore('toast.ruleApplyErrors' as any).replace('{0}', formatSyncIssues(outcome.rules.errors)),
           'error'
         );
       }
@@ -458,6 +484,15 @@
           <span class="btn-label">{$tStore('repo.deleteButton' as any)}</span>
         </button>
       </div>
+
+      {#if autocommitPaused}
+        <div class="autocommit-status" title={$tStore('repoDetail.autocommitHint' as any)}>
+          ⏸
+          {#each autocommitPausedParts as part, i (i)}
+            {#if part === '{0}'}<code>{currentBranch}</code>{:else if part === '{1}'}<code>{autocommitBranch}</code>{:else}{part}{/if}
+          {/each}
+        </div>
+      {/if}
     </div>
 
     <!-- F-021: Tabs navigation. Order: Bugs → Tasks → Secrets → Stats (B-003). -->
@@ -847,6 +882,17 @@
 
   .local-path.warn {
     color: #f59e0b;
+  }
+
+  /* T-000198: auto-commit paused because the checkout is on another branch. */
+  .autocommit-status {
+    font-size: 12px;
+    color: var(--toast-warning, #d97706);
+    padding-top: 4px;
+  }
+
+  .autocommit-status code {
+    font-family: monospace;
   }
 
   .mini {

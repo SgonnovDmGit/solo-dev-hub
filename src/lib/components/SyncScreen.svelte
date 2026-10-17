@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { selectedProjectId, currentScreen } from '$lib/stores/ui';
   import { addToast } from '$lib/stores/ui';
   import { allRepos } from '$lib/stores/repos';
@@ -65,7 +66,9 @@
       }
       addToast(msg, 'success');
       if (result.errors.length > 0) {
-        addToast($tStore('sync.errors').replace('{0}', result.errors.join('; ')), 'warning');
+        // T-000198: one translated line per issue under a counted header.
+        const header = $tStore('sync.errors').replace('{0}', String(result.errors.length));
+        addToast(`${header}\n${formatSyncIssues(result.errors)}`, 'warning');
       }
       // F-000039: report REQ pairs auto-closed via .impl.md acknowledgement.
       if (result.auto_closed.length > 0) {

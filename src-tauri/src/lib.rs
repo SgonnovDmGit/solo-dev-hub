@@ -70,7 +70,9 @@ pub fn run() {
     let startup_rules =
         sync::deliver_rules_at_startup(&db, claude_dir.as_deref()).and_then(|report| {
             if !report.errors.is_empty() {
-                eprintln!("Warning: rule delivery at startup: {:?}", report.errors);
+                for issue in &report.errors {
+                    eprintln!("Warning: rule delivery at startup: {}", issue);
+                }
             }
             // Only when something was actually rendered — a report can carry
             // collection findings alone.
@@ -219,6 +221,7 @@ pub fn run() {
             // T-000137: per-repo auto-commit branch selector
             commands::sync::get_autocommit_branch,
             commands::sync::set_autocommit_branch,
+            commands::sync::get_repo_current_branch,
             // Templates (0.6.0)
             commands::templates::list_template_languages,
             commands::templates::list_template_files,

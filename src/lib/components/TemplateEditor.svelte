@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { addToast } from '$lib/stores/ui';
   import { tStore } from '$lib/i18n';
   import { listTemplateFiles, saveTemplateFile, resetTemplateFile } from '$lib/api/tauri-commands';
@@ -72,7 +73,7 @@
         toastRulesFindings(outcome);
         if (outcome.errors.length > 0) {
           addToast(
-            $tStore('toast.ruleApplyErrors' as any).replace('{0}', outcome.errors.join('; ')),
+            $tStore('toast.ruleApplyErrors' as any).replace('{0}', formatSyncIssues(outcome.errors)),
             'error'
           );
         }

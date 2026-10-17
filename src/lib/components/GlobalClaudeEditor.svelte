@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { toastRulesFindings } from '$lib/utils/rules-report';
   import { onMount } from 'svelte';
   import { currentScreen, addToast } from '$lib/stores/ui';
@@ -70,7 +71,7 @@
       // T-000207: the render collected pending hand-backs first — name them.
       toastRulesFindings(result.rules);
       if (result.rules.errors.length > 0) {
-        addToast($tStore('toast.ruleApplyErrors' as any).replace('{0}', result.rules.errors.join('; ')), 'error');
+        addToast($tStore('toast.ruleApplyErrors' as any).replace('{0}', formatSyncIssues(result.rules.errors)), 'error');
       }
       addToast(
         $tStore('appDefaults.syncGlobalDone' as any).replace('{0}', result.path),

@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::db::AppDb;
-use crate::models::{Repository, SyncResult};
+use crate::models::{Repository, SyncIssue, SyncIssueCode as Code, SyncResult};
 use crate::sync;
 
 /// Mutable accumulator for one `run_project_sync` pass. `copied` counts REQ /
@@ -26,7 +26,7 @@ struct SyncCounters {
     copied: usize,
     responses: usize,
     migrated: usize,
-    errors: Vec<String>,
+    errors: Vec<SyncIssue>,
     /// T-000205: skills whose text was taken back out of a flagged repo copy.
     rules_taken: Vec<String>,
     /// T-000207: `<skill> (<repo>)` markers found beside an already-canonical copy.
@@ -52,6 +52,22 @@ impl SyncCounters {
         }
     }
 
+    /// Record an issue once per pass. T-000198: two passes can meet the same
+    /// fact — the rule refresh and the skeleton pass both render a held copy,
+    /// a missing repo root is hit by the skeleton and the directional pass —
+    /// and the owner should read it once.
+    fn push(&mut self, issue: SyncIssue) {
+        if !self.errors.contains(&issue) {
+            self.errors.push(issue);
+        }
+    }
+
+    fn extend(&mut self, issues: impl IntoIterator<Item = SyncIssue>) {
+        for issue in issues {
+            self.push(issue);
+        }
+    }
+
     fn into_result(self) -> SyncResult {
         SyncResult {
             copied: self.copied,
@@ -64,6 +80,68 @@ impl SyncCounters {
             committed: self.committed,
         }
     }
+}
+
+// ── T-000198: issue builders shared by the directional passes ──────────────
+
+/// `file` could not be copied into `target` (a repo, or a side of a pair).
+fn copy_failed(file: &str, target: &str, e: impl std::fmt::Display) -> SyncIssue {
+    SyncIssue::new(Code::CopyFailed, file)
+        .target(target)
+        .detail(e)
+}
+
+fn no_local_path(repo: &Repository) -> SyncIssue {
+    SyncIssue::new(Code::NoLocalPath, repo.display_name())
+}
+
+/// `ensure_root_exists` failed. The detail is the path, not its English message.
+fn root_missing(repo: &Repository) -> SyncIssue {
+    let issue = SyncIssue::new(Code::RootMissing, repo.display_name());
+    match repo.local_path.as_deref() {
+        Some(p) => issue.detail(p),
+        None => issue,
+    }
+}
+
+/// Both the old and the new folder exist under `parent`.
+fn rename_collision(old: &str, new: &str, parent: &Path) -> SyncIssue {
+    let parent = parent
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| parent.display().to_string());
+    SyncIssue::new(Code::RenameCollision, old)
+        .target(new)
+        .detail(format!("{}/", parent))
+}
+
+fn rename_failed(old: &str, new: &str, e: impl std::fmt::Display) -> SyncIssue {
+    SyncIssue::new(Code::RenameReplayFailed, old)
+        .target(new)
+        .detail(e)
+}
+
+/// The rename log of `what` could not be read from the database.
+fn renames_lookup(what: &str, e: impl std::fmt::Display) -> SyncIssue {
+    SyncIssue::new(Code::LookupFailed, format!("renames of {}", what)).detail(e)
+}
+
+fn auto_close_failed(counterpart: &str, e: impl std::fmt::Display) -> SyncIssue {
+    SyncIssue::new(Code::ReqAutoCloseFailed, counterpart).detail(e)
+}
+
+/// A Case B / Case C migration warning, kept verbatim as the detail.
+fn migration_issue(subject: &str, detail: impl std::fmt::Display) -> SyncIssue {
+    SyncIssue::new(Code::MigrationFailed, subject).detail(detail)
+}
+
+/// A connected microservice project resolves no server repo.
+fn no_server_repo(db: &AppDb, ms_project_id: i64) -> SyncIssue {
+    let name = db
+        .get_project(ms_project_id)
+        .map(|p| p.name)
+        .unwrap_or_else(|_| format!("#{}", ms_project_id));
+    SyncIssue::new(Code::MissingCounterpart, name).target("server")
 }
 
 /// The four `_global` doc templates written to every repo during Phase-0.
@@ -106,33 +184,38 @@ fn write_repo_skeletons(
     tpl: &SkeletonTemplates,
     c: &mut SyncCounters,
 ) {
+    let file_issue = |file: &str, e: String| {
+        SyncIssue::new(Code::ManagedFileFailed, label)
+            .target(file)
+            .detail(e)
+    };
     if let Err(e) = sync::generate_project_md(db, md_project_id, base) {
-        c.errors.push(format!("project.md for {}: {}", label, e));
+        c.push(file_issue("docs/project.md", e));
     }
     if let Err(e) =
         sync::update_claude_md_section(db, Some(md_project_id), role, &base.join("CLAUDE.md"))
     {
-        c.errors.push(format!("CLAUDE.md for {}: {}", label, e));
+        c.push(file_issue("CLAUDE.md", e));
     }
     // Runs only after `refresh_rules` collected across the portfolio (see
     // `run_project_sync_in`); a copy still flagged after that is held, not written.
+    // After an uptake the refresh has already rendered and reported this repo;
+    // `push` keeps each held copy to one line.
     match sync::render_skills_to_repo(db, base) {
-        Ok(r) => c.errors.extend(r.held_errors(label)),
-        Err(e) => c.errors.push(format!("sdh_skills for {}: {}", label, e)),
+        Ok(r) => c.extend(r.held_issues(label)),
+        Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
     }
     if let Err(e) = sync::sync_gitignore_section(&tpl.gitignore, base) {
-        c.errors.push(format!(".gitignore for {}: {}", label, e));
+        c.push(file_issue(".gitignore", e));
     }
     if let Err(e) = sync::sync_gitattributes_section(&tpl.gitattributes, base) {
-        c.errors
-            .push(format!(".gitattributes for {}: {}", label, e));
+        c.push(file_issue(".gitattributes", e));
     }
     if let Err(e) = sync::copy_doc_skeleton_if_missing(&tpl.todo, base, "todo.md") {
-        c.errors.push(format!("todo.md for {}: {}", label, e));
+        c.push(file_issue("docs/todo.md", e));
     }
     if let Err(e) = sync::copy_doc_skeleton_if_missing(&tpl.bug_reports, base, "bug-reports.md") {
-        c.errors
-            .push(format!("bug-reports.md for {}: {}", label, e));
+        c.push(file_issue("docs/bug-reports.md", e));
     }
 }
 
@@ -140,19 +223,21 @@ fn write_repo_skeletons(
 /// handlers.md propagation. `srv_base` is the server repo root.
 fn sync_client_to_server(
     db: &AppDb,
+    srv: &Repository,
     srv_base: &Path,
     clients: &[&Repository],
     c: &mut SyncCounters,
 ) {
+    let srv_name = srv.display_name();
     for client in clients {
         if let Some(ref client_path) = client.local_path {
             let client_base = Path::new(client_path);
             // B-001: skip clients whose folder was moved/deleted.
-            if let Err(e) = sync::ensure_root_exists(client_base) {
-                c.errors
-                    .push(format!("Client {}: {}", client.display_name(), e));
+            if sync::ensure_root_exists(client_base).is_err() {
+                c.push(root_missing(client));
                 continue;
             }
+            let client_label = client.display_name();
             let client_req_dir = client_base.join("docs").join("backend-requirements");
             // F-033: canonical_folder_name() is the single source of truth.
             let client_name = client.canonical_folder_name();
@@ -168,31 +253,23 @@ fn sync_client_to_server(
                         ) {
                             Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                             Ok(sync::RenameOutcome::NoOp) => {}
-                            Ok(sync::RenameOutcome::Collision) => c.errors.push(format!(
-                                "Rename collision on server side: both {}/ and {}/ exist under client-requirements — manual intervention needed",
-                                r.old_canonical, r.new_canonical
+                            Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
+                                &r.old_canonical,
+                                &r.new_canonical,
+                                &client_requirements_parent,
                             )),
-                            Err(e) => c.errors.push(format!(
-                                "Rename replay {} → {} on server: {}",
-                                r.old_canonical, r.new_canonical, e
-                            )),
+                            Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                         }
                     }
                 }
-                Err(e) => c
-                    .errors
-                    .push(format!("List renames for client {}: {}", client.id, e)),
+                Err(e) => c.push(renames_lookup(&client_label, e)),
             }
             let srv_client_dir = client_requirements_parent.join(&client_name);
 
             // F-000039: auto-close pairs the client (sender) acknowledged via .impl.md.
             match sync::auto_close_impl_pairs(&client_req_dir, &srv_client_dir) {
                 Ok(closed) => c.auto_closed.extend(closed),
-                Err(e) => c.errors.push(format!(
-                    "Auto-close impl -> {}: {}",
-                    client.display_name(),
-                    e
-                )),
+                Err(e) => c.push(auto_close_failed(&client_label, e)),
             }
 
             // Copy REQ-*.md from client (source of truth) to server.
@@ -203,7 +280,7 @@ fn sync_client_to_server(
                 match sync::copy_file_if_changed(&src, &dst) {
                     Ok(true) => c.copied += 1,
                     Ok(false) => {}
-                    Err(e) => c.errors.push(format!("Copy {} -> server: {}", req_file, e)),
+                    Err(e) => c.push(copy_failed(&req_file, &srv_name, e)),
                 }
             }
 
@@ -215,9 +292,7 @@ fn sync_client_to_server(
                 match sync::copy_file_if_changed(&src, &dst) {
                     Ok(true) => c.responses += 1,
                     Ok(false) => {}
-                    Err(e) => c
-                        .errors
-                        .push(format!("Copy {} -> client: {}", resp_file, e)),
+                    Err(e) => c.push(copy_failed(&resp_file, &client_label, e)),
                 }
             }
 
@@ -228,10 +303,9 @@ fn sync_client_to_server(
             if old_api.exists() && !new_api.exists() {
                 match sync::migrate_file(&old_api, &new_api) {
                     Ok(()) => c.migrated += 1,
-                    Err(e) => c.errors.push(format!(
-                        "Migrate api.md on {}: {}",
-                        client.display_name(),
-                        e
+                    Err(e) => c.push(migration_issue(
+                        &format!("{}: docs/api.md", client_label),
+                        e,
                     )),
                 }
             }
@@ -242,10 +316,7 @@ fn sync_client_to_server(
                 match sync::copy_file_if_changed(&srv_api, &new_api) {
                     Ok(true) => c.copied += 1,
                     Ok(false) => {}
-                    Err(e) => {
-                        c.errors
-                            .push(format!("Copy api.md -> {}: {}", client.display_name(), e))
-                    }
+                    Err(e) => c.push(copy_failed("api.md", &client_label, e)),
                 }
             }
             // M5 review-fix: `api.md` absent → silent skip, symmetric
@@ -267,11 +338,7 @@ fn sync_client_to_server(
                 match sync::copy_file_if_changed(&srv_handlers, &client_handlers) {
                     Ok(true) => c.copied += 1,
                     Ok(false) => {}
-                    Err(e) => c.errors.push(format!(
-                        "Copy handlers.md -> {}: {}",
-                        client.display_name(),
-                        e
-                    )),
+                    Err(e) => c.push(copy_failed("handlers.md", &client_label, e)),
                 }
             }
 
@@ -281,9 +348,7 @@ fn sync_client_to_server(
                 &client_base.join("docs").join("server-api"),
             ) {
                 Ok(n) => c.copied += n,
-                Err(e) => c
-                    .errors
-                    .push(format!("Copy my_api -> {}: {}", client.display_name(), e)),
+                Err(e) => c.push(copy_failed("docs/my_api/", &client_label, e)),
             }
         }
     }
@@ -310,40 +375,33 @@ fn sync_server_to_microservice(
     for ms_project_id in microservice_ids {
         let ms_server_repo = match db.server_repo_of_microservice(*ms_project_id) {
             Ok(r) => r,
-            Err(e) => {
-                c.errors
-                    .push(format!("Microservice project {}: {}", ms_project_id, e));
+            Err(_) => {
+                c.push(no_server_repo(db, *ms_project_id));
                 continue;
             }
         };
         let ms_path = match ms_server_repo.local_path.as_deref() {
             Some(p) => p,
             None => {
-                c.errors.push(format!(
-                    "Microservice server-repo {} has no local_path",
-                    ms_server_repo.display_name()
-                ));
+                c.push(no_local_path(&ms_server_repo));
                 continue;
             }
         };
         let ms_base = Path::new(ms_path);
         // B-001: skip microservices whose folder was moved/deleted.
-        if let Err(e) = sync::ensure_root_exists(ms_base) {
-            c.errors.push(format!(
-                "Microservice {}: {}",
-                ms_server_repo.display_name(),
-                e
-            ));
+        if sync::ensure_root_exists(ms_base).is_err() {
+            c.push(root_missing(&ms_server_repo));
             continue;
         }
+        let ms_label = ms_server_repo.display_name();
         // Resolve microservice-project name for subfolder on server side.
         let ms_project = match db.get_project(*ms_project_id) {
             Ok(p) => p,
             Err(e) => {
-                c.errors.push(format!(
-                    "Microservice project {} lookup: {}",
-                    ms_project_id, e
-                ));
+                c.push(
+                    SyncIssue::new(Code::LookupFailed, format!("project #{}", ms_project_id))
+                        .detail(e),
+                );
                 continue;
             }
         };
@@ -366,12 +424,13 @@ fn sync_server_to_microservice(
             ) {
                 Ok(true) => c.migrated += 1,
                 Ok(false) => {}
-                Err(e) => c.errors.push(format!(
-                    "Case B migrate {} → {}: {}",
-                    ms_name, ms_canonical, e
+                Err(e) => c.push(migration_issue(
+                    &format!("{} → {}", ms_name, ms_canonical),
+                    e,
                 )),
             }
-            c.errors.append(&mut case_b_warnings);
+            let subject = format!("{} → {}", ms_name, ms_canonical);
+            c.extend(case_b_warnings.iter().map(|w| migration_issue(&subject, w)));
         }
 
         // F-033 Stage 1e: replay ms-server-repo renames on parent side (microservice-requirements/).
@@ -385,21 +444,16 @@ fn sync_server_to_microservice(
                     ) {
                         Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                         Ok(sync::RenameOutcome::NoOp) => {}
-                        Ok(sync::RenameOutcome::Collision) => c.errors.push(format!(
-                            "Rename collision on server side: both {}/ and {}/ exist under microservice-requirements — manual intervention needed",
-                            r.old_canonical, r.new_canonical
+                        Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
+                            &r.old_canonical,
+                            &r.new_canonical,
+                            &ms_req_parent,
                         )),
-                        Err(e) => c.errors.push(format!(
-                            "Rename replay {} → {} on server: {}",
-                            r.old_canonical, r.new_canonical, e
-                        )),
+                        Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                     }
                 }
             }
-            Err(e) => c.errors.push(format!(
-                "List renames for ms-server-repo {}: {}",
-                ms_server_repo.id, e
-            )),
+            Err(e) => c.push(renames_lookup(&ms_label, e)),
         }
 
         // T-000092: replay ms-PROJECT renames on parent side
@@ -413,21 +467,14 @@ fn sync_server_to_microservice(
                     match sync::replay_rename_in_dir(&ms_api_parent, &r.old_name, &r.new_name) {
                         Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                         Ok(sync::RenameOutcome::NoOp) => {}
-                        Ok(sync::RenameOutcome::Collision) => c.errors.push(format!(
-                            "Rename collision on parent side: both {}/ and {}/ exist under microservice-api — manual intervention needed",
-                            r.old_name, r.new_name
-                        )),
-                        Err(e) => c.errors.push(format!(
-                            "Project rename replay {} → {} on parent: {}",
-                            r.old_name, r.new_name, e
-                        )),
+                        Ok(sync::RenameOutcome::Collision) => {
+                            c.push(rename_collision(&r.old_name, &r.new_name, &ms_api_parent))
+                        }
+                        Err(e) => c.push(rename_failed(&r.old_name, &r.new_name, e)),
                     }
                 }
             }
-            Err(e) => c.errors.push(format!(
-                "List renames for ms-project {}: {}",
-                ms_project_id, e
-            )),
+            Err(e) => c.push(renames_lookup(&ms_name, e)),
         }
 
         // F-033 Stage 1e: replay server renames on ms side (server-requirements/).
@@ -441,20 +488,16 @@ fn sync_server_to_microservice(
                     ) {
                         Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                         Ok(sync::RenameOutcome::NoOp) => {}
-                        Ok(sync::RenameOutcome::Collision) => c.errors.push(format!(
-                            "Rename collision on microservice side: both {}/ and {}/ exist under server-requirements — manual intervention needed",
-                            r.old_canonical, r.new_canonical
+                        Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
+                            &r.old_canonical,
+                            &r.new_canonical,
+                            &ms_srv_parent,
                         )),
-                        Err(e) => c.errors.push(format!(
-                            "Rename replay {} → {} on microservice: {}",
-                            r.old_canonical, r.new_canonical, e
-                        )),
+                        Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                     }
                 }
             }
-            Err(e) => c
-                .errors
-                .push(format!("List renames for server {}: {}", srv.id, e)),
+            Err(e) => c.push(renames_lookup(&srv.display_name(), e)),
         }
 
         // F-033 Stage 1f Case C: migrate flat server-requirements/*.md to nested
@@ -486,9 +529,13 @@ fn sync_server_to_microservice(
             let mut case_c_warnings = Vec::new();
             match sync::migrate_flat_to_nested(&ms_srv_parent, lookup, &mut case_c_warnings) {
                 Ok(n) => c.migrated += n,
-                Err(e) => c.errors.push(format!("Case C migration: {}", e)),
+                Err(e) => c.push(migration_issue(&ms_label, e)),
             }
-            c.errors.append(&mut case_c_warnings);
+            c.extend(
+                case_c_warnings
+                    .iter()
+                    .map(|w| migration_issue(&ms_label, w)),
+            );
         }
 
         let srv_ms_dir = ms_req_parent.join(&ms_canonical);
@@ -498,9 +545,7 @@ fn sync_server_to_microservice(
         // F-000039: auto-close pairs the server (sender) acknowledged via .impl.md.
         match sync::auto_close_impl_pairs(&srv_ms_dir, &ms_srv_dir) {
             Ok(closed) => c.auto_closed.extend(closed),
-            Err(e) => c
-                .errors
-                .push(format!("Auto-close impl (server->ms): {}", e)),
+            Err(e) => c.push(auto_close_failed(&ms_label, e)),
         }
 
         // Copy REQ-*.md from server (source of truth) to microservice server-repo.
@@ -511,9 +556,7 @@ fn sync_server_to_microservice(
             match sync::copy_file_if_changed(&src, &dst) {
                 Ok(true) => c.copied += 1,
                 Ok(false) => {}
-                Err(e) => c
-                    .errors
-                    .push(format!("Copy {} -> microservice: {}", req_file, e)),
+                Err(e) => c.push(copy_failed(&req_file, &ms_label, e)),
             }
         }
 
@@ -525,9 +568,7 @@ fn sync_server_to_microservice(
             match sync::copy_file_if_changed(&src, &dst) {
                 Ok(true) => c.responses += 1,
                 Ok(false) => {}
-                Err(e) => c
-                    .errors
-                    .push(format!("Copy {} -> server: {}", resp_file, e)),
+                Err(e) => c.push(copy_failed(&resp_file, &srv.display_name(), e)),
             }
         }
 
@@ -546,10 +587,10 @@ fn sync_server_to_microservice(
                 match sync::copy_file_if_changed(&ms_api_src, &ms_api_dst) {
                     Ok(true) => c.copied += 1,
                     Ok(false) => {}
-                    Err(e) => c.errors.push(format!(
-                        "Copy ms api.md from {}: {}",
-                        ms_server_repo.display_name(),
-                        e
+                    Err(e) => c.push(copy_failed(
+                        &format!("{}: api.md", ms_label),
+                        &srv.display_name(),
+                        e,
                     )),
                 }
             }
@@ -563,10 +604,10 @@ fn sync_server_to_microservice(
                 match sync::copy_file_if_changed(&ms_handlers_src, &ms_handlers_dst) {
                     Ok(true) => c.copied += 1,
                     Ok(false) => {}
-                    Err(e) => c.errors.push(format!(
-                        "Copy ms handlers.md from {}: {}",
-                        ms_server_repo.display_name(),
-                        e
+                    Err(e) => c.push(copy_failed(
+                        &format!("{}: handlers.md", ms_label),
+                        &srv.display_name(),
+                        e,
                     )),
                 }
             }
@@ -580,10 +621,10 @@ fn sync_server_to_microservice(
                     .join(&ms_name),
             ) {
                 Ok(n) => c.copied += n,
-                Err(e) => c.errors.push(format!(
-                    "Copy ms my_api from {}: {}",
-                    ms_server_repo.display_name(),
-                    e
+                Err(e) => c.push(copy_failed(
+                    &format!("{}: docs/my_api/", ms_label),
+                    &srv.display_name(),
+                    e,
                 )),
             }
         }
@@ -611,9 +652,8 @@ fn sync_microservice_to_parents(
 ) {
     if let Some(ref ms_path) = ms_server.local_path {
         let ms_base = Path::new(ms_path);
-        if let Err(e) = sync::ensure_root_exists(ms_base) {
-            c.errors
-                .push(format!("Microservice {}: {}", ms_server.display_name(), e));
+        if sync::ensure_root_exists(ms_base).is_err() {
+            c.push(root_missing(ms_server));
         } else {
             let ms_canonical = ms_server.canonical_folder_name();
             let ms_project_name = db
@@ -627,8 +667,13 @@ fn sync_microservice_to_parents(
                 let parent_repos = match db.list_repos_by_project(Some(parent_project.id)) {
                     Ok(r) => r,
                     Err(e) => {
-                        c.errors
-                            .push(format!("Parent {} list repos: {}", parent_project.name, e));
+                        c.push(
+                            SyncIssue::new(
+                                Code::LookupFailed,
+                                format!("repos of {}", parent_project.name),
+                            )
+                            .detail(e),
+                        );
                         continue;
                     }
                 };
@@ -636,30 +681,22 @@ fn sync_microservice_to_parents(
                     .iter()
                     .find(|r| r.role.as_deref() == Some("server"))
                 else {
-                    c.errors.push(format!(
-                        "Parent {}: no server-repo found",
-                        parent_project.name
-                    ));
+                    c.push(
+                        SyncIssue::new(Code::MissingCounterpart, parent_project.name.clone())
+                            .target("server"),
+                    );
                     continue;
                 };
                 let Some(ref parent_local) = parent_server.local_path else {
-                    c.errors.push(format!(
-                        "Parent {} ({}): server-repo has no local_path",
-                        parent_project.name,
-                        parent_server.display_name()
-                    ));
+                    c.push(no_local_path(parent_server));
                     continue;
                 };
                 let parent_base = Path::new(parent_local);
-                if let Err(e) = sync::ensure_root_exists(parent_base) {
-                    c.errors.push(format!(
-                        "Parent {} ({}): {}",
-                        parent_project.name,
-                        parent_server.display_name(),
-                        e
-                    ));
+                if sync::ensure_root_exists(parent_base).is_err() {
+                    c.push(root_missing(parent_server));
                     continue;
                 }
+                let parent_label = parent_server.display_name();
                 let parent_canonical = parent_server.canonical_folder_name();
 
                 // MS → parent: api.md + handlers.md + my_api. T-000172: skipped
@@ -678,10 +715,7 @@ fn sync_microservice_to_parents(
                         match sync::copy_file_if_changed(&src, &dst) {
                             Ok(true) => c.copied += 1,
                             Ok(false) => {}
-                            Err(e) => c.errors.push(format!(
-                                "Copy {} -> parent {}: {}",
-                                filename, parent_project.name, e
-                            )),
+                            Err(e) => c.push(copy_failed(filename, &parent_label, e)),
                         }
                     }
 
@@ -694,7 +728,7 @@ fn sync_microservice_to_parents(
                             .join(&ms_project_name),
                     ) {
                         Ok(n) => c.copied += n,
-                        Err(e) => c.errors.push(format!("Copy ms my_api -> parent: {}", e)),
+                        Err(e) => c.push(copy_failed("docs/my_api/", &parent_label, e)),
                     }
                 }
 
@@ -711,9 +745,7 @@ fn sync_microservice_to_parents(
                 // F-000039: auto-close pairs the parent server (sender) acknowledged via .impl.md.
                 match sync::auto_close_impl_pairs(&parent_ms_dir, &ms_parent_dir) {
                     Ok(closed) => c.auto_closed.extend(closed),
-                    Err(e) => c
-                        .errors
-                        .push(format!("Auto-close impl (parent->ms): {}", e)),
+                    Err(e) => c.push(auto_close_failed(&parent_label, e)),
                 }
 
                 for req_file in sync::scan_requirements(&parent_ms_dir) {
@@ -722,10 +754,7 @@ fn sync_microservice_to_parents(
                     match sync::copy_file_if_changed(&src, &dst) {
                         Ok(true) => c.copied += 1,
                         Ok(false) => {}
-                        Err(e) => c.errors.push(format!(
-                            "Copy {} from parent {} to MS: {}",
-                            req_file, parent_project.name, e
-                        )),
+                        Err(e) => c.push(copy_failed(&req_file, &ms_server.display_name(), e)),
                     }
                 }
 
@@ -736,10 +765,7 @@ fn sync_microservice_to_parents(
                     match sync::copy_file_if_changed(&src, &dst) {
                         Ok(true) => c.responses += 1,
                         Ok(false) => {}
-                        Err(e) => c.errors.push(format!(
-                            "Copy {} from MS to parent {}: {}",
-                            resp_file, parent_project.name, e
-                        )),
+                        Err(e) => c.push(copy_failed(&resp_file, &parent_label, e)),
                     }
                 }
             }
@@ -760,7 +786,7 @@ fn run_codex_broadcast(db: &AppDb, project_id: i64, project_type: &str, c: &mut 
     let mut fold = |o: sync::CodexBroadcastOutcome| {
         c.copied += o.copied;
         c.migrated += o.pruned;
-        c.errors.extend(o.errors);
+        c.extend(o.errors);
     };
     // Consumer-driven: pull each connected codex into this project.
     for codex_id in db.list_connected_codices(project_id).unwrap_or_default() {
@@ -813,21 +839,16 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
                 ) {
                     Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                     Ok(sync::RenameOutcome::NoOp) => {}
-                    Ok(sync::RenameOutcome::Collision) => c.errors.push(format!(
-                        "Rename collision on consumer side: both {}/ and {}/ exist under microservice-requirements — manual intervention needed",
-                        r.old_canonical, r.new_canonical
+                    Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
+                        &r.old_canonical,
+                        &r.new_canonical,
+                        &sender_req_parent,
                     )),
-                    Err(e) => c.errors.push(format!(
-                        "Rename replay {} → {} on consumer: {}",
-                        r.old_canonical, r.new_canonical, e
-                    )),
+                    Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                 }
             }
         }
-        Err(e) => c.errors.push(format!(
-            "List renames for codex repo {}: {}",
-            recipient.id, e
-        )),
+        Err(e) => c.push(renames_lookup(&recipient.display_name(), e)),
     }
 
     // Replay sender (consumer) repo renames on the recipient's server-requirements/ side.
@@ -841,29 +862,22 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
                 ) {
                     Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                     Ok(sync::RenameOutcome::NoOp) => {}
-                    Ok(sync::RenameOutcome::Collision) => c.errors.push(format!(
-                        "Rename collision on codex side: both {}/ and {}/ exist under server-requirements — manual intervention needed",
-                        r.old_canonical, r.new_canonical
+                    Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
+                        &r.old_canonical,
+                        &r.new_canonical,
+                        &recipient_srv_parent,
                     )),
-                    Err(e) => c.errors.push(format!(
-                        "Rename replay {} → {} on codex: {}",
-                        r.old_canonical, r.new_canonical, e
-                    )),
+                    Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                 }
             }
         }
-        Err(e) => c.errors.push(format!(
-            "List renames for consumer repo {}: {}",
-            sender.id, e
-        )),
+        Err(e) => c.push(renames_lookup(&sender.display_name(), e)),
     }
 
     // F-000039: auto-close pairs the consumer (sender) acknowledged via .impl.md.
     match sync::auto_close_impl_pairs(&sender_dir, &recipient_dir) {
         Ok(closed) => c.auto_closed.extend(closed),
-        Err(e) => c
-            .errors
-            .push(format!("Auto-close impl (consumer->codex): {}", e)),
+        Err(e) => c.push(auto_close_failed(&recipient.display_name(), e)),
     }
 
     // Copy REQ-*.md from consumer (source of truth) to codex.
@@ -873,7 +887,7 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
         match sync::copy_file_if_changed(&src, &dst) {
             Ok(true) => c.copied += 1,
             Ok(false) => {}
-            Err(e) => c.errors.push(format!("Copy {} -> codex: {}", req_file, e)),
+            Err(e) => c.push(copy_failed(&req_file, &recipient.display_name(), e)),
         }
     }
 
@@ -884,9 +898,7 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
         match sync::copy_file_if_changed(&src, &dst) {
             Ok(true) => c.responses += 1,
             Ok(false) => {}
-            Err(e) => c
-                .errors
-                .push(format!("Copy {} -> consumer: {}", resp_file, e)),
+            Err(e) => c.push(copy_failed(&resp_file, &sender.display_name(), e)),
         }
     }
 }
@@ -910,7 +922,7 @@ fn run_peer_channels(db: &AppDb, project_id: i64, c: &mut SyncCounters) {
     c.copied += o.copied;
     c.migrated += o.pruned;
     c.auto_closed.extend(o.closed);
-    c.errors.extend(o.errors);
+    c.extend(o.errors);
 }
 
 fn run_codex_req_channels(db: &AppDb, project_id: i64, project_type: &str, c: &mut SyncCounters) {
@@ -920,20 +932,12 @@ fn run_codex_req_channels(db: &AppDb, project_id: i64, project_type: &str, c: &m
     // Returns None (after pushing an error) otherwise.
     let guard = |repo: &Repository, c: &mut SyncCounters| -> bool {
         let Some(ref lp) = repo.local_path else {
-            c.errors.push(format!(
-                "Codex REQ: {} repo {} has no local_path",
-                repo.role.as_deref().unwrap_or("?"),
-                repo.display_name()
-            ));
+            c.push(no_local_path(repo));
             return false;
         };
         let base = Path::new(lp);
         if sync::ensure_root_exists(base).is_err() {
-            c.errors.push(format!(
-                "Codex REQ: {} repo {} root missing",
-                repo.role.as_deref().unwrap_or("?"),
-                repo.display_name()
-            ));
+            c.push(root_missing(repo));
             return false;
         }
         true
@@ -1034,7 +1038,7 @@ pub(crate) fn run_project_sync_in(
         sync::RenderScope::UptakeOnly,
         None,
     );
-    c.errors.extend(rules.errors);
+    c.extend(rules.errors);
     c.rules_taken = rules.taken;
     c.rules_lost = rules.lost;
 
@@ -1047,18 +1051,12 @@ pub(crate) fn run_project_sync_in(
         let Some(path) = repo.local_path.as_deref() else {
             // B-000002: surface silently-skipped repos so user sees why project.md /
             // CLAUDE.md / .gitignore weren't written for this repo.
-            c.errors.push(format!(
-                "Repo {}: no local_path set — project.md / CLAUDE.md / .gitignore skipped",
-                label
-            ));
+            c.push(no_local_path(repo));
             continue;
         };
         let base = Path::new(path);
-        if let Err(e) = sync::ensure_root_exists(base) {
-            c.errors.push(format!(
-                "Repo {}: {} — project.md / CLAUDE.md / .gitignore skipped",
-                label, e
-            ));
+        if sync::ensure_root_exists(base).is_err() {
+            c.push(root_missing(repo));
             continue;
         }
         write_repo_skeletons(
@@ -1073,26 +1071,17 @@ pub(crate) fn run_project_sync_in(
     }
     for ms_id in &microservice_ids {
         let Ok(ms_server) = db.server_repo_of_microservice(*ms_id) else {
-            c.errors.push(format!(
-                "Microservice project {}: no server-repo resolved — project.md skipped",
-                ms_id
-            ));
+            c.push(no_server_repo(db, *ms_id));
             continue;
         };
         let label = ms_server.display_name();
         let Some(path) = ms_server.local_path.as_deref() else {
-            c.errors.push(format!(
-                "Microservice {}: no local_path set — project.md skipped",
-                label
-            ));
+            c.push(no_local_path(&ms_server));
             continue;
         };
         let base = Path::new(path);
-        if let Err(e) = sync::ensure_root_exists(base) {
-            c.errors.push(format!(
-                "Microservice {}: {} — project.md skipped",
-                label, e
-            ));
+        if sync::ensure_root_exists(base).is_err() {
+            c.push(root_missing(&ms_server));
             continue;
         }
         write_repo_skeletons(
@@ -1109,9 +1098,12 @@ pub(crate) fn run_project_sync_in(
     // Server/client checks only matter for `standard` project type. A
     // `microservice` project intentionally has neither — surfacing those as
     // errors produces false-positive warning toasts on every sync.
-    let project_type = db
-        .get_project(project_id)
-        .ok()
+    let project = db.get_project(project_id).ok();
+    let project_name = project
+        .as_ref()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| format!("#{}", project_id));
+    let project_type = project
         .map(|p| p.project_type)
         .unwrap_or_else(|| "standard".to_string());
     if project_type == "standard" {
@@ -1121,28 +1113,26 @@ pub(crate) fn run_project_sync_in(
         // trains the user to ignore them. The "No server" case stays a
         // warning because the server is the core of the standard flow.
         if server.is_none() {
-            c.errors.push("No server found in project".to_string());
+            c.push(SyncIssue::new(Code::MissingCounterpart, project_name.clone()).target("server"));
         } else if clients.is_empty() {
-            c.errors.push("No clients found in project".to_string());
+            c.push(SyncIssue::new(Code::MissingCounterpart, project_name.clone()).target("client"));
         }
     }
 
     if let Some(srv) = server {
         if srv.local_path.is_none() {
-            c.errors
-                .push(format!("Server {} has no local_path", srv.display_name()));
+            c.push(no_local_path(srv));
         }
         if let Some(ref srv_path) = srv.local_path {
             let srv_base = Path::new(srv_path);
 
             // B-001: guard — do not silently recreate a moved/deleted server folder.
-            if let Err(e) = sync::ensure_root_exists(srv_base) {
-                c.errors
-                    .push(format!("Server {}: {}", srv.display_name(), e));
+            if sync::ensure_root_exists(srv_base).is_err() {
+                c.push(root_missing(srv));
                 return Ok(c.into_result());
             }
 
-            sync_client_to_server(db, srv_base, &clients, &mut c);
+            sync_client_to_server(db, srv, srv_base, &clients, &mut c);
             sync_server_to_microservice(db, srv, srv_base, &microservice_ids, false, &mut c);
         }
     }
@@ -1186,25 +1176,19 @@ pub(crate) fn run_project_sync_in(
                         Ok(crate::git_ops::CommitOutcome::Committed { .. }) => {
                             c.committed.push(repo.display_name());
                         }
-                        Ok(crate::git_ops::CommitOutcome::WrongBranch { current, expected }) => {
-                            c.errors.push(format!(
-                                "Auto-commit skipped for {}: on branch {:?}, expected {}",
-                                repo.display_name(),
-                                current,
-                                expected
-                            ));
-                        }
+                        // T-000198: a repo on another branch is repo state, not a
+                        // sync failure — RepoDetail shows it beside the branch
+                        // setting. Reporting it here repeated it on every sync of
+                        // every project, since this loop walks the portfolio.
+                        Ok(crate::git_ops::CommitOutcome::WrongBranch { .. }) => {}
                         Ok(crate::git_ops::CommitOutcome::NothingToCommit) => {}
-                        Err(e) => {
-                            c.errors
-                                .push(format!("Auto-commit {}: {}", repo.display_name(), e))
-                        }
+                        Err(e) => c.push(
+                            SyncIssue::new(Code::AutocommitFailed, repo.display_name()).detail(e),
+                        ),
                     }
                 }
             }
-            Err(e) => c
-                .errors
-                .push(format!("Auto-commit: failed to list repos: {}", e)),
+            Err(e) => c.push(SyncIssue::new(Code::LookupFailed, "auto-commit repos").detail(e)),
         }
     }
 
@@ -1414,6 +1398,92 @@ mod tests {
         assert_eq!(copy_of(ms_dir.path(), "sdh-debugging"), edited);
         assert!(!marker_of(ms_dir.path(), "sdh-debugging").exists());
         assert_eq!(result.rules_taken, vec!["sdh-debugging".to_string()]);
+    }
+
+    /// T-000198: in a sync that takes a rule up, `refresh_rules` renders every
+    /// repo (reporting held copies) and the skeleton pass renders this project's
+    /// repos again. A held copy must still be reported once per pass.
+    #[test]
+    fn test_held_copy_is_reported_once_in_an_uptake_sync() {
+        let (db, _db_dir, home) = seeded_db();
+        let a_dir = TempDir::new().unwrap();
+        let b_dir = TempDir::new().unwrap();
+        let p = db.create_project("P", None, "standard").unwrap();
+        for (dir, name) in [(&a_dir, "alpha"), (&b_dir, "beta")] {
+            db.insert_local_repository(
+                &dir.path().to_string_lossy(),
+                name,
+                Some(p.id),
+                Some("tool"),
+            )
+            .unwrap();
+            sync::render_skills_to_repo(&db, dir.path()).unwrap();
+        }
+        // An uptake, so the refresh renders everywhere...
+        hand_back_edit(a_dir.path(), "sdh-debugging");
+        // ...and a conflict (different text per repo), so both copies are held.
+        hand_back_edit(a_dir.path(), "sdh-retro");
+        hand_back_edit(b_dir.path(), "sdh-retro");
+
+        let result = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
+
+        assert_eq!(result.rules_taken, vec!["sdh-debugging".to_string()]);
+        let held: Vec<_> = result
+            .errors
+            .iter()
+            .filter(|e| e.code == Code::RuleHeld)
+            .collect();
+        assert_eq!(held.len(), 2, "one per held copy: {:?}", held);
+    }
+
+    /// T-000198: a repo whose checkout is on another branch than its configured
+    /// auto-commit branch is repo state (shown in RepoDetail), not a sync error.
+    /// The auto-commit loop walks the whole portfolio, so as an error it was
+    /// repeated on every sync of every project.
+    #[test]
+    fn test_autocommit_on_another_branch_is_not_a_sync_issue() {
+        let (db, _db_dir, home) = seeded_db();
+        let dir = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {:?}: {:?}", args, out);
+        };
+        git(&["init", "-q"]);
+        git(&["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        git(&[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        let p = db.create_project("P", None, "standard").unwrap();
+        let repo = db
+            .insert_local_repository(
+                &dir.path().to_string_lossy(),
+                "wb",
+                Some(p.id),
+                Some("server"),
+            )
+            .unwrap();
+        db.set_autocommit_branch(repo.id, Some("master")).unwrap();
+
+        let result = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
+
+        assert!(result.committed.is_empty());
+        assert!(
+            !result.errors.iter().any(|e| e.subject == "wb"),
+            "{:?}",
+            result.errors
+        );
     }
 
     /// A marker beside a copy that already equals the rule means the edit it
@@ -1877,7 +1947,9 @@ mod tests {
         // templates and no server repo, which the other passes report.
         let r = run_project_sync(&db, p.id).unwrap();
         assert!(
-            !r.errors.iter().any(|e| e.starts_with("Peer channel")),
+            !r.errors
+                .iter()
+                .any(|e| matches!(e.code, Code::PeerChannelFailed | Code::VersionConflict)),
             "{:?}",
             r.errors
         );

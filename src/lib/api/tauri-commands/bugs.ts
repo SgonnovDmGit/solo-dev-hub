@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { FileBugNote, ReadBugsResult, BugView, MigrationReport } from '$lib/types';
+import type { FileBugNote, ReadBugsResult, BugView, MigrationReport, SyncIssue } from '$lib/types';
 
 
 // ── File-based Bug commands ──────────────────────────────────────────────────
@@ -26,7 +26,7 @@ export async function reconcileBugsForRepo(repoId: number): Promise<void> {
 
 export interface ReconcileAllReport {
   repos_scanned: number;
-  errors: string[];
+  errors: SyncIssue[];
 }
 
 /** Portfolio-wide MD→DB reconcile for bugs + tasks (no cross-repo file copies). */

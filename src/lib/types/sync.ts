@@ -1,11 +1,42 @@
 import type { Repository } from './core';
 import type { RulesRefresh } from './templates';
 
+/** T-000198: family of a non-fatal sync issue. Mirrors `SyncIssueCode` in
+ *  `models/sync.rs` (serde snake_case). Translated by `formatSyncIssue` via the
+ *  i18n key `syncIssue.<code>`. */
+export type SyncIssueCode =
+  | 'copy_failed'
+  | 'no_local_path'
+  | 'root_missing'
+  | 'rename_collision'
+  | 'rename_replay_failed'
+  | 'lookup_failed'
+  | 'missing_counterpart'
+  | 'managed_file_failed'
+  | 'peer_channel_failed'
+  | 'version_conflict'
+  | 'req_auto_close_failed'
+  | 'migration_failed'
+  | 'autocommit_failed'
+  | 'rule_unknown_skill'
+  | 'rule_held'
+  | 'rule_failed';
+
+/** T-000198: one non-fatal issue of a sync-like pass. Mirrors `SyncIssue` in
+ *  `models/sync.rs`; absent `target` / `detail` are omitted keys, not null.
+ *  `detail` is raw OS / git / DB text and is never translated. */
+export interface SyncIssue {
+  code: SyncIssueCode;
+  subject: string;
+  target?: string;
+  detail?: string;
+}
+
 export interface SyncResult {
   copied: number;
   responses: number;
   migrated: number;
-  errors: string[];
+  errors: SyncIssue[];
   /** F-000039: base REQ filenames whose pair was auto-closed via a sender `.impl.md` drop. */
   auto_closed: string[];
   /** T-000137: display names of repos that received an SDH auto-commit of synced cross-repo files. */

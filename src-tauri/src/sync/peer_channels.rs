@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::db::AppDb;
-use crate::models::Repository;
+use crate::models::{Repository, SyncIssue, SyncIssueCode as Code};
 use crate::sync;
 
 /// Channel root under `docs/`.
@@ -48,7 +48,7 @@ pub struct PeerChannelOutcome {
     /// Base filenames of exchanges closed by a marker this pass.
     pub closed: Vec<String>,
     /// Non-fatal per-pair failures surfaced to the user.
-    pub errors: Vec<String>,
+    pub errors: Vec<SyncIssue>,
 }
 
 pub fn channel_root(base: &Path) -> PathBuf {
@@ -147,6 +147,11 @@ fn ensure_skeleton(base: &Path, peer: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A failed peer-channel step on `subject` (a repo, file or folder).
+fn peer_issue(subject: impl Into<String>, e: impl std::fmt::Display) -> SyncIssue {
+    SyncIssue::new(Code::PeerChannelFailed, subject).detail(e)
+}
+
 /// Remove every exchange whose author dropped a closing marker, from ALL the
 /// directories that hold a copy of it.
 ///
@@ -177,10 +182,7 @@ fn close_marked(dirs: &[PathBuf], marker: &str, companions: &[&str], out: &mut P
                 if path.exists() {
                     match std::fs::remove_file(&path) {
                         Ok(()) => out.pruned += 1,
-                        Err(e) => {
-                            out.errors
-                                .push(format!("Peer channel: {}: {}", path.display(), e))
-                        }
+                        Err(e) => out.errors.push(peer_issue(path.display().to_string(), e)),
                     }
                 }
             }
@@ -198,7 +200,7 @@ fn mirror_outbox(src: &Path, dst: &Path, out: &mut PeerChannelOutcome) {
             out.copied += o.copied;
             out.pruned += o.pruned;
         }
-        Err(e) => out.errors.push(format!("Peer channel outbox->inbox: {e}")),
+        Err(e) => out.errors.push(peer_issue(dst.display().to_string(), e)),
     }
 }
 
@@ -213,7 +215,9 @@ fn mirror_outbox(src: &Path, dst: &Path, out: &mut PeerChannelOutcome) {
 /// Equal timestamps with differing content cannot be attributed to either
 /// author, so nothing is written and the pair is reported. Under the
 /// "one file, one writer" rule that state means someone edited a replica.
-fn union_pacts(a: &Path, b: &Path, out: &mut PeerChannelOutcome) {
+///
+/// `sides` names the two repos, for the report.
+fn union_pacts(a: &Path, b: &Path, sides: &str, out: &mut PeerChannelOutcome) {
     let mut names = scan_md(a, |_| true);
     for name in scan_md(b, |_| true) {
         if !names.contains(&name) {
@@ -231,7 +235,7 @@ fn union_pacts(a: &Path, b: &Path, out: &mut PeerChannelOutcome) {
             (true, true) => {
                 let (Ok(ca), Ok(cb)) = (std::fs::read(&pa), std::fs::read(&pb)) else {
                     out.errors
-                        .push(format!("Peer channel pact: cannot read {name}"));
+                        .push(SyncIssue::new(Code::PeerChannelFailed, name.clone()).target(sides));
                     continue;
                 };
                 if ca == cb {
@@ -240,10 +244,9 @@ fn union_pacts(a: &Path, b: &Path, out: &mut PeerChannelOutcome) {
                 match (mtime(&pa), mtime(&pb)) {
                     (Some(ta), Some(tb)) if ta > tb => copy_one(&pa, &pb, out),
                     (Some(ta), Some(tb)) if tb > ta => copy_one(&pb, &pa, out),
-                    _ => out.errors.push(format!(
-                        "Peer channel pact: {name} differs on both sides with the same \
-                         timestamp — one file has two writers, resolve by hand"
-                    )),
+                    _ => out
+                        .errors
+                        .push(SyncIssue::new(Code::VersionConflict, name.clone()).target(sides)),
                 }
             }
             (false, false) => {}
@@ -255,7 +258,7 @@ fn copy_one(src: &Path, dst: &Path, out: &mut PeerChannelOutcome) {
     match sync::copy_file_if_changed(src, dst) {
         Ok(true) => out.copied += 1,
         Ok(false) => {}
-        Err(e) => out.errors.push(format!("Peer channel pact copy: {e}")),
+        Err(e) => out.errors.push(peer_issue(dst.display().to_string(), e)),
     }
 }
 
@@ -280,11 +283,9 @@ pub fn sync_peer_pair(a: &Repository, b: &Repository) -> PeerChannelOutcome {
     let b_base = Path::new(b_local);
     for (base, repo) in [(a_base, a), (b_base, b)] {
         if sync::ensure_root_exists(base).is_err() {
-            out.errors.push(format!(
-                "Peer channel: repo {} root missing ({})",
-                repo.display_name(),
-                base.display()
-            ));
+            out.errors.push(
+                SyncIssue::new(Code::RootMissing, repo.display_name()).detail(base.display()),
+            );
             return out;
         }
     }
@@ -293,11 +294,11 @@ pub fn sync_peer_pair(a: &Repository, b: &Repository) -> PeerChannelOutcome {
     let b_name = b.canonical_folder_name();
 
     if let Err(e) = ensure_skeleton(a_base, &b_name) {
-        out.errors.push(format!("Peer channel skeleton: {e}"));
+        out.errors.push(peer_issue(a.display_name(), e));
         return out;
     }
     if let Err(e) = ensure_skeleton(b_base, &a_name) {
-        out.errors.push(format!("Peer channel skeleton: {e}"));
+        out.errors.push(peer_issue(b.display_name(), e));
         return out;
     }
 
@@ -335,7 +336,8 @@ pub fn sync_peer_pair(a: &Repository, b: &Repository) -> PeerChannelOutcome {
     // 2. Copies.
     mirror_outbox(&a_out, &b_in, &mut out);
     mirror_outbox(&b_out, &a_in, &mut out);
-    union_pacts(&a_pact, &b_pact, &mut out);
+    let sides = format!("{}, {}", a.display_name(), b.display_name());
+    union_pacts(&a_pact, &b_pact, &sides, &mut out);
 
     out
 }
@@ -348,7 +350,13 @@ pub fn run_peer_channels(db: &AppDb, project_id: i64) -> PeerChannelOutcome {
     let repos = match db.list_repos_by_project(Some(project_id)) {
         Ok(r) => r,
         Err(e) => {
-            out.errors.push(format!("Peer channels: {e}"));
+            out.errors.push(
+                SyncIssue::new(
+                    Code::LookupFailed,
+                    format!("repos of project #{}", project_id),
+                )
+                .detail(e),
+            );
             return out;
         }
     };
@@ -358,10 +366,13 @@ pub fn run_peer_channels(db: &AppDb, project_id: i64) -> PeerChannelOutcome {
         let peers = match db.peers_of_repo(repo.id) {
             Ok(p) => p,
             Err(e) => {
-                out.errors.push(format!(
-                    "Peer channels: peers of {}: {e}",
-                    repo.display_name()
-                ));
+                out.errors.push(
+                    SyncIssue::new(
+                        Code::LookupFailed,
+                        format!("peers of {}", repo.display_name()),
+                    )
+                    .detail(e),
+                );
                 continue;
             }
         };

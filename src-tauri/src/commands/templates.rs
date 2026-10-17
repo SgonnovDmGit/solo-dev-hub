@@ -102,7 +102,11 @@ fn save_template_file_in(
     );
     let mut errors = rules.errors;
     if claude_dir.is_none() {
-        errors.push("Cannot determine home directory".to_string());
+        errors.push(
+            SyncIssue::new(SyncIssueCode::ManagedFileFailed, "~/.claude")
+                .target("skills/")
+                .detail("cannot determine home directory"),
+        );
     }
     Ok(TemplateSaveOutcome {
         rendered: true,
@@ -202,7 +206,7 @@ mod tests {
             outcome
                 .errors
                 .iter()
-                .any(|e| e.contains("unresolved hand-back")),
+                .any(|e| e.code == SyncIssueCode::RuleHeld),
             "the skipped copy is reported: {:?}",
             outcome.errors
         );

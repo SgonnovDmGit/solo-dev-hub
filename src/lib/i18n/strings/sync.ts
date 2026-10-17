@@ -15,7 +15,8 @@ export const ru = {
   'sync.statusResponded': 'Есть ответ',
   'sync.confirm': 'Подтвердить',
   'sync.back': '← Назад к проекту',
-  'sync.errors': 'Ошибки: {0}',
+  // T-000198: header line; the translated issues follow, one per line.
+  'sync.errors': 'Замечания синхронизации ({0}):',
   'sync.openSync': 'Синхронизация',
   'sync.microserviceSkipped': 'Микросервис {0} пропущен: {1}',
   'sync.autoClosed': 'Авто-закрыто пар: {0}',
@@ -53,7 +54,7 @@ export const en: Record<keyof typeof ru, string> = {
   'sync.statusResponded': 'Responded',
   'sync.confirm': 'Confirm',
   'sync.back': '\u2190 Back to project',
-  'sync.errors': 'Errors: {0}',
+  'sync.errors': 'Sync issues ({0}):',
   'sync.openSync': 'Sync',
   'sync.microserviceSkipped': 'Microservice {0} skipped: {1}',
   'sync.autoClosed': 'Auto-closed pairs: {0}',

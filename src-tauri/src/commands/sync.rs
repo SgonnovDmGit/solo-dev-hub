@@ -998,6 +998,86 @@ pub fn get_autocommit_branch(db: State<AppDb>, repo_id: i64) -> Result<Option<St
     db.get_autocommit_branch(repo_id).map_err(|e| e.to_string())
 }
 
+/// T-000198: the branch the repo's checkout is on right now, so RepoDetail can
+/// say the auto-commit is paused when it differs from the configured one.
+/// Computed live, never stored. `None` when the repo has no local checkout, is
+/// not a git repo, git is unavailable, or HEAD is detached / unborn.
+/// Async: it spawns git, which must not run on the UI thread.
+#[tauri::command(async)]
+pub fn get_repo_current_branch(db: State<AppDb>, repo_id: i64) -> Result<Option<String>, String> {
+    repo_current_branch(&db, repo_id)
+}
+
+fn repo_current_branch(db: &AppDb, repo_id: i64) -> Result<Option<String>, String> {
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let Some(path) = repo.local_path.as_deref() else {
+        return Ok(None);
+    };
+    let path = Path::new(path);
+    if !crate::git_ops::is_git_repo(path) {
+        return Ok(None);
+    }
+    let Some(git) = crate::git_ops::check_git_available() else {
+        return Ok(None);
+    };
+    crate::git_ops::current_branch(&git, path)
+}
+
+#[cfg(test)]
+mod current_branch_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?}: {:?}", args, out);
+    }
+
+    #[test]
+    fn test_repo_current_branch_reads_the_checkout() {
+        let db = AppDb::new(std::path::PathBuf::from(":memory:")).unwrap();
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        let repo = db
+            .insert_local_repository(&dir.path().to_string_lossy(), "wb", None, None)
+            .unwrap();
+        assert_eq!(
+            repo_current_branch(&db, repo.id).unwrap(),
+            Some("dev".to_string())
+        );
+    }
+
+    #[test]
+    fn test_repo_current_branch_is_none_outside_git() {
+        let db = AppDb::new(std::path::PathBuf::from(":memory:")).unwrap();
+        let dir = TempDir::new().unwrap();
+        let repo = db
+            .insert_local_repository(&dir.path().to_string_lossy(), "plain", None, None)
+            .unwrap();
+        assert_eq!(repo_current_branch(&db, repo.id).unwrap(), None);
+    }
+}
+
 #[tauri::command]
 pub fn set_autocommit_branch(
     db: State<AppDb>,

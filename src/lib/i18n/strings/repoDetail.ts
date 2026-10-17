@@ -17,6 +17,8 @@ export const ru = {
   'repoDetail.labelAutocommit': 'Автокоммит',
   'repoDetail.autocommitPlaceholder': 'ветка (пусто = выкл)',
   'repoDetail.autocommitHint': 'Ветка для авто-коммита синкнутых кросс-репо файлов. Пусто = выключено. Коммит только если репо сейчас на этой ветке.',
+  // T-000198: shown when the checkout is on another branch than the configured one
+  'repoDetail.autocommitPaused': 'Авто-коммит на паузе: репо на ветке {0}, настроена {1}',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -38,4 +40,5 @@ export const en: Record<keyof typeof ru, string> = {
   'repoDetail.labelAutocommit': 'Auto-commit',
   'repoDetail.autocommitPlaceholder': 'branch (empty = off)',
   'repoDetail.autocommitHint': 'Branch to auto-commit synced cross-repo files onto. Empty = disabled. Commits only when the repo is currently on this branch.',
+  'repoDetail.autocommitPaused': 'Auto-commit paused: repo is on branch {0}, configured {1}',
 };

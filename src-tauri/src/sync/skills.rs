@@ -4,7 +4,7 @@
 // (`<repo>/docs/sdh_skills/<name>.md`). Single source -> two render targets.
 
 use crate::db::AppDb;
-use crate::models::{Repository, RulesRefresh};
+use crate::models::{Repository, RulesRefresh, SyncIssue, SyncIssueCode};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -87,16 +87,11 @@ pub struct RepoRender {
 }
 
 impl RepoRender {
-    /// The held copies as report lines, keyed by `label` (the repo).
-    pub fn held_errors(&self, label: &str) -> Vec<String> {
+    /// The held copies as issues, keyed by `label` (the repo).
+    pub fn held_issues(&self, label: &str) -> Vec<SyncIssue> {
         self.held
             .iter()
-            .map(|name| {
-                format!(
-                    "{}: {}.md copy left as is: unresolved hand-back",
-                    label, name
-                )
-            })
+            .map(|name| SyncIssue::new(SyncIssueCode::RuleHeld, label).target(name.clone()))
             .collect()
     }
 }
@@ -167,7 +162,7 @@ struct Collected {
     taken: Vec<String>,
     lost: Vec<String>,
     superseded: Vec<String>,
-    errors: Vec<String>,
+    errors: Vec<SyncIssue>,
 }
 
 /// T-000205: take an approved rule edit back out of a repo's own copy.
@@ -208,7 +203,8 @@ fn collect_approved_skill_edits(
     let known: HashMap<String, String> = match list_skill_templates(db) {
         Ok(v) => v.into_iter().collect(),
         Err(e) => {
-            out.errors.push(format!("skill list: {}", e));
+            out.errors
+                .push(SyncIssue::new(SyncIssueCode::LookupFailed, "skill list").detail(e));
             return out;
         }
     };
@@ -237,18 +233,19 @@ fn collect_approved_skill_edits(
                 continue;
             };
             let Some(current) = known.get(name) else {
-                out.errors.push(format!(
-                    "{}: {} is flagged but is not a known skill — a rule cannot be invented in a repo copy",
-                    label, marker
-                ));
+                out.errors.push(
+                    SyncIssue::new(SyncIssueCode::RuleUnknownSkill, label.clone()).target(marker),
+                );
                 continue;
             };
             if settings_edit == Some(name) {
                 match clear_marker(&entry.path()) {
                     Ok(()) => out.superseded.push(format!("{} ({})", name, label)),
-                    Err(e) => out
-                        .errors
-                        .push(format!("{}: marker not cleared: {}", name, e)),
+                    Err(e) => out.errors.push(
+                        SyncIssue::new(SyncIssueCode::RuleFailed, name)
+                            .target(marker)
+                            .detail(e),
+                    ),
                 }
                 continue;
             }
@@ -256,9 +253,11 @@ fn collect_approved_skill_edits(
             match fs::read_to_string(&copy) {
                 Ok(content) if content == *current => match clear_marker(&entry.path()) {
                     Ok(()) => out.lost.push(format!("{} ({})", name, label)),
-                    Err(e) => out
-                        .errors
-                        .push(format!("{}: marker not cleared: {}", name, e)),
+                    Err(e) => out.errors.push(
+                        SyncIssue::new(SyncIssueCode::RuleFailed, name)
+                            .target(marker)
+                            .detail(e),
+                    ),
                 },
                 Ok(content) => {
                     // The marker may carry the approval line. Empty is allowed;
@@ -275,9 +274,11 @@ fn collect_approved_skill_edits(
                         entry.path(),
                     ));
                 }
-                Err(e) => out
-                    .errors
-                    .push(format!("{}: cannot read {}: {}", label, stem, e)),
+                Err(e) => out.errors.push(
+                    SyncIssue::new(SyncIssueCode::RuleFailed, name)
+                        .target(format!("{}: {}", label, stem))
+                        .detail(e),
+                ),
             }
         }
     }
@@ -285,16 +286,19 @@ fn collect_approved_skill_edits(
     for (name, copies) in handed {
         let first = &copies[0].1;
         if let Some(other) = copies.iter().find(|(_, content, _)| content != first) {
-            out.errors.push(format!(
-                "{} was handed back with different text by {} and {} — resolve it and re-flag one of them",
-                name, copies[0].0, other.0
-            ));
+            out.errors.push(
+                SyncIssue::new(SyncIssueCode::VersionConflict, name.clone())
+                    .target(format!("{}, {}", copies[0].0, other.0)),
+            );
             continue; // markers stay put: nobody's edit is thrown away
         }
         let file_name = format!("{}{}{}", SKILL_PREFIX, name, SKILL_SUFFIX);
         if let Err(e) = db.upsert_template_file("_global", &file_name, first, true) {
-            out.errors
-                .push(format!("{}: cannot store the new text: {}", name, e));
+            out.errors.push(
+                SyncIssue::new(SyncIssueCode::RuleFailed, name.clone())
+                    .target(file_name.clone())
+                    .detail(e),
+            );
             continue;
         }
         for (_, _, marker) in &copies {
@@ -302,8 +306,11 @@ fn collect_approved_skill_edits(
                 // The text is already stored; a surviving marker now sits beside
                 // a copy equal to the rule, so the next pass reports it as lost
                 // instead of taking it up again.
-                out.errors
-                    .push(format!("{}: marker not cleared: {}", name, e));
+                out.errors.push(
+                    SyncIssue::new(SyncIssueCode::RuleFailed, name.clone())
+                        .target(marker.display().to_string())
+                        .detail(e),
+                );
             }
         }
         out.taken.push(name);
@@ -353,7 +360,9 @@ pub fn refresh_rules(
     let repos = match db.list_repos_with_local_path(None) {
         Ok(v) => v,
         Err(e) => {
-            report.errors.push(format!("repository list: {}", e));
+            report
+                .errors
+                .push(SyncIssue::new(SyncIssueCode::LookupFailed, "repository list").detail(e));
             Vec::new()
         }
     };
@@ -398,14 +407,18 @@ fn render_scope(
                     report.repos = 1;
                     report
                         .errors
-                        .extend(r.held_errors(&base.display().to_string()));
+                        .extend(r.held_issues(&base.display().to_string()));
                 }
-                Err(e) => report.errors.push(format!("{}: {}", base.display(), e)),
+                Err(e) => report.errors.push(
+                    SyncIssue::new(SyncIssueCode::ManagedFileFailed, base.display().to_string())
+                        .target("docs/sdh_skills/")
+                        .detail(e),
+                ),
             }
         }
         RenderScope::Global => match claude_dir.map(|dir| render_skills_global(db, dir)) {
             Some(Ok(n)) => report.skills = n,
-            Some(Err(e)) => report.errors.push(format!("~/.claude/skills: {}", e)),
+            Some(Err(e)) => report.errors.push(claude_skills_issue(e)),
             None => {}
         },
         RenderScope::Everywhere | RenderScope::UptakeOnly => {}
@@ -438,12 +451,12 @@ fn render_skills_everywhere(
     db: &AppDb,
     claude_dir: Option<&Path>,
     repos: &[Repository],
-) -> (usize, usize, Vec<String>) {
+) -> (usize, usize, Vec<SyncIssue>) {
     let mut errors = Vec::new();
     let skills = match claude_dir.map(|dir| render_skills_global(db, dir)) {
         Some(Ok(n)) => n,
         Some(Err(e)) => {
-            errors.push(format!("~/.claude/skills: {}", e));
+            errors.push(claude_skills_issue(e));
             0
         }
         None => 0,
@@ -460,15 +473,19 @@ fn render_skills_everywhere(
         if !base.is_dir() {
             continue;
         }
-        // A local-only repo has no github_name — fall back to its path so the
-        // message still points at something the owner can find.
-        let label = repo.github_name.as_deref().unwrap_or(path);
+        // T-000198: the same label the project-sync skeleton pass uses, so a
+        // held copy seen by both renders of one pass is reported once.
+        let label = repo.display_name();
         match render_skills_to_repo(db, base) {
             Ok(r) => {
                 touched += 1;
-                errors.extend(r.held_errors(label));
+                errors.extend(r.held_issues(&label));
             }
-            Err(e) => errors.push(format!("{}: {}", label, e)),
+            Err(e) => errors.push(
+                SyncIssue::new(SyncIssueCode::ManagedFileFailed, label)
+                    .target("docs/sdh_skills/")
+                    .detail(e),
+            ),
         }
     }
     (skills, touched, errors)
@@ -492,7 +509,9 @@ pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option
     let repos = match db.list_repos_with_local_path(None) {
         Ok(v) => v,
         Err(e) => {
-            report.errors.push(format!("repository list: {}", e));
+            report
+                .errors
+                .push(SyncIssue::new(SyncIssueCode::LookupFailed, "repository list").detail(e));
             Vec::new()
         }
     };
@@ -501,7 +520,9 @@ pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option
     let seeded = match crate::template_seeder::seed_bundled_templates(db) {
         Ok(n) => n,
         Err(e) => {
-            report.errors.push(format!("template seeding: {}", e));
+            report
+                .errors
+                .push(SyncIssue::new(SyncIssueCode::LookupFailed, "template seeding").detail(e));
             0
         }
     };
@@ -521,6 +542,13 @@ pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option
     } else {
         None
     }
+}
+
+/// A failed render of the user-level skills.
+fn claude_skills_issue(e: impl std::fmt::Display) -> SyncIssue {
+    SyncIssue::new(SyncIssueCode::ManagedFileFailed, "~/.claude")
+        .target("skills/")
+        .detail(e)
 }
 
 /// Remove `<claude_dir>/skills/sdh-*` folders that are not in `keep` (the current
@@ -842,7 +870,13 @@ mod tests {
 
         assert!(taken.is_empty(), "nothing is taken up on a conflict");
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("different text"), "{}", errors[0]);
+        assert_eq!(
+            errors[0].code,
+            SyncIssueCode::VersionConflict,
+            "{}",
+            errors[0]
+        );
+        assert_eq!(errors[0].subject, "sdh-alpha");
         assert_eq!(
             db.get_template_file("_global", "skill.sdh-alpha.md.tmpl")
                 .unwrap()
@@ -886,7 +920,16 @@ mod tests {
 
         assert!(taken.is_empty());
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("not a known skill"), "{}", errors[0]);
+        assert_eq!(
+            errors[0].code,
+            SyncIssueCode::RuleUnknownSkill,
+            "{}",
+            errors[0]
+        );
+        assert_eq!(
+            errors[0].target.as_deref(),
+            Some("sdh-invented.md.approved")
+        );
     }
 
     #[test]

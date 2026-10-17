@@ -109,7 +109,7 @@ pub fn reconcile_bugs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<(), Str
 #[derive(serde::Serialize)]
 pub struct ReconcileAllReport {
     repos_scanned: usize,
-    errors: Vec<String>,
+    errors: Vec<SyncIssue>,
 }
 
 /// B-000016 (dogfood follow-up): portfolio-wide reconcile for Dashboard ↻.
@@ -122,13 +122,17 @@ pub struct ReconcileAllReport {
 pub fn reconcile_all_projects(db: State<AppDb>) -> Result<ReconcileAllReport, String> {
     let repos = db.list_all_repos().map_err(|e| e.to_string())?;
     let repos_scanned = repos.len();
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<SyncIssue> = Vec::new();
 
     for r in repos {
         // Bugs reconcile — silent-skip pre-migration state.
         if let Err(e) = sync::reconcile_bugs_for_repo(&db, r.id) {
             if !e.contains("not migrated") {
-                errors.push(format!("Bugs {}: {}", r.display_name(), e));
+                errors.push(
+                    SyncIssue::new(SyncIssueCode::ManagedFileFailed, r.display_name())
+                        .target("docs/bug-reports.md")
+                        .detail(e),
+                );
             }
         }
         // Tasks reconcile — same silent-skip rule. SyncTasksReport.events_emitted
@@ -136,7 +140,11 @@ pub fn reconcile_all_projects(db: State<AppDb>) -> Result<ReconcileAllReport, St
         // refreshed Dashboard numbers).
         if let Err(e) = sync::sync_tasks_for_repo(&db, r.id) {
             if !e.contains("not migrated") {
-                errors.push(format!("Tasks {}: {}", r.display_name(), e));
+                errors.push(
+                    SyncIssue::new(SyncIssueCode::ManagedFileFailed, r.display_name())
+                        .target("docs/todo.md")
+                        .detail(e),
+                );
             }
         }
     }
