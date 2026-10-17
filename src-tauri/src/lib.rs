@@ -69,10 +69,8 @@ pub fn run() {
     let claude_dir = dirs::home_dir().map(|h| h.join(".claude"));
     let startup_rules =
         sync::deliver_rules_at_startup(&db, claude_dir.as_deref()).and_then(|report| {
-            if !report.errors.is_empty() {
-                for issue in &report.errors {
-                    eprintln!("Warning: rule delivery at startup: {}", issue);
-                }
+            for issue in &report.errors {
+                eprintln!("Warning: rule delivery at startup: {}", issue);
             }
             // Only when something was actually rendered — a report can carry
             // collection findings alone.

@@ -1017,7 +1017,7 @@ fn repo_current_branch(db: &AppDb, repo_id: i64) -> Result<Option<String>, Strin
     if !crate::git_ops::is_git_repo(path) {
         return Ok(None);
     }
-    let Some(git) = crate::git_ops::check_git_available() else {
+    let Some(git) = crate::git_ops::cached_git() else {
         return Ok(None);
     };
     crate::git_ops::current_branch(&git, path)

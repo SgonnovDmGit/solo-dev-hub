@@ -3,6 +3,8 @@
 // {detail}, `formatSyncIssue` appends the raw detail after a colon.
 // `lookup_failed` carries a fixed token in `target` (what was being read),
 // translated through the `syncIssueLookup.<token>` keys below.
+import type { SyncIssueCode, SyncIssueLookup } from '$lib/types/sync';
+
 export const ru = {
   'syncIssue.copy_failed': 'Не удалось скопировать {subject} → {target}',
   'syncIssue.no_local_path': 'У репозитория {subject} не задан локальный путь — пропущен',
@@ -62,3 +64,9 @@ export const en: Record<keyof typeof ru, string> = {
   'syncIssueLookup.home_dir': 'home directory',
   'syncIssueLookup.autocommit_repos': 'auto-commit repositories',
 };
+
+// T-000198: compile-time guard — a code or lookup token without a key here
+// fails `npm run check` instead of shipping an untranslated toast line.
+type SyncIssueKeys = Record<`syncIssue.${SyncIssueCode}` | `syncIssueLookup.${SyncIssueLookup}`, string>;
+const _ruCoversEveryCode: SyncIssueKeys = ru;
+void _ruCoversEveryCode;

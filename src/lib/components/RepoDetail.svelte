@@ -92,14 +92,8 @@
     }
   }
 
-  // B-000028 loaded the saved auto-commit branch and then, when it was empty,
-  // silently persisted `dev` if the repo had such a branch. That turned *opening
-  // a repo card* into opting it into auto-commit: a repo whose working tree sits
-  // on `main` then reports "expected dev" on every sync, for a setting nobody
-  // chose. Auto-commit writes commits — it is opt-in, always. The branch list is
-  // still loaded for the picker; nothing is written.
+  // T-000198: read the checkout's branch live (git, off the UI thread).
   async function loadCurrentBranch() {
-    currentBranch = null;
     const id = repo?.id;
     if (id === undefined || !repo?.local_path) return;
     try {
@@ -111,7 +105,16 @@
     }
   }
 
+  // B-000028 loaded the saved auto-commit branch and then, when it was empty,
+  // silently persisted `dev` if the repo had such a branch. That turned *opening
+  // a repo card* into opting it into auto-commit for a setting nobody chose.
+  // Auto-commit writes commits — it is opt-in, always. The branch list is still
+  // loaded for the picker; nothing is written.
   async function loadAutocommitState() {
+    // Cleared before anything awaits: otherwise the new repo's configured branch
+    // briefly sits next to the previous repo's checkout branch and flashes a
+    // false "paused" line.
+    currentBranch = null;
     await loadAutocommitBranch();
     await Promise.all([loadCurrentBranch(), loadBranches()]);
   }

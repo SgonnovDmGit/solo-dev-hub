@@ -518,14 +518,15 @@ fn sync_server_to_microservice(
             }
         }
         if !parent_candidates.is_empty() {
-            let lookup = |name: &str| -> Vec<(String, PathBuf)> {
+            let parent_copies = |name: &str| -> Vec<(String, PathBuf)> {
                 parent_candidates
                     .iter()
                     .map(|(c, d)| (c.clone(), d.join(name)))
                     .collect()
             };
             let mut case_c_warnings = Vec::new();
-            match sync::migrate_flat_to_nested(&ms_srv_parent, lookup, &mut case_c_warnings) {
+            match sync::migrate_flat_to_nested(&ms_srv_parent, parent_copies, &mut case_c_warnings)
+            {
                 Ok(n) => c.migrated += n,
                 Err(e) => c.push(migration_issue(&ms_label, e)),
             }
@@ -1566,7 +1567,8 @@ mod tests {
         assert!(!marker_of(dir.path(), "sdh-debugging").exists());
         assert_eq!(
             result.rules_lost,
-            vec!["sdh-debugging (lostrepo)".to_string()]
+            vec![format!("sdh-debugging ({})", dir.path().to_string_lossy())],
+            "a local-only repo is labelled by its checkout path"
         );
     }
 

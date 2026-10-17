@@ -5,7 +5,8 @@ import type { SyncIssue } from '$lib/types';
 
 /**
  * T-000198: one translated line for one sync issue. The template comes from
- * `syncIssue.<code>`; `{subject}` / `{target}` / `{detail}` are substituted,
+ * `syncIssue.<code>`; `{subject}` / `{target}` / `{detail}` are substituted.
+ * A non-empty target the template does not place is appended in parentheses,
  * and a detail the template does not place is appended after a colon — it is
  * raw OS / git text and is never translated. A code this build does not know
  * (a newer backend) falls back to English built from the raw fields.
@@ -34,6 +35,11 @@ export function formatSyncIssue(issue: SyncIssue, loc: Locale = get(locale)): st
   let line = fill(fill(template, '{subject}', issue.subject), '{target}', target)
     .replace(/ {2,}/g, ' ')
     .trim();
+  // A target the template does not place still names something (e.g. the two
+  // sides of a peer pair), so it is appended in parentheses — never as "()".
+  if (!template.includes('{target}') && target) {
+    line += ` (${target})`;
+  }
   if (template.includes('{detail}')) {
     line = fill(line, '{detail}', issue.detail ?? '');
   } else if (issue.detail) {

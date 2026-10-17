@@ -4,7 +4,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { formatSyncIssue, formatSyncIssues } from '../sync-issues';
-import type { SyncIssue } from '$lib/types';
+import { SYNC_ISSUE_CODES, SYNC_ISSUE_LOOKUPS, type SyncIssue } from '$lib/types';
+import { translations } from '$lib/i18n/translations';
 
 describe('formatSyncIssue', () => {
   const copy: SyncIssue = {
@@ -64,6 +65,35 @@ describe('formatSyncIssue', () => {
     expect(formatSyncIssue(issue, 'ru')).toBe(
       'Файл REQ-009.md оставлен в server-requirements/: у родителей нет такой же копии — возможно, устарел',
     );
+  });
+
+  it('appends a target the template does not place, in parentheses', () => {
+    const issue: SyncIssue = {
+      code: 'peer_channel_failed',
+      subject: 'PACT-001_x.md',
+      target: 'alpha, beta',
+      detail: 'Access is denied. (os error 5)',
+    };
+    expect(formatSyncIssue(issue, 'ru')).toBe(
+      'Канал между равными: сбой на PACT-001_x.md (alpha, beta): Access is denied. (os error 5)',
+    );
+  });
+
+  it('never renders an empty target as "()"', () => {
+    const issue: SyncIssue = { code: 'peer_channel_failed', subject: 'alpha', target: '' };
+    expect(formatSyncIssue(issue, 'en')).toBe('Peer channel failed at alpha');
+  });
+
+  it('has a ru and en line for every code and lookup token', () => {
+    for (const loc of ['ru', 'en'] as const) {
+      const table = translations[loc] as Record<string, string>;
+      for (const code of SYNC_ISSUE_CODES) {
+        expect(table[`syncIssue.${code}`], `${loc} syncIssue.${code}`).toBeTruthy();
+      }
+      for (const token of SYNC_ISSUE_LOOKUPS) {
+        expect(table[`syncIssueLookup.${token}`], `${loc} syncIssueLookup.${token}`).toBeTruthy();
+      }
+    }
   });
 
   it('falls back to English from the raw fields for an unknown code', () => {

@@ -2,27 +2,45 @@ import type { Repository } from './core';
 import type { RulesRefresh } from './templates';
 
 /** T-000198: family of a non-fatal sync issue. Mirrors `SyncIssueCode` in
- *  `models/sync.rs` (serde snake_case). Translated by `formatSyncIssue` via the
- *  i18n key `syncIssue.<code>`. */
-export type SyncIssueCode =
-  | 'copy_failed'
-  | 'no_local_path'
-  | 'root_missing'
-  | 'rename_collision'
-  | 'rename_replay_failed'
-  | 'lookup_failed'
-  | 'missing_counterpart'
-  | 'managed_file_failed'
-  | 'peer_channel_failed'
-  | 'version_conflict'
-  | 'req_auto_close_failed'
-  | 'migration_failed'
-  | 'migration_left_in_place'
-  | 'migration_diverged'
-  | 'autocommit_failed'
-  | 'rule_unknown_skill'
-  | 'rule_held'
-  | 'rule_failed';
+ *  `models/sync.rs` (serde snake_case; a Rust test checks every wire name is
+ *  listed here). Translated by `formatSyncIssue` via `syncIssue.<code>`; the
+ *  i18n table fails to compile when a code has no key. */
+export const SYNC_ISSUE_CODES = [
+  'copy_failed',
+  'no_local_path',
+  'root_missing',
+  'rename_collision',
+  'rename_replay_failed',
+  'lookup_failed',
+  'missing_counterpart',
+  'managed_file_failed',
+  'peer_channel_failed',
+  'version_conflict',
+  'req_auto_close_failed',
+  'migration_failed',
+  'migration_left_in_place',
+  'migration_diverged',
+  'autocommit_failed',
+  'rule_unknown_skill',
+  'rule_held',
+  'rule_failed',
+] as const;
+export type SyncIssueCode = (typeof SYNC_ISSUE_CODES)[number];
+
+/** T-000198: what a `lookup_failed` issue was reading — its `target` token.
+ *  Mirrors `models::sync::lookup` in Rust; translated via `syncIssueLookup.<token>`. */
+export const SYNC_ISSUE_LOOKUPS = [
+  'renames',
+  'repos',
+  'project',
+  'skills',
+  'seeding',
+  'peers',
+  'codex_source',
+  'home_dir',
+  'autocommit_repos',
+] as const;
+export type SyncIssueLookup = (typeof SYNC_ISSUE_LOOKUPS)[number];
 
 /** T-000198: one non-fatal issue of a sync-like pass. Mirrors `SyncIssue` in
  *  `models/sync.rs`; absent `target` / `detail` are omitted keys, not null.

@@ -291,7 +291,10 @@ mod tests {
         assert_eq!(outcome.taken, vec!["sdh-retro".to_string()]);
         assert_eq!(
             outcome.superseded,
-            vec!["sdh-debugging (agentrepo)".to_string()],
+            vec![format!(
+                "sdh-debugging ({})",
+                repo_dir.path().to_string_lossy()
+            )],
             "the set-aside hand-back is reported, not dropped silently"
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);

@@ -64,6 +64,19 @@ pub fn check_git_available() -> Option<GitBinary> {
     None
 }
 
+/// `check_git_available`, probed once per process: the first successful probe
+/// is kept, so per-call paths (RepoDetail asks on every repo open) spawn no
+/// `git --version`. A failed probe is not kept — installing git later works
+/// without restarting the app.
+pub fn cached_git() -> Option<GitBinary> {
+    static GIT: std::sync::OnceLock<GitBinary> = std::sync::OnceLock::new();
+    if let Some(git) = GIT.get() {
+        return Some(git.clone());
+    }
+    let git = check_git_available()?;
+    Some(GIT.get_or_init(|| git).clone())
+}
+
 /// True if `local_path` looks like a git work tree (has a `.git` entry).
 /// `.git` may be a directory (normal repo) or a file (worktree, submodule);
 /// `Path::exists` accepts both.
@@ -96,8 +109,6 @@ pub fn detect_repo_state(local_path: &Path) -> RepoState {
 }
 
 /// Current checked-out branch name, or None if detached HEAD (or unborn).
-// T-000141 foundation: consumed by the v1.7.0 auto-commit wiring (T-000137+).
-#[allow(dead_code)]
 pub fn current_branch(git: &GitBinary, local_path: &Path) -> Result<Option<String>, String> {
     let out = spawn_cmd(&git.0)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])

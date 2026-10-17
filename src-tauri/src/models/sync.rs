@@ -394,4 +394,75 @@ mod tests {
             assert_eq!(serde_json::to_value(code).unwrap(), wire);
         }
     }
+
+    /// Every code, listed through an exhaustive match: a new variant does not
+    /// compile until it is added here, and the test below then demands it in TS.
+    fn all_codes() -> Vec<SyncIssueCode> {
+        use SyncIssueCode::*;
+        let all = vec![
+            CopyFailed,
+            NoLocalPath,
+            RootMissing,
+            RenameCollision,
+            RenameReplayFailed,
+            LookupFailed,
+            MissingCounterpart,
+            ManagedFileFailed,
+            PeerChannelFailed,
+            VersionConflict,
+            ReqAutoCloseFailed,
+            MigrationFailed,
+            MigrationLeftInPlace,
+            MigrationDiverged,
+            AutocommitFailed,
+            RuleUnknownSkill,
+            RuleHeld,
+            RuleFailed,
+        ];
+        for code in &all {
+            match code {
+                CopyFailed | NoLocalPath | RootMissing | RenameCollision | RenameReplayFailed
+                | LookupFailed | MissingCounterpart | ManagedFileFailed | PeerChannelFailed
+                | VersionConflict | ReqAutoCloseFailed | MigrationFailed | MigrationLeftInPlace
+                | MigrationDiverged | AutocommitFailed | RuleUnknownSkill | RuleHeld
+                | RuleFailed => {}
+            }
+        }
+        all
+    }
+
+    /// T-000198 review: the TS mirror (`SYNC_ISSUE_CODES` / `SYNC_ISSUE_LOOKUPS`
+    /// in `types/sync.ts`) must list every Rust wire name — the i18n table is
+    /// checked against those lists at compile time, so together a new code
+    /// cannot ship without a translation.
+    #[test]
+    fn test_ts_mirror_lists_every_code_and_lookup_token() {
+        let ts = include_str!("../../../src/lib/types/sync.ts");
+        for code in all_codes() {
+            let wire = serde_json::to_value(code).unwrap();
+            let wire = wire.as_str().unwrap();
+            assert!(
+                ts.contains(&format!("'{}'", wire)),
+                "types/sync.ts SYNC_ISSUE_CODES lacks '{}'",
+                wire
+            );
+        }
+        for token in [
+            lookup::RENAMES,
+            lookup::REPOS,
+            lookup::PROJECT,
+            lookup::SKILLS,
+            lookup::SEEDING,
+            lookup::PEERS,
+            lookup::CODEX_SOURCE,
+            lookup::HOME_DIR,
+            lookup::AUTOCOMMIT_REPOS,
+        ] {
+            assert!(
+                ts.contains(&format!("'{}'", token)),
+                "types/sync.ts SYNC_ISSUE_LOOKUPS lacks '{}'",
+                token
+            );
+        }
+    }
 }

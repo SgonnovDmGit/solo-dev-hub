@@ -205,7 +205,8 @@ struct Collected {
 ///   skill: the hand-back is not taken, its marker is cleared, and it is
 ///   reported so the owner knows an agent's text was set aside.
 ///
-/// Lost and superseded entries read `<skill> (<repo>)`.
+/// Lost and superseded entries read `<skill> (<repo>)`, the repo labelled by
+/// `rule_copy_label` (full `owner/name`, or the path of a local-only repo).
 fn collect_approved_skill_edits(
     db: &AppDb,
     repos: &[Repository],
@@ -232,7 +233,9 @@ fn collect_approved_skill_edits(
         let Ok(entries) = fs::read_dir(&dir) else {
             continue; // no copies here yet — nothing can have been handed back
         };
-        let label = repo.display_name();
+        // T-000198: one unambiguous label for every finding of this pass —
+        // issues and the `<skill> (<repo>)` lines alike.
+        let label = rule_copy_label(repo);
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             let Some(marker) = file_name.to_str() else {
@@ -255,7 +258,7 @@ fn collect_approved_skill_edits(
                     Ok(()) => out.superseded.push(format!("{} ({})", name, label)),
                     Err(e) => out.errors.push(
                         SyncIssue::new(SyncIssueCode::RuleFailed, name)
-                            .target(marker)
+                            .target(format!("{}: {}", label, marker))
                             .detail(e),
                     ),
                 }
@@ -267,7 +270,7 @@ fn collect_approved_skill_edits(
                     Ok(()) => out.lost.push(format!("{} ({})", name, label)),
                     Err(e) => out.errors.push(
                         SyncIssue::new(SyncIssueCode::RuleFailed, name)
-                            .target(marker)
+                            .target(format!("{}: {}", label, marker))
                             .detail(e),
                     ),
                 },
@@ -919,6 +922,68 @@ mod tests {
         assert!(!s2.join("sdh-beta.md.approved").exists());
     }
 
+    /// Two GitHub repos of different owners sharing a last segment, both with
+    /// their copies rendered. Returns their `docs/sdh_skills` dirs.
+    fn same_named_repos(db: &AppDb, one: &TempDir, two: &TempDir) -> (PathBuf, PathBuf) {
+        insert_repo(db, "a/foo", &one.path().to_string_lossy());
+        insert_repo(db, "b/foo", &two.path().to_string_lossy());
+        render_skills_to_repo(db, one.path()).unwrap();
+        render_skills_to_repo(db, two.path()).unwrap();
+        (
+            one.path().join("docs/sdh_skills"),
+            two.path().join("docs/sdh_skills"),
+        )
+    }
+
+    /// T-000198 review: the collection labels repos unambiguously, so the same
+    /// refusal in `a/foo` and `b/foo` stays two issues after the per-pass dedupe.
+    #[test]
+    fn test_unknown_skill_flags_in_same_named_repos_stay_distinct() {
+        let db = db_with_skill();
+        let one = TempDir::new().unwrap();
+        let two = TempDir::new().unwrap();
+        let (s1, s2) = same_named_repos(&db, &one, &two);
+        hand_back(&s1, "sdh-invented", "X", "");
+        hand_back(&s2, "sdh-invented", "X", "");
+        let repos = db.list_repos_with_local_path(None).unwrap();
+
+        let Collected { errors, .. } = collect_approved_skill_edits(&db, &repos, None);
+
+        let mut subjects: Vec<&str> = errors.iter().map(|e| e.subject.as_str()).collect();
+        subjects.sort();
+        assert_eq!(subjects, vec!["a/foo", "b/foo"], "{:?}", errors);
+    }
+
+    /// T-000198 review: a marker that cannot be cleared names the repo it sits
+    /// in. A directory under the marker's name makes `remove_file` fail on
+    /// every platform, without a test seam.
+    #[test]
+    fn test_a_stuck_marker_names_its_repo() {
+        let db = db_with_skill();
+        let one = TempDir::new().unwrap();
+        let two = TempDir::new().unwrap();
+        let (s1, s2) = same_named_repos(&db, &one, &two);
+        // A marker beside an unchanged copy: the "lost" path, which clears it.
+        fs::create_dir(s1.join("sdh-alpha.md.approved")).unwrap();
+        fs::create_dir(s2.join("sdh-alpha.md.approved")).unwrap();
+        let repos = db.list_repos_with_local_path(None).unwrap();
+
+        let Collected { errors, .. } = collect_approved_skill_edits(&db, &repos, None);
+
+        let mut targets: Vec<&str> = errors.iter().filter_map(|e| e.target.as_deref()).collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![
+                "a/foo: sdh-alpha.md.approved",
+                "b/foo: sdh-alpha.md.approved"
+            ],
+            "{:?}",
+            errors
+        );
+        assert!(errors.iter().all(|e| e.code == SyncIssueCode::RuleFailed));
+    }
+
     #[test]
     fn test_a_flag_on_an_unknown_skill_is_refused() {
         // A repo copy cannot invent a rule: the name has to be one the bundle
@@ -1071,7 +1136,13 @@ mod tests {
             "a stale marker must not mark the rule as a fork"
         );
         assert!(report.taken.is_empty(), "{:?}", report.taken);
-        assert_eq!(report.lost, vec!["sdh-debugging (stale)".to_string()]);
+        assert_eq!(
+            report.lost,
+            vec![format!(
+                "sdh-debugging ({})",
+                repo_dir.path().to_string_lossy()
+            )]
+        );
         assert!(!skills.join("sdh-debugging.md.approved").exists());
         assert_eq!(
             fs::read_to_string(skills.join("sdh-debugging.md")).unwrap(),
