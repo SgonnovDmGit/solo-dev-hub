@@ -102,11 +102,7 @@ fn save_template_file_in(
     );
     let mut errors = rules.errors;
     if claude_dir.is_none() {
-        errors.push(
-            SyncIssue::new(SyncIssueCode::ManagedFileFailed, "~/.claude")
-                .target("skills/")
-                .detail("cannot determine home directory"),
-        );
+        errors.push(SyncIssue::lookup(lookup::HOME_DIR, ""));
     }
     Ok(TemplateSaveOutcome {
         rendered: true,

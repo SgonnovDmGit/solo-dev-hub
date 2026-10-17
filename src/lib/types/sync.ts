@@ -17,6 +17,8 @@ export type SyncIssueCode =
   | 'version_conflict'
   | 'req_auto_close_failed'
   | 'migration_failed'
+  | 'migration_left_in_place'
+  | 'migration_diverged'
   | 'autocommit_failed'
   | 'rule_unknown_skill'
   | 'rule_held'

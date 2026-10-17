@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::db::AppDb;
-use crate::models::{Repository, SyncIssue, SyncIssueCode as Code};
+use crate::models::{lookup, Repository, SyncIssue, SyncIssueCode as Code};
 use crate::sync;
 
 /// Channel root under `docs/`.
@@ -350,13 +350,8 @@ pub fn run_peer_channels(db: &AppDb, project_id: i64) -> PeerChannelOutcome {
     let repos = match db.list_repos_by_project(Some(project_id)) {
         Ok(r) => r,
         Err(e) => {
-            out.errors.push(
-                SyncIssue::new(
-                    Code::LookupFailed,
-                    format!("repos of project #{}", project_id),
-                )
-                .detail(e),
-            );
+            out.errors
+                .push(SyncIssue::lookup(lookup::REPOS, format!("#{}", project_id)).detail(e));
             return out;
         }
     };
@@ -366,13 +361,8 @@ pub fn run_peer_channels(db: &AppDb, project_id: i64) -> PeerChannelOutcome {
         let peers = match db.peers_of_repo(repo.id) {
             Ok(p) => p,
             Err(e) => {
-                out.errors.push(
-                    SyncIssue::new(
-                        Code::LookupFailed,
-                        format!("peers of {}", repo.display_name()),
-                    )
-                    .detail(e),
-                );
+                out.errors
+                    .push(SyncIssue::lookup(lookup::PEERS, repo.display_name()).detail(e));
                 continue;
             }
         };

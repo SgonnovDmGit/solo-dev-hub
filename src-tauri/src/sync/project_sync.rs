@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::db::AppDb;
-use crate::models::{Repository, SyncIssue, SyncIssueCode as Code, SyncResult};
+use crate::models::{lookup, Repository, SyncIssue, SyncIssueCode as Code, SyncResult};
 use crate::sync;
 
 /// Mutable accumulator for one `run_project_sync` pass. `copied` counts REQ /
@@ -123,14 +123,14 @@ fn rename_failed(old: &str, new: &str, e: impl std::fmt::Display) -> SyncIssue {
 
 /// The rename log of `what` could not be read from the database.
 fn renames_lookup(what: &str, e: impl std::fmt::Display) -> SyncIssue {
-    SyncIssue::new(Code::LookupFailed, format!("renames of {}", what)).detail(e)
+    SyncIssue::lookup(lookup::RENAMES, what).detail(e)
 }
 
 fn auto_close_failed(counterpart: &str, e: impl std::fmt::Display) -> SyncIssue {
     SyncIssue::new(Code::ReqAutoCloseFailed, counterpart).detail(e)
 }
 
-/// A Case B / Case C migration warning, kept verbatim as the detail.
+/// A Case B / Case C migration that failed; `detail` is the path + raw OS error.
 fn migration_issue(subject: &str, detail: impl std::fmt::Display) -> SyncIssue {
     SyncIssue::new(Code::MigrationFailed, subject).detail(detail)
 }
@@ -171,7 +171,7 @@ fn load_skeleton_templates(db: &AppDb) -> SkeletonTemplates {
 
 /// Write the Phase-0 skeleton files (project.md + CLAUDE.md section +
 /// .gitignore + .gitattributes + todo.md + bug-reports.md) into a single repo.
-/// Each failure is surfaced as a per-file error keyed by `label`; callers own
+/// Each failure is surfaced as a per-file issue keyed by the repo; callers own
 /// the no-local_path / ensure_root_exists guards (their wording differs per
 /// caller). `md_project_id` is the project whose project.md is generated —
 /// the current project for repos, the microservice-project for ms-servers.
@@ -179,11 +179,13 @@ fn write_repo_skeletons(
     db: &AppDb,
     md_project_id: i64,
     base: &Path,
-    role: Option<&str>,
-    label: &str,
+    repo: &Repository,
     tpl: &SkeletonTemplates,
     c: &mut SyncCounters,
 ) {
+    let role = repo.role.as_deref();
+    let label = repo.display_name();
+    let label = label.as_str();
     let file_issue = |file: &str, e: String| {
         SyncIssue::new(Code::ManagedFileFailed, label)
             .target(file)
@@ -202,7 +204,7 @@ fn write_repo_skeletons(
     // After an uptake the refresh has already rendered and reported this repo;
     // `push` keeps each held copy to one line.
     match sync::render_skills_to_repo(db, base) {
-        Ok(r) => c.extend(r.held_issues(label)),
+        Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo))),
         Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
     }
     if let Err(e) = sync::sync_gitignore_section(&tpl.gitignore, base) {
@@ -398,10 +400,7 @@ fn sync_server_to_microservice(
         let ms_project = match db.get_project(*ms_project_id) {
             Ok(p) => p,
             Err(e) => {
-                c.push(
-                    SyncIssue::new(Code::LookupFailed, format!("project #{}", ms_project_id))
-                        .detail(e),
-                );
+                c.push(SyncIssue::lookup(lookup::PROJECT, format!("#{}", ms_project_id)).detail(e));
                 continue;
             }
         };
@@ -429,8 +428,7 @@ fn sync_server_to_microservice(
                     e,
                 )),
             }
-            let subject = format!("{} → {}", ms_name, ms_canonical);
-            c.extend(case_b_warnings.iter().map(|w| migration_issue(&subject, w)));
+            c.extend(case_b_warnings);
         }
 
         // F-033 Stage 1e: replay ms-server-repo renames on parent side (microservice-requirements/).
@@ -531,11 +529,7 @@ fn sync_server_to_microservice(
                 Ok(n) => c.migrated += n,
                 Err(e) => c.push(migration_issue(&ms_label, e)),
             }
-            c.extend(
-                case_c_warnings
-                    .iter()
-                    .map(|w| migration_issue(&ms_label, w)),
-            );
+            c.extend(case_c_warnings);
         }
 
         let srv_ms_dir = ms_req_parent.join(&ms_canonical);
@@ -668,11 +662,7 @@ fn sync_microservice_to_parents(
                     Ok(r) => r,
                     Err(e) => {
                         c.push(
-                            SyncIssue::new(
-                                Code::LookupFailed,
-                                format!("repos of {}", parent_project.name),
-                            )
-                            .detail(e),
+                            SyncIssue::lookup(lookup::REPOS, parent_project.name.clone()).detail(e),
                         );
                         continue;
                     }
@@ -1047,7 +1037,6 @@ pub(crate) fn run_project_sync_in(
     let tpl = load_skeleton_templates(db);
 
     for repo in &all_repos {
-        let label = repo.display_name();
         let Some(path) = repo.local_path.as_deref() else {
             // B-000002: surface silently-skipped repos so user sees why project.md /
             // CLAUDE.md / .gitignore weren't written for this repo.
@@ -1059,22 +1048,13 @@ pub(crate) fn run_project_sync_in(
             c.push(root_missing(repo));
             continue;
         }
-        write_repo_skeletons(
-            db,
-            project_id,
-            base,
-            repo.role.as_deref(),
-            &label,
-            &tpl,
-            &mut c,
-        );
+        write_repo_skeletons(db, project_id, base, repo, &tpl, &mut c);
     }
     for ms_id in &microservice_ids {
         let Ok(ms_server) = db.server_repo_of_microservice(*ms_id) else {
             c.push(no_server_repo(db, *ms_id));
             continue;
         };
-        let label = ms_server.display_name();
         let Some(path) = ms_server.local_path.as_deref() else {
             c.push(no_local_path(&ms_server));
             continue;
@@ -1084,15 +1064,7 @@ pub(crate) fn run_project_sync_in(
             c.push(root_missing(&ms_server));
             continue;
         }
-        write_repo_skeletons(
-            db,
-            *ms_id,
-            base,
-            ms_server.role.as_deref(),
-            &label,
-            &tpl,
-            &mut c,
-        );
+        write_repo_skeletons(db, *ms_id, base, &ms_server, &tpl, &mut c);
     }
 
     // Server/client checks only matter for `standard` project type. A
@@ -1188,7 +1160,7 @@ pub(crate) fn run_project_sync_in(
                     }
                 }
             }
-            Err(e) => c.push(SyncIssue::new(Code::LookupFailed, "auto-commit repos").detail(e)),
+            Err(e) => c.push(SyncIssue::lookup(lookup::AUTOCOMMIT_REPOS, "").detail(e)),
         }
     }
 
@@ -1408,22 +1380,36 @@ mod tests {
         let (db, _db_dir, home) = seeded_db();
         let a_dir = TempDir::new().unwrap();
         let b_dir = TempDir::new().unwrap();
+        let c_dir = TempDir::new().unwrap();
         let p = db.create_project("P", None, "standard").unwrap();
-        for (dir, name) in [(&a_dir, "alpha"), (&b_dir, "beta")] {
-            db.insert_local_repository(
-                &dir.path().to_string_lossy(),
-                name,
-                Some(p.id),
-                Some("tool"),
-            )
-            .unwrap();
+        db.insert_local_repository(
+            &a_dir.path().to_string_lossy(),
+            "alpha",
+            Some(p.id),
+            Some("tool"),
+        )
+        .unwrap();
+        // Two GitHub repos of different owners sharing a last segment: their
+        // held copies are distinct and must not merge into one line.
+        for (dir, gh) in [(&b_dir, "a/foo"), (&c_dir, "b/foo")] {
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO repositories (github_name, local_path, project_id, role) VALUES (?1, ?2, ?3, 'tool')",
+                    rusqlite::params![gh, dir.path().to_string_lossy(), p.id],
+                )
+                .unwrap();
+        }
+        for dir in [&a_dir, &b_dir, &c_dir] {
             sync::render_skills_to_repo(&db, dir.path()).unwrap();
         }
         // An uptake, so the refresh renders everywhere...
         hand_back_edit(a_dir.path(), "sdh-debugging");
-        // ...and a conflict (different text per repo), so both copies are held.
-        hand_back_edit(a_dir.path(), "sdh-retro");
-        hand_back_edit(b_dir.path(), "sdh-retro");
+        // ...and a conflict (different text per repo), so every copy is held.
+        for dir in [&a_dir, &b_dir, &c_dir] {
+            hand_back_edit(dir.path(), "sdh-retro");
+        }
 
         let result = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
 
@@ -1433,7 +1419,48 @@ mod tests {
             .iter()
             .filter(|e| e.code == Code::RuleHeld)
             .collect();
-        assert_eq!(held.len(), 2, "one per held copy: {:?}", held);
+        assert_eq!(held.len(), 3, "one per held copy: {:?}", held);
+    }
+
+    /// T-000198 review: a flat REQ on the microservice side with no matching
+    /// parent copy is left in place on every sync of the parent. It must reach
+    /// the owner as a code of its own, not as an English sentence in `detail`.
+    #[test]
+    fn test_case_c_stale_flat_file_is_reported_left_in_place() {
+        let (db, _db_dir, home) = seeded_db();
+        let srv_dir = TempDir::new().unwrap();
+        let ms_dir = TempDir::new().unwrap();
+        let p = db.create_project("P", None, "standard").unwrap();
+        let ms = db.create_project("M", None, "microservice").unwrap();
+        db.insert_local_repository(
+            &srv_dir.path().to_string_lossy(),
+            "srv",
+            Some(p.id),
+            Some("server"),
+        )
+        .unwrap();
+        db.insert_local_repository(
+            &ms_dir.path().to_string_lossy(),
+            "ms-srv",
+            Some(ms.id),
+            Some("server"),
+        )
+        .unwrap();
+        db.connect_microservice(p.id, ms.id).unwrap();
+        let flat = ms_dir.path().join("docs").join("server-requirements");
+        fs::create_dir_all(&flat).unwrap();
+        fs::write(flat.join("REQ-009_stale.md"), "orphan").unwrap();
+
+        let result = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
+
+        let issue = result
+            .errors
+            .iter()
+            .find(|e| e.subject == "REQ-009_stale.md")
+            .unwrap_or_else(|| panic!("no issue for the stale file: {:?}", result.errors));
+        assert_eq!(issue.code, Code::MigrationLeftInPlace, "{:?}", issue);
+        assert_eq!(issue.detail, None, "no prose in detail: {:?}", issue);
+        assert!(flat.join("REQ-009_stale.md").exists(), "left in place");
     }
 
     /// T-000198: a repo whose checkout is on another branch than its configured
@@ -1478,11 +1505,36 @@ mod tests {
 
         let result = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
 
-        assert!(result.committed.is_empty());
         assert!(
-            !result.errors.iter().any(|e| e.subject == "wb"),
+            !result
+                .errors
+                .iter()
+                .any(|e| e.code == Code::AutocommitFailed),
             "{:?}",
             result.errors
+        );
+        // The WrongBranch path was really taken: the sync wrote tracked
+        // candidates (the managed .gitignore), yet nothing was committed.
+        assert!(result.committed.is_empty());
+        assert!(dir.path().join(".gitignore").exists());
+        let head = std::process::Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "1",
+            "no new commit"
+        );
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain", "--", ".gitignore"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "the managed file is still uncommitted"
         );
     }
 

@@ -39,7 +39,8 @@ pub enum SyncIssueCode {
     RenameCollision,
     /// Rename replay failed on the filesystem. subject = old, target = new.
     RenameReplayFailed,
-    /// An internal read of app data (DB / repo list / skill list) failed. subject = what.
+    /// An internal read of app data failed. subject = the entity (may be empty),
+    /// target = one of the `lookup::*` tokens naming what was being read.
     LookupFailed,
     /// A project lacks the repo of a role the sync needs. subject = project, target = role.
     MissingCounterpart,
@@ -53,6 +54,12 @@ pub enum SyncIssueCode {
     ReqAutoCloseFailed,
     /// A one-time folder/file migration failed or was left alone. subject = what.
     MigrationFailed,
+    /// A flat legacy REQ file had no matching parent copy (possibly stale) and
+    /// was left in the flat folder. subject = file.
+    MigrationLeftInPlace,
+    /// A flat legacy REQ file differs from its copy on the parent(s) and was
+    /// left in the flat folder. subject = file, target = the parents.
+    MigrationDiverged,
     /// The auto-commit of synced files failed. subject = repo, detail = git output.
     AutocommitFailed,
     /// A rule copy is flagged but names no known skill. subject = repo, target = marker.
@@ -76,7 +83,26 @@ pub struct SyncIssue {
     pub detail: Option<String>,
 }
 
+/// T-000198: what a `lookup_failed` issue was reading — the fixed `target`
+/// tokens the frontend translates (`syncIssueLookup.<token>`).
+pub mod lookup {
+    pub const RENAMES: &str = "renames";
+    pub const REPOS: &str = "repos";
+    pub const PROJECT: &str = "project";
+    pub const SKILLS: &str = "skills";
+    pub const SEEDING: &str = "seeding";
+    pub const PEERS: &str = "peers";
+    pub const CODEX_SOURCE: &str = "codex_source";
+    pub const HOME_DIR: &str = "home_dir";
+    pub const AUTOCOMMIT_REPOS: &str = "autocommit_repos";
+}
+
 impl SyncIssue {
+    /// A failed internal read of `what` (a `lookup::*` token) for `subject`.
+    pub fn lookup(what: &'static str, subject: impl Into<String>) -> Self {
+        Self::new(SyncIssueCode::LookupFailed, subject).target(what)
+    }
+
     pub fn new(code: SyncIssueCode, subject: impl Into<String>) -> Self {
         Self {
             code,
@@ -355,6 +381,11 @@ mod tests {
             (SyncIssueCode::VersionConflict, "version_conflict"),
             (SyncIssueCode::ReqAutoCloseFailed, "req_auto_close_failed"),
             (SyncIssueCode::MigrationFailed, "migration_failed"),
+            (
+                SyncIssueCode::MigrationLeftInPlace,
+                "migration_left_in_place",
+            ),
+            (SyncIssueCode::MigrationDiverged, "migration_diverged"),
             (SyncIssueCode::AutocommitFailed, "autocommit_failed"),
             (SyncIssueCode::RuleUnknownSkill, "rule_unknown_skill"),
             (SyncIssueCode::RuleHeld, "rule_held"),

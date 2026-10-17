@@ -4,7 +4,7 @@
 // (`<repo>/docs/sdh_skills/<name>.md`). Single source -> two render targets.
 
 use crate::db::AppDb;
-use crate::models::{Repository, RulesRefresh, SyncIssue, SyncIssueCode};
+use crate::models::{lookup, Repository, RulesRefresh, SyncIssue, SyncIssueCode};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -94,6 +94,18 @@ impl RepoRender {
             .map(|name| SyncIssue::new(SyncIssueCode::RuleHeld, label).target(name.clone()))
             .collect()
     }
+}
+
+/// T-000198: the repo label of a held rule copy. Both renders of a project
+/// sync report held copies, and the pass keeps one line per distinct issue, so
+/// the label must be one both use AND unambiguous: the full `owner/name`, or
+/// the checkout path for a local-only repo — never the last segment alone,
+/// which two owners can share.
+pub fn rule_copy_label(repo: &Repository) -> String {
+    repo.github_name
+        .clone()
+        .or_else(|| repo.local_path.clone())
+        .unwrap_or_else(|| repo.display_name())
 }
 
 /// Render each skill to `<repo_base>/docs/sdh_skills/<name>.md` (flat reference
@@ -204,7 +216,7 @@ fn collect_approved_skill_edits(
         Ok(v) => v.into_iter().collect(),
         Err(e) => {
             out.errors
-                .push(SyncIssue::new(SyncIssueCode::LookupFailed, "skill list").detail(e));
+                .push(SyncIssue::lookup(lookup::SKILLS, "").detail(e));
             return out;
         }
     };
@@ -362,7 +374,7 @@ pub fn refresh_rules(
         Err(e) => {
             report
                 .errors
-                .push(SyncIssue::new(SyncIssueCode::LookupFailed, "repository list").detail(e));
+                .push(SyncIssue::lookup(lookup::REPOS, "").detail(e));
             Vec::new()
         }
     };
@@ -475,7 +487,7 @@ fn render_skills_everywhere(
         }
         // T-000198: the same label the project-sync skeleton pass uses, so a
         // held copy seen by both renders of one pass is reported once.
-        let label = repo.display_name();
+        let label = rule_copy_label(repo);
         match render_skills_to_repo(db, base) {
             Ok(r) => {
                 touched += 1;
@@ -511,7 +523,7 @@ pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option
         Err(e) => {
             report
                 .errors
-                .push(SyncIssue::new(SyncIssueCode::LookupFailed, "repository list").detail(e));
+                .push(SyncIssue::lookup(lookup::REPOS, "").detail(e));
             Vec::new()
         }
     };
@@ -522,7 +534,7 @@ pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option
         Err(e) => {
             report
                 .errors
-                .push(SyncIssue::new(SyncIssueCode::LookupFailed, "template seeding").detail(e));
+                .push(SyncIssue::lookup(lookup::SEEDING, "").detail(e));
             0
         }
     };

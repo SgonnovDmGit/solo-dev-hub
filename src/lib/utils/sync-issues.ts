@@ -24,7 +24,16 @@ export function formatSyncIssue(issue: SyncIssue, loc: Locale = get(locale)): st
   if (issue.code === 'missing_counterpart' && target) {
     target = table[`role.${target}` as TranslationKey] ?? target;
   }
-  let line = fill(fill(template, '{subject}', issue.subject), '{target}', target);
+  // `lookup_failed` names what was being read by a fixed token; an unknown
+  // token (a newer backend) is shown as is.
+  if (issue.code === 'lookup_failed' && target) {
+    target = table[`syncIssueLookup.${target}`] ?? target;
+  }
+  // An empty subject or target leaves a stray space behind; tidy the template
+  // part only, so the raw detail stays exactly as it came.
+  let line = fill(fill(template, '{subject}', issue.subject), '{target}', target)
+    .replace(/ {2,}/g, ' ')
+    .trim();
   if (template.includes('{detail}')) {
     line = fill(line, '{detail}', issue.detail ?? '');
   } else if (issue.detail) {

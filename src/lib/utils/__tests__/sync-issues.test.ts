@@ -43,6 +43,29 @@ describe('formatSyncIssue', () => {
     expect(formatSyncIssue(issue, 'ru')).toBe('В проекте Lensa нет репозитория с ролью «Сервер»');
   });
 
+  it('translates what a lookup was reading, with or without a subject', () => {
+    const renames: SyncIssue = {
+      code: 'lookup_failed',
+      subject: 'alpha',
+      target: 'renames',
+      detail: 'database is locked',
+    };
+    expect(formatSyncIssue(renames, 'ru')).toBe(
+      'Внутренняя ошибка чтения: история переименований alpha: database is locked',
+    );
+    const home: SyncIssue = { code: 'lookup_failed', subject: '', target: 'home_dir' };
+    expect(formatSyncIssue(home, 'en')).toBe('Internal read failed: home directory');
+    const unknown: SyncIssue = { code: 'lookup_failed', subject: 'x', target: 'new_token' };
+    expect(formatSyncIssue(unknown, 'en')).toBe('Internal read failed: new_token x');
+  });
+
+  it('reports a stale flat file as left in place, without prose in detail', () => {
+    const issue: SyncIssue = { code: 'migration_left_in_place', subject: 'REQ-009.md' };
+    expect(formatSyncIssue(issue, 'ru')).toBe(
+      'Файл REQ-009.md оставлен в server-requirements/: у родителей нет такой же копии — возможно, устарел',
+    );
+  });
+
   it('falls back to English from the raw fields for an unknown code', () => {
     const issue = {
       code: 'from_a_newer_backend',

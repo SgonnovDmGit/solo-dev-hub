@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use crate::db::AppDb;
-use crate::models::{SyncIssue, SyncIssueCode as Code};
+use crate::models::{lookup, SyncIssue, SyncIssueCode as Code};
 use crate::sync;
 
 /// Aggregated result of broadcasting one codex into one consumer.
@@ -44,8 +44,7 @@ pub fn broadcast_codex_to_consumer(
         Ok(p) => p.name,
         Err(e) => {
             outcome.errors.push(
-                SyncIssue::new(Code::LookupFailed, format!("project #{}", codex_project_id))
-                    .detail(e),
+                SyncIssue::lookup(lookup::PROJECT, format!("#{}", codex_project_id)).detail(e),
             );
             return outcome;
         }
@@ -107,11 +106,7 @@ pub fn broadcast_codex_to_consumer(
             Ok(p) => p,
             Err(e) => {
                 outcome.errors.push(
-                    SyncIssue::new(
-                        Code::LookupFailed,
-                        format!("codex {} {} source path", codex_name, role),
-                    )
-                    .detail(e),
+                    SyncIssue::lookup(lookup::CODEX_SOURCE, codex_repo.display_name()).detail(e),
                 );
                 continue;
             }
