@@ -20,6 +20,7 @@ The medium is **any visual preview available to the current agent**: artifacts, 
 - **Variants side by side** — 2–4 layouts next to each other (interactive medium — toggles for **variant** / **theme** light-dark / **width** narrow-wide-full in one mockup; static medium — separate renders), to compare live.
 - **Pixel-precise** — iterate on concrete edits ("smaller gap", "chip further left"), not on vague words.
 - **Full-width adaptive** — no artificial `max-width` constraint if the product is full-width.
+- **A failure or refusal frame shows every surface whose state the failure changes** — the list row, the draft tile, the composer — not only the message bubble. The acceptance defect this exists for lived exactly in the surface the board did not draw: a draft tile vanished after a refusal.
 
 ## Ground the fork in what the project already does
 
@@ -39,17 +40,40 @@ The tell, after the fact: at implementation it turns out the accepted mockup is
 built by changing the contents of a widget that was already there. The variant
 was in the project from the start and should have been shown.
 
+**"This is how it looks today" is a screenshot taken this session, not a redraw
+from memory.** Take it before the first frame; a board whose baseline is
+remembered has already cost a round.
+
 ## Iteration discipline
 
 - **After 2 consecutive "not quite"** — don't run a third blind iteration. Bring in the ui-ux skill + show variants **side by side** (variant/theme/width toggles), let the user point pixel-precisely.
 - **Don't bail to "known limitation / won't fix"** before explicitly listing the remaining options. "So it can't be done?" from the user = a signal you bailed early.
 - **A failed CSS experiment — revert it immediately**, don't hoard it as "defense in depth".
+- **A redirect applies to every frame it touches.** After each owner note, list the frames it changes and re-render all of them before the next showing. A frame still carrying the rejected variant reads as "you did not listen" and costs the most expensive kind of round.
+- **Name what the frame deliberately lacks.** A static frame cannot show an omission that only appears in use (no player on a recording card, no undo after a destructive tap). List such omissions in the board's decisions so the owner rules on them at the board, not at acceptance.
 
 ## Before you hand it over
 
+- Проверять размеры и читаемость, а не только наличие элементов.
+- Утвержденный текст не сокращать без согласования.
+- Приёмка таблицы включает поведение закреплённых областей, прокрутку и выделение текста.
+- **A new capability reopens the restrictions it makes pointless:** list them on the board and put each to the owner as a fork.
 - **Look at the rendered mockup yourself first.** Open what you are about to hand over
   and view it. This rule has existed since v1.12.0 and has twice fired for nothing —
   both times the owner caught by eye what no tool could see.
+- **Не использовать интерфейс как место для оправдания модели данных.** Постоянные
+  подсказки оператору не должны объяснять, почему сущность «не совсем такая», или
+  пересказывать внутренние оговорки. На экране оставляем только фактическое
+  состояние, риск и доступное действие; остальное фиксируем в спецификации. Если
+  без пояснения оператор не сможет принять решение, даём его кратко и по месту,
+  предпочтительно по запросу (`tooltip`/«Подробнее»), а не постоянным баннером.
+- **Цветовой замок теперь должен перечислять конкретные поверхности и намеренно неизменные потребители общего токена.**
+- **Проверяем полную матрицу: палитра × светлость × rest/hover/focus/pressed, включая временные Send/Stop.**
+- Для кнопок с заливкой отдельно проверять читаемость текста и различимость состояний на фактическом фоне. Проход по контрасту текста не доказывает заметность отклика; наличие штатного оверлея библиотеки не заменяет проверку результата.
+- **Для окон нужны две композиции: короткое содержимое и переполнение.**
+- Если несколько состояний воспринимаются как одно окно, замок должен определять общую оболочку и неподвижные якоря. Проверять нужно переходы между состояниями при одинаковом размере окна: высоту, положение общих элементов, подвал и сохранение прокрутки. Два отдельно корректных скриншота не доказывают устойчивость перехода.
+- Для нового режима показывать последовательность: вход → выбор → выполнение → результат → следующий запуск. Явно определить, что сохраняется, очищается и наследуется. Временная недоступность действия сама по себе не означает исчезновения выбранного состояния.
+- **Геометрию формулируем относительно явного якоря: «центр первой строки», а не просто «по вертикали».**
 - **A simplification in the mockup is flagged explicitly in the spec.** Drew a stub
   instead of the real layout, skipped a state, showed three items where there will be
   twenty — say so, or the mockup gets read as a settled decision.
@@ -57,6 +81,17 @@ was in the project from the start and should have been shown.
   word stays English in the UI, grep the existing keys: help screens and new surfaces
   mirror terminology that is already agreed, and a mismatch costs an extra round of
   translation.
+
+## Отмена после замка возвращается в борд
+
+**Отмена после замка возвращается в борд.** Замок закрывается по мокапу, и
+мокап переживает спеку: его открывают, когда текст спеки уже не помнят.
+Поэтому любое решение владельца, отменяющее или меняющее залоченный пункт,
+дописывается **в сам борд** — помеченным и датированным, до начала следующей
+задачи. Записать отмену только в шапку спеки недостаточно: следующий читатель
+откроет борд и прочитает отменённое как утверждённое. Перерисовывать рамку не
+обязательно — достаточно назвать, что по этому пункту источник истины теперь
+продукт.
 
 ## Output: the accepted mockup is the design gate
 

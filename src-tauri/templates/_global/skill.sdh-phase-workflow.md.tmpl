@@ -23,23 +23,92 @@ Use this when scoping a user request, before starting implementation. For any re
 
 ## Phase workflow steps
 
-1. **Chat** — discuss scope, decisions, trade-offs. One focused question per message. If a single message would carry 3+ decision points — switch from chat to drafting a spec. *Precondition:* if the feature touches a server, run the pre-flight server-surface check first (skill `sdh-api-contract-consume`); block on missing endpoints before entering chat.
+1. **Chat** — discuss scope, decisions, trade-offs. One focused question per message. If a single message would carry 3+ decision points — switch from chat to drafting a spec. *Precondition:* if the feature touches a server, run the pre-flight server-surface check first (skill `sdh-api-contract-consume`); missing capabilities block only dependent work. Continue useful, contract-supported work within the agreed scope, and file the dependent remainder under a later or thematically appropriate release with its unblocking REQ. Do not invent missing data; state the limitation explicitly.
+   - **A numeric choice is offered together with the constraint that fixes its
+     range.** Options like "2, 3 or 4" quietly assert that the range itself is
+     settled, and the owner cannot see what holds it — so the one question worth
+     asking never gets asked. Name the binding limit, where it comes from (a setting
+     of yours, a counterparty's documented cap, a consequence of how you call them),
+     and which of those would have to move for a larger answer. In one project the
+     owner answered a 2/3/4 offer with "can we do 8?"; the useful reply was that the
+     ceiling was held not by any documented limit but by the shape of our own request
+     — the counterparty drew sequentially inside a single call, so we paid for the
+     sequence and got none of its benefit. Three tasks came out of that question, and
+     none of them out of the three options.
 2. **Spec** — a markdown doc with sections: context (why), scope (which tasks), files-to-modify (full paths), decisions (brief rationale each), verification (per `## Verification (manual smoke)` in this skill). The spec file is mandatory when chat saturates (≥3 decisions in one message) or the user asks explicitly. For phase work comfortably spread across messages with few decisions per message, the chat thread itself serves as the spec — the user's explicit "OK, go" in step 4 closes it. *For non-server features with a visual surface — do mockups first, via skill `sdh-visual-mockups`: the accepted mockup carries the design decisions, and the spec text after it can be thin.*
-3. **Self-review** — re-read the spec (or the chat thread acting as spec) and report any ambiguity or internal contradiction: mismatched symbol / state-field names between sections, files in scope but missing from files-to-modify, decisions contradicting each other, missing localisation / i18n cleanup, missing test updates.
+   **A defect report sets the entry point, not the boundary.** When a REQ or bug report names the sites of a divergence, enumerate the sites yourself — search by MEANING (the predicate, the invariant, the condition), not by the report's text. The reporter sees the surface they collided with; they are not obliged to know the others. A meaning that lives in more than one place is collapsed into one named function — otherwise the next fix again closes two sites out of four.
+3. **Self-review** — re-read the spec (or the chat thread acting as spec) and report any ambiguity or internal contradiction: mismatched symbol / state-field names between sections, files in scope but missing from files-to-modify, decisions contradicting each other, missing localisation / i18n cleanup, missing test updates, verification steps that the spec's own decisions make impossible to perform through the product as the spec leaves it.
+   **Спека, продолжающая нить прошлого релиза, сверяется с его решениями по тексту.** Открой прошлую спеку и выпиши таблицу «решение Рn → как соблюдено здесь» ДО самообзора. Сверка по памяти теряет ровно те пункты, которые казались очевидными: в v1.30.0 так потерялся третий источник из Р8 и завелась вторая копия уже хранимой величины.
+   **Меняешь объявленный артефакт — перечисли его читателей, а не только писателей.** Grep по имени поля/ключа во ВСЕХ пакетах, включая те, что читают его из хранилища, и все поверхности, где он публикуется наружу. Два релиза подряд самообзор терял именно читателя: v1.30.0 — объект, собранный руками в возврате; v1.31.0 — предикат, решавший по старой форме, и второй эндпоинт, публиковавший ту же схему.
+   - **Самопроверка, меняющая уже принятое решение, обосновывает замену тем же способом,
+     что и первоначальный выбор.** «Так согласованнее с соседним кодом» обоснованием не
+     является, пока не проверена ОБЛАСТЬ соседа: предикат, правило или инвариант,
+     скопированный у соседней ветки, приносит с собой её предпосылку и в более широкой
+     выборке отрезает именно новую часть. Если самопроверка предлагает замену — она
+     формулирует, какой замер её подтвердит, и этот замер попадает в `## Verification`.
+   - **Гвард, на который спека опирается как на защиту, — прочитать на пределе.** Если спека
+     ссылается на существующий кап, таймаут или лимит, открыть ветку «предел достигнут» и
+     написать одной строкой, что в этот момент видит пользователь: текст, пустоту, 500. Кап,
+     который «держит петлю», возвращая пустой ответ, — не защита, а обрыв. Если новая
+     функциональность увеличивает число срабатываний гварда (тул, провоцирующий цепочку
+     вызовов; чтение по одному), пункт на предел обязателен в `## Verification`.
+   - **A decision that flips an existing behaviour names the tests that assert
+     the old one.** Grep the test tree for the old expectation before the spec is
+     locked and list those files under files-to-modify. Otherwise the Implementer
+     stops at a red test the spec never mentioned, and the fork lands on the
+     Architect mid-build instead of at review.
+   - **Тесты старого поведения ищутся по входу, а не по ожидаемому выходу.** Тест,
+     который проходит через изменяемую ветку как через ступеньку к своему предмету,
+     старый ответ не проверяет, но падает на нём. Грепать команду или шаг в подготовке
+     тестов при нужном предусловии; если реализация уже под рукой, включить новое
+     поведение и прогнать набор до того, как фиксировать список в спеке.
+   - **Решение ради экономии сверяется с соседними.** Пункт вида «не трогаем X,
+     чтобы не платить Y» (кэш, токены, запросы) проверяется по остальным решениям
+     спеки: если в тот же момент другое решение всё равно платит Y, экономии нет,
+     и пункт снимается до показа владельцу — иначе под мнимую экономию вырастают
+     страховки и тексты, которые владельцу приходится разбирать.
 4. **User OK** — the user reviews the spec (or thread), approves or returns corrections. Iterate until approved. Do not start implementation before approval.
+   - **Остаток «не в этом релизе», названный в спеке, получает карточку в момент одобрения спеки.** Грепни спеку на «не в этом релизе / остаток / позже» и на каждое место заведи карточку под версией с автором решения либо запиши явное «не делаем» со словом владельца.
 5. **Implementation** — task by task. Each task commits on completion per the project's implementation workflow.
 
+При сдаче части релиза первая строка называет готовую часть и оставшиеся части. Готовность отдельной задачи не обозначается как готовность кандидата всего релиза.
+
+**Пункт задачи не отменяется исполнителем.** Показался лишним — сначала проверь потребителей
+предмета (grep по репозиториям контрагентов, не только по своему), потом **спроси владельца**.
+Отчёт, в котором пункт уже не сделан, приходит поздно: откатывать придётся работу, а не решение.
+«Так чище / так красивее / третье имя хуже» — вкус, а не довод; доводом служат данные о
+потребителях, замер или ссылка на документацию.
+
 **Filing tasks in `docs/todo.md`:** any task this spec spawns (or that surfaces mid-work) goes **under a `## vX.Y.Z` roadmap header** — the version you expect to ship it in — never a flat backlog. The only open question allowed is timing relative to the next MAJOR; see "Task filing — always the roadmap, never a backlog" in skill `sdh-release-lifecycle`.
+
+**A deferral needs a card, not a sentence.** When the spec takes work *out* of
+scope — "this comes later", "after X", "not in this release", "the threshold
+arrives as a task" — it leaves a `T-NNNNNN` in `docs/todo.md` in the **same
+pass**, under the version header it belongs to. A promise in prose has no owner
+and no date, and it dies with the spec: spec files are gitignored and live
+exactly one release. Before calling a spec finished, grep your own text for the
+deferral words and give every hit either a card or a rewrite that removes the
+deferral. The card records **why** it was deferred and **what unblocks it** —
+without that the next implementer either rediscovers the work from scratch or
+repeats the very violation the deferral was avoiding. A handoff note's
+"deliberately not in this release" section is **not** a substitute: it tells the
+implementer not to build the thing, while the card tells the project the thing is
+not forgotten. Declining scope is as much a decision as accepting it, and it
+leaves the same kind of trace.
 
 This sequence is one task-level cycle. It runs inside the broader release lifecycle (skill `sdh-release-lifecycle`): that skill's "Implementation" stage is where these five steps execute per task, and its own Spec / Spec-review stages mirror steps 2–4 at the release level.
 
 ## Grounding the spec
 
-Twelve checks that belong to the Chat and Spec steps above. Each one was paid for by a spec that had to be rewritten.
+The checks below belong to the Chat and Spec steps above. Each one was paid for by a spec that had to be rewritten.
+
+**Every clause of the task line becomes a spec item with its own decision.** A clause
+deferred "to clarify at take-up" is a question to the owner at spec review, never the
+author's own reading.
 
 **Check the premise, not just the wording.**
 
-- **Before designing from the owner's own phrasing, say it back in your own words and get a yes.** A short, precise sentence is the easy one to misread: it carries a whole design and gives you nothing to catch yourself on. One line of confirmation — "so the agent edits its own copy rather than writing a separate document, right?" — costs a message. Getting it wrong costs the entire design round, and you will not notice, because your version is coherent too.
+Для условия автоматического действия назвать продуктовый факт и источник, который его подтверждает. Косвенный признак — отсутствие данных, первая регистрация, число объектов — не подменяет этот факт без явного решения владельца.
 
 - The request leans on an outside model ("like X does it") or on a roadmap label ("secrets vault") → verify the **root premise** before designing: does the referenced thing exist, and is it what the owner actually means? A spec built on a wrong premise burns whole, mockup included.
 - **Before designing a new mechanism, check whether a working one already exists.**
@@ -52,20 +121,40 @@ Twelve checks that belong to the Chat and Spec steps above. Each one was paid fo
 - The task description is narrow but the domain underneath is murky → ask "what does this task actually solve" **before** writing code. The same one-line phrasing has been implemented two different ways.
 - Declared in a schema, a config or a `meta.json` **does not mean executed**. Grep the consumer before asserting in a spec that a behaviour exists — a field can sit dead for a feature's entire lifetime.
 
+- **A claim about the order of runtime events is a premise, not a conclusion —
+  measure it.** "This will be recreated when X", "Y happens before Z", "that key
+  forces the subtree to rebuild" are hypotheses until something prints. Reading the
+  code carefully is not enough: the framework, not your code, decides that a widget
+  with a stable global key is *moved* rather than rebuilt, and an outer key on it is
+  then inert. A counter in the builder, a log in the constructor, one probe run —
+  minutes. Where the probe is genuinely expensive, write in the spec that the claim
+  is **unverified** and require a test whose stated purpose is to catch the
+  architect being wrong.
+- **A spec that introduces two mechanisms for one outcome must state their order.**
+  Left unordered, the implementer picks one — correctly, by the letter — and the
+  result is a race. The tell is two sentences that each promise the same end state
+  by a different route.
+- **A rule that keys on a case the contract enumerates ("only lever X", "only vendor
+  Y") is written over the data property that makes the case special** (a field that
+  translates into the same axis), so a case the contract did not list is covered by
+  construction. An enumerated case in a contract is a snapshot; the next row arrives
+  without it.
+
 **Name the numbers before the spec, not at acceptance.**
 
 - Any feature that creates, derives or links something **automatically** must state the size of the set **on the owner's live data**: "on your portfolio this yields N of them". The database is right there; one query is cheaper than reworking after the release build.
 - A design point carrying a numeric ratio (weights, thresholds, timeouts) goes to chat as its own edge-case question, instead of hiding in a paragraph of the spec.
+- **Разрыв между двумя величинами считается только при одинаковых исключениях.** Прежде чем назвать разрыв числом, выпиши, кого каждая сторона не считает, и приведи обе к общему набору. Привести нельзя — назови величины раздельно и не вычитай одну из другой.
+
+**A measurement's conclusion is stated within the quantity that was measured.**
+
+- Before writing the conclusion, name what the instrument actually measured, and build the conclusion about that alone. Everything wider goes into a separate **"what this measurement does not say"** paragraph — that paragraph is mandatory, because in a month the numbers will be read without the context. A narrow correct conclusion is stronger than a broad arguable one: it cannot be refuted in one sentence, and it does not cancel itself at the next measurement.
 
 **How to talk at this stage.**
 
 - An absolute claim about the project's behaviour ("X doesn't do Y", "for the first time") is either fact-checked with a grep or hedged in tone. It is checkable, and the owner will check it.
 - Every multiple-choice question ends with an explicit **"let's discuss this in chat"** option. Without it the fork forces a choice where a conversation was needed — and the frame itself is what most often turns out to be wrong.
 - Chat with visible options for a non-trivial task is required **even under a "work without stopping" directive**: that directive removes confirmations on mechanics, not on design choices.
-
-**Decisions you took alone.**
-
-- A spec that says "decided without asking, object if you disagree" has to **list** those decisions, and the ones with a visual surface go to acceptance as something the owner *looks at*, not as a line he reads. Agreement on paper is not agreement on screen: a choice he waved through in the list can be rejected within a minute of seeing it rendered. Listing them is also what keeps them honest — a decision nobody can find is not a decision taken alone, it is a decision hidden.
 
 **A bug with no stated target.**
 
@@ -109,6 +198,10 @@ release with an unproven "can't".
 - **Spec location:** path and naming convention for spec files (e.g. `docs/specs/<YYYY-MM-DD>-<phase-name>.md`). Spec files are gitignored unless the project says otherwise.
 - **Implementation workflow:** how step 5 runs — subagent-driven (a fresh subagent per task, per-task commits) or sequential (tasks in the current session, per-task or batched commits).
 
+## Verification scope and frequency
+
+Частоту гейтов бери из текущего задания, не наследуй из предыдущего релиза. Повторная проверка должна соответствовать изменившемуся пути; полный прогон не заменяет точную регрессию.
+
 ## Verification (manual smoke)
 
 Each spec written under `## Phase workflow steps` includes a `## Verification` (or `## Manual smoke`) section — hands-on UI/feature checks, distinct from unit tests.
@@ -117,7 +210,50 @@ Required content:
 - **Per changed feature:** open `<route / screen>` → verify `<expected behavior>`.
 - **Parameter combinations:** list combos to try (e.g. *"filter A × filter B, verify intersection"*).
 - **Regression checks:** list adjacent untouched features; open each and confirm nothing broke.
+- When changing rejection or rollback handling, test the successful operation through the same creation, navigation, and refresh sequence.
 - **Edge cases:** empty states, error paths, races if any.
 - **Cross-feature integration:** if changing feature A may affect B — list the touchpoint.
+- **A smoke item that needs expensive or server-driven state names how that state
+  will be produced before the spec is approved.** Use one of three honest forms:
+  a reproducible fixture, a controlled server/admin trigger, or an explicit
+  rollout item preclassified as `NOT_TESTED` when neither exists. Do not leave
+  the owner to manufacture a near-limit history, wait for a rare automatic
+  event, or spend a paid workload ad hoc during acceptance. `NOT_TESTED` is not
+  `PASS`; whether it blocks artifact readiness is decided in the release scope,
+  not improvised after the candidate is built.
+- **A verification item that names an endpoint is grepped against the project's own contract (`docs/my_api/`) before the spec is OK'd** — a smoke step for a route that does not exist is a spec defect, not a smoke finding.
+- **Тест, доказывающий фикс, обязан быть показан красным на данных ТОЙ ЖЕ формы, что приходят живьём** — не на удобной фикстуре. Кодировка, язык, длина и структура значений — часть формы: дефект, живущий на кириллице или на длинных значениях, полулатинская фикстура пропускает, и тест остаётся зелёным на сломанном коде.
 
 List length scales with complexity: 3–5 items for a small fix, 10+ for a multi-screen phase.
+
+## Артефакт со стареющей предпосылкой проверяет себя сам
+
+Когда задача производит не правку кода, а **инструмент** — набор данных, стенд
+замера, гейт, эталон, — у него почти всегда есть предпосылка, верная в день
+заведения и способная протухнуть потом: «ответа на этот вопрос в корпусе нет»,
+«эта ветка недостижима», «у провайдера такой возможности не бывает».
+
+Предпосылка не ломается с ошибкой. Она тихо перестаёт быть верной, а инструмент
+продолжает выдавать числа — уже неправильные, но правдоподобные. Это худший
+вид отказа: измеряющий им пользуется с полным доверием.
+
+**Способ проверить предпосылку встраивается в собственную выдачу инструмента, а
+не в памятку.** Памятку читает тот, кто и так помнит; выдачу читают каждый раз,
+потому что за ней и приходят.
+
+Три приёма, которыми это делается:
+
+- выдача **сортируется так, чтобы подозрительное оказалось сверху** — не по
+  алфавиту и не в порядке заведения, а по той величине, которая растёт, когда
+  предпосылка протухает;
+- рядом стоит **прямая инструкция, что означает плохая верхняя строка и что с
+  ней делать** — в самом отчёте, не в README рядом с ним;
+- если у инструмента есть шкала, в него закладывается **опорная точка**, по
+  которой шкалу читают: без неё «0,45» выглядит числом, а не почти-полом.
+
+Замерено на SwanContext v0.15.0. Набор из двадцати вопросов «ответа в корпусе
+нет» получил такую сортировку и такую строку — и **первый же прогон нашёл в
+наборе вопрос, на который корпус отвечает**. Один из двадцати был неверен с
+самого заведения; без встроенной проверки он задирал бы среднее и порог сколько
+угодно долго, и никто бы не пришёл это проверять. Проверка нашла дефект раньше,
+чем инструмент успел соврать.

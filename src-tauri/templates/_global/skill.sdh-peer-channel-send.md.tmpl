@@ -121,6 +121,8 @@ A file edited by both sides diverges on the first exchange. That is the only pro
 - **PACT** — drop `PACT-NNN_<slug>.impl.md` next to your proposal. The app removes the whole triple on both sides at the next sync.
 - **HANDOFF / NOTE** — drop `<name>.done.md` next to the body in your `outbox/`. The app removes both files on both sides.
 
+**Drop the marker only after the peer has had a sync to read the body.** `.done.md` removes both files on both sides at the next pass, so a marker dropped in the same pass as the NOTE — or right after the release it announces — erases the message before it is delivered. The sign it was read: the peer's own `.done.md` on the exchange that prompted yours, a reply NOTE, or a task in their plan; failing all three, close at your next release's inbox scan and say so in the registry line.
+
 In the **same pass**, fill the registry line's `closed` date, final status, and where the result went. Once the files are gone the ledger is the only record — a line you did not finish is a number whose story is lost.
 
 ## What this channel must not be used for

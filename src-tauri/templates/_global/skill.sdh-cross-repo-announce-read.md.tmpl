@@ -22,9 +22,12 @@ A client is read-only: it only receives announcements, never writes.
 
 ## Step 1. Scan at session start
 
+Also at every release closure, not only at session start: a long session outlives an arrival.
+
 Check the folder for your role:
 - **Client** → `docs/server-announcements/`
 - **Parent server** → `docs/microservice-announcements/`
+- **Every role** → the peer channel as well: `docs/InOutBox/inbox/<peer>/` and `docs/InOutBox/pact/<peer>/` (skill `sdh-peer-channel-answer`). A peer NOTE has no receipt and no ✓ in the app, so nothing else will surface it.
 
 Each subfolder is named after the sender repo/project (last segment, e.g. `web-app-backend`). Inside — `ANNOUNCE-*.md` files.
 
@@ -33,6 +36,7 @@ Each subfolder is named after the sender repo/project (last segment, e.g. `web-a
 For each file found:
 1. Read the body (`## Why this matters` / `## What changed` / `## What you need to do` / `## References`).
 2. **Integrate or apply** what's needed — the code/config/behavior changes the "What you need to do" section requires.
+   - Анонс, который вводит новый код ошибки или статус, проверяется тестом именно с этим кодом против вашего обработчика - даже если текст говорит "сохраните имеющуюся проверку". Предикат по равенству кода молча отправляет новый код в чужую ветку.
 3. **Delete the file.** Deletion is the implicit acknowledgement — there is no `.response.md`, no ✓ through the app. A file you deleted means "accepted and applied".
 
 ## Step 3. Commit the deletion

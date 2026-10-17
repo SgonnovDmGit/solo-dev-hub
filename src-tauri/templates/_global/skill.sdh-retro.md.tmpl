@@ -16,7 +16,11 @@ The retro is saved to the assistant's auto-memory directory as a `project`-type 
 - Path: `<auto-memory-dir>/retro_v<X_Y_Z>.md` (e.g. `retro_v0_33_0.md`).
 - Index entry in `MEMORY.md`: `- [Retro v0.33.0](retro_v0_33_0.md) — <one-line hook>`.
 
-Not committed to `docs/` or any repo path. Privacy of internal reflections + persistence across sessions = exactly what auto-memory is for. If retros multiply and make `MEMORY.md` noisy — consolidate older ones into a single `feedback` memory *"patterns across N retros"*; defer until it's a real problem.
+Not committed to `docs/` or any repo path. Privacy of internal reflections + persistence across sessions = exactly what auto-memory is for.
+
+**Retro index lines are consolidated on a trigger, not on judgment.** Retro entries accumulate one per release and eventually push `MEMORY.md` past its size limit — at which point part of the index silently stops loading, and nothing tells you which part. Do not wait for it to become "a real problem": when the retro lines pass **a third of the index**, or the first size warning appears, fold them in the same pass.
+
+**Fold by moving, not by distilling.** Move the retro index lines **verbatim** into one `reference` memory (`retros_index.md`) and leave a single pointer line in `MEMORY.md`. The retro files stay where they are — wiki-links into them keep working. Distilling retros into "patterns across N retros" loses the hooks that make an old retro findable and costs an hour; moving the lines costs twenty minutes and loses nothing. Measured on D'Lemma 2026-09-08: 57 lines, 9.1 KB of 33.1, index back under the limit in one pass.
 
 ## Precondition — stage 10 first
 

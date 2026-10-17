@@ -26,6 +26,10 @@ Before writing — check it is actually an announcement, not something else:
 | You did something on your own initiative that affects the recipient | **Announcement** |
 | You did work for recipient A; a side effect also hit recipient B | **Announcement** to B |
 | You reworked internals (refactor, deprecation) and the recipient's integration must adjust | **Announcement** |
+| Заявка получателя (REQ) была закрыта ✓ **до** того, как вы её выпустили, — переписывать квитанцию некуда | **Анонс** — теперь он и есть квитанция о выпуске |
+
+Порог «получателю надо что-то менять» к последней строке не применяется: у выпуска заявки нет другого
+канала, а получатель ждёт именно этого сообщения.
 
 **Threshold: actionable impact required.** An announcement is appropriate **only if the recipient would need to do something** — change code, config, behavior, or acknowledge a deprecation timeline. The mere existence of a related change on your side (a new admin-only endpoint, an internal refactor that does not change the wire format) is **not** enough. Pure surface additions the recipient may or may not adopt go through the normal `docs/api.md` sync — it picks them up on its own schedule.
 
@@ -53,6 +57,7 @@ In the recipient's announcement folder:
 - Folder absent → create it and use `001`.
 - Folder present with at least one `ANNOUNCE-*.md` → `max(existing NNN) + 1`.
 - **Do not reuse** numbers of deleted (acknowledged) entries — `NNN` is a monotonic counter, not a slot allocator. Numbers always grow, even after acknowledgements remove files (keeps the recipient's git history readable).
+- A folder listing shows only announcements not yet acknowledged — acknowledged ones are deleted together with their number, so `max(existing NNN)` alone can hand you a number already used. Before picking `NNN`, look for higher numbers in the recipient's own records (its `docs/done.md`, commit messages, specs): "ANNOUNCE-004 and 005 accepted" in their journal means the next number is 006 even when the folder holds only 003.
 - The counter is per-(sender × recipient) pair, not global.
 
 **Subfolder name** — **last-segment / canonical** form (e.g. `web-app-backend`, not `SgonnovDmGit/web-app-backend`), matching the `client-requirements/<client-repo>/` convention. Take your own canonical name from your `docs/project.md` `## Repositories` row whose `Path` matches the current working directory.

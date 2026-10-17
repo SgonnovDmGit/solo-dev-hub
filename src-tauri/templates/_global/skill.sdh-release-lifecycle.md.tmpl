@@ -30,6 +30,8 @@ Orthogonal to scope — it overlays both light and full. The essence: **a single
 - **How it turns on:** at spec/mockup acceptance (stage 4c) the assistant offers: *"design accepted, the rest is mechanical — I'll run Implementation → Test → the documentation part of Closure without approvals, only announcing transitions. OK?"* The grant is the user's. A standing "work without stopping" directive = pre-granted.
 - **What runs autonomously:** stages 5–8 + the documentation part of Closure (bump, Changelog, done.md, closure commit on dev).
 - **Always a stop, even in autonomous mode:** two interactive gates survive the autonomous run. (1) For **client / landing / any visual surface** — the user's **visual sign-off** at Test (they look at the built or running UI and approve) before Closure proceeds. (2) The git canon block (tag / master-merge / master-push) is user-only. Never emit the git block before the visual is approved, and emit it **once** — then wait, don't re-post it each turn. A server / tool / microservice whose smoke is automated has no visual gate (its smoke self-verifies) — autonomous mode there runs straight to the git block.
+
+**Фразы “можно выполнять”, “го”, “отправил” и “закрываем релиз” не являются делегированием owner-only git-блока. Ассистент отдаёт одну команду запуска скрипта выпуска и останавливается. Исключение возможно только по прямой разовой команде владельца самому выполнить merge/tag/push с перечислением этих действий.**
 - **Stop only at an uncovered fork.** In an autonomous run the agent stops for the user **only at a decision fork the spec does not cover**. A question the agent can answer itself — from the spec, the code, or a sensible default — it answers, and continues. No "let me ask myself out loud and pause" stops, no re-confirming decisions the spec already settled. The whole point of the front-loaded gate is that the middle runs without check-ins.
 - **Exit from the mode (re-engage):** a new non-obvious decision, a blocker, scope grew → re-evaluate the bump class, smoke revealed a problem → announce a loop back; afterward the autonomous mode may be offered again.
 
@@ -39,14 +41,30 @@ Every task written to `docs/todo.md` goes **under a `## vX.Y.Z` release header**
 
 The **only** uncertainty allowed is **timing relative to the next MAJOR**. If you genuinely cannot pin the exact minor/patch, still place the task on the timeline at MAJOR granularity: under your best-guess pre-MAJOR version, or under a coarse `## vN.0.0` (or later) section for work deferred past the next major. "In scope before the next major, or after it?" is the single legitimate open question — answer it and file the task under the matching header. Never leave a task unsorted.
 
+**Shifting roadmap headers drags the closure tasks' names with it.** A task named "Close vX.Y.Z" lives inside the section whose number it names, and moving the section does not move the name. The rot is silent and cumulative — visible only when you read a task's text rather than its position: in one project three closure tasks were each lagging exactly one shift behind their own slot. Renumbering a section means re-reading the tasks inside it for the old number.
+
+## A release ships its whole declared composition
+
+The tasks under a `## vX.Y.Z` header are the release's **declared composition**, not a menu of candidates for it. The release spec covers all of them, and the release closes when all of them are solved. Shipping two of five is not "scope management" — it is silently re-declaring the composition on the owner's behalf.
+
+Three obligations follow:
+
+- **A release spec begins by enumerating the section.** Before writing its first line, re-read the whole `## vX.Y.Z` block and name every task in it. A task the spec does not mention is a hole, even if nobody brought it up in chat. **The owner pointing at one task does not narrow the release**: it says where to start, not what the release is.
+- **A task leaves the release only by an explicit owner decision**, recorded by moving it under a different version header in `docs/todo.md`. Silence does not move it. Neither does `low` priority, nor "it needs a spec of its own" — that is an estimate of effort, not a licence to omit: either the spec gets written, or the owner moves the task.
+- **A gap between the spec and the section is said out loud before implementation.** If the section holds five tasks and the spec covers two, that is reported at spec review, not discovered when the candidate is reviewed.
+
+Operations tasks (`O-` / `M-`) are not part of the composition and never gate a release — they carry no version by definition (see "Operations tasks").
+
 ## Scope grew mid-release → re-check the bump class
 
-The bump class is decided once at Analysis (stage 2) — but a release rarely stays exactly as scoped. **The moment a task joins the release on the fly, re-run the bump class on the *whole* release, not just the new task.** A dogfood patch that picks up a new user-facing affordance mid-flight is no longer a PATCH; a MINOR that grows a breaking change is no longer a MINOR. Don't let the *original* class ride just because the earliest tasks fit it — the highest-grade change in the final scope sets the class. This has slipped repeatedly (a new UI section shipped under a PATCH tag because fixes dominated the release). When you add scope, say in one line: "scope grew by X → bump class stays/becomes Y." Confirm a bump-class *increase* to MAJOR/MINOR with the user (the "ask before MAJOR/MINOR" rule fires again), and re-title the `## vX.Y.Z` header if the number changed.
+The bump class is decided once at Analysis (stage 2) — but a release rarely stays exactly as scoped. **The moment a task joins the release on the fly, re-run the bump class on the *whole* release, not just the new task.** A dogfood patch that picks up a new user-facing affordance mid-flight is no longer a PATCH; a MINOR that grows a breaking change is no longer a MINOR. Don't let the *original* class ride just because the earliest tasks fit it — the highest-grade change in the final scope sets the class. This has slipped repeatedly (a new UI section shipped under a PATCH tag because fixes dominated the release). When you add scope, say in one line: "scope grew by X → bump class stays/becomes Y." Confirm a bump-class *increase* to MAJOR/MINOR with the user (the "ask before MAJOR/MINOR" rule fires again), and re-title the `## vX.Y.Z` header if the number changed. Исключение — задача, доводящая недостигнутую цель выпущенного релиза: класс не поднимает, выпуск остаётся PATCH (см. стадию Analysis).
 
 ## Stages
 
 1. **Request** — the user's kickoff for a release scope, feature batch, or non-trivial task.
 2. **Analysis** — the assistant estimates scope, classifies fast-lane vs phase and light vs full track, surfaces blockers/dependencies, and for features needing server endpoints runs the pre-flight surface check (skill `sdh-api-contract-consume`). **The bump class (PATCH/MINOR/MAJOR) and version number are decided here** — not deferred to closure: the `## vX.Y.Z` header in the Plan must be right from the start. MAJOR/MINOR is confirmed with the user here (the "ask before MAJOR/MINOR" rule fires at Analysis). Output: a one-message scope picture + class + version the user confirms or redirects.
+
+   **Measure before calling the work large.** An estimate of "that is a separate task, there is a lot there" made without measuring costs more than the measurement. If the volume can be counted by a script or a query in minutes — count it and name the number, not the adjective. A measurement taken before the reasoning about cost often cancels the reasoning entirely.
    - **First action of Analysis: check which roadmap slots are taken.** Before naming a
      version, look at the `## vX.Y.Z` headers already used in `docs/todo.md` and in the
      roadmap. A number produced from memory has to be replayed after tasks are already
@@ -57,6 +75,12 @@ The bump class is decided once at Analysis (stage 2) — but a release rarely st
    - **The bump class is decided by whether the user gains a new affordance**, not by
      the volume of edits: a new user-facing surface is MINOR even at three changed
      lines.
+   - **Выпуск, доводящий недостигнутую цель уже выпущенного релиза, — PATCH.** У релиза есть цель;
+     вышел, не достигнув её, — следующий выпуск исправляет, даже если несёт новую настройку, миграцию,
+     колонку или поле контракта. Два пункта выше (колонка в схеме, новая возможность) и «спроси перед
+     MINOR» здесь не срабатывают. Класс, который назвал владелец, закрыт: не приписывай «по SemVer это
+     MINOR» ни в плане, ни в спеке, ни в чате — оговорка заставляет владельца второй раз защищать
+     принятое решение.
    - **The owner picked the riskier option → name a concrete risk, not a general
      unease.** One line on what exactly can go wrong and at which step. **If the risk is
      real** — irreversible data loss, breakage at a counterparty, a failure users will
@@ -73,16 +97,86 @@ The bump class is decided once at Analysis (stage 2) — but a release rarely st
 6. **Plan review** *(full track)* — assistant **self-review only (4a), NOT a user-approval gate.** The implementation plan / task breakdown is the AI's own working artifact — filed to `docs/todo.md` for tracking, but the user's single approval gate was the **spec** (stage 4c). Don't ask the user to sign off on the task breakdown; just self-review it: scope alignment with the spec, missing/over-broad tasks, priority/effort sanity, order/dependencies. *(Light track: folded into Analysis.)*
 7. **Implementation** — task by task per the implementation step of `sdh-phase-workflow`, using the project's implementation workflow. Each completed task moves from `docs/todo.md` to `docs/done.md`.
 8. **Test** — manual smoke per the spec's `## Verification` + automated suites (`cargo test`, `npm test`, `npm run check`). **Test counts and pass/fail go into Changelog only AFTER the real smoke, never from progress notes.** A bug surfacing here or at closure — see the late-catch rule in `sdh-release-closure` (a small confident fix folds into the current release).
-   - **The acceptance plan is checked for being *performable*, not only for being complete.** A step that asks the owner to stage state inside a live working repository — plant a file, edit a document the tooling owns, put a real project into a test posture — is not an acceptance step: those repositories are doing their own work and are not a test bench. When a behaviour cannot honestly be exercised by hand, that is the signal to **cover it with a test**, including building whatever seam the test needs, rather than to ask the owner for the favour. Hand him the checks that are genuinely his: the ones he can see.
+   - **An empty cell, a zero count or a dash on a surface this release built is a defect until the
+     source confirms the emptiness:** call the endpoint and count the field before sign-off. A
+     plausible story for the emptiness («not on sale yet») is a reason to check, not a result. Paid
+     for by DM LAB v0.66.0: an edition column stood empty on the stand for a day and a half over an
+     invented slug.
+   - **Smoke rows derive from the release goals stated at spec start, one goal per task.**
+     An edge path noticed while reading the code is a pack case, not an owner smoke row:
+     the owner checks what the release promised, the pack checks what the code can do.
+   - **Если спека называет красные условия замера, проверка смока утверждает каждое из них, а не более слабую замену.**
+     Зелёный смок при нарушенном условии спеки — дефект проверки, а не успех релиза: он докладывает
+     зелёное ровно о том, что спека считала провалом.
    - **Visual sign-off gate (client / landing / any visual surface).** For a release whose changes are visual, the smoke **is the user eyeballing the actual built/running UI** — automated suites and the assistant's self-review do **not** substitute for it. **Closure does not start and the git canon block is not shown until the user explicitly approves the visual.** This gate holds even in autonomous mode. Present the closure git block **once**, after that approval — re-posting it before sign-off just makes the user run the same tag/merge commands repeatedly. *(Server / tool / microservice releases self-verify via automated smoke — no visual gate; run straight to the git block.)*
+   - **Two release tasks that touch the same input get ONE smoke item, not two.** When one edit changes what the client receives and another reads what stayed in history (or the reverse), each passes its own check in isolation: the defect lives in the gap between them and shows up only on a call where both fired. While writing the spec, list the pairs — which tasks read or write the same field — and give every pair a single item that runs through both. Paid for by LenSA Code v1.35.0: one task clamped a page limit of 900 down to the tool ceiling of 500 before the call reached the client, another printed the range in the export from the stored call, where 900 was still sitting. Both smoke items were green; together they produced a line describing a step that never happened, diverging from the client's own feed on exactly the calls the client's acceptance test covers.
+   - **Пункт смока, наблюдающий текст или эффект, до прогона предъявляет носитель.** Назвать ручку мало: подтверди строкой контракта, что предмет виден именно в её выдаче, либо прочитай её один раз на старом объекте, где этот текст уже есть. Проверка стоит минуту, промах стоит прогона на контуре и выглядит как дефект продукта.
+   - **A verification list names its scope and its address before the first item.** Three lines ahead of the items: what this list covers, what of the release it deliberately does **not** cover, and where to look — branch, version, and whether that build is running locally or deployed. Without them the list reads as the whole release, because that is what a checklist looks like, and two failures follow. The user checks **prod** for work still unmerged on the integration branch, sees nothing changed, and reports the feature broken. Or every item matches, the user concludes the release is finished and acts on it — dispatching closure while half the scope is unbuilt. Neither is the user misreading: an unscoped list asserted completeness and they believed it. Paid for by D'Lemma v0.41.0, where one list did both in the same release.
+   - **Чек-лист приемки называет и то, что владелец увидит, но что уже вынесено — с id карточки, — чтобы приемка не докладывала решенное.**
+   - **A measurement must cover the path the product cannot start without.** A positive measurement covers exactly what it probed, never the subject as a whole. Before building a guarantee on one, write down which paths it did **not** touch and confirm the critical one is not among them — for a client that is not the most interesting path to probe, it is the one without which the product does not launch. Paid for by a stand measurement of 1C safe mode: eight probes covering code execution, queries, writes and posting, none covering outgoing HTTP — the one thing the client cannot live without. The product guarantee built on it stood for exactly one release, until installation made the flag take effect.
    - **Preprod smoke access (projects with a deployed preprod + auth).** Keep a `.env.preprod` holding the credentials to *log in* to preprod for the smoke: the admin-panel key and the project/user keys you smoke as. For OTP auth, also a smoke email + a cached refresh token so you don't re-run OTP on every login. **This is access for smoking, NOT the secret set that *launches* preprod** — the common mix-up: `.env.preprod` gets you *inside* to click through the changes, while the deploy/runtime secrets *boot* the environment. Don't conflate them. The file is secret — under `.gitignore` (`.env.*`), never committed. *(N/A to projects with no deployed preprod / no auth, e.g. desktop tools.)*
+   - **A probe's failure message names the status and error code — never the raw body.**
+     Responses to key-issuing and token-minting calls carry the plaintext secret; a
+     `throw "… body: $raw"` on the assertion that precedes the cleanup step prints the
+     secret into the run log and leaves the key live. Raw bodies go to a diagnostic dump,
+     not into the failure message. Paid for by Swan_InfraConnect v1.1.0: a smoke probe
+     asserting `200` on a `201` endpoint printed a fresh api key into the run log and
+     never reached its own `DELETE`; the key had to be revoked by hand.
+   - **Dormant-shipped capability: the live smoke is owed at the flip, not at the ship.** A
+     mechanism shipped switched off (unreachable threshold, `off` flag) has only been tested on
+     the shape its tests imagined; the first real traffic through it happens when the flag flips.
+     Treat the flip as a release stage of its own: the release that switches it on carries a
+     `## Verification` for the mechanism as if it were new — a live turn on preprod under the
+     switched-on config, asserted by state through an instrument that shows what the mechanism
+     produced (not by the model's compliance). A green suite at ship time is not evidence at flip
+     time; on LenSA Code a four-release-old dormant mechanism surfaced two defects in its first
+     live smoke.
+   - **Прибор, снимающий окно чужого действия, запускается ДО действия.** Пик при выкате,
+     рестарте или чужом акте живёт минуты и по требованию не повторяется. Опрос ставится
+     на фон прежде, чем команда отдана, и глушится после. Замер, снятый задним числом,
+     называет, какую часть окна он не видел, и пиком не считается.
+   - **Смок, который намеренно роняет прогон CI (проверка отказа), не запускается на коммите, который пойдёт в тег.**
+   - **Прибор покрытия считает от того, что исполняется, а не от того, что проверяет.** «Сколько
+     должно быть» берётся из таблицы маршрутов, схемы, списка задач — не из документа, полноту
+     которого меряем: документ не видит ровно то, что в нём пропущено.
+   - **A threshold rule on a ratio is measured at the scale the rule protects.** A ratio taken
+     on a short fixture is fixed cost, not throughput; before a cap is lowered or kept on it,
+     spend one call at the long end. One measured call decides what an argument cannot.
+   - **A comparison baseline carries its configuration.** Record beside every baseline
+     number what it was measured on — model, ceiling, prompt, contour — and before
+     comparing a new measurement against it, confirm each of those still holds. If both
+     the thing measured and the condition changed, the difference belongs to neither: do
+     not report it, re-measure with one variable moved.
 9. **Closure** — full checklist + git canon: skill `sdh-release-closure`. The tag command is the user's action.
 10. **Next-release plan** — a **light re-estimation and re-slicing**, NOT a design session. This stage is expected at every closure (it's cheap — minutes) so don't skip it, but don't balloon it either. Re-read the tasks already filed under the next `## vX.Y.Z` header(s) and: re-check effort/priority against what this release just taught you, split any task that has outgrown its estimate, drop or merge ones this release made moot, and confirm the next version's scope with the user. **Do NOT spec, brainstorm, or design here** — no files-to-modify, no decisions, no "phase 2 of the next release". If a task turns out to need real design, that belongs to the *next* release's Spec stage, not this one. Output: the next `## vX.Y.Z` section, re-estimated and re-sliced (still on the roadmap — see "Task filing").
+   - Re-estimate from the current code and current contract. For each carried task, inspect the present hotspot size/responsibilities and verify that every required endpoint and response field exists; do not preserve the previous numeric estimate by default.
+   - **Оценка, пролежавшая без пересчёта дольше месяца, — не оценка, а память о ней.**
+     Прежде чем переносить её в следующий релиз, потратьте минуту на то, что измеримо
+     механически: сколько файлов, сколько ручек, сколько строк реально попадает под
+     задачу. Число из описания, написанное при заведении, устаревает молча и тихо
+     занижает объём релиза.
+   - **A zero effort on a next-slot task is a defect of the plan, not a placeholder.** A
+     slot that "gets its estimate after the brainstorm" stays at zero for releases and
+     makes the roadmap arithmetic lie — the bullet above covers a stale number, this one
+     covers a number that was never there. Stage 10 replaces every zero with a coarse
+     band (`~N h, before brainstorm`) and the one-line decomposition that produced it;
+     the brainstorm refines a number, it does not start from nothing. Paid for by
+     Swan_InfraConnect: two retros in a row noted the zeros on the next two slots and
+     changed nothing.
 11. **Retro** — a structured retrospective: skill `sdh-retro`. **Does not begin until stage 10 has produced its output.** If you find yourself heading into a retro straight after Test/Closure, stop — the next-release re-estimation (stage 10) comes first. The recurring slip is impl/closure → retro, skipping stage 10 entirely; `sdh-retro` re-checks this as a precondition.
 
 ## Stage transitions
 
 - The assistant announces each transition: **"moving from stage <X> to stage <Y>"**.
+- **A stage that has a skill begins by invoking that skill — the current copy, never the one
+  remembered from earlier in the session or carried in a compaction summary.** Summaries
+  label earlier skill text "for context only" and mean it: skills are re-synced between
+  sessions, and a stale copy reads as complete. Executing a stage without a fresh `Skill(...)`
+  call in the same turn is executing from memory. The same holds for every `sdh-*` skill
+  outside the lifecycle (cross-repo exchanges, codex, debugging). Paid for by
+  Swan_InfraConnect v1.1.0 twice in one session: closure ran from a copy that lacked the
+  "smoke against the local build first" rule and paid three smoke failures on preprod; the
+  retro ran from a four-point copy of a five-point skill and was redone.
 - Skipping a stage (in the full track) requires explicit permission: *"can I go straight to impl?" / "no retro this time?"* — the assistant proposes the skip with a one-line reason; the user acks or declines. Default — **no skipping**. *(The light track already folds Plan/Plan-review by default — that's not a "skip", it's the track.)*
 - **Loops back to an earlier stage are allowed but not default.** The chain runs forward by default. A loop (impl reveals a gap → back to Spec for an amendment → re-run Spec-review → resume Implementation) happens on user request or when circumstances force it (new constraint, missing endpoint surface, broken assumption, **scope grew → re-evaluate bump class**). The assistant announces loops the same way: *"a gap surfaced, moving from stage 7 back to stage 3, ok?"* — the user acks. Without an explicit loop announcement, the lifecycle is strictly forward.
 
@@ -99,8 +193,34 @@ When the owner says **"ship it"**, every unmet criterion closes on the spot:
 
 This holds even when the owner agreed to that criterion earlier. Agreeing to a checklist is not a promise to be held to it — the owner is entitled to spend the risk, and it is their risk to spend. The failure this prevents is concrete: acceptance protocol agreed up front, fifteen hours of release behind it, one item the owner does not care about fails to converge, the owner says "ship it" — and the release runs five more hours.
 
+**Acceptance closes the release to additions, too.** Once the owner has said "I accept", the release is closed not only to its remaining criteria but to new findings: name a finding **once**, and file it straight into the next slot. Proposing "let's fold this in too, it's small" after acceptance is the same scope growth as before it, only paid for with someone else's time.
+
 ## Anti-loop: don't circle a gate you can't satisfy
 
 A stage — closure especially — can trap an agent in a loop: it hits a check it cannot pass, retries the same sequence, fails the same way, and burns tokens circling. Often the gate is one the agent **imposed on itself** (a self-created precondition, an over-strict clean-tree/verification check, a smoke step that can't succeed in this environment).
 
 **Rule: if you repeat a stage or step without progress, or hit a gate you cannot satisfy, STOP — do not loop.** Question the gate itself: is this precondition actually required, or did I invent it? Is it satisfiable here at all? Then **escalate to the user** with the specific gate and why it's stuck, rather than attempting the same pass again. This is systematic-debugging's "3 failed fixes → question the architecture," applied to process gates: the third identical failure means the gate is wrong, not that a fourth try will land. A five-hour token-burn on a self-made impossible closure gate is exactly what this rule exists to prevent.
+
+## A gate enforces a decision, and the decision must be the owner's
+
+A gate is the strongest carrier a rule can have. A doc can be re-read and argued
+with; a gate is a wall that silently produces the same outcome every time.
+
+So a gate may only enforce a decision the **owner** made. A gate enforcing the
+agent's own inference is a machine for repeating one mistake: it turns a guess
+into a wall, and every run after that looks like the rule working.
+
+Two consequences:
+
+- **Every gate names the decision it enforces, and whose it is** — in the gate's
+  own text, beside the check. Unattributed, it reads on a later context as
+  settled fact, including to the agent that wrote it once its memory of writing
+  it is gone.
+- **A gate the owner overrides is not a gate that needs an exception — it is a
+  gate that was wrong.** Remove it, or re-ground it in what the owner actually
+  decided.
+
+What this prevents, measured: an agent generalised a rule about secrets to a
+product key, wrote that conclusion into a release gate, and shipped ten
+consecutive artifacts that could not connect at all. Every one of them passed
+its checklist.

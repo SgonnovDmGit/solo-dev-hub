@@ -55,6 +55,10 @@ its verification are never the same hands.
      the report. Stop only if the correction implies a design choice — semantics
      changed, a shared contract is touched, the behaviour became different — never for
      a changed name, path or call signature.
+   - **The report lists every behavioural change made on a shared path as its own
+     numbered deviation** — including changes that look mechanical (a changed
+     condition, a widened guard). The Reviewer reads the report as a map only if it
+     is complete; an unlisted change is a finding.
    - If the spec is ambiguous, contradicts a test, or has a gap, the Implementer does
      **not** patch the spec silently — it **raises it to the Architect**, and the
      **Architect decides who fixes the spec** (fixes it themselves, or hands it back).
@@ -66,6 +70,11 @@ its verification are never the same hands.
 5. **Implementer closes.** Once any review is clean, the Implementer runs Test →
    Closure docs (stages 8–9), then hands the **next-release plan** (stage 10) back to
    the Architect. The git canon block (tag / master-merge / push) stays **user-only**.
+   - **Cleanup after the tag.** The Architect removes the Implementers' worktrees and
+     branches at closure, after the tag (`git worktree remove --force`,
+     `git branch -D`). A squash merge means `git cherry` still lists their commits as
+     `+` — expected, not unmerged work. A worktree found after a compaction is the
+     footprint of the run, not an anomaly.
 6. **Retro** — see ownership below.
 
 Stage ownership on the lifecycle: the Architect owns stages 1–6 and 10 (next-release
@@ -89,17 +98,33 @@ substitute** for a self-sufficient spec. The spec itself must stand alone:
   applying** commands (`cargo fmt --check`, never `cargo fmt`). An applying formatter
   masks its own diff, and review then sees a clean tree where the work did not match
   the convention.
+- A case that asserts several conditions either splits into one case per condition
+  or, on failure, prints the state it saw (status, tool errors, rows, values) — the
+  run names the failed condition, nobody guesses it from the code.
+- **Задание, указывающее на образец, называет известные дефекты образца и то,
+  какие из них воспроизводить не надо.** Заведённая на такой дефект карточка
+  этого не заменяет: исполнитель её не читает.
 - **Grounded in the actual codebase.** Before writing the spec, the Architect greps a
   neighbour file for the real conventions (serde/naming/API shape) and writes those
   into the spec — the Implementer matches the spec, not the surrounding code it never
   reads. The same grounding applies to **any claim about what already exists** — "this
   function does X", "covered by N tests", "the field is already read" — and it is
-  written concretely: full path, real symbol name, line number. The spec is the only
+  written concretely: full path, real symbol name, line number. The same applies to a
+  claim about what surrounds the code — the runtime's lifecycle (what is loaded when,
+  in which event), a limit in a contract file, that a user can actually reach the
+  setting the spec says they will feel: verified at its source — the platform
+  documentation, the contract, the surface code — and cited in the spec before
+  handoff. The Implementer builds exactly what is written; a wish written as a fact
+  becomes a faithful build of the wish. The spec is the only
   artifact that survives both a handoff to another agent **and** a compaction of its
   own author: after one, the codebase is gone from context and a grounded spec is what
   makes re-reading unnecessary, while a vague one ("the sync module") forces it.
+  Список потребителей значения строится поиском и по имени константы, и по самому числу.
 - No aspirational claims. "Handle all the lanes" that a test contradicts is a spec
   bug; assert only what is true and testable.
+- Записка называет, кто делает коммит версии до первого выката. Если исполнитель
+  закрытие не ведёт, бамп и Changelog — за архитектором до вручения акта, иначе
+  гвард выката упадёт на константе.
 
 If the context won't fit into spec + a short note, the task isn't specced enough to
 hand off yet — that's the signal, not a reason to backchannel it.
@@ -118,7 +143,11 @@ is not zero, and a critical finding spends the owner's attention first.
 Review the **result**, in this order:
 
 1. **Spec compliance** — does it do what the spec said, no more, no less? Extra
-   unrequested work is a finding too.
+   unrequested work is a finding too. A deviation the Implementer words as "kept the
+   existing separate behaviour/geometry of X" is a finding until the Reviewer has
+   asked why X is separate and got an answer from the spec or the code — the wording
+   makes a divergence look deliberate (an artist composer shipped without voice on
+   the phone behind exactly that sentence).
 2. **Shared-contract integrity** — the highest-value pass. For every shared accessor,
    cross-repo contract, or broadcast edge the change touched: **grep ALL its consumers
    and confirm the design promise still holds.** The most-repeated escape in this
@@ -128,10 +157,13 @@ Review the **result**, in this order:
 3. **Code quality** — correctness, clarity, tests that test behaviour not
    implementation.
 
+Verify that test data satisfies the operation’s prerequisites and can reach the expected outcome. Do not check only field names and response shapes.
+
 On a finding:
 - **In-scope defect** → back to the Implementer for rework, then re-review. The
   Reviewer does **not** silently fix it — that erases attribution and hides the gap.
 - **Out-of-scope** finding → a `T-NNNNNN` in `docs/todo.md`, never a silent fold.
+- A finding whose fix widens or narrows a predicate names, in its fix, every reader of that same meaning (send and retry, list and card button) found by searching for the meaning, not the symbol — a fix aimed at one reader opens one door of two.
 
 ## Retro ownership
 

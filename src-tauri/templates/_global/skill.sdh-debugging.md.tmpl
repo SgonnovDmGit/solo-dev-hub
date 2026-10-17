@@ -11,21 +11,49 @@ description: >
 
 You are here with a bug in hand, about to decide where to look. This skill is about the **first move** — the place a given class of symptom actually hides, as opposed to the place it appears. Every rule below was paid for by a real incident in this portfolio.
 
-## Two rules before any hypothesis
+## Five rules before any hypothesis
 
 **1. Reproducible → reproduce, then speak.** If the report is "X won't start / hangs / doesn't work" and X runs locally (dev server, build, CLI command), **run it and read the actual output before naming a cause**. A hypothesis offered without a log is labelled a guess, not stated as fact. And do not anchor on the first warning you see: if the same warning appears in a successful run too, it is not the cause.
 
+Reproduce failures in external-command wrappers with the actual command in an isolated environment using the same shell.
+
 **2. Hard to reproduce → narrow the axes, then fix.** Order: **when** (under which conditions) → **where** (which screens or components) → **what** (the state at that moment) → and only then the fix. For UI bugs on Windows, "another monitor / another zoom level / another DPI" belongs in the first two or three questions, not the tenth.
+
+**3. A reported defect is never explained away as intended.** Hearing "it broke", do not build a story about why it is supposed to behave that way: the story closes the search and shifts the blame onto whoever reported it. If the by-design explanation does turn out to be right, it must rest on the artifact and not on a guess about the reason — "the file contains a placeholder" is checkable, "the placeholder is there because the key is secret" is not. Until the fact is confirmed, the question **"what exactly did you launch"** comes *before* the theory, and the search continues in parallel.
+
+**4. Not reproducible for you → ask for the artifact, not for remembered facts.** When the defect lives on someone else's machine, the cheapest next move is a screenshot, a dump, an exported file — not a list of questions. A question makes the reporter reconstruct the past from memory and answer in *your* vocabulary: field names, ids, internal states they never see. An artifact carries the facts you did not know to ask for, and it closes branches you would otherwise walk for hours. Ask questions only when no artifact exists or it does not settle the matter — and phrase them in what the person **sees on screen**, never in identifiers. Отказ дать артефакт — не повод просить второй раз. Предложи совместное воспроизведение: прибор включается до действия репортёра, репортёр действует, ты смотришь.
+
+Регрессионная проверка должна охранять наблюдаемый симптом пользователя. Исправление связанного технического дефекта не закрывает жалобу, если исходный симптом сохраняется.
+
+Регрессию перекрытия интерфейса воспроизводить через реальный путь входа, сохраняя предшествующие маршруты и открытые панели. Координаты цели не доказывают, что пользователь её видит.
+
+При жалобе на мерцание, исчезновение элемента или потерю фокуса проверять промежуточные кадры реального действия. Проверка только после завершения всех анимаций может скрыть дефект; регрессия должна видеть момент исчезновения.
+
+Различай первую загрузку, фоновое обновление с сохраненными данными, ошибку и смену аккаунта. Воспроизводи тот переход, который вызывает дефект; сброс состояния не заменяет обновление.
+
+**5. Before you spend the human's turn, read the sources you already hold.** A person's attention is the most expensive instrument in the loop, and it is taken last. Before asking for an observation, check what is already on your disk: the dependency's own sources, a connected reference corpus, your own code, earlier exports and dumps. "Can you check X for me?" is legitimate only after those four have answered "not here". The failure this prevents is concrete: an agent proposed the owner spend a turn probing whether a processing reads its own catalog reference, and then found the entire parameter chain in the framework's sources a minute later. This rule orders rule 4 rather than replacing it — rule 4 says *what* to ask for once asking is warranted; this one says asking is not warranted yet.
+
+**Sources you can run are stronger than sources you can read.** When the suspect is a
+counterparty whose code is on your disk, run *its* code on *your* exact input before
+writing it a request: its own test harness, your payload injected from outside its tree
+(`go test -overlay`, a temporary test file that never lands in its repository), its
+repository untouched. Reading tells you what the code should do; running shows the line
+that does something else. Paid for by D'Lemma v0.105.0: seven paid stand conversations
+showed only that Claude ignored the user's reply after an image; running the router's own
+adapter on the server's real message tail found the dropping line in twenty-five minutes,
+at no cost, and the request went out with a file and a line instead of a symptom.
 
 ## Symptom → where to look first
 
 | Symptom | First move | Where NOT to start |
 |---|---|---|
 | Blank where data should be | Read the render function and trace **backwards**: source, filters, defaults for unset fields | Template syntax, adding placeholders |
+| A value arrives at the far side subtly wrong — extra space, wrong case, mangled date | Print the exact bytes actually sent, then read the conversion that produced them | Tracing who calls whom |
 | "X stays selected / active / dirty when it shouldn't" | Grep **every** write to that state and audit each one | Fixing only the path the user happened to hit |
 | Partial state — some artifacts gone, others survived, no repro | Read the **order of steps** in the code; the survivor is an oracle (below) | Guessing where the code aborted |
 | Your own write reverts, state regenerates | Stop and grep the write / regen / sync / refresh paths for that file | Repeating the write |
 | Render or runtime misbehaves while a sibling app on the same stack works | Diff manifest, lockfile, config and binary assets against the working sibling | Iterating design or config variants |
+| You fixed the reported path and the symptom is back elsewhere | Grep the same predicate **by field name** across sibling transports and call sites (sync / stream / re-attach / admin mirror); fix the copies in the same commit | Closing on the path the report named |
 
 ## The operation-order oracle
 
@@ -36,11 +64,24 @@ When a bug leaves **partial state** and you cannot reproduce it, the sequence of
 
 You can often ship a fix from this deduction alone without ever reproducing the bug — but then say so: deduced, not reproduced.
 
+## At a boundary, check the representation before the flow
+
+When a value crosses a boundary — into a URL, a JSON body, a file name, a header — start by asking *what it turned into*, and only then trace who calls whom. Reading control flow answers "is the value passed along correctly" and stays silent on "is it still the same value".
+
+The tell that this class applies: the value is a **number or a date**, and the boundary needs a **token**. Default stringification is built for humans — thousands separators, locale-shaped dates, trailing zeroes — and the damage shows on only part of the range, which is exactly why the tests stay green. An id of 17 survives it; 14159 does not.
+
+Two consequences:
+
+- **Read a stringify call at a boundary as a formatter, not as "take the value".** The same line reads as innocent twice in a row when you are looking for control flow — that is how one of these lived a week in a function already read.
+- **A test that sends a number across a boundary must use a value past the formatter's first threshold** — four digits and up for separators, a fractional part for decimals. A trio of 0, 1 and 17 proves nothing.
+
 ## When your own edit reverts
 
 You wrote the file and it came back to its previous content. You set a status and it regenerated. That is not friction to push through — it is the bug surfacing. From the second occurrence, stop repeating the write and grep for what could overwrite it; a system reminder saying the file was modified, with no obvious user action behind it, is a literal signal. This is about reverting **writes**, not stale **reads** — an IDE highlight or a browser cache is cured by a refresh.
 
 ## The instrument lies
+
+Ожидания об окружении подтверждай фактическими параметрами запуска и измерением. Размер окна и имя раннера не доказывают платформу или тип указателя; документированный факт, локальное наблюдение и гипотеза должны быть разделены.
 
 Three cases where the signal is distorted not by the bug but by the tool standing
 between you and the fact:
@@ -57,10 +98,36 @@ between you and the fact:
   of the world. Re-probe it in two minutes before building a workaround: the workaround
   costs an order of magnitude more than the check.
 
+**A negative result is not proven until the instrument has shown a positive one.**
+An instrument that answers "no" on every input is more often broken than revealing:
+a flag the utility does not support, an image that never pulled, a parameter that
+did not bind to its own request — every one of those is indistinguishable from an
+honest refusal once the output is silenced. So before reporting or writing down a
+negative conclusion: (1) run the instrument on an input whose answer must be
+positive, and (2) show in the output that it discriminates — two different inputs
+gave two different answers. Be especially suspicious of **uniformity**: the same
+answer where the conditions are known to differ is a signal about the instrument,
+not about the world.
+
+The failure costs more than the check. Writing a measured claim into a contract, a
+changelog or a counterpart's receipt in the same pass as the measurement publishes
+the instrument's defect as a fact about the product, and the next reader has no way
+to tell. A measured claim that changes a contract is re-derived with a **second,
+different** instrument first.
+
 And do not close a hunt early: before calling something a known limitation, enumerate
 the remaining unchecked options out loud. See the always-on rule **An unproven "can't"
 never narrows the product** in the global rules — declaring impossibility and then
 disabling functionality is the failure that rule exists to stop.
+
+## A repaired mechanism does not prove coverage
+
+**Проверенный механизм ничего не говорит о множестве, на котором его зовут.**
+Доказав, что функция делает своё дело, не утверждай, что она «разберёт
+накопленное»: выборка, которая её вызывает, — отдельный факт с собственным
+окном, фильтром и предикатом. Открой её и назови, что в неё попадает, а что
+нет. Утверждение об охвате, сделанное по работающему механизму, звучит
+убедительно именно потому, что механизм действительно работает.
 
 ## Relation to `superpowers:systematic-debugging`
 

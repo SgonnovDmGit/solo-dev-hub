@@ -28,6 +28,8 @@ Solo Dev Hub moves files between repos itself — you **never** copy, move, or d
 
 `NNN` is chosen at creation and **never** renamed or renumbered. `_<slug>` is a short kebab-case readability hint — recommended but optional (the app matches by the globs `REQ-*.md`).
 
+**Revising your own REQ before any receipt has arrived — edit the existing `REQ-NNN_<slug>.md` in place, do not author a second file under the same number.** A `REQ-NNN_<other-slug>.md` alongside the original creates a collision at the recipient: which of the two is the source of truth, and does the new one replace the old or supplement it? Renaming the slug when you edit the file is fine — the number is what must stay singular. This is the same principle as the `clarification-needed` loop later in this doc (there the *recipient* edits their own receipt in place; here the *sender* edits their own REQ in place) — just applied before a receipt exists to trigger it, when you change your mind on your own initiative rather than in response to a question back.
+
 ## Step 1. Pick the number `NNN` — from the registry
 
 The number comes from **`registry.md` in the root of your outgoing channel**, not from the folder listing:
@@ -119,6 +121,7 @@ Blob storage is at the server's discretion.
 - If you later **edit** the REQ — the next sync overwrites the recipient's copy. **The source of truth (you) always wins.**
 - The recipient writes a receipt; **the app returns** its copy to your outgoing folder.
 - You **do not edit** the receipt copy on your side — the edit will be overwritten at sync.
+- **A receipt or announcement that unblocks a task re-slots it in the same pass:** remove the task's blocked note in `docs/todo.md` and tell the owner which release it now sits in.
 
 Sync state of the pair shown in the UI (computed from the filesystem): `new` (REQ exists on your side, not yet on the recipient's) → `sent` (both sides, no receipt) → `responded` (receipt appeared).
 
@@ -140,6 +143,8 @@ Two ways to close (delete) a pair — both remove all files on both sides:
 **If NOT satisfied** with a final receipt (`implemented` / `partially` / `declined`) — do not "reject"; write a new `REQ-N+1_<slug>.md` with a clarified ask. The original pair may stay open until answered or be closed immediately.
 
 **If the receipt is `clarification-needed`** — a different path: edit the **original** `REQ-NNN.md` inline (do not open `REQ-N+1`), adding the answers. The next sync delivers the updated REQ, the recipient overwrites the receipt with a final status. The loop continues until you write a complete REQ.
+
+**Withdrawing an open REQ.** If the ask is cancelled before the receipt arrives, edit the **original** `REQ-NNN.md` itself: put `**WITHDRAWN <date>:** <one line why>` right under the H1 and leave the body. Your copy is the source of truth, so the next sync overwrites the recipient's copy and they stop working on it. A note in your own registry or chat does not reach them — the recipient implements what its copy says. Close the pair with `.impl.md` once the receipt lands, whatever its status.
 
 ## Downstream REQ (forwarding, server only)
 
