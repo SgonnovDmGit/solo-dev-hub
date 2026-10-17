@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { toastRulesFindings } from '$lib/utils/rules-report';
   import { open } from "@tauri-apps/plugin-dialog";
   import {
     hasPat,
@@ -99,6 +100,11 @@
     try {
       const result = await syncGlobalClaudeMd();
       aiRulesLastSyncAt.set(result.synced_at);
+      // T-000207: the render collected pending hand-backs first — name them.
+      toastRulesFindings(result.rules);
+      if (result.rules.errors.length > 0) {
+        addToast($tStore('toast.ruleApplyErrors' as any).replace('{0}', result.rules.errors.join('; ')), 'error');
+      }
       addToast($tStore('appDefaults.syncGlobalDone' as any).replace('{0}', result.path), 'success');
     } catch (err) {
       addToast(String(err), 'error');

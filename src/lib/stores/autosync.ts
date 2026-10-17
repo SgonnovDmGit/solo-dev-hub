@@ -7,6 +7,7 @@ import { get } from 'svelte/store';
 import { autoSyncEnabled, autoSyncIntervalMin, autoSyncLastAt, saveAutoSyncLastAt } from './settings';
 import { projects } from './projects';
 import { syncProject } from '$lib/api/tauri-commands';
+import { toastRulesFindings } from '$lib/utils/rules-report';
 
 const CHECK_INTERVAL_MS = 60_000;
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -37,7 +38,10 @@ async function tick(): Promise<void> {
   try {
     for (const p of enabled) {
       try {
-        await syncProject(p.id);
+        const result = await syncProject(p.id);
+        // T-000207: a rule uptake or a lost hand-back marker is rare and must
+        // never pass unnoticed — unlike ordinary errors, report it every time.
+        toastRulesFindings({ taken: result.rules_taken, lost: result.rules_lost, superseded: [] });
       } catch {
         // swallow — don't spam toasts every tick on a persistently failing repo
       }

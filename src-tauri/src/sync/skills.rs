@@ -250,6 +250,8 @@ pub enum RenderScope<'a> {
     Everywhere,
     /// One checkout only (init docs). `~/.claude/skills/` is left alone.
     Repo(&'a Path),
+    /// `~/.claude/skills/` only (the global-rules button).
+    Global,
     /// Nothing of its own: the caller renders the repos it owns afterwards
     /// (a project sync, through `write_repo_skeletons`).
     UptakeOnly,
@@ -284,28 +286,59 @@ pub fn refresh_rules(
     };
 
     let collected = collect_approved_skill_edits(db, &repos, settings_edit);
-    report.taken = collected.taken;
-    report.lost = collected.lost;
-    report.superseded = collected.superseded;
-    report.errors.extend(collected.errors);
+    report.absorb(collected);
+    let everywhere = !report.taken.is_empty();
+    render_scope(db, claude_dir, scope, everywhere, &repos, &mut report);
+    report
+}
 
-    let everywhere = !report.taken.is_empty() || matches!(scope, RenderScope::Everywhere);
+/// The render half of a refresh: `scope`, widened to everywhere when
+/// `everywhere` is set (an uptake, or a startup seed that changed the bundle).
+/// Only ever called after the collection over `repos` has run.
+fn render_scope(
+    db: &AppDb,
+    claude_dir: Option<&Path>,
+    scope: RenderScope,
+    everywhere: bool,
+    repos: &[Repository],
+    report: &mut RulesRefresh,
+) {
+    let everywhere = everywhere || matches!(scope, RenderScope::Everywhere);
     if everywhere {
-        let (skills, touched, errors) = render_skills_everywhere(db, claude_dir, &repos);
+        let (skills, touched, errors) = render_skills_everywhere(db, claude_dir, repos);
         report.skills = skills;
         report.repos = touched;
         report.errors.extend(errors);
-    }
-    if let RenderScope::Repo(base) = scope {
-        // Rendered even after an everywhere pass: the target may not be among
-        // the stored checkouts, and an unchanged file is not rewritten anyway.
-        match render_skills_to_repo(db, base) {
-            Ok(_) if everywhere => {}
-            Ok(_) => report.repos = 1,
-            Err(e) => report.errors.push(format!("{}: {}", base.display(), e)),
+        if !matches!(scope, RenderScope::Repo(_)) {
+            return;
         }
     }
-    report
+    match scope {
+        RenderScope::Repo(base) => {
+            // Rendered even after an everywhere pass: the target may not be among
+            // the stored checkouts, and an unchanged file is not rewritten anyway.
+            match render_skills_to_repo(db, base) {
+                Ok(_) if everywhere => {}
+                Ok(_) => report.repos = 1,
+                Err(e) => report.errors.push(format!("{}: {}", base.display(), e)),
+            }
+        }
+        RenderScope::Global => match claude_dir.map(|dir| render_skills_global(db, dir)) {
+            Some(Ok(n)) => report.skills = n,
+            Some(Err(e)) => report.errors.push(format!("~/.claude/skills: {}", e)),
+            None => {}
+        },
+        RenderScope::Everywhere | RenderScope::UptakeOnly => {}
+    }
+}
+
+impl RulesRefresh {
+    fn absorb(&mut self, collected: Collected) {
+        self.taken = collected.taken;
+        self.lost = collected.lost;
+        self.superseded = collected.superseded;
+        self.errors.extend(collected.errors);
+    }
 }
 
 /// T-000203: apply the current rule text everywhere an agent reads it from —
@@ -360,21 +393,51 @@ fn render_skills_everywhere(
     (skills, touched, errors)
 }
 
-/// Startup: seed the bundled templates and, when the seed changed anything,
-/// deliver the rules outwards — collecting first, like every other render.
-/// Returns `None` when the bundle was unchanged and nothing was rendered.
-pub fn deliver_rules_after_seed(
-    db: &AppDb,
-    claude_dir: Option<&Path>,
-) -> Result<Option<RulesRefresh>, String> {
-    match crate::template_seeder::seed_bundled_templates(db)? {
-        0 => Ok(None),
-        _ => Ok(Some(refresh_rules(
+/// Startup, on every launch: collect pending hand-backs, THEN seed the bundled
+/// templates, then render everywhere if the seed changed anything or the
+/// collection took up or lost something.
+///
+/// The order is the point (T-000207 follow-up). The seed rewrites non-custom
+/// rows to the new bundle text, so collecting after it compares a stale marker's
+/// copy — equal to the OLD canonical text — against the NEW row: the stale copy
+/// would be taken up, flagged custom, and silently revert the bundle update.
+/// Collected first, a genuine hand-back is stored as custom (which the seed then
+/// leaves alone) and a stale marker is reported lost.
+///
+/// Returns `None` when there is nothing to tell and nothing was rendered.
+pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option<RulesRefresh> {
+    let mut report = RulesRefresh::default();
+    let repos = match db.list_repos_with_local_path(None) {
+        Ok(v) => v,
+        Err(e) => {
+            report.errors.push(format!("repository list: {}", e));
+            Vec::new()
+        }
+    };
+    report.absorb(collect_approved_skill_edits(db, &repos, None));
+
+    let seeded = match crate::template_seeder::seed_bundled_templates(db) {
+        Ok(n) => n,
+        Err(e) => {
+            report.errors.push(format!("template seeding: {}", e));
+            0
+        }
+    };
+    let render = seeded > 0 || !report.taken.is_empty() || !report.lost.is_empty();
+    if render {
+        render_scope(
             db,
             claude_dir,
-            RenderScope::Everywhere,
-            None,
-        ))),
+            RenderScope::UptakeOnly,
+            true,
+            &repos,
+            &mut report,
+        );
+    }
+    if render || !report.errors.is_empty() {
+        Some(report)
+    } else {
+        None
     }
 }
 
@@ -778,7 +841,7 @@ mod tests {
             )
             .unwrap();
 
-        let report = deliver_rules_after_seed(&db, Some(home.path())).unwrap();
+        let report = deliver_rules_at_startup(&db, Some(home.path()));
 
         assert!(
             report.is_some(),
@@ -794,6 +857,94 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&copy).unwrap(), edited);
         assert!(!skills.join("sdh-debugging.md.approved").exists());
+    }
+
+    /// T-000207 follow-up: a marker left over from the bug sits beside a copy
+    /// equal to the OLD canonical text, and this launch's seed brings new bundle
+    /// text. Collecting after the seed would take the stale copy up, flag it
+    /// custom and silently revert the bundle update. It must be reported lost.
+    #[test]
+    fn test_startup_stale_marker_with_a_changed_bundle_is_lost_and_the_bundle_kept() {
+        let tmp = TempDir::new().unwrap();
+        let db = AppDb::new(tmp.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        // The previous build's text, as the database held it before upgrading.
+        db.upsert_template_file(
+            "_global",
+            "skill.sdh-debugging.md.tmpl",
+            "OLD CANONICAL",
+            false,
+        )
+        .unwrap();
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let (_, skills) = rendered_repo(&db, &repo_dir, "stale");
+        fs::write(skills.join("sdh-debugging.md.approved"), "").unwrap();
+
+        let report = deliver_rules_at_startup(&db, Some(home.path()))
+            .expect("the seed changed something, so there is a report");
+
+        let bundle =
+            crate::template_seeder::bundled_file_content("_global", "skill.sdh-debugging.md.tmpl")
+                .unwrap();
+        let row = db
+            .get_template_file("_global", "skill.sdh-debugging.md.tmpl")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.content, bundle, "the bundle update is kept");
+        assert!(
+            !row.is_custom,
+            "a stale marker must not mark the rule as a fork"
+        );
+        assert!(report.taken.is_empty(), "{:?}", report.taken);
+        assert_eq!(report.lost, vec!["sdh-debugging (stale)".to_string()]);
+        assert!(!skills.join("sdh-debugging.md.approved").exists());
+        assert_eq!(
+            fs::read_to_string(skills.join("sdh-debugging.md")).unwrap(),
+            bundle,
+            "and the copy now carries the new bundle text"
+        );
+    }
+
+    /// T-000207 follow-up: the startup collection runs on every launch, not
+    /// only when the seed changed something — a pending hand-back is taken up.
+    #[test]
+    fn test_startup_collects_even_when_the_bundle_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let db = AppDb::new(tmp.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let (_, skills) = rendered_repo(&db, &repo_dir, "pending");
+        let copy = skills.join("sdh-retro.md");
+        let edited = format!("{}\n\nHANDED BACK\n", fs::read_to_string(&copy).unwrap());
+        hand_back(&skills, "sdh-retro", &edited, "");
+
+        let report = deliver_rules_at_startup(&db, Some(home.path()));
+
+        assert_eq!(
+            db.get_template_file("_global", "skill.sdh-retro.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            edited
+        );
+        assert!(!skills.join("sdh-retro.md.approved").exists());
+        assert_eq!(report.map(|r| r.taken), Some(vec!["sdh-retro".to_string()]));
+    }
+
+    /// Nothing pending and an unchanged bundle: a normal launch renders nothing.
+    #[test]
+    fn test_startup_with_nothing_to_do_renders_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let db = AppDb::new(tmp.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        let home = TempDir::new().unwrap();
+
+        let report = deliver_rules_at_startup(&db, Some(home.path()));
+
+        assert!(report.is_none());
+        assert!(!home.path().join("skills").exists());
     }
 
     /// End-to-end guard: the REAL bundle (via seed_bundled_templates) must carry

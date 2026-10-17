@@ -66,23 +66,17 @@ pub fn run() {
     // the portfolio before rendering over them. What it found is held in managed
     // state until the frontend asks for it once (`take_startup_rules_report`).
     let claude_dir = dirs::home_dir().map(|h| h.join(".claude"));
-    let startup_rules = match sync::deliver_rules_after_seed(&db, claude_dir.as_deref()) {
-        Ok(None) => None,
-        Ok(Some(report)) => {
+    let startup_rules =
+        sync::deliver_rules_at_startup(&db, claude_dir.as_deref()).and_then(|report| {
             if !report.errors.is_empty() {
-                eprintln!("Warning: rule delivery after seeding: {:?}", report.errors);
+                eprintln!("Warning: rule delivery at startup: {:?}", report.errors);
             }
             eprintln!(
                 "[startup] rules delivered: {} skills, {} repositories",
                 report.skills, report.repos
             );
             Some(report).filter(|r| !r.is_quiet())
-        }
-        Err(e) => {
-            eprintln!("Warning: template seeding failed: {}", e);
-            None
-        }
-    };
+        });
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

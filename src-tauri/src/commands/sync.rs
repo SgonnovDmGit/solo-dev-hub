@@ -11,20 +11,39 @@ use tauri::State;
 pub struct SyncGlobalClaudeResult {
     path: String,
     synced_at: String,
+    /// T-000207: what the rule refresh found — the button renders
+    /// `~/.claude/skills/`, so it collects pending hand-backs first.
+    rules: RulesRefresh,
 }
 
-#[tauri::command]
+/// Async because the rule refresh scans every repo in the portfolio and, after
+/// an uptake, renders into all of them — not work for the UI thread.
+#[tauri::command(async)]
 pub fn sync_global_claude_md(db: State<AppDb>) -> Result<SyncGlobalClaudeResult, String> {
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    sync_global_claude_md_in(&db, &home)
+}
+
+/// The body of `sync_global_claude_md`, with the home directory injected so a
+/// test can run it against a sandbox instead of the real `~/.claude/`.
+fn sync_global_claude_md_in(db: &AppDb, home: &Path) -> Result<SyncGlobalClaudeResult, String> {
     let claude_path = home.join(".claude").join("CLAUDE.md");
-    sync::update_claude_md_global(&db, &claude_path)?;
-    sync::render_skills_global(&db, &home.join(".claude"))?;
+    sync::update_claude_md_global(db, &claude_path)?;
+    // T-000207: through `refresh_rules`, so hand-backs pending anywhere in the
+    // portfolio are collected before `~/.claude/skills/` is rendered over.
+    let rules = sync::refresh_rules(
+        db,
+        Some(&home.join(".claude")),
+        sync::RenderScope::Global,
+        None,
+    );
     let now = chrono::Utc::now().to_rfc3339();
     db.set_setting("ai_rules_last_sync_at", &now)
         .map_err(|e| e.to_string())?;
     Ok(SyncGlobalClaudeResult {
         path: claude_path.display().to_string(),
         synced_at: now,
+        rules,
     })
 }
 
@@ -827,6 +846,50 @@ mod tests {
             );
             assert!(!skills.join(format!("{}.md.approved", name)).exists());
         }
+    }
+
+    /// T-000207 follow-up: the global-rules button renders `~/.claude/skills/`.
+    /// It must collect pending hand-backs first, like every other render.
+    #[test]
+    fn test_global_rules_button_collects_pending_handbacks() {
+        let db_dir = TempDir::new().unwrap();
+        let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        db.insert_local_repository(&repo_dir.path().to_string_lossy(), "agentrepo", None, None)
+            .unwrap();
+        crate::sync::render_skills_to_repo(&db, repo_dir.path()).unwrap();
+        let skills = repo_dir.path().join("docs").join("sdh_skills");
+        let copy = skills.join("sdh-retro.md");
+        let edited = format!("{}\n\nHANDED BACK\n", fs::read_to_string(&copy).unwrap());
+        fs::write(&copy, &edited).unwrap();
+        fs::write(skills.join("sdh-retro.md.approved"), "").unwrap();
+
+        let result = sync_global_claude_md_in(&db, home.path()).unwrap();
+        assert_eq!(result.rules.taken, vec!["sdh-retro".to_string()]);
+
+        assert_eq!(
+            db.get_template_file("_global", "skill.sdh-retro.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            edited,
+            "the pending hand-back became the rule"
+        );
+        assert!(!skills.join("sdh-retro.md.approved").exists());
+        assert_eq!(
+            fs::read_to_string(
+                home.path()
+                    .join(".claude")
+                    .join("skills")
+                    .join("sdh-retro")
+                    .join("SKILL.md")
+            )
+            .unwrap(),
+            edited,
+            "the user-level skill carries the taken-up text"
+        );
     }
 
     // T-000173: a consumer connected to a codex sees one incoming edge per
