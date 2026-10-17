@@ -10,162 +10,81 @@ description: >
   sdh-cross-repo-req-answer.
 ---
 
-You are here if you are **asking another repo for something** and writing an outgoing requirement. REQ is the **reactive** channel: you ask, the other side answers.
+You are asking another repo for something. REQ is the reactive channel along the hierarchy: client → server, server → microservice, microservice → its parent server. The recipient owes an answer.
 
-- A REQ **arrived** for you and you need to answer with a receipt → skill `sdh-cross-repo-req-answer`.
-- You want to **push** something proactively, expecting no answer (server→client, microservice→parent) → skill `sdh-cross-repo-announce-send`.
+- A REQ arrived for you → `sdh-cross-repo-req-answer`. A push with no answer expected → `sdh-cross-repo-announce-send`. Two repos on the same level (client↔client, server↔server, ms↔ms) → `sdh-peer-channel-send`.
+- Solo Dev Hub moves files between repos. You never copy, move or delete across a repo boundary; you write only in your own outgoing folder.
 
-**Who sends REQs:** client → server; server → microservice; microservice → its parent server. REQ runs along the **hierarchy** — every edge here has a direction of debt, which is what obliges the recipient to answer.
+## Files
 
-Two repos at the **same level** — client ↔ client, server ↔ server, microservice ↔ microservice, in one project or across products — have no such debt and therefore no REQ channel: use the peer channel instead (skill `sdh-peer-channel-send`). Which side of a vertical edge you are on is what decides the direction; a client is a recipient only of a peer's exchange, never of a requirement.
+- `REQ-NNN_<slug>.md` — yours, the source of truth; the recipient holds a replica.
+- `REQ-NNN_<slug>.response.md` — the recipient's receipt; your copy is a replica, never edit it.
+- `NNN` is never renamed or reused. The slug is optional (the app matches `REQ-*.md`).
+- Revising your REQ before a receipt: edit the same file in place, never a second file under the same number.
 
-Solo Dev Hub moves files between repos itself — you **never** copy, move, or delete them across a repo boundary manually. Your area is only your own **outgoing** folder.
-
-## Files and ownership
-
-- **Requirement** `REQ-NNN_<slug>.md` — authored by **you**. Your copy is the **source of truth**; the recipient's copy is a synced replica (you edit only your own).
-- **Receipt** `REQ-NNN_<slug>.response.md` — authored by the **recipient**. Its copy is the source of truth; the copy that lands with you is a replica. **You do not edit it.**
-
-`NNN` is chosen at creation and **never** renamed or renumbered. `_<slug>` is a short kebab-case readability hint — recommended but optional (the app matches by the globs `REQ-*.md`).
-
-## Step 1. Pick the number `NNN` — from the registry
-
-The number comes from **`registry.md` in the root of your outgoing channel**, not from the folder listing:
+## 1. Number — from the registry
 
 | You | Registry |
 |---|---|
-| Client (→ server) | `docs/backend-requirements/registry.md` |
-| Server (→ microservice) | `docs/microservice-requirements/registry.md` |
+| Client → server | `docs/backend-requirements/registry.md` |
+| Server → microservice | `docs/microservice-requirements/registry.md` |
 
-**Why not just glob the folder.** Closing a pair deletes its files, so a number that lives only in a filename disappears with them: `max + 1` will eventually hand out a number the counterpart already has, and two different `REQ-014`s in one history is a reference that no longer references anything. The registry is append-only and Solo Dev Hub never writes or deletes it, so a closure cannot erase a number.
+- New number = `max` over the registry + 1, three digits. One counter per channel, across all counterparties.
+- Registry missing or empty → seed it first from every `REQ-*.md` in the channel, all subfolders; nothing anywhere → `001`. Never take the number from the folder listing: closed pairs are deleted.
+- Write the opening line in the same pass as the REQ: `- REQ-014 | out | swan_code_server | pagination on /orders | 2026-08-24 | | |` — fields `id | direction | counterpart | subject | opened | closed | final status | where the result went`. Direction is `out` here. The app never writes or deletes the registry.
 
-1. `max` over the **registry** (one counter per channel, across all counterparties in it).
-2. New = `max + 1`, zero-padded to 3 digits (`001`, `047`).
-3. Registry missing or empty — **first seed it** from every `REQ-*.md` currently in the channel, across all counterparty subfolders, one line each, then continue from `max + 1`. Skipping the seed would restart at `001` on top of live pairs.
-4. Nothing anywhere — start at `001`.
+## 2. Folder
 
-**Numbers are never reused**, not even after a pair is closed and its files are gone.
-
-Registry line — eight pipe-separated fields, the same shape in every channel:
-
-```
-- REQ-014 | out | swan_code_server | pagination on /orders | 2026-08-24 | 2026-08-26 | responded | implemented in v1.4.0
-```
-
-`id | direction (out/in) | counterpart | subject | opened | closed | final status | where the result went`
-
-`direction` is always `out` in this channel — you are the only side that allocates a number here. It stays in the format so a registry reads the same everywhere, including the peer channel where both sides allocate.
-
-**Write the opening line in the same pass as the REQ file.** That single line is what makes the number safe; the closing fields are bookkeeping you fill in later. If the pair is closed by the app's ✓ button rather than by you, fill the closing fields the next time you touch the channel.
-
-## Step 2. Put it in your outgoing folder
-
-| You | Your outgoing folder |
+| You | Outgoing folder |
 |---|---|
-| Client (→ server) | `docs/backend-requirements/` (flat — a client has one server) |
-| Server (→ microservice) | `docs/microservice-requirements/<microservice-project-name>/` (nested — a server has many microservices) |
+| Client → server | `docs/backend-requirements/` |
+| Server → microservice | `docs/microservice-requirements/<microservice-project-name>/` |
 
-Nesting appears when there can be many counterparties. Folder renames (repo renamed on GitHub) are handled by the app — **do not rename manually**.
+Never rename sync folders — the app handles renames.
 
-## Step 3. Write the REQ body
-
-The body is free-form, but a good REQ has structure — so the recipient can estimate scope and check for completion without a round-trip:
+## 3. Body
 
 ```markdown
-# REQ-NNN: <short one-line title>
+# REQ-NNN: <one-line title>
 
 ## Description
-What is needed and **why** — the problem context, not just "do X".
-Without context the recipient guesses intent and often guesses wrong.
+What is needed and why — the problem, not just "do X".
 
 ## Acceptance criteria
-A checkable "done when…" list:
-- [ ] concrete observable condition 1
-- [ ] concrete observable condition 2
+- [ ] observable condition
+- [ ] observable condition
 
 ## Context (optional)
-Links, constraints, examples, related endpoints/tables.
+Links, constraints, related endpoints or tables.
 ```
 
-**Body rules:**
-- **Phrase in terms of the recipient's contract.** If you are a server writing to a microservice — ask for what *the server needs from the MS*, not "the client wants X" (the microservice has no contract with the client; see "Downstream REQ").
-- **Audience (admin-vs-user), if it matters for RBAC/access, state explicitly in the body** — don't expect the recipient to infer it from the repo name.
-- The more concrete the acceptance criteria, the lower the chance of a `clarification-needed`.
+- Phrase it in the recipient's contract: a server asks a microservice for what the server needs, never "the client wants X".
+- If audience (admin vs user) matters for access, say it in the body.
 
-### Example: a full REQ
+## 4. Delivery
 
-File `docs/backend-requirements/REQ-007_avatar-upload.md` (client → server):
+- The next sync delivers the REQ and, later, returns the receipt. Your later edits overwrite the recipient's copy.
+- UI states: `new` → `sent` → `responded`.
+- A receipt or announcement that unblocks a task: remove the blocked note in `docs/todo.md` in the same pass and tell the owner which release it now sits in.
 
-```markdown
-# REQ-007: User avatar upload
+## 5. Closing
 
-## Description
-The client needs an endpoint to upload an avatar from the profile. Today the
-avatar is set only by an external URL — users ask to upload a file directly.
+- **✓ in the app**, or **drop an empty `REQ-NNN_<slug>.impl.md`** beside your REQ when you are done integrating. The next sync deletes `.md`, `.response.md` and `.impl.md` on both sides.
+- Fill the registry line (closed date, final status, where the result went) in the same pass. Closed by ✓ → fill it the next time you touch the channel.
+- **After dropping `.impl.md`, touch nothing.** Deleting any of the files yourself before a sync processes the close makes the next sync re-send your REQ as open, with no receipt.
+- Unsatisfied with a final receipt (`implemented` / `partially` / `declined`): write `REQ-N+1` with the clarified ask.
+- Receipt is `clarification-needed`: answer inline in the **original** REQ; the recipient overwrites its receipt.
+- Withdrawing an open REQ: put `**WITHDRAWN <date>:** <why>` under its H1 and keep the body; close with `.impl.md` once any receipt lands.
 
-## Acceptance criteria
-- [ ] `POST /profile/avatar` accepts a multipart file (jpg/png, ≤ 2 MB)
-- [ ] Returns `{ "avatarUrl": string }` with a public link
-- [ ] Type/size validation with error codes in docs/api.md
+## Downstream REQ (server forwarding a client REQ to a microservice)
 
-## Context
-The profile is already documented in docs/server-api/api.md (PATCH /profile).
-Blob storage is at the server's discretion.
-```
+An ordinary send, plus:
+1. Reformulate in server↔microservice terms.
+2. Right after the H1: `**Forwarded-from:** <client-repo-last-segment>/REQ-NNN` (e.g. `web-app-client/REQ-001`). One client REQ forwarded to several microservices → the header in each.
 
-## Step 4. Sync delivers the REQ and returns the receipt
+When to forward and the client receipt: `sdh-cross-repo-req-answer`, "Forwarding".
 
-- **The app** copies the REQ into the recipient's incoming folder at the next sync.
-- If you later **edit** the REQ — the next sync overwrites the recipient's copy. **The source of truth (you) always wins.**
-- The recipient writes a receipt; **the app returns** its copy to your outgoing folder.
-- You **do not edit** the receipt copy on your side — the edit will be overwritten at sync.
+## Never
 
-Sync state of the pair shown in the UI (computed from the filesystem): `new` (REQ exists on your side, not yet on the recipient's) → `sent` (both sides, no receipt) → `responded` (receipt appeared).
-
-## Step 5. Close the pair when satisfied with the receipt
-
-Two ways to close (delete) a pair — both remove all files on both sides:
-
-1. **Manual ✓** — the user clicks ✓ in the app (`confirm_requirement`). Available for any responded pair.
-2. **`.impl.md` (LLM-authorable)** — you drop an (optionally empty) file `REQ-NNN_<slug>.impl.md` next to the REQ in your **own outgoing** folder. At the next sync Solo Dev Hub detects it and tears down the whole triple (`.md` + `.response.md` + `.impl.md`) on both sides. This lets the sender's LLM close its own loops without a human ✓.
-
-**`.impl.md` rules:**
-- Authored **only by the sender**, only in the sender's outgoing folder. The file's existence is the signal; empty is fine, any content is ignored by the app.
-- Drop it **only when you are done integrating and satisfied** with the receipt.
-- **Finish the registry line in the same pass.** Fill `closed`, the final status and where the result went in the channel's `registry.md` before the sync tears the files down — after it, the ledger is the only record the exchange ever existed.
-- **Dropping `.impl.md` is the ENTIRE close action — then STOP.** Do not also delete the `REQ-NNN.md`, the `.response.md`, or the `.impl.md` yourself. The app tears down all three, on both sides, at the next sync — let one sync run and do not "tidy up" the files by hand.
-
-> **Failure mode — base-REQ resurrection.** If you delete the `.impl.md` yourself (or delete the `.response.md`) *before* a sync has processed the close, the auto-close never fires — and because the sender's copy of `REQ-NNN.md` is the **source of truth**, the *next* sync re-copies it to the recipient with no receipt attached. The recipient then sees a live "open" requirement that was already implemented, and puzzles over why. So after dropping `.impl.md`: **touch nothing, let a sync run — the app does every deletion.**
-
-**If NOT satisfied** with a final receipt (`implemented` / `partially` / `declined`) — do not "reject"; write a new `REQ-N+1_<slug>.md` with a clarified ask. The original pair may stay open until answered or be closed immediately.
-
-**If the receipt is `clarification-needed`** — a different path: edit the **original** `REQ-NNN.md` inline (do not open `REQ-N+1`), adding the answers. The next sync delivers the updated REQ, the recipient overwrites the receipt with a final status. The loop continues until you write a complete REQ.
-
-## Downstream REQ (forwarding, server only)
-
-When you are a **server** and received a client REQ that requires work in a connected microservice, you write an outgoing REQ to the microservice. This is an ordinary send (steps 1–3) with two differences:
-
-1. **Reformulate in server↔MS contract terms.** Not "the client wants X" verbatim — the microservice has no contract with clients. Ask for what the server needs from the MS.
-2. **Add the linkage header** immediately after the H1:
-
-```markdown
-# REQ-002: Avatar blob storage
-
-**Forwarded-from:** web-app-client/REQ-001
-
-## Description
-...
-```
-
-The header uses the **last-segment / canonical** form of the client repo name (`web-app-client/REQ-001`, not `SgonnovDmGit/web-app-client/REQ-001`), matching the folder names. One client REQ forwarded to several microservices → the same header in **each** downstream REQ.
-
-**Why the header:** it lets the server recover an in-flight chain across sessions. Without it, the link between a client REQ and its downstream MS REQs is not discoverable from the filesystem alone.
-
-Whether and **when** to forward, waiting for the whole chain, and writing the final client receipt — that is the answer side: see skill `sdh-cross-repo-req-answer`, section "Forwarding (triangular flow)".
-
-## What you must NOT do (sender side)
-
-- **Do not author a `REQ-*.md` in someone else's / your incoming folder.** You write only to your own outgoing folder. (If you are a server — do not write a REQ in `docs/client-requirements/<client>/`: the app populates it from the client, and your REQ there will be mistaken for an incoming request. Server-initiated communication to a client goes through announcements.)
-- **Do not edit a `REQ-*.response.md`** — the receipt belongs to the recipient; the edit will be overwritten.
-- **Do not delete** `REQ-*.md` / `.response.md` / `.impl.md` by hand — the app removes all of them. Closing is **only** via ✓ or dropping `.impl.md`; deleting files manually orphans the base REQ and resurrects it on the recipient (see §5 "Failure mode").
-- **Do not rename/renumber `NNN`** and **do not rename sync folders** — they are app-managed.
+- Write a `REQ-*.md` into an incoming folder (a server writing in `docs/client-requirements/` — server-to-client goes through announcements).
+- Edit a `.response.md`, delete pair files by hand, renumber, rename sync folders.

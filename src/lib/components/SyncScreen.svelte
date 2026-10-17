@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { selectedProjectId, currentScreen } from '$lib/stores/ui';
   import { addToast } from '$lib/stores/ui';
   import { allRepos } from '$lib/stores/repos';
@@ -6,6 +7,7 @@
   import { tStore } from '$lib/i18n';
   import { syncProject, listProjectRequirements, confirmRequirement, listCodexEdges, listPeerChannels } from '$lib/api/tauri-commands';
   import { noteManualSync } from '$lib/stores/autosync';
+  import { toastRulesFindings } from '$lib/utils/rules-report';
   import { getDisplayName, type RequirementInfo, type CodexEdgeInfo, type PeerChannelInfo } from '$lib/types';
 
   let requirements = $state<RequirementInfo[]>([]);
@@ -64,7 +66,9 @@
       }
       addToast(msg, 'success');
       if (result.errors.length > 0) {
-        addToast($tStore('sync.errors').replace('{0}', result.errors.join('; ')), 'warning');
+        // T-000198: one translated line per issue under a counted header.
+        const header = $tStore('sync.errors').replace('{0}', String(result.errors.length));
+        addToast(`${header}\n${formatSyncIssues(result.errors)}`, 'warning');
       }
       // F-000039: report REQ pairs auto-closed via .impl.md acknowledgement.
       if (result.auto_closed.length > 0) {
@@ -74,15 +78,11 @@
       if (result.committed.length > 0) {
         addToast($tStore('sync.committed').replace('{0}', String(result.committed.length)), 'info');
       }
-      // T-000205: a rule taken back out of a repo's flagged copy now applies to
-      // the whole portfolio. Nothing verifies the approval behind the flag, so
-      // naming what was picked up is the only trace there is — always shown.
-      if (result.rules_taken.length > 0) {
-        addToast(
-          $tStore('sync.rulesTaken' as any).replace('{0}', result.rules_taken.join(', ')),
-          'info'
-        );
-      }
+      // T-000205 / T-000207: a rule taken back out of a repo's flagged copy now
+      // applies to the whole portfolio, and a lost marker means an edit never
+      // arrived. Nothing verifies the approval behind a flag, so both are always
+      // named.
+      toastRulesFindings({ taken: result.rules_taken, lost: result.rules_lost, superseded: [] });
       await loadRequirements();
     } catch (e) {
       addToast(String(e), 'error');

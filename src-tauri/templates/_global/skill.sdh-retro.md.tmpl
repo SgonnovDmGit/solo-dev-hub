@@ -8,56 +8,47 @@ description: >
   session-reflection). Delivered as one block, saved immediately.
 ---
 
-You are here at the retro stage — the last in the release cycle (skill `sdh-release-lifecycle`), or whenever the user asks for a retro directly. The retro is **expected** at every closure unless the user explicitly skips it. It is **cheap self-improvement** and the highest-leverage stage for tuning how the LLM and user work together — observations evaporate at the session boundary if not captured.
+The last stage of a release (`sdh-release-lifecycle`), or whenever the user asks. Expected at every closure unless the user skips it.
+
+**Precondition:** stage 10 (next-release re-estimation) is done. If not — do it first.
+
+## Five points
+
+1. **What worked / what didn't** — working modes, decisions, friction, missed steps; an honest read of your own actions. Do not score the user.
+2. **Readiness** — of the release (coherent, or corners cut?) and of the project (debt, stability, distance to milestones).
+3. **What made the owner indignant** — in the owner's own words, quoted unsoftened, with the trigger. It sets the order for point 4. Nothing → write "nothing".
+4. **What to change in the process** — concrete edits to a skill, gate or repo step. Name any loop, stuck gate or token burn and the change that prevents it.
+5. **Lessons → a home.** "Nothing to record" is a normal outcome. Do not write a lesson just to fill the point.
+
+| Home | What goes there | How |
+|---|---|---|
+| Nowhere | already covered by a rule, or a one-off | — |
+| This repo's `CLAUDE.md` | true here, false in another repo: stack, tooling, local convention | edit directly; **replace or shorten** an existing line before adding one |
+| Auto-memory | the owner's phrasing and judgment, this session's history | write directly |
+| Codex svod | a practice of a role's subject area (server retries, admin error handling) | in the Codex repo directly; elsewhere by REQ |
+| Skill `sdh-*` | method that holds in every repo and every role | **nominate only**, see below |
+
+**Default home is the repo or nowhere.** A lesson goes to a skill only if all hold:
+- it is true in every repo and every role, not a habit of this project;
+- the **fresh** skill text (invoke it now) does not already say it — check by meaning, not by grep for your phrase;
+- it is written as a dry instruction: no story, project name, version, date or "paid for by";
+- moving a rule into a skill is a rewrite for that skill's trigger, not a copy; split along role and trigger, not topic.
+
+A retro never edits a skill. It nominates: target skill, exact English wording, and a Russian translation beside it. The owner approves each nomination by a separate reply; then the text is handed back as in **Editing a skill** (global rules).
+
+A nomination that adds a gate also says how fast the rule reaches the people it binds and who is allowed to write there.
+
+A rule that never fired in this project: read its scope clause before blaming discipline.
 
 ## Storage
 
-The retro is saved to the assistant's auto-memory directory as a `project`-type memory file:
-- Path: `<auto-memory-dir>/retro_v<X_Y_Z>.md` (e.g. `retro_v0_33_0.md`).
-- Index entry in `MEMORY.md`: `- [Retro v0.33.0](retro_v0_33_0.md) — <one-line hook>`.
+- `<auto-memory-dir>/retro_v<X_Y_Z>.md`, `project` type; index line `- [Retro vX.Y.Z](retro_vX_Y_Z.md) — <hook>` in `MEMORY.md`. Not committed to the repo.
+- When retro lines exceed a third of `MEMORY.md`, or the first size warning appears: move them verbatim into one `reference` memory `retros_index.md` and leave one pointer line. Move, do not summarise.
 
-Not committed to `docs/` or any repo path. Privacy of internal reflections + persistence across sessions = exactly what auto-memory is for. If retros multiply and make `MEMORY.md` noisy — consolidate older ones into a single `feedback` memory *"patterns across N retros"*; defer until it's a real problem.
+## Delivery
 
-## Precondition — stage 10 first
+One message with all five points and the memory-file draft, **in chat**. Save the file in the same pass without asking. Never stage it point by point.
 
-Before running the retro, confirm the **next-release re-estimation (stage 10 of `sdh-release-lifecycle`)** actually happened — the recurring slip is jumping impl/closure → retro and skipping it. If stage 10 wasn't done, do it first, then the retro.
+## One-time: sorting an old memory silo
 
-## Checklist (five points — all mandatory content of the retro file)
-
-Actionable-first: the retro exists to *change how the next release goes*, not to score anyone.
-
-1. **What worked / what didn't.** The collaboration patterns, working modes, and decisions worth keeping — and the friction: scope drift, missed workflow steps, planning errors, surprises. Include an honest read of **the LLM's own actions this session** (what it did well, where it slipped or skipped steps) — that feeds point 5. **Do not score the user here** — the affectionate, honest critique of the user lives in the informal `session-reflection` skill, not in the formal retro.
-2. **Readiness.** Two levels:
-   - **Release readiness** — was the closed release coherent, or did sharp corners and workarounds land?
-   - **Project readiness overall** — technical debt, stability, distance to upcoming milestones, known holes.
-3. **What made the owner indignant.** A different sensor from point 1: point 1 is the agent's read of its own machinery, this one is the owner's pain, and the two rarely coincide. Record **what irritated, frustrated or angered the owner during this release — in the owner's own words, unsoftened** — together with what triggered it. Quote, do not paraphrase into neutral prose: *"but he proposed it himself and I agreed!"* survives the session, *"there was some friction around file selection"* does not. This point **sets the queue for point 4**: a rule that caused indignation gets fixed before a rule that merely looked untidy to the agent. If nothing caused indignation, write that down too — an empty entry is a reading, silence is not. Without this point the owner's pains never enter the retro at all, and by the next session they are gone.
-4. **What to change in the process.** The actionable core. Concrete edits to the workflow itself — a skill, a gate, a repo-internal process step — surfaced by how *this* session actually went. **Explicitly flag any loop, stuck state, self-made impossible gate, or token burn**, and name the process change that prevents a repeat. "The process bit us, here's the fix" becomes a real edit here, not a lament — usually paired with a memory (point 5) or a direct skill/gate change in the same pass.
-5. **Lessons → a home.** Every lesson gets exactly one home, and the retro is not finished until each one has it. Choose by the nature of the lesson, not by what is convenient to write:
-
-   | Home | What goes there | How far it reaches | How it is written |
-   |---|---|---|---|
-   | **Codex** (practices svod) | domain practice tied to a role's subject area: retries and idempotency on a server, error normalisation in an admin client, key boundaries | the Codex's consumers, matched by role lane | from the Codex repo directly; from any other repo only via REQ — the `docs/codex/` inbox is read-only and is overwritten by sync |
-   | **Skill `sdh-*`** | method of work that does not depend on role: how to debug, how to review, how to run a release, how to hand a task to another agent | every managed repo | only through the owner — see **Editing a skill** in the global rules |
-   | **This repo's `CLAUDE.md`** | a statement that would be **false** in another repo: stack, tooling, a local convention | this repository | the retro writes it directly |
-   | **Auto-memory** (`feedback` / `project`) | the harness, the owner's phrasing and judgment, this session's own history | this project's memory directory, on this machine | the retro writes it directly |
-
-   **Take the widest home the lesson has actually earned.** Memory directories are bound to a project path: a general working-style rule filed as a memory is invisible in every other repo — including to the same assistant working there. That is exactly how a portfolio ends up with thousands of siloed lessons and no shared canon.
-
-   **A retro never edits a skill.** It *nominates*: it names the target skill and writes the exact wording. The edit itself is операционка and goes through the owner. The same holds for the Codex when you are not in its repo — the nomination becomes a REQ, not an edit of the inbox.
-
-   A lesson may split across homes; the memory file goes away once every part of it has one.
-
-## One-time: sorting an existing memory silo
-
-A memory directory that grew under the old rule — where everything defaulted to memory — is sorted with the same four-home test, one silo at a time, by the agent working in that repo: judging "is this still true?" needs that repo's code in context.
-
-- **Sort `feedback` memories only.** Retros, snapshots and `user` memories stay where they are: they are memory by nature, and a bulk sweep that eats them destroys the only record of what the owner actually said.
-- **Verify before promoting.** A memory is a point-in-time observation; if it names a file, a flag or a symbol, check that it still exists before the lesson becomes a rule for the whole portfolio.
-- **Promote, then delete the source** — the file goes once every part of it has a home.
-- Skill nominations accumulate in a batch for the owner, like any other skill edit. Once the owner has approved one, hand the text back through the flagged copy — see **Editing a skill** in the global rules. Until it is approved the retro only nominates and writes nothing into a skill.
-
-## How to deliver
-
-The retro is delivered **as one block**: the full opinion on all five points in a single message — including the proposed memory-file draft inline. **Save it immediately** — write the retro file (and any feedback/project memory) in the same pass. **Do not ask "save or not?"** — saving is the default; the user comments / overrides / adds context afterward and the final file reflects the post-comment state. Asking permission to save is a wasted round-trip: the assistant already has all the observations, the user steers post-hoc.
-
-**Do not stage the retro point by point.** Separate turns waiting for "ok" between each drag the cycle's last stage into N+1 round-trips for no information gained.
+Sort `feedback` memories only — retros, snapshots and `user` memories stay. Verify that named files or symbols still exist before promoting. Promote, then delete the source. Skill nominations from the sort go to the owner as a batch.

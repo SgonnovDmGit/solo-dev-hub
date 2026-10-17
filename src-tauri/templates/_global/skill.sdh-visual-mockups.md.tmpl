@@ -9,55 +9,46 @@ description: >
   (release-lifecycle).
 ---
 
-You are here when a feature has a **visual surface** and the main decision is how it looks: a new UI screen, landing page, component, visual redesign. For visual work a mockup is not an illustration but the **carrier of design decisions**: the accepted mockup is the design gate, after which the rest is usually mechanical.
+A feature with a visual surface, where the main decision is how it looks. The accepted mockup carries the design decisions and is the design gate. Not for server or non-visual work.
 
-Not for server/non-visual tasks — there the decisions are textual and no mockup is needed.
+## Show, don't describe
 
-## Method: show, don't describe (by any available means)
+Any visual preview the agent has (artifact, HTML in a browser, rendered images).
+- 2–4 variants side by side; in an interactive medium, toggles for variant, light/dark theme and width.
+- Iterate on concrete edits ("smaller gap", "chip further left").
+- Full width if the product is full width — no artificial `max-width`.
+- A failure or refusal frame shows every surface the failure changes (list row, draft tile, composer), not only the message.
 
-The medium is **any visual preview available to the current agent**: artifacts, a self-contained HTML preview in a browser, rendered images, etc. The medium is secondary — the principle matters: the user **sees** the design, does not read a description of it. What to reproduce regardless of medium:
+## Ground the fork in what exists
 
-- **Variants side by side** — 2–4 layouts next to each other (interactive medium — toggles for **variant** / **theme** light-dark / **width** narrow-wide-full in one mockup; static medium — separate renders), to compare live.
-- **Pixel-precise** — iterate on concrete edits ("smaller gap", "chip further left"), not on vague words.
-- **Full-width adaptive** — no artificial `max-width` constraint if the product is full-width.
+- Before drawing, grep how this kind of element is already drawn in the project and include it, labelled "how it looks today" — a screenshot taken this session, not a redraw from memory. No such element yet → say so: "both variants are new".
 
-## Ground the fork in what the project already does
+## Iterating
 
-Before drawing layout variants, grep for how this class of element is **already
-drawn in the project**, and put that existing variant among the ones you show,
-labelled "this is how it looks today". Grounding a mockup is the same discipline
-as grounding a spec: the spec greps a neighbouring file for the real idioms, the
-mockup greps for the real widgets.
+- Two "not quite" in a row → no third blind round: variants side by side, let the owner point at pixels.
+- Never settle on "known limitation" before listing the remaining options.
+- Revert a failed CSS experiment at once.
+- After each owner note, list every frame it changes and re-render all of them before showing again.
+- Name what a static frame cannot show (a missing player, no undo) so the owner rules on it at the board.
 
-A fork that omits what the system already does is not a choice — it is a poll
-about your sketches. The owner ends up picking between two of your inventions
-while a third, live one exists, and the answer comes back as that third one. If
-there genuinely is no existing variant, say so out loud: "the project has no such
-element yet, both of these are new." Then the choice is honest.
+## Before handing it over
 
-The tell, after the fact: at implementation it turns out the accepted mockup is
-built by changing the contents of a widget that was already there. The variant
-was in the project from the start and should have been shown.
+- Open the rendered mockup and look at it yourself.
+- Check sizes and legibility, not only that elements exist. Never shorten approved text without agreement.
+- Tables: pinned areas, scrolling, text selection. Dialogs: two compositions — short content and overflow.
+- States that read as one window share a shell and fixed anchors; check the transitions at the same window size (height, shared elements, footer, scroll kept).
+- A new mode is shown as a sequence: entry → choice → run → result → next launch, stating what is kept, cleared and inherited. A temporarily unavailable action does not erase the selected state.
+- State geometry against an explicit anchor ("centre of the first row").
+- Colour: a colour lock lists the exact surfaces and the consumers of a shared token that deliberately stay unchanged; check the full matrix palette × lightness × rest/hover/focus/pressed, temporary states included; for filled buttons check text legibility and state distinctness on the real background.
+- The UI shows the actual state, the risk and the available action — not explanations of why the data model is "not quite" something; if an explanation is needed, short and in place, preferably on demand.
+- A new capability reopens the restrictions it makes pointless: list them and put each to the owner.
+- Flag every simplification in the spec (a stub, a skipped state, three items where there will be twenty).
+- Take terms from the app's existing i18n keys.
 
-## Iteration discipline
+## After the lock
 
-- **After 2 consecutive "not quite"** — don't run a third blind iteration. Bring in the ui-ux skill + show variants **side by side** (variant/theme/width toggles), let the user point pixel-precisely.
-- **Don't bail to "known limitation / won't fix"** before explicitly listing the remaining options. "So it can't be done?" from the user = a signal you bailed early.
-- **A failed CSS experiment — revert it immediately**, don't hoard it as "defense in depth".
+An owner decision that cancels or changes a locked item is written into the board itself, marked and dated, before the next task — the board is what people reopen. Redrawing is optional; naming that the product is now the source of truth for that item is enough.
 
-## Before you hand it over
+## Output
 
-- **Look at the rendered mockup yourself first.** Open what you are about to hand over
-  and view it. This rule has existed since v1.12.0 and has twice fired for nothing —
-  both times the owner caught by eye what no tool could see.
-- **A simplification in the mockup is flagged explicitly in the spec.** Drew a stub
-  instead of the real layout, skipped a state, showed three items where there will be
-  twenty — say so, or the mockup gets read as a settled decision.
-- **Check terms against the app's i18n instead of inventing them.** Before deciding a
-  word stays English in the UI, grep the existing keys: help screens and new surfaces
-  mirror terminology that is already agreed, and a mismatch costs an extra round of
-  translation.
-
-## Output: the accepted mockup is the design gate
-
-The accepted mockup carries the design decisions — the spec text after it can be thin (see the spec step of `sdh-phase-workflow`). And this is usually where all the judgment is settled and the rest is mechanical → the cycle's **autonomous mode** naturally kicks in (see `sdh-release-lifecycle`): the user grants a carry-forward OK at mockup acceptance, and Implementation → Test → the documentation part of Closure roll on without per-stage approvals.
+The accepted mockup is the design gate; the spec after it can be thin (`sdh-phase-workflow`), and the autonomous mode usually starts here (`sdh-release-lifecycle`).

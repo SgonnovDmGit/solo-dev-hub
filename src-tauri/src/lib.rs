@@ -61,23 +61,27 @@ pub fn run() {
     // happened to press the global-rules button or sync a project. Deliver it on
     // the launch that actually changed something; an unchanged bundle renders
     // nothing, and the render itself skips files that already match.
-    match template_seeder::seed_bundled_templates(&db) {
-        Ok(0) => {}
-        Ok(_) => {
-            if let Some(home) = dirs::home_dir() {
-                let (skills, repos, errors) =
-                    sync::render_skills_everywhere(&db, &home.join(".claude"));
-                if !errors.is_empty() {
-                    eprintln!("Warning: rule delivery after seeding: {:?}", errors);
-                }
+    //
+    // T-000207: `deliver_rules_at_startup` collects pending hand-backs across the
+    // portfolio on every launch, before the seed and before rendering over them.
+    // What it found is held in managed state until the frontend asks for it once
+    // (`take_startup_rules_report`).
+    let claude_dir = dirs::home_dir().map(|h| h.join(".claude"));
+    let startup_rules =
+        sync::deliver_rules_at_startup(&db, claude_dir.as_deref()).and_then(|report| {
+            for issue in &report.errors {
+                eprintln!("Warning: rule delivery at startup: {}", issue);
+            }
+            // Only when something was actually rendered — a report can carry
+            // collection findings alone.
+            if report.skills > 0 || report.repos > 0 {
                 eprintln!(
                     "[startup] rules delivered: {} skills, {} repositories",
-                    skills, repos
+                    report.skills, report.repos
                 );
             }
-        }
-        Err(e) => eprintln!("Warning: template seeding failed: {}", e),
-    }
+            Some(report).filter(|r| !r.is_quiet())
+        });
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -114,6 +118,9 @@ pub fn run() {
             Ok(())
         })
         .manage(db)
+        .manage(commands::templates::StartupRulesReport(
+            std::sync::Mutex::new(startup_rules),
+        ))
         .invoke_handler(tauri::generate_handler![
             // Projects
             commands::project::create_project,
@@ -212,12 +219,14 @@ pub fn run() {
             // T-000137: per-repo auto-commit branch selector
             commands::sync::get_autocommit_branch,
             commands::sync::set_autocommit_branch,
+            commands::sync::get_repo_current_branch,
             // Templates (0.6.0)
             commands::templates::list_template_languages,
             commands::templates::list_template_files,
             commands::templates::get_template_file,
             commands::templates::save_template_file,
             commands::templates::reset_template_file,
+            commands::templates::take_startup_rules_report,
             // Deploy (0.7.0 / v0.18.0 multi-env)
             commands::deploy::set_deploy_target,
             commands::deploy::get_repo_deploy_config,

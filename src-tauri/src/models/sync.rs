@@ -20,12 +20,133 @@ pub struct WriteResult {
     pub errors: Vec<WriteError>,
 }
 
+/// T-000198: family of a non-fatal sync issue. Serialised as a snake_case
+/// string (`"copy_failed"`); the frontend translates it via the i18n key
+/// `syncIssue.<code>` (`formatSyncIssue` in `utils/sync-issues.ts`). Adding a
+/// variant means adding that key in ru + en; an unknown code falls back to
+/// English text built from `subject` / `detail`.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncIssueCode {
+    /// A file or folder could not be copied/mirrored. subject = file, target = destination.
+    CopyFailed,
+    /// A repo has no local_path, so it was skipped. subject = repo.
+    NoLocalPath,
+    /// A repo's root folder is missing or not a folder. subject = repo, detail = path.
+    RootMissing,
+    /// Rename replay found both the old and new folder. subject = old, target = new,
+    /// detail = the parent folder they sit in.
+    RenameCollision,
+    /// Rename replay failed on the filesystem. subject = old, target = new.
+    RenameReplayFailed,
+    /// An internal read of app data failed. subject = the entity (may be empty),
+    /// target = one of the `lookup::*` tokens naming what was being read.
+    LookupFailed,
+    /// A project lacks the repo of a role the sync needs. subject = project, target = role.
+    MissingCounterpart,
+    /// An app-managed file could not be written or reconciled. subject = repo, target = file.
+    ManagedFileFailed,
+    /// A peer-channel (InOutBox) step failed. subject = repo / file.
+    PeerChannelFailed,
+    /// Two writers left different versions of one item. subject = item, target = the sides.
+    VersionConflict,
+    /// A `.impl.md` auto-close of REQ pairs failed. subject = counterpart.
+    ReqAutoCloseFailed,
+    /// A one-time folder/file migration failed or was left alone. subject = what.
+    MigrationFailed,
+    /// A flat legacy REQ file had no matching parent copy (possibly stale) and
+    /// was left in the flat folder. subject = file.
+    MigrationLeftInPlace,
+    /// A flat legacy REQ file differs from its copy on the parent(s) and was
+    /// left in the flat folder. subject = file, target = the parents.
+    MigrationDiverged,
+    /// The auto-commit of synced files failed. subject = repo, detail = git output.
+    AutocommitFailed,
+    /// A rule copy is flagged but names no known skill. subject = repo, target = marker.
+    RuleUnknownSkill,
+    /// A flagged rule copy was left as is: unresolved hand-back. subject = repo, target = skill.
+    RuleHeld,
+    /// A hand-back step (read / store / clear marker) failed. subject = skill or repo.
+    RuleFailed,
+}
+
+/// T-000198: one non-fatal issue found by a sync-like pass. Replaces free
+/// English strings so the UI can show each one translated, one per line.
+/// `detail` is raw OS / git / DB text and is never translated.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SyncIssue {
+    pub code: SyncIssueCode,
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// T-000198: what a `lookup_failed` issue was reading — the fixed `target`
+/// tokens the frontend translates (`syncIssueLookup.<token>`).
+pub mod lookup {
+    pub const RENAMES: &str = "renames";
+    pub const REPOS: &str = "repos";
+    pub const PROJECT: &str = "project";
+    pub const SKILLS: &str = "skills";
+    pub const SEEDING: &str = "seeding";
+    pub const PEERS: &str = "peers";
+    pub const CODEX_SOURCE: &str = "codex_source";
+    pub const HOME_DIR: &str = "home_dir";
+    pub const AUTOCOMMIT_REPOS: &str = "autocommit_repos";
+}
+
+impl SyncIssue {
+    /// A failed internal read of `what` (a `lookup::*` token) for `subject`.
+    pub fn lookup(what: &'static str, subject: impl Into<String>) -> Self {
+        Self::new(SyncIssueCode::LookupFailed, subject).target(what)
+    }
+
+    pub fn new(code: SyncIssueCode, subject: impl Into<String>) -> Self {
+        Self {
+            code,
+            subject: subject.into(),
+            target: None,
+            detail: None,
+        }
+    }
+
+    pub fn target(mut self, target: impl Into<String>) -> Self {
+        self.target = Some(target.into());
+        self
+    }
+
+    pub fn detail(mut self, detail: impl std::fmt::Display) -> Self {
+        self.detail = Some(detail.to_string());
+        self
+    }
+}
+
+/// English rendering — for logs and test failure messages, not for the UI.
+impl std::fmt::Display for SyncIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = serde_json::to_value(self.code)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        write!(f, "{}: {}", code, self.subject)?;
+        if let Some(t) = &self.target {
+            write!(f, " -> {}", t)?;
+        }
+        if let Some(d) = &self.detail {
+            write!(f, " ({})", d)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SyncResult {
     pub copied: usize,
     pub responses: usize,
     pub migrated: usize,
-    pub errors: Vec<String>,
+    pub errors: Vec<SyncIssue>,
     /// F-000039: base REQ filenames (`REQ-NNN_slug.md`) whose pair the sender
     /// acknowledged via a `.impl.md` drop and was auto-torn-down this sync.
     #[serde(default)]
@@ -41,6 +162,19 @@ pub struct SyncResult {
     /// at least be visible after the fact.
     #[serde(default)]
     pub rules_taken: Vec<String>,
+    /// T-000207: `<skill> (<repo>)` — markers found beside a copy already equal
+    /// to the rule. The edit they stood for was lost before it was collected;
+    /// the marker is cleared and the rule left as it was.
+    #[serde(default)]
+    pub rules_lost: Vec<String>,
+}
+
+/// T-000207: result of `init_docs_for_repo` — the files written plus what the
+/// rule refresh found, since that command renders the repo's rule copies too.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InitDocsOutcome {
+    pub updated: Vec<String>,
+    pub rules: super::RulesRefresh,
 }
 
 /// F-000041: report from `untrack_files`. `untracked` = total file count
@@ -206,4 +340,129 @@ pub enum UpsertRepoOutcome {
         github_id: Option<i64>,
         candidates: Vec<Repository>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-000198: the frontend reads `code` as a plain snake_case string and
+    /// treats absent `target` / `detail` as missing keys — a mismatch with
+    /// `types/sync.ts` would fail silently, so the shape is pinned here.
+    #[test]
+    fn test_sync_issue_serde_shape() {
+        let full = SyncIssue::new(SyncIssueCode::CopyFailed, "REQ-001.md")
+            .target("srv")
+            .detail("Access is denied. (os error 5)");
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::json!({
+                "code": "copy_failed",
+                "subject": "REQ-001.md",
+                "target": "srv",
+                "detail": "Access is denied. (os error 5)"
+            })
+        );
+
+        let bare = SyncIssue::new(SyncIssueCode::NoLocalPath, "alpha");
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            serde_json::json!({ "code": "no_local_path", "subject": "alpha" })
+        );
+
+        for (code, wire) in [
+            (SyncIssueCode::RootMissing, "root_missing"),
+            (SyncIssueCode::RenameCollision, "rename_collision"),
+            (SyncIssueCode::RenameReplayFailed, "rename_replay_failed"),
+            (SyncIssueCode::LookupFailed, "lookup_failed"),
+            (SyncIssueCode::MissingCounterpart, "missing_counterpart"),
+            (SyncIssueCode::ManagedFileFailed, "managed_file_failed"),
+            (SyncIssueCode::PeerChannelFailed, "peer_channel_failed"),
+            (SyncIssueCode::VersionConflict, "version_conflict"),
+            (SyncIssueCode::ReqAutoCloseFailed, "req_auto_close_failed"),
+            (SyncIssueCode::MigrationFailed, "migration_failed"),
+            (
+                SyncIssueCode::MigrationLeftInPlace,
+                "migration_left_in_place",
+            ),
+            (SyncIssueCode::MigrationDiverged, "migration_diverged"),
+            (SyncIssueCode::AutocommitFailed, "autocommit_failed"),
+            (SyncIssueCode::RuleUnknownSkill, "rule_unknown_skill"),
+            (SyncIssueCode::RuleHeld, "rule_held"),
+            (SyncIssueCode::RuleFailed, "rule_failed"),
+        ] {
+            assert_eq!(serde_json::to_value(code).unwrap(), wire);
+        }
+    }
+
+    /// Every code, listed through an exhaustive match: a new variant does not
+    /// compile until it is added here, and the test below then demands it in TS.
+    fn all_codes() -> Vec<SyncIssueCode> {
+        use SyncIssueCode::*;
+        let all = vec![
+            CopyFailed,
+            NoLocalPath,
+            RootMissing,
+            RenameCollision,
+            RenameReplayFailed,
+            LookupFailed,
+            MissingCounterpart,
+            ManagedFileFailed,
+            PeerChannelFailed,
+            VersionConflict,
+            ReqAutoCloseFailed,
+            MigrationFailed,
+            MigrationLeftInPlace,
+            MigrationDiverged,
+            AutocommitFailed,
+            RuleUnknownSkill,
+            RuleHeld,
+            RuleFailed,
+        ];
+        for code in &all {
+            match code {
+                CopyFailed | NoLocalPath | RootMissing | RenameCollision | RenameReplayFailed
+                | LookupFailed | MissingCounterpart | ManagedFileFailed | PeerChannelFailed
+                | VersionConflict | ReqAutoCloseFailed | MigrationFailed | MigrationLeftInPlace
+                | MigrationDiverged | AutocommitFailed | RuleUnknownSkill | RuleHeld
+                | RuleFailed => {}
+            }
+        }
+        all
+    }
+
+    /// T-000198 review: the TS mirror (`SYNC_ISSUE_CODES` / `SYNC_ISSUE_LOOKUPS`
+    /// in `types/sync.ts`) must list every Rust wire name — the i18n table is
+    /// checked against those lists at compile time, so together a new code
+    /// cannot ship without a translation.
+    #[test]
+    fn test_ts_mirror_lists_every_code_and_lookup_token() {
+        let ts = include_str!("../../../src/lib/types/sync.ts");
+        for code in all_codes() {
+            let wire = serde_json::to_value(code).unwrap();
+            let wire = wire.as_str().unwrap();
+            assert!(
+                ts.contains(&format!("'{}'", wire)),
+                "types/sync.ts SYNC_ISSUE_CODES lacks '{}'",
+                wire
+            );
+        }
+        for token in [
+            lookup::RENAMES,
+            lookup::REPOS,
+            lookup::PROJECT,
+            lookup::SKILLS,
+            lookup::SEEDING,
+            lookup::PEERS,
+            lookup::CODEX_SOURCE,
+            lookup::HOME_DIR,
+            lookup::AUTOCOMMIT_REPOS,
+        ] {
+            assert!(
+                ts.contains(&format!("'{}'", token)),
+                "types/sync.ts SYNC_ISSUE_LOOKUPS lacks '{}'",
+                token
+            );
+        }
+    }
 }

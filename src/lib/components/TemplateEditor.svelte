@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { addToast } from '$lib/stores/ui';
   import { tStore } from '$lib/i18n';
   import { listTemplateFiles, saveTemplateFile, resetTemplateFile } from '$lib/api/tauri-commands';
   import type { TemplateFile } from '$lib/types';
   import ConfirmDialog from './ConfirmDialog.svelte';
+  import { toastRulesFindings } from '$lib/utils/rules-report';
 
   let { languageKey, excludeFiles = [] }: { languageKey: string; excludeFiles?: string[] } = $props();
 
@@ -66,9 +68,12 @@
             .replace('{1}', String(outcome.repos)),
           'success'
         );
+        // T-000207: the save collected pending hand-backs across the portfolio
+        // before rendering — name what was taken up, lost or set aside.
+        toastRulesFindings(outcome);
         if (outcome.errors.length > 0) {
           addToast(
-            $tStore('toast.ruleApplyErrors' as any).replace('{0}', outcome.errors.join('; ')),
+            $tStore('toast.ruleApplyErrors' as any).replace('{0}', formatSyncIssues(outcome.errors)),
             'error'
           );
         }

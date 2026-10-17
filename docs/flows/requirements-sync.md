@@ -89,7 +89,8 @@
 ## Автоматизация (v1.7.0)
 
 - **Авто-синк** (`src/lib/stores/autosync.ts`, T-000136): фоновый таймер тикает раз в 60 с; если включён и прошёл интервал — последовательно вызывает `sync_project` по проектам. Ручной Sync в UI — тот же путь.
-- **Авто-коммит** (T-000137): если у репо настроена auto-commit-ветка и репо сейчас на ней — после sync приложение коммитит **только tracked** cross-repo doc-папки (pathspec-scoped, автором `Solo Dev Hub`, префикс `chore(sdh-sync):`). Gitignore’нутые inbox-папки пропускаются, `-f` не форсит.
+- **Авто-коммит** (T-000137): если у репо настроена auto-commit-ветка и репо сейчас на ней — после sync приложение коммитит **только tracked** cross-repo doc-папки (pathspec-scoped, автором `Solo Dev Hub`, префикс `chore(sdh-sync):`). Gitignore’нутые inbox-папки пропускаются, `-f` не форсит. Репо на другой ветке — коммит пропускается молча: это состояние репо, а не ошибка синка (T-000198). `RepoDetail` показывает рядом с полем ветки «Авто-коммит на паузе: репо на ветке X, настроена Y» — ветка читается живьём при открытии репо (`get_repo_current_branch`, async, в БД не хранится).
+- **Ошибки синка** (T-000198): `SyncResult.errors` — список `SyncIssue { code, subject, target?, detail? }` (`models/sync.rs` ↔ `types/sync.ts`), не строки. `code` — одно из 18 семейств (`copy_failed`, `root_missing`, `rule_held`, `migration_left_in_place`…); у `lookup_failed` в `target` — фиксированный токен того, что читалось (`renames`, `repos`, `home_dir`…); фронт переводит каждое через `syncIssue.<code>` (`formatSyncIssue` в `utils/sync-issues.ts`) и показывает по строке на замечание. `detail` — сырой текст ОС/git, не переводится. Одинаковое замечание за проход пишется один раз (`SyncCounters::push`).
 - **Тред-модель** (T-000154): `sync_project` — `#[tauri::command(async)]`, тяжёлая работа (fs + git-субпроцессы) уходит с UI-потока, окно не морозится.
 
 ## Статусная модель (SyncScreen)

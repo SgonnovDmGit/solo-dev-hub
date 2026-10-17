@@ -11,28 +11,59 @@ use tauri::State;
 pub struct SyncGlobalClaudeResult {
     path: String,
     synced_at: String,
+    /// T-000207: what the rule refresh found — the button renders
+    /// `~/.claude/skills/`, so it collects pending hand-backs first.
+    rules: RulesRefresh,
 }
 
-#[tauri::command]
+/// Async because the rule refresh scans every repo in the portfolio and, after
+/// an uptake, renders into all of them — not work for the UI thread.
+#[tauri::command(async)]
 pub fn sync_global_claude_md(db: State<AppDb>) -> Result<SyncGlobalClaudeResult, String> {
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    sync_global_claude_md_in(&db, &home)
+}
+
+/// The body of `sync_global_claude_md`, with the home directory injected so a
+/// test can run it against a sandbox instead of the real `~/.claude/`.
+fn sync_global_claude_md_in(db: &AppDb, home: &Path) -> Result<SyncGlobalClaudeResult, String> {
     let claude_path = home.join(".claude").join("CLAUDE.md");
-    sync::update_claude_md_global(&db, &claude_path)?;
-    sync::render_skills_global(&db, &home.join(".claude"))?;
+    sync::update_claude_md_global(db, &claude_path)?;
+    // T-000207: through `refresh_rules`, so hand-backs pending anywhere in the
+    // portfolio are collected before `~/.claude/skills/` is rendered over.
+    let rules = sync::refresh_rules(
+        db,
+        Some(&home.join(".claude")),
+        sync::RenderScope::Global,
+        None,
+    );
     let now = chrono::Utc::now().to_rfc3339();
     db.set_setting("ai_rules_last_sync_at", &now)
         .map_err(|e| e.to_string())?;
     Ok(SyncGlobalClaudeResult {
         path: claude_path.display().to_string(),
         synced_at: now,
+        rules,
     })
 }
 
 /// Init skeletons for a single repo — F-016 manual trigger.
 /// Copies-if-missing: docs/todo.md, docs/bug-reports.md; section-merges .gitignore + .gitattributes.
 /// Returns list of filenames actually created (empty list = all already exist).
-#[tauri::command]
-pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>, String> {
+// T-000207: async — the rule refresh scans the whole portfolio and, after an
+// uptake, renders into every repo; not work for the UI thread.
+#[tauri::command(async)]
+pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<InitDocsOutcome, String> {
+    init_docs_for_repo_in(&db, dirs::home_dir(), repo_id)
+}
+
+/// The body of `init_docs_for_repo`, with the home directory injected so a test
+/// can run it against a sandbox instead of the real `~/.claude/`.
+fn init_docs_for_repo_in(
+    db: &AppDb,
+    home: Option<std::path::PathBuf>,
+    repo_id: i64,
+) -> Result<InitDocsOutcome, String> {
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
     let path = repo
         .local_path
@@ -78,13 +109,22 @@ pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>,
     // App-owned files (project.md + CLAUDE.md section) — always overwritten when
     // the repo is attached to a project. Orphan repos (project_id=None) skip this
     // since project-context wouldn't render meaningfully.
-    sync::render_skills_to_repo(&db, base)?;
+    // T-000207: through `refresh_rules`, so a hand-back pending in this repo —
+    // or anywhere else in the portfolio — is collected before the render
+    // overwrites it. Failures are reported in `rules.errors`, not fatal.
+    let claude_dir = home.map(|h| h.join(".claude"));
+    let rules = sync::refresh_rules(
+        db,
+        claude_dir.as_deref(),
+        sync::RenderScope::Repo(base),
+        None,
+    );
     updated.push("docs/sdh_skills/".to_string());
     if let Some(pid) = repo.project_id {
-        sync::generate_project_md(&db, pid, base)?;
+        sync::generate_project_md(db, pid, base)?;
         updated.push("docs/project.md".to_string());
         sync::update_claude_md_section(
-            &db,
+            db,
             Some(pid),
             repo.role.as_deref(),
             &base.join("CLAUDE.md"),
@@ -97,7 +137,7 @@ pub fn init_docs_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<String>,
         // why project.md / CLAUDE.md weren't updated.
         updated.push("(project.md + CLAUDE.md skipped — repo has no project assigned)".to_string());
     }
-    Ok(updated)
+    Ok(InitDocsOutcome { updated, rules })
 }
 
 // T-000154: runs off the main thread. `run_project_sync` does heavy synchronous
@@ -751,12 +791,101 @@ pub fn list_renames_for_repo(db: State<AppDb>, repo_id: i64) -> Result<Vec<RepoR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::skills::test_support::hand_back_edit;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn make_db() -> AppDb {
         AppDb::new(PathBuf::from(":memory:")).unwrap()
+    }
+
+    /// T-000207: init docs re-renders one repo's copies. A hand-back pending
+    /// there -- or anywhere else in the portfolio -- is collected first.
+    #[test]
+    fn test_init_docs_collects_before_it_renders() {
+        let db_dir = TempDir::new().unwrap();
+        let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        let home = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let repo = db
+            .insert_local_repository(&target.path().to_string_lossy(), "target", None, None)
+            .unwrap();
+        db.insert_local_repository(&elsewhere.path().to_string_lossy(), "elsewhere", None, None)
+            .unwrap();
+        let mut edits = Vec::new();
+        for (dir, name) in [(&target, "sdh-debugging"), (&elsewhere, "sdh-retro")] {
+            crate::sync::render_skills_to_repo(&db, dir.path()).unwrap();
+            let edited = hand_back_edit(dir.path(), name);
+            edits.push((dir.path().to_path_buf(), name, edited));
+        }
+
+        let outcome = init_docs_for_repo_in(&db, Some(home.path().to_path_buf()), repo.id).unwrap();
+        assert_eq!(
+            outcome.rules.taken,
+            vec!["sdh-debugging".to_string(), "sdh-retro".to_string()]
+        );
+
+        for (dir, name, edited) in &edits {
+            let skills = dir.join("docs").join("sdh_skills");
+            assert_eq!(
+                db.get_template_file("_global", &format!("skill.{}.md.tmpl", name))
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                *edited,
+                "{} became the rule",
+                name
+            );
+            assert_eq!(
+                fs::read_to_string(skills.join(format!("{}.md", name))).unwrap(),
+                *edited
+            );
+            assert!(!skills.join(format!("{}.md.approved", name)).exists());
+        }
+    }
+
+    /// T-000207 follow-up: the global-rules button renders `~/.claude/skills/`.
+    /// It must collect pending hand-backs first, like every other render.
+    #[test]
+    fn test_global_rules_button_collects_pending_handbacks() {
+        let db_dir = TempDir::new().unwrap();
+        let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        db.insert_local_repository(&repo_dir.path().to_string_lossy(), "agentrepo", None, None)
+            .unwrap();
+        crate::sync::render_skills_to_repo(&db, repo_dir.path()).unwrap();
+        let skills = repo_dir.path().join("docs").join("sdh_skills");
+        let edited = hand_back_edit(repo_dir.path(), "sdh-retro");
+
+        let result = sync_global_claude_md_in(&db, home.path()).unwrap();
+        assert_eq!(result.rules.taken, vec!["sdh-retro".to_string()]);
+
+        assert_eq!(
+            db.get_template_file("_global", "skill.sdh-retro.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            edited,
+            "the pending hand-back became the rule"
+        );
+        assert!(!skills.join("sdh-retro.md.approved").exists());
+        assert_eq!(
+            fs::read_to_string(
+                home.path()
+                    .join(".claude")
+                    .join("skills")
+                    .join("sdh-retro")
+                    .join("SKILL.md")
+            )
+            .unwrap(),
+            edited,
+            "the user-level skill carries the taken-up text"
+        );
     }
 
     // T-000173: a consumer connected to a codex sees one incoming edge per
@@ -867,6 +996,86 @@ mod tests {
 #[tauri::command]
 pub fn get_autocommit_branch(db: State<AppDb>, repo_id: i64) -> Result<Option<String>, String> {
     db.get_autocommit_branch(repo_id).map_err(|e| e.to_string())
+}
+
+/// T-000198: the branch the repo's checkout is on right now, so RepoDetail can
+/// say the auto-commit is paused when it differs from the configured one.
+/// Computed live, never stored. `None` when the repo has no local checkout, is
+/// not a git repo, git is unavailable, or HEAD is detached / unborn.
+/// Async: it spawns git, which must not run on the UI thread.
+#[tauri::command(async)]
+pub fn get_repo_current_branch(db: State<AppDb>, repo_id: i64) -> Result<Option<String>, String> {
+    repo_current_branch(&db, repo_id)
+}
+
+fn repo_current_branch(db: &AppDb, repo_id: i64) -> Result<Option<String>, String> {
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let Some(path) = repo.local_path.as_deref() else {
+        return Ok(None);
+    };
+    let path = Path::new(path);
+    if !crate::git_ops::is_git_repo(path) {
+        return Ok(None);
+    }
+    let Some(git) = crate::git_ops::cached_git() else {
+        return Ok(None);
+    };
+    crate::git_ops::current_branch(&git, path)
+}
+
+#[cfg(test)]
+mod current_branch_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?}: {:?}", args, out);
+    }
+
+    #[test]
+    fn test_repo_current_branch_reads_the_checkout() {
+        let db = AppDb::new(std::path::PathBuf::from(":memory:")).unwrap();
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        let repo = db
+            .insert_local_repository(&dir.path().to_string_lossy(), "wb", None, None)
+            .unwrap();
+        assert_eq!(
+            repo_current_branch(&db, repo.id).unwrap(),
+            Some("dev".to_string())
+        );
+    }
+
+    #[test]
+    fn test_repo_current_branch_is_none_outside_git() {
+        let db = AppDb::new(std::path::PathBuf::from(":memory:")).unwrap();
+        let dir = TempDir::new().unwrap();
+        let repo = db
+            .insert_local_repository(&dir.path().to_string_lossy(), "plain", None, None)
+            .unwrap();
+        assert_eq!(repo_current_branch(&db, repo.id).unwrap(), None);
+    }
 }
 
 #[tauri::command]

@@ -1,24 +1,25 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo } from '$lib/types';
+import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult } from '$lib/types';
 
 
 // ── Requirements sync commands ──────────────────────────────────────────────
-
-export interface SyncGlobalClaudeResult {
-  path: string;
-  synced_at: string;
-}
 
 export async function syncGlobalClaudeMd(): Promise<SyncGlobalClaudeResult> {
   return await invoke<SyncGlobalClaudeResult>('sync_global_claude_md');
 }
 
-export async function initDocsForRepo(repoId: number): Promise<string[]> {
-  return invoke<string[]>('init_docs_for_repo', { repoId });
+export async function initDocsForRepo(repoId: number): Promise<InitDocsOutcome> {
+  return invoke<InitDocsOutcome>('init_docs_for_repo', { repoId });
 }
 
 export async function syncProject(projectId: number): Promise<SyncResult> {
   return invoke<SyncResult>('sync_project', { projectId });
+}
+
+/** T-000198: the branch the repo's checkout is on now (live, not stored);
+ *  null when there is no local git checkout or HEAD is detached / unborn. */
+export async function getRepoCurrentBranch(repoId: number): Promise<string | null> {
+  return invoke<string | null>('get_repo_current_branch', { repoId });
 }
 
 export async function listProjectRequirements(projectId: number): Promise<RequirementInfo[]> {

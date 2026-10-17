@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { onMount } from 'svelte';
   import '../app.css';
   import { currentScreen, navigateTo, goBack } from '$lib/stores/ui';
@@ -9,7 +10,8 @@
   import { startAutoSyncTimer } from '$lib/stores/autosync';
   import { loadAllRepos, backfillAutocommitDevBranch, pendingMergeCases, type AmbiguousMergeCase } from '$lib/stores/repos';
   import { addToast } from '$lib/stores/ui';
-  import { resolveMergeWithLocal, forceInsertGithubRepo } from '$lib/api/tauri-commands';
+  import { resolveMergeWithLocal, forceInsertGithubRepo, takeStartupRulesReport } from '$lib/api/tauri-commands';
+  import { toastRulesFindings } from '$lib/utils/rules-report';
   import { tStore, tf, initLocale } from '$lib/i18n';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { checkForUpdate, updaterStatus } from '$lib/stores/updater';
@@ -50,6 +52,19 @@
   // no-op'd through the proxy.
   let ctxMenu = $state.raw<{ x: number; y: number; target: HTMLInputElement | HTMLTextAreaElement } | null>(null);
 
+  async function showStartupRulesReport() {
+    try {
+      const report = await takeStartupRulesReport();
+      if (!report) return;
+      toastRulesFindings(report);
+      if (report.errors.length > 0) {
+        addToast(tf('toast.rulesStartupErrors', formatSyncIssues(report.errors)), 'warning');
+      }
+    } catch (e) {
+      console.warn('startup rules report unavailable', e);
+    }
+  }
+
   async function refreshMaximized() {
     try { isMaximized = await appWindow.isMaximized(); } catch {}
   }
@@ -63,6 +78,9 @@
     await loadSettings();
     await initUiScale();
     await Promise.all([loadProjects(), loadAllRepos()]);
+    // T-000207: the startup rule delivery (after a seed that changed the bundle)
+    // collects pending hand-backs first; show what it found, once.
+    void showStartupRulesReport();
     // B-000028: default empty auto-commit branches to `dev` portfolio-wide, in
     // the background (non-blocking) — needs a PAT to read each repo's branches.
     const token = get(pat);

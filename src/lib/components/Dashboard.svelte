@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { onMount } from 'svelte';
   import {
     currentPeriod,
@@ -35,7 +36,9 @@
     try {
       const report = await reconcileAllProjects();
       if (report.errors.length > 0) {
-        addToast(report.errors.join('; '), 'warning');
+        // T-000198: one translated line per issue under a counted header.
+        const header = $tStore('sync.errors').replace('{0}', String(report.errors.length));
+        addToast(`${header}\n${formatSyncIssues(report.errors)}`, 'warning');
       }
     } catch (e) {
       addToast(String(e), 'error');

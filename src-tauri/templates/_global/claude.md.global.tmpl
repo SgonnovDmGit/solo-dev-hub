@@ -1,323 +1,131 @@
 # Solo Dev Hub — global AI rules
 
-This section is managed by Solo Dev Hub. It describes **formats and contracts** used across every project. For per-project context (name, repos, microservices) see the repo's own `CLAUDE.md`.
+Managed by Solo Dev Hub: formats and contracts shared by every project. Per-project context (name, repos, microservices) is in the repo's own `CLAUDE.md`.
 
-**Escape rules (apply to all pipe-separated formats below — todo, done, bug-reports):**
-- Literal `|` inside a free-form field (`description`, `comment`, `version`) → write as `\|`
-- Literal newline inside a free-form field → write as `\n`
-- Enum and id fields must not contain `|` or newlines.
+## How the rules apply
 
-## Workflow skills (on-demand)
+- **A repo's own `CLAUDE.md` wins.** Where it conflicts with this section or a skill, follow the repo and name the conflict to the owner in one line.
+- **A step that has a skill starts by invoking that skill in the same turn.** Skills change between sessions. Not a source: skill text re-injected after a compaction, a compaction summary, memory, or the previous release's artifact ("how it was done last time").
+- **A procedure the owner can choose is a default, not a duty.** Who fixes review findings, who closes, how much ceremony — the owner decides per release; a skill only supplies the default.
+- **Stop what you started.** Before finishing a task, stop the processes you launched — dev servers, watchers, test runners, background shells. Anything left running on purpose: name it and why.
 
-Workflow-heavy rules are not inlined here — they load on demand. In Claude Code they surface automatically as `sdh-*` skills by their description; for any agent, the same content is in each repo's `docs/sdh_skills/*.md`. Read the matching one when the trigger applies:
+## Workflow skills (on demand)
 
-| When you… | Skill / file |
+In Claude Code they surface as `sdh-*` skills; for any agent the same text is in `docs/sdh_skills/*.md`.
+
+| When you… | Skill |
 |---|---|
-| author or close an OUTGOING cross-repo REQ (you're asking) | `sdh-cross-repo-req-send` |
-| answer a REQ that ARRIVED for you (write a receipt) | `sdh-cross-repo-req-answer` |
-| push an unsolicited announcement to a client / parent server | `sdh-cross-repo-announce-send` |
+| author or close an OUTGOING cross-repo REQ | `sdh-cross-repo-req-send` |
+| answer a REQ that ARRIVED for you | `sdh-cross-repo-req-answer` |
+| push an announcement to a client / parent server | `sdh-cross-repo-announce-send` |
+| process announcements that arrived (session start) | `sdh-cross-repo-announce-read` |
 | start an exchange with an EQUAL (client↔client, server↔server, ms↔ms) | `sdh-peer-channel-send` |
-| answer something an equal sent you (ack / handoff / note) | `sdh-peer-channel-answer` |
-| process announcements that arrived (at session start) | `sdh-cross-repo-announce-read` |
-| add/change/remove an api.md endpoint (maintain your contract) | `sdh-api-contract-maintain` |
+| answer something an equal sent you | `sdh-peer-channel-answer` |
+| add/change/remove an `api.md` endpoint | `sdh-api-contract-maintain` |
 | check another repo's server surface before a spec | `sdh-api-contract-consume` |
-| apply a practices svod that landed in docs/codex/ (you're a consumer) | `sdh-codex-consume` |
-| curate your own Codex svod of practices (you're the publisher) | `sdh-codex-maintain` |
-| document a multi-file/multi-layer feature flow | `sdh-feature-flow-docs` |
+| apply a Codex svod that landed in `docs/codex/` | `sdh-codex-consume` |
+| curate your own Codex svod | `sdh-codex-maintain` |
+| document a multi-file / multi-layer feature flow | `sdh-feature-flow-docs` |
 | scope a non-trivial task (≥2 decisions / cross-boundary / ≥3 subtasks) | `sdh-phase-workflow` |
-| debug a bug — where to look first for this class of symptom | `sdh-debugging` |
-| split dev work across two AI agents — one specs, another implements, then it's reviewed | `sdh-agent-collaboration` |
-| design a non-server visual surface (screen / landing / component) | `sdh-visual-mockups` |
-| run a release (any SemVer bump) — stages, tracks, transitions | `sdh-release-lifecycle` |
-| close a release tag (checklist + git canon) | `sdh-release-closure` |
-| run a retrospective at release closure | `sdh-retro` |
+| debug a bug | `sdh-debugging` |
+| split work between two AI agents (spec → implement → review) | `sdh-agent-collaboration` |
+| design a non-server visual surface | `sdh-visual-mockups` |
+| run a release (any SemVer bump) | `sdh-release-lifecycle` |
+| close a release tag | `sdh-release-closure` |
+| run a retrospective | `sdh-retro` |
+| start a new project or repo, scaffold its docs | `sdh-project-start` |
 
-# Editing a skill
+## Editing a skill
 
-A skill reaches **every repo in the portfolio**, so a careless edit travels further than any code change.
+A skill reaches every repo in the portfolio.
 
-- **The owner acks the wording before it is written.** Any agent may draft and propose; none writes into a skill unopposed. Show the exact block, wait, then edit. A skill edit is **never delegated to a subagent** and never arrives as a side effect of another task.
-- **Only the canon is edited — the `skill.*.md.tmpl` template in the Solo Dev Hub repo.** `~/.claude/skills/<name>/SKILL.md` and `<repo>/docs/sdh_skills/<name>.md` are two **outputs** of one source; they are rewritten on every sync, and an unmarked edit there vanishes without a trace.
-- **The one way to hand a rule back from another repo: edit your own `docs/sdh_skills/<name>.md` and drop an empty `<name>.md.approved` beside it.** The next sync takes that text as the new rule and pushes it to every repository. **The marker means the owner has already approved this exact wording, in chat, before you wrote the file.** It is not a request and not a nomination, so never create it on your own initiative. Without the marker the copy stays an output and your edit is overwritten. A name the bundle does not know is refused: a rule cannot be invented in a copy. Two repositories handing the same skill back with different text are refused as a conflict — agree first, then flag one of them. The sync names every rule it takes up.
-- **Delivery does not wait for a release.** The per-repo copies are rendered from the database row on every sync, so the same agreed text applied through Settings → App defaults reaches every repo immediately. That row is marked `is_custom=1`; once the next build carries the same text into the bundle, the flag is cleared automatically and the fork heals.
-- **It is операционка, not a release task.** No `todo.md` entry and no per-edit ceremony — but accumulated rule changes are listed as **one** Changelog line at the next closure, so the version step stays explained.
-
-- **A gate is designed together with its delivery and ownership constraints.** When
-  proposing a rule about who edits the canon and how, answer two questions in the same
-  breath: how fast does an edit reach the people it concerns, and who is even allowed to
-  write into that repository. A gate that depends on frequent releases, or on access
-  people do not have, looks tidy and does not work.
-
-The boundary with the Codex: a practice tied to a role's subject area belongs in the svod, not in a skill. A skill carries method that does not depend on role.
-
-Four rules about the rules themselves:
-
-- **Moving a rule into a skill is a rewrite, not a relocation.** A skill has a trigger
-  and a role, so the rule can be narrowed to the moment it is actually needed and
-  sharpened with specifics the general text had no room for. "Port it verbatim" is a
-  missed opportunity, and usually a sign the author did not understand why it was being
-  extracted.
-- **Split along the boundary of role and trigger, not of topic.** One cluster of rules
-  becomes several skills whenever it contains different roles inside — sender and
-  receiver, publisher and consumer, the author of a spec and its implementer. A skill
-  serving both sides of an exchange surfaces at the wrong time for both.
-- **Two rules that contradict each other about the same artifact are a bug in the
-  rules, not in the code.** If a behaviour violates one rule precisely because it obeys
-  another, the text needs fixing, not just the code — and the fork goes to the owner
-  rather than being resolved silently.
-- **A rule that has never once fired is a rule to suspect of a scope clause.** A
-  checklist step that has never applied to your project in all this time most likely
-  excludes you by its own wording ("servers only", "if there is a DB") rather than
-  waiting for its moment. Read the clause before blaming your discipline.
+- **The owner approves the exact wording first.** Show the block; the approval is the owner's separate reply to that block. An "ok" inside a message about something else (a release, a hand-off) does not approve a text. Never delegate a skill edit to a subagent, never make one as a side effect of another task.
+- **The canon is the `skill.*.md.tmpl` in the Solo Dev Hub repo.** `~/.claude/skills/<name>/SKILL.md` and `<repo>/docs/sdh_skills/<name>.md` are outputs, rewritten on every sync.
+- **Hand-back from another repo:** edit your `docs/sdh_skills/<name>.md` first, then drop an empty `<name>.md.approved` beside it. The marker states the owner already approved this exact text — never create it on your own initiative. The next sync takes the text up and names it; check that it did. Unknown skill names are refused; two repos handing back different text for one skill are refused as a conflict.
+- **Delivery does not wait for a release:** the same text through Settings → App defaults reaches every repo on the next sync. Rule changes are not `todo.md` tasks; they get one Changelog line at the next closure **of the Solo Dev Hub repo**.
+- **A skill holds a dry instruction.** No case stories, project names, dates or "paid for by" — those stay in the project's retro.
+- Two rules contradicting each other about one artifact is a bug in the rules: take it to the owner, don't resolve it silently.
 
 # Agreed decisions are not reopened
 
-A decision is **agreed** once it was discussed with the owner **and written down** — in a spec, a task, a doc, a rule file, or the chat thread that stood in for a spec. This includes the ordinary case where **the agent proposed it and the owner accepted**: who authored the proposal does not make it any less agreed.
+A decision is **agreed** once discussed with the owner and written down (spec, task, doc, rule, or the chat that served as the spec) — including when the agent proposed it and the owner accepted. The agent does not reopen it, re-litigate it, offer alternatives "just in case", or replace it with its own measurement. Only the owner reopens it.
 
-An agreed decision is closed. The agent does not reopen it, does not re-litigate it, does not offer an alternative "just in case", and does not voice fresh doubt about it. Only the owner reopens an agreed decision.
-
-**Every record names its author** — who proposed, who accepted. A decision the agent took alone, with no owner in the loop, is marked as such and is **not** agreed: it stays open to objection, and the agent says so where it matters.
-
-**Consequences of an agreed decision are not anomalies.** A file that differs, a field that exists, a folder that appeared *because that is what was decided* is not a foreign edit, not a defect, and not grounds for an investigation. Before treating a difference as a surprise, check whether it is the footprint of a decision already on record.
-
-Why the rule exists: compaction and session boundaries erase the conversation but not the artifact. Without an authored record the agent later meets the consequence of its own accepted proposal, fails to recognise it, and hands it back to the owner as an anomaly — spending a second time the hours the owner already paid for.
+Every record names its author. A number or a choice the agent made alone is marked as the agent's, never written as the owner's words — and it stays open to objection. A file, field or folder that exists because of an agreed decision is its footprint, not an anomaly.
 
 # An unproven "can't" never narrows the product
 
-"That can't be done", "the provider doesn't support it", "this is impossible here" are
-claims that need a **source**, not conclusions you arrive at from fatigue or a skim.
-Without a source it is a guess, and **a guess has no right to change the product**.
-
-The concrete prohibition: do not switch off, delete or trim functionality — neither
-what already works nor what is **planned** — on the strength of your own unsourced
-claim. Clearing a capability flag on an external service, dropping a field, narrowing
-a branch, "let's disable it for now and bring it back later" — all of that is narrowing
-the product, and it requires either documentation or an explicit decision by the owner.
-
-**A claim about an external system's capabilities is checked against that system's
-documentation.** Not against what you could read in a wrapper, not against a general
-impression of the provider, not against a memory of an older API version. No reference,
-no claim — say "I found no confirmation, I need the documentation" instead.
-
-**A correction generalises.** When the owner refutes one such claim with documentation,
-the lesson is not "that particular claim was wrong" but "my way of arriving at claims
-like this is unreliable". Immediately re-check **the other claims of the same kind made
-in the same pass** — otherwise there is another one five minutes later.
-
-If you are genuinely stuck, stop and say so plainly: what you tried, where you stopped,
-which paths are still unchecked, and what you need in order to check them. Narrowing the
-product is the owner's decision, and only an explicit one.
-
-The owner knows the domain. Their objection to your "impossible" is evidence that you
-did not search enough, not an invitation to argue.
+"Impossible", "the provider doesn't support it", "too expensive to check", "a code comment says so" are claims that need a source — the external system's own documentation, or a measurement. Without one, do not disable, delete, defer or trim anything, built or planned: narrowing the product is the owner's explicit decision. Say "I found no confirmation, I need the documentation" instead. When the owner refutes one such claim, re-check every claim of the same kind from the same pass.
 
 # File formats
 
+Escape rules for every pipe-separated format below: a literal `|` in a free-form field → `\|`, a newline → `\n`. Enum and id fields never contain `|` or newlines.
+
 ## `docs/todo.md`
 
-Line: `- [ ] <id> | <description> | <effort> | <priority> | <status> | <created_at>`
+`- [ ] <id> | <description> | <effort> | <priority> | <status> | <created_at>`
 
-- `id` — `T-NNNNNN` (task) or `F-NNNNNN` (feature). 6-digit zero-padded number (e.g. `T-000042`, `F-000013`). **Always required — never leave empty.** LLM assigns the next free id — **T- and F- have independent counters**; scan the file for the max used number *within the same prefix*, use +1, format as `{prefix}-{:06}`. User may also assign manually. No app-side counter — LLM/user is responsible for uniqueness within each prefix. Parser is lenient — legacy 3-digit IDs (`T-001`) still read correctly; on next add, write the new id with 6-digit padding.
-- `description` — free-form text.
-- `effort` — hours, integer or decimal (`2`, `0.5`, `8`). Required. Use `0` if unknown.
-- `priority` — one of: `critical` / `high` / `medium` / `low`.
-- `status` — one of: `open` / `in-progress` / `review`.
-  - `open` — not started
-  - `in-progress` — work in flight
-  - `review` — implementation done, under self/peer review before moving to done
-- `created_at` — `YYYY-MM-DD`. **App-managed** when task created via app's "+ Add task". When LLM creates a task by editing the file directly, set today's date. Immutable post-create.
-
-Example:
-```
-- [ ] T-000042 | Add Go deploy template | 4 | high | open | 2026-04-26
-- [ ] T-000043 | Refactor sidebar | 2 | medium | in-progress | 2026-04-22
-- [ ] T-000044 | Write tests for X | 1 | medium | review | 2026-04-21
-```
-
-LLM/user policy: either may add / edit / move tasks. When a task is completed, move it (LLM or user) from `todo.md` into `done.md` under the appropriate `## YYYY-MM-DD` section. When adding a new task, LLM **must** include `created_at` = today's date (YYYY-MM-DD). Existing tasks' `created_at` is immutable — never edit it.
-
-### Optional release grouping (recommended for versioned projects)
-
-Tasks may be grouped under `## vX.Y.Z — <short description>` section headers for visual readability when planning across multiple releases:
-
-```
-## v0.31.0 — deploy config split + new template
-
-- [ ] T-000103 | Deploy config split | 6 | high | open | 2026-05-14
-- [ ] T-000107 | SvelteKit deploy template | 3 | medium | open | 2026-05-14
-
-## v1.0.0 — public launch
-
-- [ ] T-000064 | Public flip | 3 | high | open | 2026-04-26
-```
-
-Plain markdown readers treat `## ...` lines as comments — tasks under any header (or no header) read identically as a flat list. Some tools may use these headers as release-grouping signals: Solo Dev Hub, for example, parses `## vX.Y.Z` and surfaces the inherited version as a sortable column in the Tasks view. Two shapes count as a version — `v` followed by a digit (`## v1.16.1`), or a bare number carrying at least one dot or dash (`## 2026.09.01`, `## 1.16.1`); the separator is what tells a version from prose, so a header like `## 3 things this week` is not one. The token is inherited exactly as written. Word headers such as `## Format`, `## Backlog` or `## Операционка` are ignored and neither set nor clear the current version. Headers stay optional — use when they help planning, skip for small/single-version projects.
-
-### Operations tasks (`O-` / `M-`) — non-code, never release blockers
-
-Beside the code classes `T-`/`F-`, two classes capture **операционка** — work that has to be *done*, not *coded*, but that the AI still needs to know the execution context of:
-
-- `O-NNNNNN` — **technical** operations (infra, accounts, registrations, access, hand-run config).
-- `M-NNNNNN` — **marketing** operations (announcements, copy, landing, publications).
-
-Rules:
-- **Same line format** as any todo task (`effort` / `priority` / `status` / `created_at` all apply). Independent 6-digit counters per prefix, exactly like `T-`/`F-` — scan for the max within the same prefix, +1, `{prefix}-{:06}`.
-- **Never a release blocker.** Open `O-`/`M-` tasks do **not** gate a code release — do not treat them as blockers when tagging `vX.Y.Z`. They **never participate in `## vX.Y.Z` release grouping**: their `version` is always empty (a tool that inherits version from headers must force it empty for `O-`/`M-`, even under a version header).
-- **The operations section goes first, above every version section.** Group them under a plain non-version header — `## Операционка` or its local-language equivalent. It belongs to no release, so at the bottom of the file it ends up below everything planned and stops catching the eye — and these are the only tasks nobody but the owner will ever recall. File order: the format notes, then operations, then the version sections nearest-first.
-- **In `done.md`** an `O-`/`M-` entry leaves the version slot empty (`- O-000001 | … | `).
-- **Why a separate class:** without it, no-code tasks land inside code releases and get mistaken for release blockers. The class makes their nature explicit and keeps the release gate about code.
+- `id` — required: `T-NNNNNN` (task), `F-NNNNNN` (feature), `O-NNNNNN` (technical operations), `M-NNNNNN` (marketing operations). Each prefix has its own counter: max within the prefix + 1, 6 digits. Legacy 3-digit ids still parse.
+- `effort` — hours (`0` if unknown). `priority` — `critical` / `high` / `medium` / `low`. `status` — `open` / `in-progress` / `review`.
+- `created_at` — `YYYY-MM-DD`, today when you add the line; never edit it afterwards.
+- Release grouping: tasks sit under `## vX.Y.Z — <description>` headers (a version is `v` + digit, or a bare number with a dot or dash). Word headers (`## Операционка`) set no version.
+- `O-` / `M-` are non-code work: never a release blocker, never under a version header, always empty version. Their section `## Операционка` goes first, above the version sections (nearest first).
+- Done task → move it to `done.md`.
 
 ## `docs/done.md`
 
-Structure:
-```markdown
-## 2026-04-21                             ← date section header, YYYY-MM-DD
-- D-000001 | Refactor SecretsPanel | v0.13.9
-- T-000045 | Fix login regression | v0.13.9
-- | Tiny doc tweak | v0.13.9              ← empty id slot (pipes still present)
-```
+Under `## YYYY-MM-DD` (completion day), append at the bottom: `- <id> | <description> | <version>`. Exactly three fields; an empty id still keeps both pipes (`- | text | v1.0`). Version empty for `O-`/`M-`. No checkbox. Append-only — never edit or remove history. `D-NNNNNN` is a display-only id inside the app; elsewhere refer to the description.
 
-- `## <date>` — section header in `YYYY-MM-DD`. Groups tasks by completion day.
-- Line has **exactly 3 pipe-separated fields**: `- <id> | <description> | <version>`. The `id` slot may be left empty — the line then reads literally: markdown dash `-`, one space, first pipe `|`, description, pipe, version. Example: `- | Description here | v1.0`. Both pipes must always be present.
-- No `[x]` checkbox — the file itself is the "done" list.
-- If the `id` slot is empty, the app assigns a synthetic `D-NNNNNN` (6-digit) for display (in-memory only, file is not rewritten). **`D-NNNNNN` exists only inside the app's UI** — when referring to a done entry elsewhere (commit message, conversation, other files), use the description text, not `D-NNNNNN`.
-- Parser is lenient on id format — legacy 3-digit IDs (`T-045`, `D-001`) still read correctly. New entries written by LLM/app use 6-digit padding (`T-000045`).
-- `version` — SemVer tag like `v0.13.9` recommended. Any free-form string accepted. May be empty (always empty for `O-`/`M-` operations entries — they're not release-scoped).
-- **Ordering:** new entries are appended at the bottom of the current `## <date>` section (chronological within the day).
+## `docs/bug-reports.md`
 
-LLM/user policy: LLM or user moves completed tasks from `todo.md` here (append under the correct `## YYYY-MM-DD` section). **Historical entries must not be modified or removed** — `done.md` is an append-only log.
+`- <id> | <date> | <description> | <severity> | <category> | <status> | <fix_attempts> | <comment>`
 
-## `docs/bug-reports.md` (v2, 8 fields)
-
-Line: `- <id> | <date> | <description> | <severity> | <category> | <status> | <fix_attempts> | <comment>`
-
-- `id` — `B-NNNNNN` (6-digit zero-padded, e.g. `B-000042`). **Assigned by the app** (immutable). LLM must not rename. Parser is lenient — legacy 3-digit IDs (`B-042`) still read correctly.
-- `date` — `YYYY-MM-DD`. **Set by the app on creation** (immutable).
-- `description` — free-form. **User-owned**.
-- `severity` — `critical` / `major` / `medium` / `minor`. **User-owned**.
-- `category` — `ui_ux` / `ux_flow` / `logic` / `auth` / `database` / `performance` / `security` / `integration` / `other`. **User-owned**. `other` is the catch-all; the app normalises unknown values (from stale files or hand-edits outside the app's dropdown) to `other` on load — internal safety-net.
-- `status` — workflow values: `created` / `in-progress` / `testing` / `rejected` / `confirmed`.
-  - `created` — **set by the app** when user creates the bug. LLM only transitions from here.
-  - `in-progress` — LLM transitions `created → in-progress` when it takes the bug into work. Stays here while fix is being attempted.
-  - `testing` — fix applied, comment describes what was done. Awaiting user verification. This transition bumps `fix_attempts` +1.
-  - `confirmed` — user verified the fix via app's ✓ button. Row temporarily stays in file as a signal to the LLM that cleanup is owed. **Cleanup trigger: any time the LLM reads `bug-reports.md` in response to a user signal about bugs ("посмотри баги", "I added bugs", "check the bug list", "оба починились отметил", a new bug-list mention, or about to take an action on bugs), the LLM removes all currently-`confirmed` rows in the same pass. The user signal IS the trigger — don't wait for an unrelated future edit, and don't leave confirmed rows lingering across sessions. The cleanup edit bundles with whatever else changes in that same pass (taking new bugs into work, writing testing comments, etc.), not a separate commit.**
-  - `rejected` — user verified and rejected. Comment describes why. Next transition back to `in-progress` → `testing` bumps `fix_attempts`.
-  **LLM may edit `status`** within this workflow.
-- `fix_attempts` — integer ≥ 0. **App-managed** — incremented each time `status` enters `testing` (= count of fix attempts made). LLM must not touch.
-- `comment` — free-form, optional. **LLM may edit** — writes what was done, or why `rejected`.
-
-### LLM policy for bug-reports.md
-
-The LLM is allowed to:
-- **edit** the `status` and `comment` fields on existing rows
-- **delete entire rows** whose current status is `confirmed` (routine cleanup — this rule takes priority over the "edit only two fields" constraint)
-
-The LLM must NOT:
-- edit any other fields (`description`, `severity`, `category`, `id`, `date`, `fix_attempts`)
-- rename or renumber `id`
-- create new bug rows — new bugs are created only through the app's "+ Add bug" button so that `id`, `date`, and DB-side statistics are wired consistently. If the LLM spots a new bug, it should (a) ask the user to file it in the app, or (b) add a `T-NNNNNN` line to `todo.md` instead.
+- App-owned, never touch: `id` (`B-NNNNNN`), `date`, `fix_attempts`. User-owned, never touch: `description`, `severity` (`critical`/`major`/`medium`/`minor`), `category` (`ui_ux`/`ux_flow`/`logic`/`auth`/`database`/`performance`/`security`/`integration`/`other`).
+- You may edit `status` and `comment`. Flow: `created` (app) → `in-progress` (you take it) → `testing` (fix applied, comment says what was done; the app counts the attempt) → `confirmed` or `rejected` (user). Rejected → back to `in-progress`.
+- **Cleanup:** whenever you read the file in response to the user about bugs, delete every `confirmed` row in the same pass.
+- Never create bug rows — ask the user to file it in the app, or add a `T-` task to `todo.md`.
 
 # Solo Dev Hub auto-commits
 
-Solo Dev Hub syncs cross-repo files (REQ requirements, API contracts, announcements) by copying them into recipient repos' working trees. They land **uncommitted**, and a local AI assistant may treat them as "foreign" and ignore them. To prevent that, the app can **auto-commit** the synced files itself:
+Synced cross-repo files (REQ, API contracts, announcements) land in the working tree. If the repo has an auto-commit branch set and is on it, the app commits them itself — pathspec-scoped to the cross-repo doc folders plus `.gitignore` / `.gitattributes`, tracked paths only (a gitignored inbox is never force-added). Author `Solo Dev Hub <noreply@solodevhub.app>`, subject prefix `chore(sdh-sync):`.
 
-- If a repo has an **auto-commit branch** configured (per-repo setting in Solo Dev Hub), then after each sync the app commits changes **only within the cross-repo doc folders** (`docs/backend-requirements/`, `docs/client-requirements/`, `docs/microservice-requirements/`, `docs/server-requirements/`, `docs/server-api/`, `docs/microservice-api/`, `docs/server-announcements/`, `docs/microservice-announcements/`) **plus the app-managed root files** `.gitignore` and `.gitattributes` (into which the sync writes a managed block, so a template change doesn't sit as a foreign uncommitted diff) — everything **that is tracked** — a folder or managed file you've deliberately `.gitignore`d (your local "inbox") is **skipped**, never force-added. The commit is **pathspec-scoped**, so your own uncommitted work anywhere else is untouched, and it happens **only when the repo is currently on the configured branch** (otherwise the app skips and reports it).
-- The commit is authored by **`Solo Dev Hub <noreply@solodevhub.app>`** with a **`chore(sdh-sync):`** subject prefix.
-
-**Committing and `.gitignore`-ing are both valid ways to stop synced files reading as "foreign".** A gitignored folder isn't an uncommitted change — `git status` stays clean, so there's nothing to mistake for a stray edit. It's common (and fine) to `.gitignore` the *incoming* requirement / announcement folders — they're a local inbox from a counterpart, not your repo's own history — and let auto-commit handle only the folders you actually track (e.g. a synced API contract). Auto-commit respects that split: it commits the tracked cross-repo folders and leaves the gitignored ones alone (it will **not** `git add -f` an ignored path). The two mechanisms are complementary, not a conflict — pick per folder.
-
-**Recipient-LLM contract:** a commit authored by `Solo Dev Hub` / prefixed `chore(sdh-sync)` is a legitimate cross-repo file sync performed by the app — **not** foreign or accidental. Do not revert it, do not treat its files as suspect; build your own work on top of it. Synced files that are **gitignored** (a deliberate local inbox) or simply **uncommitted** (auto-commit off) are equally real, app-delivered files — use them, don't treat them as stray edits. Commit the *tracked* ones yourself as part of your normal flow if auto-commit isn't doing it; leave the gitignored ones as they are.
+Such a commit is a legitimate sync: never revert it, build on top. Synced files that are gitignored or uncommitted are equally real. If auto-commit is off and a tracked synced file blocks your work (a dirty-tree gate), commit it yourself as `chore(sdh-sync): …` without waiting to be asked.
 
 # Versioning (SemVer)
 
-Format: `MAJOR.MINOR.PATCH` (e.g. `2.3.1`). Each component is an independent counter, not a decimal — after `0.9.x` comes `0.10.0`, not `1.0.0`.
-
-| Change | Bump | Example |
-|---|---|---|
-| Bug fix, no behavior change | PATCH | `0.3.1 → 0.3.2` |
-| New feature, backward-compatible | MINOR | `0.3.2 → 0.4.0` |
-| Breaking change | MAJOR | `1.2.0 → 2.0.0` |
-
-- Projects start at `0.1.0`.
-- `0.x.y` means API is unstable, things may change.
-- `1.0.0` is a conscious decision: stable, contracts frozen, running in prod. Don't rush for marketing reasons.
-- **LLM must ask the dev before bumping MAJOR or MINOR** — confirm the bump in conversation before committing. Never auto-decide a MAJOR/MINOR jump. PATCH bumps for bug fixes can be applied routinely.
-
-### SemVer by project type
+`MAJOR.MINOR.PATCH`, each an independent counter (`0.9.x` → `0.10.0`). Start at `0.1.0`; `1.0.0` is a deliberate decision (stable, contracts frozen, in prod).
 
 | Type | MAJOR | MINOR | PATCH |
 |---|---|---|---|
-| Server (API) | Breaking API: removed endpoint, changed response format | New endpoint, new param (old still works) | Bug fix, optimization, refactor |
-| Client | Major UI overhaul, or upgrade to new MAJOR of server | New screen, new feature | Visual fixes, small bugs |
-| Microservice | Breaking API change (affects all consumers) | New functionality | Bug fix |
-| Tool | Major change | New function | Bug fix |
+| Server / microservice | breaking API change | new endpoint / parameter | fix, optimisation, refactor |
+| Client | major UI overhaul, new server MAJOR | new screen / feature | visual fix, small bug |
+| Tool | major change | new function | fix |
 
-Release workflow: see the `sdh-release-lifecycle` skill for the end-to-end stage flow and the `sdh-release-closure` skill for the full closure checklist (manifest bump, Changelog, done.md, smoke, build artifact, schema regen, closure commit, tag) + the canonical git block. The **dev** runs the tag/merge commands — LLM does not execute git tag/push autonomously.
+**Ask the owner before any MAJOR or MINOR bump.** PATCH for fixes is routine. Release flow: `sdh-release-lifecycle`, closure: `sdh-release-closure`. Tags, release merges and the `master`/`main` push are the owner's.
 
 # `Changelog.md`
 
-Format: [Keep a Changelog](https://keepachangelog.com/). Six standard change categories — use them consistently:
+[Keep a Changelog](https://keepachangelog.com/): `Added` / `Changed` / `Deprecated` / `Removed` / `Fixed` / `Security`. `## [Unreleased]` has no date; at release it becomes `## [X.Y.Z] — YYYY-MM-DD`. Empty categories may be omitted in released versions.
 
-- `Added` — new features
-- `Changed` — changes in existing functionality (backward-compatible)
-- `Deprecated` — features marked for removal in the next MAJOR; still working, but flagged
-- `Removed` — features removed in this release
-- `Fixed` — bug fixes
-- `Security` — vulnerability patches / data-integrity fixes (called out separately so users know to upgrade with priority)
+# Commits
 
-Template:
-
-```markdown
-# Changelog
-
-## [Unreleased]
-
-### Added
-### Changed
-### Deprecated
-### Removed
-### Fixed
-### Security
-
-## [0.1.0] — YYYY-MM-DD
-
-### Added
-- Initial project scaffold
-```
-
-Rules:
-- `## [Unreleased]` section **never has a date** — the date is added only when the version is tagged/released (at which point `[Unreleased]` becomes `[X.Y.Z] — YYYY-MM-DD`).
-- In released versions, empty categories may be omitted — only include headings that actually have entries.
-
-# Commit messages
-
-When the user signals "фиксируем результат, обновляем документы" / "коммитим это" / "let's commit this" / similar — assistant **proactively offers** a Conventional Commits formatted draft of the commit message in chat. The user may copy as-is, modify, or write their own.
-
-Format:
+When the user says to commit, draft a Conventional Commit in chat before any git command:
 
 ```
-<type>(<optional scope>): <short subject ≤ 70 chars>
+<type>(<scope>): <imperative subject, lowercase, no period, ≤ 70 chars>
 
-<body explaining what + why, 2–3 lines wrapped at ~72 chars>
+<what + why, 2–3 lines>
 
-<optional trailers: Refs T-NNNNNN, REF: REQ-NNN, B-NNNNNN, etc.>
+<trailers: Refs T-NNNNNN, REF: REQ-NNN, B-NNNNNN>
 ```
 
-- **Types:** `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`, `build`, `ci`.
-- **Optional scope:** short feature/module name (`payments`, `feedback`, `accounts`, `deploy`).
-- **Subject style:** imperative mood, lowercase after the colon, no trailing period. Example: `feat(deploy): add multi-env support`, not `Added multi-env support.`
-- **Trailers:** `Refs T-NNNNNN` / `REF: REQ-NNN` / `B-NNNNNN` are informational pointers to IDs in `docs/todo.md` / cross-repo REQ pairs / `docs/bug-reports.md` — they are **not** GitHub auto-close keywords (those work for issue numbers, not for our app-managed IDs).
-- **Drafting is mandatory.** The assistant proposes the commit message in chat before running any git command. Under fast-lane / *"work without stopping"* mode the assistant may proceed to commit immediately after drafting; under phase work the user typically ack's before commit lands.
-- **Committing.** If the project's `CLAUDE.md` describes a **multi-branch flow** where day-to-day work lives on an integration branch (typically `dev`) and `master` / `main` only receives release-closure merges, **the assistant may run `git commit` on that integration branch** directly. For single-branch projects, drafting only — the user runs the commit.
-- **Pushing.** Same integration branch — assistant **may `git push origin <branch>`** without explicit per-push approval. Never push to `master` / `main` directly. Never force-push. Never push tags.
-- **Tags + release merges + final `master`/`main` push** stay **user-only**. Assistant proposes the exact command and waits.
-- **Universal limits:** never `--amend` published commits, never skip hooks (`--no-verify`), never bypass signing.
+Types: `feat` `fix` `chore` `docs` `refactor` `test` `perf` `build` `ci`. Trailers are pointers to our ids, not GitHub auto-close keywords.
 
-# Shell command portability
+- Multi-branch repo (work on `dev`, `master`/`main` only gets release merges): you may commit and `git push origin dev` yourself. Single-branch repo: draft only, the user commits.
+- Never push to `master`/`main`, never force-push, never push tags, never `--amend` a published commit, never skip hooks or signing.
 
-When suggesting a command for the user to copy into a terminal (or running a chain yourself), remember: **Windows PowerShell 5.1** (default shell in VS Code on Windows) **does not understand `&&`**. Commands like `cargo fmt && cargo check` will fail with a parse error after paste.
+# Shell commands
 
-Default: **one command per invocation.** Run `cargo fmt`, then run `cargo check` separately. If you genuinely need chaining — `;` works everywhere (cmd / bash / PowerShell any version); `&&` works only in bash / cmd.exe / PowerShell 7+, not in the default Windows environment.
+Windows PowerShell 5.1 does not understand `&&`. Give one command per line; chain with `;` if you must.
 
 ---
 _This section is auto-generated by Solo Dev Hub. Do not edit between `manager:begin`/`manager:end` markers — changes will be overwritten on next sync._

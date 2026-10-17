@@ -30,6 +30,7 @@ import * as stats from './strings/stats';
 import * as dashboard from './strings/dashboard';
 import * as timeline from './strings/timeline';
 import * as sync from './strings/sync';
+import * as syncIssue from './strings/syncIssue';
 import * as appDefaults from './strings/appDefaults';
 import * as templateEditor from './strings/templateEditor';
 import * as secrets from './strings/secrets';
@@ -72,6 +73,7 @@ const ru = {
   ...dashboard.ru,
   ...timeline.ru,
   ...sync.ru,
+  ...syncIssue.ru,
   ...appDefaults.ru,
   ...templateEditor.ru,
   ...secrets.ru,
@@ -115,6 +117,7 @@ const en: Record<keyof typeof ru, string> = {
   ...dashboard.en,
   ...timeline.en,
   ...sync.en,
+  ...syncIssue.en,
   ...appDefaults.en,
   ...templateEditor.en,
   ...secrets.en,

@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::models::Repository;
+use crate::models::{Repository, SyncIssue, SyncIssueCode};
 use crate::sync::fs::{remove_file_if_exists, scan_impl_files};
 
 /// B-000021: bilateral delete of a REQ pair across sender and recipient sides.
@@ -174,13 +174,14 @@ pub fn replay_rename_in_dir(parent: &Path, old: &str, new: &str) -> Result<Renam
 ///   - `old_name` != `new_name`
 ///   - `parent/old_name/` exists
 ///   - `parent/new_name/` does NOT exist
-/// Returns Ok(true) on actual rename, Ok(false) on no-op, and pushes a warning
-/// to `warnings` if both dirs coexist (ambiguous — operator must resolve).
+/// Returns Ok(true) on actual rename, Ok(false) on no-op, and pushes a
+/// `rename_collision` issue to `warnings` if both dirs coexist (ambiguous —
+/// operator must resolve). An `Err` carries the path and the raw OS error only.
 pub fn migrate_subfolder_rename(
     parent: &Path,
     old_name: &str,
     new_name: &str,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<SyncIssue>,
 ) -> Result<bool, String> {
     if old_name == new_name || old_name.is_empty() || new_name.is_empty() {
         return Ok(false);
@@ -191,22 +192,22 @@ pub fn migrate_subfolder_rename(
         return Ok(false);
     }
     if new_dir.exists() {
-        warnings.push(format!(
-            "Migration ambiguous: both {} and {} exist — leaving alone (user should merge or remove one)",
-            old_dir.display(),
-            new_dir.display()
-        ));
+        warnings.push(
+            SyncIssue::new(SyncIssueCode::RenameCollision, old_name)
+                .target(new_name)
+                .detail(format!("{}/", folder_label(parent))),
+        );
         return Ok(false);
     }
-    fs::rename(&old_dir, &new_dir).map_err(|e| {
-        format!(
-            "fs::rename {} -> {}: {}",
-            old_dir.display(),
-            new_dir.display(),
-            e
-        )
-    })?;
+    fs::rename(&old_dir, &new_dir).map_err(|e| format!("{}: {}", old_dir.display(), e))?;
     Ok(true)
+}
+
+/// The last segment of `dir`, for a report — a folder name, never prose.
+fn folder_label(dir: &Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| dir.display().to_string())
 }
 
 /// F-033 Stage 1f Case C: migrate files from the flat `server-requirements/`
@@ -224,12 +225,15 @@ pub fn migrate_subfolder_rename(
 /// `parent_lookup` is a callable `fn(filename) -> Vec<(parent_canonical, existing_path_on_parent)>`.
 /// Passing it as a closure keeps this helper unit-testable without DB / repo deps.
 ///
-/// Returns number of flat files migrated (moved or copied-N-and-removed). Errors and
-/// orphan warnings are appended to `warnings`.
+/// Returns number of flat files migrated (moved or copied-N-and-removed). Files
+/// left in place are reported to `warnings` as issues: `migration_left_in_place`
+/// (no matching parent copy), `migration_diverged` (copies differ), or
+/// `migration_failed` with the raw OS error. An `Err` carries the path and the
+/// raw OS error only.
 pub fn migrate_flat_to_nested<F>(
     flat_root: &Path,
     mut parent_lookup: F,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<SyncIssue>,
 ) -> Result<usize, String>
 where
     F: FnMut(&str) -> Vec<(String, std::path::PathBuf)>,
@@ -267,7 +271,7 @@ where
         let flat_content = match fs::read(&flat) {
             Ok(c) => c,
             Err(e) => {
-                warnings.push(format!("Case C: read {}: {}", flat.display(), e));
+                warnings.push(SyncIssue::new(SyncIssueCode::MigrationFailed, fname).detail(e));
                 continue;
             }
         };
@@ -282,33 +286,22 @@ where
             }
         }
         if !conflicts.is_empty() {
-            warnings.push(format!(
-                "Case C: {} has diverged copies on parent(s) [{}] — manual resolution needed, left in flat root",
-                fname,
-                conflicts.join(", ")
-            ));
+            warnings.push(
+                SyncIssue::new(SyncIssueCode::MigrationDiverged, fname)
+                    .target(conflicts.join(", ")),
+            );
             continue;
         }
         match matches.len() {
             0 => {
-                warnings.push(format!(
-                    "Case C: {} has no matching parent copy — possibly stale, left in flat root",
-                    fname
-                ));
+                warnings.push(SyncIssue::new(SyncIssueCode::MigrationLeftInPlace, fname));
             }
             1 => {
                 let dst = flat_root.join(&matches[0]).join(&fname);
                 if let Some(dst_dir) = dst.parent() {
                     fs::create_dir_all(dst_dir).map_err(|e| e.to_string())?;
                 }
-                fs::rename(&flat, &dst).map_err(|e| {
-                    format!(
-                        "Case C: rename {} -> {}: {}",
-                        flat.display(),
-                        dst.display(),
-                        e
-                    )
-                })?;
+                fs::rename(&flat, &dst).map_err(|e| format!("{}: {}", flat.display(), e))?;
                 migrated += 1;
             }
             _ => {
@@ -328,12 +321,7 @@ where
                         }
                     }
                     if let Err(e) = fs::copy(&flat, &dst) {
-                        copy_error = Some(format!(
-                            "Case C: copy {} -> {}: {}",
-                            flat.display(),
-                            dst.display(),
-                            e
-                        ));
+                        copy_error = Some(format!("{}: {}", dst.display(), e));
                         break;
                     }
                     created.push(dst);
@@ -342,14 +330,13 @@ where
                     for dst in &created {
                         let _ = fs::remove_file(dst);
                     }
-                    warnings.push(format!(
-                        "Case C: {} partial-copy failed, rolled back ({}); left in flat root for retry",
-                        fname, err
-                    ));
+                    // Rolled back; left in the flat root for the next pass.
+                    warnings.push(
+                        SyncIssue::new(SyncIssueCode::MigrationFailed, fname.clone()).detail(err),
+                    );
                     continue;
                 }
-                fs::remove_file(&flat)
-                    .map_err(|e| format!("Case C: remove flat source {}: {}", flat.display(), e))?;
+                fs::remove_file(&flat).map_err(|e| format!("{}: {}", flat.display(), e))?;
                 migrated += 1;
             }
         }
@@ -465,7 +452,11 @@ mod tests {
         assert!(parent.join("old").exists());
         assert!(parent.join("new").exists());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("ambiguous"));
+        assert_eq!(warnings[0].code, SyncIssueCode::RenameCollision);
+        assert_eq!(
+            (warnings[0].subject.as_str(), warnings[0].target.as_deref()),
+            ("old", Some("new"))
+        );
     }
 
     // ── F-033 Stage 1f Case C: migrate_flat_to_nested ────────────────────────
@@ -554,7 +545,9 @@ mod tests {
         assert_eq!(migrated, 0);
         assert!(ms_flat.join("REQ-010.md").exists(), "kept in flat root");
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("diverged") || warnings[0].contains("parentB"));
+        assert_eq!(warnings[0].code, SyncIssueCode::MigrationDiverged);
+        assert_eq!(warnings[0].subject, "REQ-010.md");
+        assert_eq!(warnings[0].target.as_deref(), Some("parentB"));
     }
 
     #[test]
@@ -577,7 +570,9 @@ mod tests {
         assert_eq!(migrated, 0);
         assert!(ms_flat.join("REQ-999.md").exists());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("no matching parent copy"));
+        assert_eq!(warnings[0].code, SyncIssueCode::MigrationLeftInPlace);
+        assert_eq!(warnings[0].subject, "REQ-999.md");
+        assert_eq!(warnings[0].detail, None);
     }
 
     #[test]

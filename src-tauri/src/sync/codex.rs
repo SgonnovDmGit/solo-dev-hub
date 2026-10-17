@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use crate::db::AppDb;
+use crate::models::{lookup, SyncIssue, SyncIssueCode as Code};
 use crate::sync;
 
 /// Aggregated result of broadcasting one codex into one consumer.
@@ -14,7 +15,7 @@ pub struct CodexBroadcastOutcome {
     /// Files/dirs pruned from consumer mirrors (sum of MirrorOutcome.pruned).
     pub pruned: usize,
     /// Non-fatal per-lane failures surfaced to the user.
-    pub errors: Vec<String>,
+    pub errors: Vec<SyncIssue>,
 }
 
 /// The two audience lanes a codex can publish on.
@@ -42,9 +43,9 @@ pub fn broadcast_codex_to_consumer(
     let codex_name = match db.get_project(codex_project_id) {
         Ok(p) => p.name,
         Err(e) => {
-            outcome
-                .errors
-                .push(format!("Codex project {} lookup: {}", codex_project_id, e));
+            outcome.errors.push(
+                SyncIssue::lookup(lookup::PROJECT, format!("#{}", codex_project_id)).detail(e),
+            );
             return outcome;
         }
     };
@@ -58,17 +59,16 @@ pub fn broadcast_codex_to_consumer(
 
         // The codex publishes this lane — its source folder must exist on disk.
         let Some(codex_local) = codex_repo.local_path.as_deref() else {
-            outcome.errors.push(format!(
-                "Codex '{}' {} lane has no local_path",
-                codex_name, role
-            ));
+            outcome
+                .errors
+                .push(SyncIssue::new(Code::NoLocalPath, codex_repo.display_name()));
             continue;
         };
         let codex_base = Path::new(codex_local);
-        if let Err(e) = sync::ensure_root_exists(codex_base) {
-            outcome
-                .errors
-                .push(format!("Codex '{}' {} lane: {}", codex_name, role, e));
+        if sync::ensure_root_exists(codex_base).is_err() {
+            outcome.errors.push(
+                SyncIssue::new(Code::RootMissing, codex_repo.display_name()).detail(codex_local),
+            );
             continue;
         }
 
@@ -76,36 +76,38 @@ pub fn broadcast_codex_to_consumer(
         let consumer_repo = match db.repo_of_project_with_role(consumer_project_id, role) {
             Ok(r) => r,
             Err(_) => {
-                outcome.errors.push(format!(
-                    "Codex '{}' → consumer {}: no {}-repo to receive the svod",
-                    codex_name, consumer_project_id, role
-                ));
+                let consumer = db
+                    .get_project(consumer_project_id)
+                    .map(|p| p.name)
+                    .unwrap_or_else(|_| format!("#{}", consumer_project_id));
+                outcome
+                    .errors
+                    .push(SyncIssue::new(Code::MissingCounterpart, consumer).target(role));
                 continue;
             }
         };
         let Some(consumer_local) = consumer_repo.local_path.as_deref() else {
-            outcome.errors.push(format!(
-                "Codex '{}' → consumer {}: {}-repo has no local_path",
-                codex_name, consumer_project_id, role
+            outcome.errors.push(SyncIssue::new(
+                Code::NoLocalPath,
+                consumer_repo.display_name(),
             ));
             continue;
         };
         let consumer_base = Path::new(consumer_local);
-        if let Err(e) = sync::ensure_root_exists(consumer_base) {
-            outcome.errors.push(format!(
-                "Codex '{}' → consumer {} {} lane: {}",
-                codex_name, consumer_project_id, role, e
-            ));
+        if sync::ensure_root_exists(consumer_base).is_err() {
+            outcome.errors.push(
+                SyncIssue::new(Code::RootMissing, consumer_repo.display_name())
+                    .detail(consumer_local),
+            );
             continue;
         }
 
         let source_path = match db.codex_source_path_for_repo(codex_repo.id) {
             Ok(p) => p,
             Err(e) => {
-                outcome.errors.push(format!(
-                    "Codex '{}' {} lane source path: {}",
-                    codex_name, role, e
-                ));
+                outcome.errors.push(
+                    SyncIssue::lookup(lookup::CODEX_SOURCE, codex_repo.display_name()).detail(e),
+                );
                 continue;
             }
         };
@@ -117,10 +119,11 @@ pub fn broadcast_codex_to_consumer(
                 outcome.copied += o.copied;
                 outcome.pruned += o.pruned;
             }
-            Err(e) => outcome.errors.push(format!(
-                "Codex '{}' {} lane mirror: {}",
-                codex_name, role, e
-            )),
+            Err(e) => outcome.errors.push(
+                SyncIssue::new(Code::CopyFailed, format!("docs/codex/{}/", codex_name))
+                    .target(consumer_repo.display_name())
+                    .detail(e),
+            ),
         }
     }
 
@@ -258,12 +261,13 @@ mod tests {
         assert!(srv_inbox.join("intro.md").exists());
         // Admin lane produced exactly one role-miss error, no inbox created.
         assert_eq!(out.errors.len(), 1);
-        assert!(
-            out.errors[0].contains("admin_client")
-                && out.errors[0].contains("no admin_client-repo"),
+        assert_eq!(
+            out.errors[0].code,
+            Code::MissingCounterpart,
             "unexpected error: {:?}",
             out.errors
         );
+        assert_eq!(out.errors[0].target.as_deref(), Some("admin_client"));
     }
 
     #[test]

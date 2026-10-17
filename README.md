@@ -138,7 +138,9 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Shipped**
 
-- **v1.16.0** *(current — 2026-09-01)* — the second half of the help screen: cross-repo links, deploy, and the AI agent contract; a revision of the working rules (18 role-scoped skills, a new one on debugging); the task-event leak stopped.
+- **v1.18.0** *(current — 2026-10-17)* — an approved rule edit is never lost silently; sync problems in the interface language; the rules compressed to less than half (19 skills, a new one for starting a project).
+- **v1.17.0** — rules deliver themselves: an applied rule reaches every agent on save and on startup, and an agent's edit travels back from its own copy; peers can be linked only to equals.
+- **v1.16.0** — the second half of the help screen: cross-repo links, deploy, and the AI agent contract; a revision of the working rules (18 role-scoped skills, a new one on debugging); the task-event leak stopped.
 - **v1.15.0** — channels between equals: two repositories on the same level exchange through `docs/InOutBox/`, links created explicitly; number registries in every outgoing channel.
 - **v1.14.0** — operations tasks: classes of no-code work that never block a release, and a Type column in the task lists.
 - **v1.13.0** — the in-app help screen: the onboarding core (quick start, project setup, bug workflow), ru/en.
@@ -158,8 +160,9 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Next**
 
-- **v1.17.0** — sync errors in the interface language; a rules viewer in the app; an equality check when linking peers.
-- **v1.18.0** — cross-platform builds (macOS / Linux).
+- **v1.19.0** — Linux build; a Rules section in the app showing which rules were changed and where an edit came from.
+- **v1.20.0** — contributor mode: a second developer with their own install working in the same repositories.
+- **v1.21.0** — macOS build.
 - **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix.
 
 Per-release detail lives in the [Changelog](Changelog.md); the day-to-day task list is kept locally and is not part of the repository.
