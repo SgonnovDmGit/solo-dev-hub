@@ -14,6 +14,7 @@ import {
 } from '$lib/api/tauri-commands';
 import { addToast } from './ui';
 import { tf, t } from '$lib/i18n';
+import { bugRefusalMessage } from '$lib/utils/bug-refusal';
 
 export const bugs = writable<BugView[]>([]);
 export const bugWarnings = writable<string[]>([]);
@@ -112,7 +113,10 @@ export async function addBug(
     await createBug(currentRepoId, description, severity, category);
     await reloadBugsList();
   } catch (err) {
-    addToast(tf('toast.bugsSaveFailed', String(err)), 'error');
+    // F-000044: a shared repo may refuse a new bug number (join not approved,
+    // band full, ...): a translated reason instead of the raw code.
+    const refusal = bugRefusalMessage(err, tf);
+    addToast(refusal ?? tf('toast.bugsSaveFailed', String(err)), 'error');
   }
 }
 
