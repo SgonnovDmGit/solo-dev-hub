@@ -11,9 +11,21 @@
     createLocalRepository, getSetting, setSetting,
     reorderProject, reorderRepo, rebalanceRepoGroup, autoSortAll,
   } from '$lib/api/tauri-commands';
+  import { sharedStates } from '$lib/stores/shared';
+  import { sidebarBadge, describeSharedStatus, fillParams } from '$lib/utils/shared-mode';
   import EmptyState from './EmptyState.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import SidebarResizer from './SidebarResizer.svelte';
+
+  // F-000044: ⇄ after the name of a shared repo, ⚠ (title = the status text) when it needs attention.
+  function sharedBadgeOf(repoId: number) {
+    const st = $sharedStates.get(repoId) ?? null;
+    const badge = sidebarBadge(st);
+    if (!badge) return null;
+    const line = badge.problem ? describeSharedStatus(st) : null;
+    const title = line ? fillParams($tStore(line.textKey as any), line.params) : $tStore('shared.badge.shared' as any);
+    return { ...badge, title };
+  }
 
   // Collapsible state per project id. Default: all collapsed on first launch; persisted in settings.
   let collapsed = $state<Record<number, boolean>>({});
@@ -750,6 +762,10 @@
                         <span class="role-icon" title={$tStore('sidebar.roleTooltip').replace('{0}', repo.role)}>{getRoleIcon(repo.role)}</span>
                       {/if}
                       <span class="repo-name">{getDisplayName(repo)}</span>
+                      {#if sharedBadgeOf(repo.id)}
+                        {@const badge = sharedBadgeOf(repo.id)!}
+                        <span class="shared-badge" class:problem={badge.problem} title={badge.title}>{badge.glyph}</span>
+                      {/if}
                     </div>
                   </li>
                 {/each}
@@ -801,6 +817,10 @@
                     tabindex="0"
                   >
                     <span class="repo-name">{getDisplayName(repo)}</span>
+                    {#if sharedBadgeOf(repo.id)}
+                      {@const badge = sharedBadgeOf(repo.id)!}
+                      <span class="shared-badge" class:problem={badge.problem} title={badge.title}>{badge.glyph}</span>
+                    {/if}
                   </div>
                 </li>
               {/each}
@@ -1112,6 +1132,17 @@
     white-space: nowrap;
     flex: 1;
     min-width: 0;
+  }
+
+  /* F-000044 frame 7A: after the repo name. */
+  .shared-badge {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-muted);
+    cursor: help;
+  }
+  .shared-badge.problem {
+    color: var(--toast-warning);
   }
 
   .repo-empty {

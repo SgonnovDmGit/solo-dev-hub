@@ -37,6 +37,12 @@ export interface RepoSharedState {
   shared_role: 'main' | 'contributor' | 'pending' | null;
   /** Status code, e.g. 'needs_manual_merge'. */
   shared_status: string | null;
+  /**
+   * What the status code is about (T-000223). `needs_manual_merge`: JSON
+   * `{"branch":"dev","current":true}`; `push_rejected`: JSON
+   * `{"branch":"dev","message":"..."}`; the others: a plain reason text.
+   */
+  shared_status_detail: string | null;
 }
 
 export interface RenderedFile {

@@ -42,6 +42,7 @@ import * as reports from './strings/reports';
 import * as secretAudit from './strings/secretAudit';
 import * as help from './strings/help';
 import * as rules from './strings/rules';
+import * as shared from './strings/shared';
 
 const ru = {
   ...common.ru,
@@ -86,6 +87,7 @@ const ru = {
   ...secretAudit.ru,
   ...help.ru,
   ...rules.ru,
+  ...shared.ru,
 } as const;
 
 const en: Record<keyof typeof ru, string> = {
@@ -131,6 +133,7 @@ const en: Record<keyof typeof ru, string> = {
   ...secretAudit.en,
   ...help.en,
   ...rules.en,
+  ...shared.en,
 };
 
 export const translations: Record<Locale, Record<keyof typeof ru, string>> = { ru, en };

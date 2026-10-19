@@ -28,12 +28,19 @@
     setRepoLocalPath,
     listRules,
   } from "$lib/api/tauri-commands";
+  import { githubLogin, refreshShared } from "$lib/stores/shared";
+  import { needsClassicTokenHint } from "$lib/utils/shared-mode";
   import { currentScreen } from "$lib/stores/ui";
   import { addToast } from "$lib/stores/ui";
   import { tStore, locale, setLocale } from "$lib/i18n";
   import { tf } from "$lib/i18n";
   import { formatRelativeTime, nowTick } from "$lib/utils/time-format";
   import type { Locale } from "$lib/i18n/translations";
+
+  // F-000044 (R18): repos of other owners need a classic token.
+  const showClassicTokenHint = $derived(
+    needsClassicTokenHint($githubLogin, $allRepos.map((r) => r.github_name)),
+  );
 
   let showPat = $state(false);
   let patInput = $state("");
@@ -50,7 +57,10 @@
     if (!patInput.trim()) return;
     isSavingPat = true;
     const ok = await savePat(patInput.trim());
-    if (ok) patInput = "";
+    if (ok) {
+      patInput = "";
+      void refreshShared(); // the login of the new token
+    }
     isSavingPat = false;
   }
 
@@ -58,6 +68,7 @@
     isRemovingPat = true;
     await removePat();
     patInput = "";
+    void refreshShared();
     isRemovingPat = false;
   }
 
@@ -170,6 +181,9 @@
         </button>
       {/if}
     </div>
+    {#if showClassicTokenHint}
+      <p class="token-hint">{$tStore("shared.settings.classicTokenHint" as any)}</p>
+    {/if}
   </section>
 
   <!-- 2. Внешний вид -->
@@ -355,6 +369,7 @@
   .pat-row-1 button.icon-only { padding: 5px 7px; }
   .pat-row-1 button[disabled] { opacity: 0.5; cursor: not-allowed; }
 
+  .token-hint { margin: 8px 0 0; font-size: 12px; color: var(--text-muted); line-height: 1.4; }
   .pat-row-2 { margin-top: 6px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .pat-row-2-left { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
   .help-link-inline { font-size: 12px; color: var(--accent); text-decoration: none; white-space: nowrap; }

@@ -8,6 +8,7 @@ import { autoSyncEnabled, autoSyncIntervalMin, autoSyncLastAt, saveAutoSyncLastA
 import { projects } from './projects';
 import { syncProject } from '$lib/api/tauri-commands';
 import { toastRulesFindings } from '$lib/utils/rules-report';
+import { refreshShared } from './shared';
 
 const CHECK_INTERVAL_MS = 60_000;
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -48,6 +49,8 @@ async function tick(): Promise<void> {
     }
     lastRunMs = now;
     await saveAutoSyncLastAt(new Date().toISOString());
+    // F-000044: statuses of shared repos are settled by the sync.
+    void refreshShared();
   } finally {
     running = false;
   }
