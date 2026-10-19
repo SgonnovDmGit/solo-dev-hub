@@ -35,7 +35,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 - **Tasks (todo.md / done.md)** — each repo has an append-only completion log auto-tagged with versions. Universal data grid: filter, sort, persist preferences per tab.
 - **Activity timeline** — multi-source events (bugs, tasks, syncs, deploys, repo renames) across the entire portfolio. Date-range / kind / repo / search filters.
 - **Templates** — per-language seeds for `.gitignore`, `.gitattributes`, deploy YAML, CLAUDE.md sections. Customize once in the app, sync into every project.
-- **PAT in OS keyring** — your GitHub token goes into Windows Credential Manager (OS-level), never SQLite, never `.env`, never a plaintext file.
+- **PAT in OS keyring** — your GitHub token goes into the OS keyring (Windows Credential Manager, the Secret Service on Linux), never SQLite, never `.env`, never a plaintext file.
 - **Single .exe, ~19 MB** — Tauri v2 + WebView2. No Electron bloat. No daemon. No telemetry. The only background network call is the update-checker pinging GitHub Releases once on startup; everything else is on your explicit action.
 
 ![Bugs tab — per-repo bug list with severity, category, status workflow and per-bug attempts counter](docs/screenshots/repo-bugs.png)
@@ -54,7 +54,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 
 - **Framework** — Tauri v2 (Rust backend + WebView2 frontend, single-binary distribution)
 - **Frontend** — SvelteKit + Svelte 5 + TypeScript
-- **Backend** — Rust: SQLite via `rusqlite`, file I/O for sync, Windows Credential Manager via `keyring`
+- **Backend** — Rust: SQLite via `rusqlite`, file I/O for sync, the OS keyring (Windows Credential Manager / Linux Secret Service) via `keyring`
 - **GitHub API** — `@octokit/rest` (called directly from the JS side, never proxied through Rust)
 - **Graph** — Cytoscape.js with concentric layout, theme-aware
 - **i18n** — Russian (default) + English, ~850 type-safe keys, no runtime dependency
@@ -64,11 +64,19 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 
 ### Install
 
-> Current builds are **Windows x64 only**. Tauri supports macOS and Linux architecturally; non-Windows builds may appear in the release pipeline by request.
+> Builds are **Windows x64 and Linux x64** for now; macOS is planned for v1.21.0.
+
+**Windows**
 
 1. Download `solo-dev-hub_<version>_x64-setup.exe` from the [Releases page](https://github.com/SgonnovDmGit/solo-dev-hub/releases)
 2. Run the installer.
 3. **First launch may show a Windows SmartScreen warning** ("Unrecognized publisher"). Authenticode code-signing is on the v2.0.0 roadmap. Until then: click "More info" → "Run anyway".
+
+**Linux** (Ubuntu 22.04+ or another distribution with WebKitGTK 4.1)
+
+- `.deb`: download the `…_amd64.deb` asset from the [Releases page](https://github.com/SgonnovDmGit/solo-dev-hub/releases) and run `sudo apt install ./<file>.deb` (apt pulls in the system libraries).
+- AppImage: download the `…_amd64.AppImage` asset, `chmod +x` it and run it (needs `libfuse2`).
+- The token is kept in the Secret Service (GNOME Keyring or a compatible keyring), so a desktop session with an unlocked keyring is expected.
 
 ### First-time setup
 
@@ -76,7 +84,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
    - `repo` — full repository access (read your repos, manage Actions secrets)
    - `workflow` — required for the deploy automation
    - `read:user` — read your profile info
-2. Open Solo Dev Hub → **Settings** (cog icon) → paste the PAT → save. The token goes into Windows Credential Manager — never on disk in plaintext.
+2. Open Solo Dev Hub → **Settings** (cog icon) → paste the PAT → save. The token goes into the OS keyring — never on disk in plaintext.
 3. **Set your workspace root** — Settings → Workspace. This is the directory under which the app expects your repos to be cloned (e.g. `C:\Users\You\Development\`).
 4. Click **🔄 Sync** in the sidebar. The app fetches your repo list from GitHub.
 5. **Organize**: drag repos into projects in the sidebar, or click a repo to assign a role (server / client / microservice / landing / tool / etc.).
@@ -110,8 +118,8 @@ npm run tauri dev          # local dev with hot reload
 ### Tests
 
 ```bash
-cd src-tauri && cargo test --lib   # ~551 Rust tests
-npm test                            # vitest frontend (~86 tests)
+cd src-tauri && cargo test --lib   # ~622 Rust tests
+npm test                            # vitest frontend (~124 tests)
 npm run check                       # svelte-check
 ```
 
@@ -138,7 +146,8 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Shipped**
 
-- **v1.18.0** *(current — 2026-10-17)* — an approved rule edit is never lost silently; sync problems in the interface language; the rules compressed to less than half (19 skills, a new one for starting a project).
+- **v1.19.0** *(current — 2026-10-19)* — a Rules screen: which rules were changed, where an edit came from, settling two repos that handed one rule back differently; Linux builds (AppImage and .deb).
+- **v1.18.0** — an approved rule edit is never lost silently; sync problems in the interface language; the rules compressed to less than half (19 skills, a new one for starting a project).
 - **v1.17.0** — rules deliver themselves: an applied rule reaches every agent on save and on startup, and an agent's edit travels back from its own copy; peers can be linked only to equals.
 - **v1.16.0** — the second half of the help screen: cross-repo links, deploy, and the AI agent contract; a revision of the working rules (18 role-scoped skills, a new one on debugging); the task-event leak stopped.
 - **v1.15.0** — channels between equals: two repositories on the same level exchange through `docs/InOutBox/`, links created explicitly; number registries in every outgoing channel.
@@ -160,7 +169,6 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Next**
 
-- **v1.19.0** — Linux build; a Rules section in the app showing which rules were changed and where an edit came from.
 - **v1.20.0** — contributor mode: a second developer with their own install working in the same repositories.
 - **v1.21.0** — macOS build.
 - **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix.
