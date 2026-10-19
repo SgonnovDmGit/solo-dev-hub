@@ -77,6 +77,7 @@
     <span class="chips">
       {#if r.changed}<span class="chip changed">{$tStore('rules.chipChanged')}</span>{/if}
       {#if r.conflict}<span class="chip conflict">{$tStore('rules.chipConflict')}</span>{/if}
+      {#if r.follows_main}<span class="chip main" title={r.follows_main}>{$tStore('rules.chipFollowsMain')}</span>{/if}
     </span>
   </button>
 {/snippet}
@@ -98,4 +99,6 @@
   .chip.changed { background: rgba(234, 179, 8, 0.15); color: rgb(234, 179, 8); }
   /* Red tint of --danger (#ef4444). */
   .chip.conflict { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
+  /* The owner's canon: outlined in the accent, like the pill of the shared-repo board. */
+  .chip.main { border: 1px solid var(--accent); color: var(--accent); padding: 0 6px; }
 </style>
