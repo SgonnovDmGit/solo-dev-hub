@@ -50,19 +50,28 @@ pub fn parse_bug_reports(content: &str) -> (Vec<FileBugNote>, Vec<String>) {
     // Rows inside an HTML comment are documentation (the scaffold's example row
     // lives in one), not bugs. A comment block is only recognised when its
     // opening `<!--` starts a line, so a real row that merely mentions `<!--`
-    // in its description is never swallowed.
+    // in its description is never swallowed. A block comment also needs its
+    // closing line (one that ends with `-->`) further down: an opener that is
+    // never closed would hide every real row below it, so it is NOT a comment --
+    // it is ordinary text, plus a warning.
+    let lines: Vec<&str> = content.lines().collect();
     let mut in_comment = false;
-    for line in content.lines() {
+    for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if in_comment {
-            if trimmed.contains("-->") {
+            if trimmed.ends_with("-->") {
                 in_comment = false;
             }
             continue;
         }
         if trimmed.starts_with("<!--") {
-            if !trimmed.contains("-->") {
+            if trimmed.contains("-->") {
+                continue;
+            }
+            if lines[idx + 1..].iter().any(|l| l.trim().ends_with("-->")) {
                 in_comment = true;
+            } else {
+                warnings.push(format!("unterminated <!-- at line {}", idx + 1));
             }
             continue;
         }
@@ -298,5 +307,25 @@ mod tests {
         let md = "- B-001 | 2026-03-29 | uses <!-- in html | major | ui_ux | created | 0 |\n- B-002 | 2026-03-29 | next | major | ui_ux | created | 0 |\n";
         let (bugs, _) = parse_bug_reports(md);
         assert_eq!(bugs.len(), 2);
+    }
+
+    #[test]
+    fn test_an_unterminated_comment_opener_hides_nothing() {
+        // An opener nobody closes is ordinary text: every real row below it is
+        // still a bug, and the stray opener is reported.
+        let md = "## Open bugs\n\n<!-- forgotten\n- B-001 | 2026-03-29 | one | major | auth | created | 0 |\n- B-002 | 2026-03-29 | a --> b | major | auth | created | 0 |\n";
+        let (bugs, warnings) = parse_bug_reports(md);
+        let ids: Vec<&str> = bugs.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["B-001", "B-002"]);
+        assert_eq!(warnings, vec!["unterminated <!-- at line 3".to_string()]);
+    }
+
+    #[test]
+    fn test_a_terminated_block_comment_still_hides_its_rows() {
+        let md = "<!--\n- B-001 | 2026-03-29 | doc | major | auth | created | 0 |\n-->\n- B-002 | 2026-03-29 | real | major | auth | created | 0 |\n";
+        let (bugs, warnings) = parse_bug_reports(md);
+        assert_eq!(bugs.len(), 1);
+        assert_eq!(bugs[0].id, "B-002");
+        assert!(warnings.is_empty());
     }
 }
