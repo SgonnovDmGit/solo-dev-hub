@@ -108,6 +108,10 @@ pub struct RuleInfo {
     pub changed: bool,
     /// The rule has an open hand-back conflict.
     pub conflict: bool,
+    /// T-000224: login of the owner whose repo this install takes the rule's
+    /// text from; the rule is read-only here. `None` when the install owns it.
+    #[serde(default)]
+    pub follows_main: Option<String>,
     /// Where the text came from (`db::rules::latest_origin_event`); `None` when
     /// it predates the history.
     pub origin: Option<RuleEvent>,

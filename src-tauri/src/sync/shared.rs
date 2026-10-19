@@ -187,7 +187,7 @@ pub fn gitattributes_template_for(template: &str, shared: bool) -> String {
 // Pathspecs
 // ---------------------------------------------------------------------------
 
-const SKILLS_DIR: &str = "docs/sdh_skills";
+pub(super) const SKILLS_DIR: &str = "docs/sdh_skills";
 const SKILLS_EXCLUDES: [&str; 2] = [
     ":(exclude)docs/sdh_skills/*.approved",
     ":(exclude)docs/sdh_skills/*.conflict",
@@ -243,7 +243,7 @@ fn is_excluded_file(path: &str) -> bool {
 // Small git helpers
 // ---------------------------------------------------------------------------
 
-fn git_bytes(
+pub(super) fn git_bytes(
     git: &GitBinary,
     root: &Path,
     args: &[&str],
@@ -275,7 +275,7 @@ fn split_nul(bytes: &[u8]) -> Vec<String> {
 }
 
 /// `path -> blob sha` of every blob under `paths` at `rev`.
-fn ls_tree(
+pub(super) fn ls_tree(
     git: &GitBinary,
     root: &Path,
     rev: &str,
@@ -754,7 +754,7 @@ fn store_pair(imp: &mut ss::SharedImport, path: &str, blob: &str, commit: &str) 
         .insert(path.to_string(), format!("{}@{}", blob, commit));
 }
 
-fn blob_text(git: &GitBinary, root: &Path, sha: &str) -> Result<String, String> {
+pub(super) fn blob_text(git: &GitBinary, root: &Path, sha: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&cat_blob(git, root, sha)?).into_owned())
 }
 
@@ -1137,6 +1137,8 @@ struct RepoPass {
     /// not ours: never plumbed into, never pushed.
     blocked: HashSet<String>,
     committed: bool,
+    /// Rules whose canon this pass took from the owner (T-000224).
+    canon_changed: Vec<String>,
 }
 
 impl RepoPass {
@@ -1161,6 +1163,9 @@ pub struct SharedSync {
     passes: Vec<RepoPass>,
     /// Repos the shared path took over: the ordinary auto-commit skips them.
     pub handled: HashSet<i64>,
+    /// Rules whose canon changed because an owner's committed copy differs
+    /// (T-000224): the project sync renders everywhere when this is not empty.
+    pub canon_changed: Vec<String>,
 }
 
 impl SharedSync {
@@ -1168,7 +1173,18 @@ impl SharedSync {
         SharedSync {
             passes: Vec::new(),
             handled: HashSet::new(),
+            canon_changed: Vec::new(),
         }
+    }
+
+    /// The trusted structure phase A settled for `repo_id`, if it did: what the
+    /// CLAUDE.md section's shared block is written from (a pending helper has
+    /// no structure file in the work tree yet).
+    pub fn structure_of(&self, repo_id: i64) -> Option<&ProjectStructure> {
+        self.passes
+            .iter()
+            .find(|p| p.repo.id == repo_id)
+            .and_then(|p| p.structure.as_ref())
     }
 }
 
@@ -1494,6 +1510,11 @@ pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>, project_id: Option<i64>)
         };
         if let Some(pass) = phase_a_foreign(db, git, &repo, &root, &gh, login, mode) {
             sync.handled.insert(repo.id);
+            for rule in &pass.canon_changed {
+                if !sync.canon_changed.contains(rule) {
+                    sync.canon_changed.push(rule.clone());
+                }
+            }
             sync.passes.push(pass);
         }
     }
@@ -1515,6 +1536,7 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         fetched: false,
         blocked: HashSet::new(),
         committed: false,
+        canon_changed: Vec::new(),
     }
 }
 
@@ -1657,6 +1679,10 @@ fn phase_a_foreign(
             if role == Role::Contributor {
                 remove_own_stale_request(git, &pass);
             }
+            // Р16: this install does not render rule copies here; copies an
+            // earlier version (or the time before the join) left untracked
+            // would stop the owner's from being fast-forwarded in.
+            drop_untracked_rule_copies(git, root);
             pass.structure = Some(s);
             after_fetch(db, git, &mut pass);
             Some(pass)
@@ -1981,6 +2007,34 @@ fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass) {
     }
 }
 
+/// Р16 / BUG-1: delete the rule copies in `docs/sdh_skills/` that this install
+/// rendered itself -- `sdh-*.md` files git does not track. A contributor's
+/// install renders none there any more, and the owner's committed ones cannot
+/// be fast-forwarded over untracked files. Approval markers, reason files and
+/// anything else are left alone. Skipped when git cannot say what is tracked.
+fn drop_untracked_rule_copies(git: &GitBinary, root: &Path) {
+    let dir = root.join(SKILLS_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let Ok(tracked) = ls_files_tracked(git, root, &[SKILLS_DIR.to_string()]) else {
+        return;
+    };
+    let tracked: HashSet<String> = tracked.into_iter().collect();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("sdh-") && name.ends_with(".md")) {
+            continue;
+        }
+        if !matches!(entry.file_type(), Ok(t) if t.is_file()) {
+            continue;
+        }
+        if !tracked.contains(&format!("{}/{}", SKILLS_DIR, name)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Move the local branch back onto origin's, keeping the old tip in
 /// `refs/sdh-backup/<branch>`. `observed` is the tip `local_tip_if_ours` judged
 /// to hold nothing but our own sync commits: it is the compare-and-swap old
@@ -2084,6 +2138,38 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
             .target("docs/bug-reports.md")
             .detail(format!("import of the shared task files: {}", e));
         pass.issue(issue)
+    }
+    // T-000224 (В4): the owner's committed rule copies are this install's canon.
+    if role == Role::Contributor {
+        let main_login = pass.structure.as_ref().map(|s| s.main.login.clone());
+        if let Some(main_login) = main_login {
+            match crate::sync::shared_canon::adopt_main_canon(
+                db,
+                git,
+                &pass.repo,
+                &pass.root,
+                &main_login,
+            ) {
+                Ok(done) => {
+                    pass.canon_changed.extend(done.changed);
+                    if !done.errors.is_empty() {
+                        let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                            .target("docs/sdh_skills/")
+                            .detail(format!(
+                                "canon of the owner's rules: {}",
+                                done.errors.join("; ")
+                            ));
+                        pass.issue(issue)
+                    }
+                }
+                Err(e) => {
+                    let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                        .target("docs/sdh_skills/")
+                        .detail(format!("canon of the owner's rules: {}", e));
+                    pass.issue(issue)
+                }
+            }
+        }
     }
 }
 
@@ -2565,7 +2651,11 @@ pub fn enable_shared_mode(
 }
 
 /// Tracked files only (no untracked ones) under `paths`.
-fn ls_files_tracked(git: &GitBinary, root: &Path, paths: &[String]) -> Result<Vec<String>, String> {
+pub(super) fn ls_files_tracked(
+    git: &GitBinary,
+    root: &Path,
+    paths: &[String],
+) -> Result<Vec<String>, String> {
     Ok(split_nul(&git_bytes(
         git,
         root,

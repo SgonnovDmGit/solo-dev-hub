@@ -182,6 +182,7 @@ fn write_repo_skeletons(
     repo: &Repository,
     tpl: &SkeletonTemplates,
     quiet_conflicts: &[String],
+    shared: &sync::shared::SharedSync,
     c: &mut SyncCounters,
 ) {
     let role = repo.role.as_deref();
@@ -195,9 +196,15 @@ fn write_repo_skeletons(
     if let Err(e) = sync::generate_project_md(db, md_project_id, base) {
         c.push(file_issue("docs/project.md", e));
     }
-    if let Err(e) =
-        sync::update_claude_md_section(db, Some(md_project_id), role, &base.join("CLAUDE.md"))
-    {
+    // F-000044: the shared-repo block (owner, branch, this install's band).
+    let shared_block = sync::shared_block_for(db, repo, shared.structure_of(repo.id));
+    if let Err(e) = sync::update_claude_md_section(
+        db,
+        Some(md_project_id),
+        role,
+        &shared_block,
+        &base.join("CLAUDE.md"),
+    ) {
         c.push(file_issue("CLAUDE.md", e));
     }
     // Runs only after `refresh_rules` collected across the portfolio (see
@@ -205,9 +212,13 @@ fn write_repo_skeletons(
     // After an uptake the refresh has already rendered and reported this repo;
     // `push` keeps each held copy to one line. T-000206: copies of a conflict
     // already reported by an earlier pass stay quiet here too.
-    match sync::render_skills_to_repo(db, base) {
-        Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
-        Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
+    // Р16: not in a repo where this install is a contributor or a pending
+    // helper -- the owner's copies are the ones git carries there.
+    if !sync::skips_rule_copies(db, repo.id) {
+        match sync::render_skills_to_repo(db, base) {
+            Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
+            Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
+        }
     }
     // F-000044: a shared repo (any role) renders the blocks without the shared
     // paths; the same text for the owner and for contributors, so it never churns.
@@ -1054,12 +1065,14 @@ pub(crate) fn run_project_sync_in(
     // about to be collected. An uptake is rendered everywhere by `refresh_rules`
     // itself: a rule belongs to the whole portfolio.
     let claude_dir = home.as_ref().map(|h| h.join(".claude"));
-    let rules = sync::refresh_rules(
-        db,
-        claude_dir.as_deref(),
-        sync::RenderScope::UptakeOnly,
-        None,
-    );
+    // T-000224: an owner's rule text taken as this install's canon in phase A
+    // goes everywhere at once -- the contributor's other repos and ~/.claude.
+    let scope = if shared.canon_changed.is_empty() {
+        sync::RenderScope::UptakeOnly
+    } else {
+        sync::RenderScope::Everywhere
+    };
+    let rules = sync::refresh_rules(db, claude_dir.as_deref(), scope, None);
     c.extend(rules.errors);
     c.rules_taken = rules.taken;
     c.rules_lost = rules.lost;
@@ -1081,7 +1094,16 @@ pub(crate) fn run_project_sync_in(
             c.push(root_missing(repo));
             continue;
         }
-        write_repo_skeletons(db, project_id, base, repo, &tpl, &quiet_conflicts, &mut c);
+        write_repo_skeletons(
+            db,
+            project_id,
+            base,
+            repo,
+            &tpl,
+            &quiet_conflicts,
+            &shared,
+            &mut c,
+        );
     }
     for ms_id in &microservice_ids {
         let Ok(ms_server) = db.server_repo_of_microservice(*ms_id) else {
@@ -1097,7 +1119,16 @@ pub(crate) fn run_project_sync_in(
             c.push(root_missing(&ms_server));
             continue;
         }
-        write_repo_skeletons(db, *ms_id, base, &ms_server, &tpl, &quiet_conflicts, &mut c);
+        write_repo_skeletons(
+            db,
+            *ms_id,
+            base,
+            &ms_server,
+            &tpl,
+            &quiet_conflicts,
+            &shared,
+            &mut c,
+        );
     }
 
     // A project without a server (or a server without clients yet) is not an

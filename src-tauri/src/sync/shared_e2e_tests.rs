@@ -38,7 +38,7 @@ use super::shared::*;
 use super::shared_structure as ss;
 use crate::db::AppDb;
 use crate::models::{ActivityEvent, SyncResult, TimelineFilter};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,8 +105,6 @@ struct World {
     scratch: i64,
     master0: String,
     hook_log: PathBuf,
-    /// BUG-1 workaround on (see `workaround_untracked_skills`).
-    workaround: Cell<bool>,
     /// Refs of the remote at the last check.
     refs: RefCell<BTreeMap<String, String>>,
 }
@@ -161,7 +159,6 @@ impl World {
             scratch,
             master0,
             hook_log,
-            workaround: Cell::new(true),
             refs: RefCell::new(BTreeMap::new()),
         };
         *w.refs.borrow_mut() = w.origin_refs();
@@ -187,9 +184,6 @@ impl World {
     /// The helper presses sync on the project the repo is in (before the join
     /// has put the repo in one: on an unrelated project of theirs).
     fn sync_helper(&self) -> SyncResult {
-        if self.workaround.get() {
-            workaround_untracked_skills(&self.fx.helper_dir);
-        }
         let project = self
             .fx
             .helper_db
@@ -1277,52 +1271,127 @@ fn guard_nothing_ever_writes_master_or_main_or_forces_the_remote() {
 }
 
 // ---------------------------------------------------------------------------
-// BUG-1 (found by these scenarios, not fixed here)
+// BUG-1 (found by these scenarios, fixed)
 // ---------------------------------------------------------------------------
 
-/// BUG-1 workaround, applied to the helper's clone before every helper sync
-/// (switched off by the repro test below).
-///
-/// Symptom without it: a contributor whose project sync has rendered the rule
-/// copies into `docs/sdh_skills/` (every sync of a managed repo does, and for a
-/// contributor they stay untracked: only the owner commits them) can no longer
-/// fast-forward onto the branch the owner plumbed the skills into. `git merge
-/// --ff-only` refuses ("untracked working tree files would be overwritten"),
-/// the sync reports `AutocommitFailed` plus `needs_manual_merge` ("have
-/// diverged", which is not true) and the Merge button fails with the same git
-/// error. The helper then never gets the owner's files again.
-///
-/// The workaround lists the folder in the clone's `.git/info/exclude`: git
-/// overwrites ignored files in a merge. Delete this function, its call and the
-/// `workaround` field once the product handles the collision.
-fn workaround_untracked_skills(dir: &Path) {
-    let p = dir.join(".git").join("info").join("exclude");
-    let cur = fs::read_to_string(&p).unwrap_or_default();
-    if !cur.lines().any(|l| l.trim() == "docs/sdh_skills/") {
-        fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(p, format!("{}\ndocs/sdh_skills/\n", cur.trim_end())).unwrap();
-    }
-}
-
-/// BUG-1, minimal repro (ignored: it fails until the product is fixed; run with
-/// `--ignored`). Join as in item 2 -- one extra owner sync so the owner plumbs
-/// the skills into the helper's branch -- and the helper's next sync cannot
-/// bring them in. When it passes, drop the workaround above and un-ignore this.
+/// BUG-1 (fixed, Р16). A contributor's project sync used to render the rule
+/// copies into `docs/sdh_skills/` of the shared clone, where they stayed
+/// untracked (only the owner commits them); the owner's committed copies then
+/// could not be fast-forwarded in -- `git merge --ff-only` refused ("untracked
+/// working tree files would be overwritten"), the sync reported a false
+/// `needs_manual_merge` and the helper never got the owner's files again. Now a
+/// contributor's / pending helper's install renders nothing there, and copies an
+/// earlier run left untracked are removed.
 #[test]
-#[ignore = "BUG-1: a contributor's untracked docs/sdh_skills block the fast-forward onto the owner's branch"]
 fn bug1_a_contributors_rendered_skills_do_not_block_the_fast_forward() {
     let w = World::new();
-    w.workaround.set(false);
     w.owner_shares();
     w.sync_helper();
     w.sync_owner();
     approve_join_request(&w.fx.main_db, Some(&gb()), w.fx.main_repo, "helper").unwrap();
     w.sync_owner();
-    w.sync_helper(); // contributor: renders the rule copies, pushes its branch
+    w.sync_helper(); // contributor: renders no rule copies, pushes its branch
     w.sync_owner(); // plumbs the owner's files (with the skills) into it
     w.sync_helper(); // must fast-forward onto them
     assert_eq!(w.fx.helper_status(), None);
     assert!(w.helper_file(".sdh/project.json").contains("\"Owner\""));
+    // The owner's committed copies are what the helper's clone holds, tracked.
+    assert!(tracked(&w.fx.helper_dir, "HEAD")
+        .iter()
+        .any(|f| f.starts_with("docs/sdh_skills/sdh-")));
+}
+
+/// T-000224 (Р16, the owner's decision В4). Rules follow the owner at a
+/// contributor: copies an earlier run rendered untracked into the clone are
+/// removed (so the fast-forward goes through), the owner's committed text of a
+/// rule that differs from the helper's canon becomes the helper's canon -- custom,
+/// with a `taken` event naming the owner -- and is rendered to `~/.claude`, the
+/// rule is locked in the app while the repo is shared, and switching sharing off
+/// unlocks it, the text staying.
+#[test]
+fn the_owners_rule_canon_reaches_a_contributor_and_is_released_on_switch_off() {
+    const FILE: &str = "skill.sdh-debugging.md.tmpl";
+    const OWNER_TEXT: &str = "# The owner's own debugging rule
+";
+    let w = World::new();
+    // Before the join an earlier version of the app rendered the rules here.
+    write(
+        &w.fx.helper_dir,
+        "docs/sdh_skills/sdh-debugging.md",
+        "RENDERED BEFORE THE JOIN
+",
+    );
+    write(
+        &w.fx.helper_dir,
+        "docs/sdh_skills/sdh-retro.md",
+        "RENDERED BEFORE THE JOIN
+",
+    );
+    w.fx.main_db
+        .upsert_template_file("_global", FILE, OWNER_TEXT, true)
+        .unwrap();
+
+    w.join();
+
+    assert_eq!(w.fx.helper_status(), None);
+    let db = &w.fx.helper_db;
+    assert!(tracked(&w.fx.helper_dir, "HEAD")
+        .iter()
+        .any(|f| f == "docs/sdh_skills/sdh-retro.md"));
+    assert_eq!(
+        w.helper_file("docs/sdh_skills/sdh-debugging.md"),
+        OWNER_TEXT
+    );
+    let canon = db.get_template_file("_global", FILE).unwrap().unwrap();
+    assert_eq!(canon.content, OWNER_TEXT);
+    assert!(canon.is_custom);
+    // Only the rule whose text differs was taken, with the owner's name.
+    let origin = db.latest_origin_event("sdh-debugging").unwrap().unwrap();
+    assert_eq!(origin.kind, "taken");
+    assert_eq!(origin.note.as_deref(), Some("canon of main Owner"));
+    assert!(db.latest_origin_event("sdh-retro").unwrap().is_none());
+    assert_eq!(
+        crate::sync::shared_canon::follows_main(db, "sdh-debugging").as_deref(),
+        Some("Owner")
+    );
+    assert_eq!(
+        crate::sync::shared_canon::follows_main(db, "sdh-retro"),
+        None
+    );
+    // Delivered to the helper's other targets as well.
+    let global = w
+        .helper_home
+        .path()
+        .join(".claude/skills/sdh-debugging/SKILL.md");
+    assert_eq!(fs::read_to_string(global).unwrap(), OWNER_TEXT);
+    // The CLAUDE.md section tells the helper whose repo it is and his band.
+    let claude = w.helper_file("CLAUDE.md");
+    assert!(claude.contains("## Shared repo"), "{}", claude);
+    assert!(claude.contains("Owner: `Owner`"), "{}", claude);
+    assert!(claude.contains("`500000`–`599999`"), "{}", claude);
+    // Nothing of this is left to commit by hand.
+    assert!(g(
+        &w.fx.helper_dir,
+        &["status", "--porcelain", "docs/sdh_skills"]
+    )
+    .is_empty());
+    w.check_origin();
+
+    // The owner switches sharing off: the helper's repo is ordinary again, the
+    // rule is editable, and its text is the helper's own canon now.
+    let res = disable_shared_mode(&w.fx.main_db, &gb(), w.fx.main_repo).unwrap();
+    assert!(res.pushed, "{:?}", res);
+    w.sync_owner();
+    w.sync_helper();
+    w.sync_helper();
+    assert_eq!(shared_role(&w.fx.helper_db, w.fx.helper_repo), None);
+    assert_eq!(
+        crate::sync::shared_canon::follows_main(db, "sdh-debugging"),
+        None
+    );
+    let kept = db.get_template_file("_global", FILE).unwrap().unwrap();
+    assert_eq!((kept.content.as_str(), kept.is_custom), (OWNER_TEXT, true));
+    w.check_origin();
 }
 
 // ---------------------------------------------------------------------------

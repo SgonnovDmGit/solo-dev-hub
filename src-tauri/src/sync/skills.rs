@@ -128,6 +128,33 @@ pub fn rule_copy_label(repo: &Repository) -> String {
         .unwrap_or_else(|| repo.display_name())
 }
 
+/// F-000044 / Р16: in a shared repo where this install is a contributor or a
+/// pending helper, the rule copies under `docs/sdh_skills/` are the OWNER's:
+/// he renders and commits them, this install only receives them through git.
+/// Rendering its own copies there leaves them untracked, and the owner's
+/// committed ones then cannot be fast-forwarded in (git refuses to overwrite
+/// untracked files). So such a repo is left out of every pass that renders
+/// copies or collects hand-back markers; the owner role and ordinary repos are
+/// unchanged.
+pub fn skips_rule_copies(db: &AppDb, repo_id: i64) -> bool {
+    db.get_shared_state(repo_id)
+        .map(|s| {
+            matches!(
+                s.shared_role.as_deref(),
+                Some("contributor") | Some("pending")
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Every repo with a local path that takes part in rule copies: the portfolio
+/// minus the contributor / pending shared repos (`skips_rule_copies`).
+fn rules_repos(db: &AppDb) -> rusqlite::Result<Vec<Repository>> {
+    let mut repos = db.list_repos_with_local_path(None)?;
+    repos.retain(|r| !skips_rule_copies(db, r.id));
+    Ok(repos)
+}
+
 /// Render each skill to `<repo_base>/docs/sdh_skills/<name>.md` (flat reference
 /// copy for non-Claude-Code agents).
 ///
@@ -401,6 +428,7 @@ fn classify(
     scans: &[RepoScan],
     known: &HashMap<String, String>,
     settings_edit: Option<&str>,
+    followed: &HashSet<String>,
     out: &mut Collected,
 ) -> Found {
     let mut found = Found::default();
@@ -417,7 +445,9 @@ fn classify(
                 );
                 continue;
             };
-            if settings_edit == Some(name) {
+            // A rule that follows an owner (shared_canon) has its text from his
+            // repo; a hand-back of it is set aside like the owner's own edit.
+            if settings_edit == Some(name) || followed.contains(name) {
                 match remove_if_present(&marker.path) {
                     Ok(()) => {
                         out.superseded.push(format!("{} ({})", name, label));
@@ -553,7 +583,9 @@ fn all_sides_read(
             Err(rusqlite::Error::QueryReturnedNoRows) => continue,
             Err(e) => return Err(e),
         };
-        if repo.local_path.is_none() {
+        if repo.local_path.is_none() || skips_rule_copies(db, id) {
+            // Р16: a contributor's checkout hands nothing back, so its side
+            // cannot hold a conflict open.
             continue;
         }
         if !found.read.contains(&id) || found.unread.contains(&(rule.to_string(), id)) {
@@ -804,7 +836,10 @@ fn collect_approved_skill_edits(
         }
     };
     let scans: Vec<RepoScan> = repos.iter().filter_map(scan_repo_markers).collect();
-    let found = classify(db, &scans, &known, settings_edit, &mut out);
+    let followed: HashSet<String> = super::shared_canon::followed_rules(db)
+        .into_keys()
+        .collect();
+    let found = classify(db, &scans, &known, settings_edit, &followed, &mut out);
     // Closed first, so a `conflict_resolved` reads before whatever this pass
     // then takes up.
     let undecided = settle_open_conflicts(db, repos, &open, &found, settings_edit, &mut out);
@@ -878,9 +913,7 @@ fn live_conflict(repos: &[Repository], rule: &str) -> LiveConflict {
 /// collection cannot clear a marker halfway through the read.
 pub fn conflict_sides(db: &AppDb, rule: &str) -> Result<Vec<RuleConflictSide>, String> {
     let _guard = rules_guard();
-    let repos = db
-        .list_repos_with_local_path(None)
-        .map_err(|e| e.to_string())?;
+    let repos = rules_repos(db).map_err(|e| e.to_string())?;
     Ok(live_conflict(&repos, rule).sides)
 }
 
@@ -919,9 +952,7 @@ pub fn resolve_conflict(
     // A failed listing is refused outright: with no repos nothing is read, so
     // an accept would claim its side is gone and a reject would close the
     // conflict without clearing a single marker.
-    let repos = db
-        .list_repos_with_local_path(None)
-        .map_err(|e| e.to_string())?;
+    let repos = rules_repos(db).map_err(|e| e.to_string())?;
     let live = live_conflict(&repos, rule);
     let accepted = match accept {
         Some(label) => Some(
@@ -1028,9 +1059,7 @@ pub(crate) fn existing_checkout(repo: &Repository) -> Option<&Path> {
 
 /// T-000174: how many repos a rule reaches (`existing_checkout`).
 pub fn count_render_targets(db: &AppDb) -> Result<usize, String> {
-    let repos = db
-        .list_repos_with_local_path(None)
-        .map_err(|e| e.to_string())?;
+    let repos = rules_repos(db).map_err(|e| e.to_string())?;
     Ok(repos
         .iter()
         .filter(|repo| existing_checkout(repo).is_some())
@@ -1040,7 +1069,7 @@ pub fn count_render_targets(db: &AppDb) -> Result<usize, String> {
 /// Every repo with a local path — what a collection covers. A failed listing
 /// is reported and yields none: nothing is read, so nothing is decided.
 fn portfolio_repos(db: &AppDb, report: &mut RulesRefresh) -> Vec<Repository> {
-    match db.list_repos_with_local_path(None) {
+    match rules_repos(db) {
         Ok(v) => v,
         Err(e) => {
             report
@@ -1075,6 +1104,21 @@ fn render_scope(
     }
     match scope {
         RenderScope::Repo(base) => {
+            // Р16: a contributor's / pending helper's checkout takes no rule
+            // copies. `repos` already leaves such a repo out, so it is found by
+            // its path in the whole portfolio.
+            if db
+                .list_all_repos()
+                .map(|all| {
+                    all.iter().any(|r| {
+                        r.local_path.as_deref().map(Path::new) == Some(base)
+                            && skips_rule_copies(db, r.id)
+                    })
+                })
+                .unwrap_or(false)
+            {
+                return;
+            }
             // Rendered even after an everywhere pass: the target may not be among
             // the stored checkouts, and an unchanged file is not rewritten anyway.
             match render_skills_to_repo(db, base) {
@@ -2322,6 +2366,125 @@ mod tests {
         assert!(!skills.join("sdh-alpha.md.approved").exists());
         assert_eq!(errors.len(), 1, "{:?}", errors);
         assert_eq!(errors[0].code, SyncIssueCode::RuleFailed);
+    }
+
+    // ── F-000044 / Р16: a contributor's repo takes no rule copies ───────────────
+
+    fn repo_with_role(db: &AppDb, dir: &TempDir, name: &str, role: Option<&str>) -> Repository {
+        let repo = db
+            .insert_local_repository(&dir.path().to_string_lossy(), name, None, None)
+            .unwrap();
+        db.set_shared_role(repo.id, role).unwrap();
+        db.get_repository(repo.id).unwrap()
+    }
+
+    #[test]
+    fn test_a_contributor_or_pending_repo_gets_no_rule_copies_and_loses_none() {
+        let db = db_with_skill();
+        let ordinary = TempDir::new().unwrap();
+        let contributor = TempDir::new().unwrap();
+        let pending = TempDir::new().unwrap();
+        let owner = TempDir::new().unwrap();
+        repo_with_role(&db, &ordinary, "acme/one", None);
+        repo_with_role(&db, &contributor, "acme/two", Some("contributor"));
+        repo_with_role(&db, &pending, "acme/three", Some("pending"));
+        let owner_repo = repo_with_role(&db, &owner, "me/four", Some("main"));
+        db.set_shared_mode(owner_repo.id, true).unwrap();
+        // The contributor's clone holds the owner's tracked copies, one of them
+        // a name this install's bundle no longer has: not pruned.
+        let held = contributor.path().join("docs/sdh_skills");
+        fs::create_dir_all(&held).unwrap();
+        fs::write(held.join("sdh-alpha.md"), "THE OWNER'S ALPHA").unwrap();
+        fs::write(held.join("sdh-old.md"), "THE OWNER'S OLD").unwrap();
+
+        let report = refresh_rules(&db, None, RenderScope::Everywhere, None);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.repos, 2, "the ordinary repo and the owner's");
+        assert!(ordinary
+            .path()
+            .join("docs/sdh_skills/sdh-alpha.md")
+            .exists());
+        assert!(owner.path().join("docs/sdh_skills/sdh-alpha.md").exists());
+        assert_eq!(
+            fs::read_to_string(held.join("sdh-alpha.md")).unwrap(),
+            "THE OWNER'S ALPHA"
+        );
+        assert!(!held.join("sdh-beta.md").exists());
+        assert!(held.join("sdh-old.md").exists(), "no prune either");
+        assert!(!pending.path().join("docs").exists(), "nothing written");
+        assert_eq!(count_render_targets(&db).unwrap(), 2);
+        // The single-repo render of init docs honours it too.
+        let report = refresh_rules(&db, None, RenderScope::Repo(pending.path()), None);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!pending.path().join("docs").exists());
+    }
+
+    #[test]
+    fn test_a_contributors_hand_back_marker_is_not_collected() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        hand_back(&skills, "sdh-alpha", "ALPHA REVISED", "approved");
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+
+        assert!(report.taken.is_empty() && report.lost.is_empty());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(rule_text(&db), "ALPHA BODY");
+        assert!(skills.join("sdh-alpha.md.approved").exists(), "left alone");
+        assert_eq!(
+            fs::read_to_string(skills.join("sdh-alpha.md")).unwrap(),
+            "ALPHA REVISED"
+        );
+    }
+
+    #[test]
+    fn test_a_contributor_side_does_not_hold_a_conflict_open() {
+        let db = db_with_skill();
+        let (one, two) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (_, s1) = rendered_repo(&db, &one, "a");
+        let (r2, s2) = rendered_repo(&db, &two, "b");
+        hand_back(&s1, "sdh-alpha", "ALPHA ONE", "");
+        hand_back(&s2, "sdh-alpha", "ALPHA TWO", "");
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+        assert!(!report.errors.is_empty(), "the conflict is reported");
+        assert!(db.open_rule_conflicts().unwrap().contains("sdh-alpha"));
+
+        // The second repo becomes a contributor's: its marker is no longer read
+        // and cannot keep the conflict open; the first one's text is taken.
+        db.set_shared_role(r2.id, Some("contributor")).unwrap();
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(db.open_rule_conflicts().unwrap().is_empty());
+        assert_eq!(rule_text(&db), "ALPHA ONE");
+    }
+
+    #[test]
+    fn test_a_hand_back_of_a_rule_that_follows_an_owner_is_set_aside() {
+        let db = db_with_skill();
+        let shared = TempDir::new().unwrap();
+        let mine = TempDir::new().unwrap();
+        let shared_repo = repo_with_role(&db, &shared, "acme/shared", Some("contributor"));
+        let (_, skills) = rendered_repo(&db, &mine, "mine");
+        db.set_setting(
+            super::super::shared_canon::RULES_FROM_MAIN_KEY,
+            &format!(
+                r#"{{"sdh-alpha":{{"login":"owner","repo_id":{},"committed_at":1}}}}"#,
+                shared_repo.id
+            ),
+        )
+        .unwrap();
+        hand_back(&skills, "sdh-alpha", "ALPHA REVISED", "approved");
+
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+
+        assert!(report.taken.is_empty());
+        assert_eq!(report.superseded.len(), 1, "{:?}", report.superseded);
+        assert_eq!(rule_text(&db), "ALPHA BODY");
+        assert!(!skills.join("sdh-alpha.md.approved").exists());
     }
 
     #[test]

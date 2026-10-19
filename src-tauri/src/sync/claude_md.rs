@@ -5,6 +5,8 @@
 // bug-reports.md).
 
 use crate::db::AppDb;
+use crate::models::Repository;
+use crate::sync::shared_structure::{self as ss, ProjectStructure};
 use regex::Regex;
 use std::fs;
 use std::path::Path;
@@ -74,10 +76,14 @@ fn write_claude_section(claude_md_path: &Path, rendered: &str) -> Result<(), Str
 
 /// Per-repo CLAUDE.md: project context (name, repos, microservices, parents).
 /// Uses `claude.md.section.tmpl`. Rendered with project-specific placeholders.
+///
+/// `shared_block` fills `{{SHARED_BLOCK}}` (`shared_block_for` of the repo; empty
+/// for an ordinary one).
 pub fn update_claude_md_section(
     db: &AppDb,
     project_id: Option<i64>,
     repo_role: Option<&str>,
+    shared_block: &str,
     claude_md_path: &Path,
 ) -> Result<(), String> {
     let template_opt = db
@@ -87,8 +93,95 @@ pub fn update_claude_md_section(
         Some(t) => t.content,
         None => return Err("claude.md.section.tmpl not found in DB".to_string()),
     };
-    let rendered = render_claude_section(&template, db, project_id, repo_role)?;
+    let rendered = render_claude_section(&template, db, project_id, repo_role, shared_block)?;
     write_claude_section(claude_md_path, &rendered)
+}
+
+/// F-000044 / T-000222: the shared-repo block of the CLAUDE.md section of `repo`.
+///
+/// * the owner (shared mode on) or a contributor -> `claude.md.shared.tmpl` with
+///   this install's number band (6 digits, no separators);
+/// * a pending helper -> `claude.md.shared-pending.tmpl`;
+/// * an ordinary repo, or one whose structure cannot be told -> empty.
+///
+/// `structure` is the trusted structure phase A settled in this sync, if any;
+/// otherwise the work-tree file is read. The owner of a repo whose structure
+/// file is not written yet is described from this install's login and the
+/// repo's own branch. Templates come from the database, like the section's.
+pub fn shared_block_for(
+    db: &AppDb,
+    repo: &Repository,
+    structure: Option<&ProjectStructure>,
+) -> String {
+    let Ok(state) = db.get_shared_state(repo.id) else {
+        return String::new();
+    };
+    #[derive(PartialEq)]
+    enum Kind {
+        Owner,
+        Contributor,
+        Pending,
+    }
+    let kind = if state.shared_mode {
+        Kind::Owner
+    } else {
+        match state.shared_role.as_deref() {
+            Some("contributor") => Kind::Contributor,
+            Some("pending") => Kind::Pending,
+            _ => return String::new(),
+        }
+    };
+    let from_file = || match (repo.local_path.as_deref(), repo.github_name.as_deref()) {
+        (Some(path), Some(gh)) => ss::read_structure_file(Path::new(path), gh).ok().flatten(),
+        _ => None,
+    };
+    let structure = structure.cloned().or_else(from_file);
+    let login = db.github_login();
+
+    // (owner's login, dev branch, band)
+    let (main_login, dev_branch, band) = match (&structure, &kind) {
+        (Some(s), Kind::Pending) => (s.main.login.clone(), s.main.dev_branch.clone(), None),
+        (Some(s), _) => {
+            let Some(band) = login.as_deref().and_then(|l| ss::band_for(s, l)) else {
+                return String::new();
+            };
+            (s.main.login.clone(), s.main.dev_branch.clone(), Some(band))
+        }
+        (None, Kind::Owner) => {
+            let (Some(login), Some(branch)) = (
+                login.clone(),
+                db.get_autocommit_branch(repo.id)
+                    .ok()
+                    .flatten()
+                    .map(|b| b.trim().to_string())
+                    .filter(|b| !b.is_empty()),
+            ) else {
+                return String::new();
+            };
+            // Nobody has a band yet: the owner has everything below the first one.
+            (login, branch, Some((1, ss::FIRST_PARTICIPANT_BAND - 1)))
+        }
+        (None, _) => return String::new(),
+    };
+
+    let file = if kind == Kind::Pending {
+        "claude.md.shared-pending.tmpl"
+    } else {
+        "claude.md.shared.tmpl"
+    };
+    let Some(template) = db.get_template_file("_global", file).ok().flatten() else {
+        return String::new();
+    };
+    let mut out = template
+        .content
+        .replace("{{MAIN_LOGIN}}", &main_login)
+        .replace("{{DEV_BRANCH}}", &dev_branch);
+    if let Some((lo, hi)) = band {
+        out = out
+            .replace("{{BAND_LO}}", &format!("{:06}", lo))
+            .replace("{{BAND_HI}}", &format!("{:06}", hi));
+    }
+    out.trim().to_string()
 }
 
 /// Global `~/.claude/CLAUDE.md`: format rules (todo/done/bug-reports), no project context.
@@ -109,6 +202,7 @@ fn render_claude_section(
     db: &AppDb,
     project_id: Option<i64>,
     repo_role: Option<&str>,
+    shared_block: &str,
 ) -> Result<String, String> {
     let (name, type_display, description, repos_table, ms_block, parents_block) = if let Some(pid) =
         project_id
@@ -191,11 +285,16 @@ fn render_claude_section(
         .replace("{{PROJECT_DESCRIPTION}}", &description)
         .replace("{{REPOS_TABLE}}", &repos_table)
         .replace("{{MICROSERVICES_BLOCK}}", &ms_block)
-        .replace("{{PARENTS_BLOCK}}", &parents_block)
-        // F-000044: filled for shared repos by the band step; empty elsewhere,
-        // together with the blank line that separates it.
-        .replace("{{SHARED_BLOCK}}\n\n", "")
-        .replace("{{SHARED_BLOCK}}", "");
+        .replace("{{PARENTS_BLOCK}}", &parents_block);
+    // F-000044: the shared-repo block; an ordinary repo has none, and then the
+    // blank line that separates it goes too.
+    let rendered = if shared_block.trim().is_empty() {
+        rendered
+            .replace("{{SHARED_BLOCK}}\n\n", "")
+            .replace("{{SHARED_BLOCK}}", "")
+    } else {
+        rendered.replace("{{SHARED_BLOCK}}", shared_block.trim())
+    };
 
     Ok(rendered)
 }
@@ -226,7 +325,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let claude = tmp.path().join("CLAUDE.md");
 
-        update_claude_md_section(&db, Some(proj.id), Some("server"), &claude).unwrap();
+        update_claude_md_section(&db, Some(proj.id), Some("server"), "", &claude).unwrap();
 
         let content = fs::read_to_string(&claude).unwrap();
         assert!(content.contains("manager:begin"));
@@ -242,7 +341,7 @@ mod tests {
         let claude = tmp.path().join("CLAUDE.md");
         fs::write(&claude, "# My custom rules\n\nDo not touch.\n").unwrap();
 
-        update_claude_md_section(&db, Some(proj.id), None, &claude).unwrap();
+        update_claude_md_section(&db, Some(proj.id), None, "", &claude).unwrap();
 
         let content = fs::read_to_string(&claude).unwrap();
         assert!(
@@ -265,7 +364,7 @@ mod tests {
         )
         .unwrap();
 
-        update_claude_md_section(&db, Some(proj.id), None, &claude).unwrap();
+        update_claude_md_section(&db, Some(proj.id), None, "", &claude).unwrap();
 
         let content = fs::read_to_string(&claude).unwrap();
         assert!(content.contains("V1"), "new project name present");
@@ -283,7 +382,7 @@ mod tests {
         let original = "# Rules\n\nImportant rule.\n\n<!-- manager:begin -->\nplaceholder\n<!-- manager:end -->\n\n# More rules\n\nAnother important thing.\n";
         fs::write(&claude, original).unwrap();
 
-        update_claude_md_section(&db, Some(proj.id), None, &claude).unwrap();
+        update_claude_md_section(&db, Some(proj.id), None, "", &claude).unwrap();
 
         let content = fs::read_to_string(&claude).unwrap();
         assert!(content.contains("# Rules\n\nImportant rule."));
@@ -300,7 +399,7 @@ mod tests {
         let content = "<!-- manager:begin -->\nold1\n<!-- manager:end -->\nmiddle\n<!-- manager:begin -->\nold2\n<!-- manager:end -->\n";
         fs::write(&claude, content).unwrap();
 
-        update_claude_md_section(&db, Some(proj.id), None, &claude).unwrap();
+        update_claude_md_section(&db, Some(proj.id), None, "", &claude).unwrap();
 
         let result = fs::read_to_string(&claude).unwrap();
         assert!(result.contains("First"), "first pair replaced");
@@ -315,7 +414,7 @@ mod tests {
         let claude = tmp.path().join("CLAUDE.md");
         fs::write(&claude, "stuff\n<!-- manager:begin -->\nno end marker\n").unwrap();
 
-        let result = update_claude_md_section(&db, Some(proj.id), None, &claude);
+        let result = update_claude_md_section(&db, Some(proj.id), None, "", &claude);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Orphan"));
     }
@@ -328,7 +427,7 @@ mod tests {
         let claude = tmp.path().join("CLAUDE.md");
         fs::write(&claude, "stuff\n<!-- manager:end -->\nno begin\n").unwrap();
 
-        let result = update_claude_md_section(&db, Some(proj.id), None, &claude);
+        let result = update_claude_md_section(&db, Some(proj.id), None, "", &claude);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Orphan"));
     }
@@ -339,7 +438,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let claude = tmp.path().join("CLAUDE.md");
 
-        update_claude_md_section(&db, None, None, &claude).unwrap();
+        update_claude_md_section(&db, None, None, "", &claude).unwrap();
 
         let content = fs::read_to_string(&claude).unwrap();
         assert!(content.contains("manager:begin"));
@@ -349,6 +448,157 @@ mod tests {
         );
         assert!(content.contains("Global AI instructions"));
         assert!(content.contains("_not applicable_"));
+    }
+
+    // ── shared block (F-000044 / T-000222) ───────────────────────────────────
+
+    fn structure(participants: &[(&str, u32)]) -> ProjectStructure {
+        use crate::sync::shared_structure::{Participant, StructMain, StructProject, StructRepo};
+        ProjectStructure {
+            format: 1,
+            project: StructProject {
+                name: "P".into(),
+                project_type: "standard".into(),
+            },
+            main: StructMain {
+                login: "owner".into(),
+                dev_branch: "dev".into(),
+            },
+            repos: vec![StructRepo {
+                github: "owner/app".into(),
+                role: "tool".into(),
+            }],
+            microservices: vec![],
+            participants: participants
+                .iter()
+                .map(|(l, b)| Participant {
+                    login: l.to_string(),
+                    branch: format!("{}-dev", l),
+                    band_start: *b,
+                })
+                .collect(),
+        }
+    }
+
+    /// A repo of the test db: `mode` is the owner's switch, `role` the cached role.
+    fn shared_repo(db: &AppDb, mode: bool, role: Option<&str>) -> Repository {
+        let repo = db
+            .insert_local_repository("/nonexistent/app", "owner/app", None, None)
+            .unwrap();
+        db.set_shared_mode(repo.id, mode).unwrap();
+        db.set_shared_role(repo.id, role).unwrap();
+        db.get_repository(repo.id).unwrap()
+    }
+
+    fn section(db: &AppDb, repo: &Repository, s: Option<&ProjectStructure>) -> String {
+        let pid = match db.list_projects().unwrap().first() {
+            Some(p) => p.id,
+            None => {
+                db.create_project("Proj", Some("Desc"), "standard")
+                    .unwrap()
+                    .id
+            }
+        };
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join("CLAUDE.md");
+        let block = shared_block_for(db, repo, s);
+        update_claude_md_section(db, Some(pid), Some("tool"), &block, &claude).unwrap();
+        fs::read_to_string(&claude).unwrap()
+    }
+
+    #[test]
+    fn test_section_of_a_non_shared_repo_has_no_block_and_no_stray_blank_line() {
+        let db = make_test_db();
+        let repo = shared_repo(&db, false, None);
+        let text = section(&db, &repo, None);
+        assert!(!text.contains("{{"), "no placeholder left:\n{}", text);
+        assert!(!text.contains("Shared repo"));
+        assert!(
+            text.contains(
+                "**Role of this repo:** tool
+
+Desc"
+            ),
+            "the description follows after one blank line:
+{}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_section_of_the_owner_names_the_login_branch_and_the_low_band() {
+        let db = make_test_db();
+        db.set_setting("github_login", "owner").unwrap();
+        let repo = shared_repo(&db, true, Some("main"));
+        let s = structure(&[("helper", 500_000)]);
+        let text = section(&db, &repo, Some(&s));
+        assert!(text.contains("## Shared repo"), "{}", text);
+        assert!(
+            text.contains("Owner: `owner`, dev branch `dev`"),
+            "{}",
+            text
+        );
+        assert!(text.contains("`000001`–`499999`"), "{}", text);
+        assert!(!text.contains("{{"));
+    }
+
+    #[test]
+    fn test_section_of_a_contributor_has_his_own_band() {
+        let db = make_test_db();
+        db.set_setting("github_login", "helper").unwrap();
+        let repo = shared_repo(&db, false, Some("contributor"));
+        let s = structure(&[("helper", 500_000), ("other", 600_000)]);
+        let text = section(&db, &repo, Some(&s));
+        assert!(
+            text.contains("Owner: `owner`, dev branch `dev`"),
+            "{}",
+            text
+        );
+        assert!(text.contains("`500000`–`599999`"), "{}", text);
+        let text = {
+            db.set_setting("github_login", "other").unwrap();
+            section(&db, &repo, Some(&s))
+        };
+        assert!(text.contains("`600000`–`699999`"), "{}", text);
+    }
+
+    #[test]
+    fn test_section_of_a_pending_helper_uses_the_pending_wording() {
+        let db = make_test_db();
+        db.set_setting("github_login", "newbie").unwrap();
+        let repo = shared_repo(&db, false, Some("pending"));
+        let s = structure(&[("helper", 500_000)]);
+        let text = section(&db, &repo, Some(&s));
+        assert!(text.contains("## Shared repo"), "{}", text);
+        assert!(
+            text.contains("waiting for the owner's approval"),
+            "{}",
+            text
+        );
+        assert!(
+            !text.contains("number band"),
+            "no band for a pending helper"
+        );
+        assert!(!text.contains("{{"));
+    }
+
+    #[test]
+    fn test_section_of_an_owner_without_a_structure_file_falls_back_to_his_branch() {
+        let db = make_test_db();
+        db.set_setting("github_login", "owner").unwrap();
+        let repo = shared_repo(&db, true, None);
+        db.set_autocommit_branch(repo.id, Some("dev")).unwrap();
+        let text = section(&db, &repo, None);
+        assert!(
+            text.contains("Owner: `owner`, dev branch `dev`"),
+            "{}",
+            text
+        );
+        assert!(text.contains("`000001`–`499999`"), "{}", text);
+        // Without a login there is nothing to say: no block, no leftovers.
+        db.delete_setting("github_login").unwrap();
+        let text = section(&db, &repo, None);
+        assert!(!text.contains("Shared repo") && !text.contains("{{"));
     }
 
     // ── copy_doc_skeleton_if_missing tests (F-016) ───────────────────────────

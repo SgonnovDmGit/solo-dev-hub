@@ -128,10 +128,12 @@ fn init_docs_for_repo_in(
     if let Some(pid) = repo.project_id {
         sync::generate_project_md(db, pid, base)?;
         updated.push("docs/project.md".to_string());
+        let shared_block = sync::shared_block_for(db, &repo, None);
         sync::update_claude_md_section(
             db,
             Some(pid),
             repo.role.as_deref(),
+            &shared_block,
             &base.join("CLAUDE.md"),
         )?;
         updated.push("CLAUDE.md (section)".to_string());
