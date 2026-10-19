@@ -10,7 +10,19 @@ permissions:
 
 jobs:
   publish-tauri:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            # Windows bundle target (nsis) comes from tauri.conf.json.
+            args: ''
+          - platform: ubuntu-22.04
+            # Oldest runner with webkit2gtk-4.1 = widest glibc compatibility.
+            # The signed AppImage feeds the linux-x86_64 entry in latest.json.
+            args: '--bundles appimage,deb'
+
+    runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Checkout
@@ -21,6 +33,12 @@ jobs:
         with:
           node-version: 20
           cache: npm
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget file libssl-dev libxdo-dev             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
 
       - name: Install frontend dependencies
         run: npm ci
@@ -58,3 +76,4 @@ jobs:
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
           includeUpdaterJson: true
+          args: ${{ matrix.args }}

@@ -26,6 +26,8 @@ tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Credential store is chosen per OS. Without an explicit store feature keyring
+# silently falls back to a non-persistent mock store, so every target must name one.
 keyring = { version = "3", features = ["windows-native"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
@@ -34,6 +36,11 @@ regex = "1"
 include_dir = "0.7"
 aes-gcm = "0.10"
 base64 = "0.22"
+
+# Linux: Secret Service over D-Bus (GNOME Keyring / KWallet). Needs libdbus-1-dev to build.
+# Cargo unifies features per target, so Windows builds still pull only windows-native.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"
