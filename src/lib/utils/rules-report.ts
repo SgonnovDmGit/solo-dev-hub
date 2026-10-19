@@ -10,12 +10,12 @@ import { addToast } from '$lib/stores/ui';
  */
 export function toastRulesFindings(r: { taken: string[]; lost: string[]; superseded: string[] }): void {
   if (r.taken.length > 0) {
-    addToast(tf('toast.rulesTaken', r.taken.join(', ')), 'info');
+    addToast(tf('toast.rulesTaken', r.taken.join(', ')), 'info', { persist: true });
   }
   if (r.lost.length > 0) {
     addToast(tf('toast.rulesLost', r.lost.join(', ')), 'warning');
   }
   if (r.superseded.length > 0) {
-    addToast(tf('toast.rulesSuperseded', r.superseded.join(', ')), 'info');
+    addToast(tf('toast.rulesSuperseded', r.superseded.join(', ')), 'info', { persist: true });
   }
 }

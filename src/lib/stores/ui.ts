@@ -40,13 +40,15 @@ export function goBack(): void {
 }
 export const toasts = writable<Toast[]>([]);
 
-export function addToast(message: string, type: ToastType = 'info'): void {
+export function addToast(message: string, type: ToastType = 'info', opts?: { persist?: boolean }): void {
   const id = ++toastCounter;
   toasts.update((list) => [...list, { id, message, type }]);
 
   // B-000027: errors/warnings persist until the user dismisses them (they may be
   // long and need reading/copying). Transient success/info auto-dismiss after 5s.
-  if (type !== 'error' && type !== 'warning') {
+  // T-000211: `persist` keeps any type until closed — rule uptake toasts rewrite
+  // copies across the whole portfolio and must not vanish unread.
+  if (!opts?.persist && type !== 'error' && type !== 'warning') {
     setTimeout(() => {
       toasts.update((list) => list.filter((t) => t.id !== id));
     }, 5000);
