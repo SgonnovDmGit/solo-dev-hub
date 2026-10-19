@@ -641,10 +641,29 @@ mod tests {
     /// Парсер не должен panic'ить, hang'ить или возвращать нереальные результаты
     /// на фактическом файле пользователя (134 строки, смесь форматов: с id и без,
     /// с commit и без, кириллица, старые секционные заголовки `## День DD.MM.YYYY`).
+    /// The owner's own `docs/<name>` read at run time. Those files are gitignored,
+    /// so a clean checkout (CI) has none: `include_str!` used to fail the whole
+    /// test build there (T-000210). Absent → the real-file tests skip themselves.
+    fn local_doc(name: &str) -> Option<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("docs")
+            .join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => Some(content),
+            Err(_) => {
+                eprintln!("skipped: {} not present (gitignored)", path.display());
+                None
+            }
+        }
+    }
+
     #[test]
     fn test_parse_done_real_file_does_not_panic() {
-        let content = include_str!("../../../docs/done.md");
-        let (tasks, warnings) = parse_done_tasks(content);
+        let Some(content) = local_doc("done.md") else {
+            return;
+        };
+        let (tasks, warnings) = parse_done_tasks(&content);
         eprintln!(
             "done.md stats: {} tasks, {} warnings",
             tasks.len(),
@@ -667,8 +686,10 @@ mod tests {
 
     #[test]
     fn test_parse_todo_real_file_does_not_panic() {
-        let content = include_str!("../../../docs/todo.md");
-        let (tasks, warnings) = parse_todo_tasks(content);
+        let Some(content) = local_doc("todo.md") else {
+            return;
+        };
+        let (tasks, warnings) = parse_todo_tasks(&content);
         assert!(tasks.len() + warnings.len() > 0);
     }
 
@@ -678,8 +699,10 @@ mod tests {
     #[test]
     fn test_serialize_done_real_file_to_json() {
         use crate::models::ReadDoneResult;
-        let content = include_str!("../../../docs/done.md");
-        let (tasks, warnings) = parse_done_tasks(content);
+        let Some(content) = local_doc("done.md") else {
+            return;
+        };
+        let (tasks, warnings) = parse_done_tasks(&content);
         let result = ReadDoneResult { tasks, warnings };
         let json = serde_json::to_string(&result).expect("serde must not fail");
         eprintln!("JSON size: {} bytes", json.len());

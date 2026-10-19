@@ -21,9 +21,12 @@ pub mod migrations;
 pub mod peers;
 pub mod projects;
 pub mod repos;
+pub mod rules;
 pub mod stats;
 pub mod tasks_events;
 pub mod timeline;
+
+pub use rules::{conflict_note, parse_conflict_repo_ids, rule_event};
 
 pub struct AppDb {
     pub conn: Mutex<Connection>,

@@ -4,6 +4,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.19.0] — 2026-10-19
+
+The rules get a screen of their own: which rule was changed, where an edit came from, how to settle two repos disagreeing. And the app now builds for Linux.
+
+### Added
+- **A Rules screen (T-000174).** The skills sat in the raw template list under App defaults, with no sign that they are special: nothing showed which ones had been changed, how they differed from the canon, or that an edit there rewrites every repo's copy. Settings → AI rules now opens a screen of its own. The card's summary line reads "Rules: 20 · changed: 4 · conflicts: 0 · copies in 47 repos". The screen lists the 19 skills and the global section and marks the ones that differ from the canon. Each rule has:
+  - a diff against the bundled text;
+  - an in-place reset;
+  - a history of what happened to it: taken up from a repo, saved, reset, superseded, lost, conflict, conflict resolved;
+  - its origin, e.g. "taken up from repo X on such a date".
+
+  Migration v33 adds `rule_events` and `rule_conflicts`; `docs/schema/` regenerated. The skills left the App defaults list, and the global section is edited on this screen too.
+- **Linux build (T-000210).** CI builds an AppImage and a `.deb` for every release tag, next to the Windows installer, and the same bundles for every push to `dev` as workflow artifacts. On Linux the PAT and the data key live in the Secret Service (GNOME Keyring and compatibles). Before this the keyring library silently fell back to an in-memory store there, so a token would not have survived a restart. The `.deb` was installed on a live Ubuntu 26 and picked up its repositories.
+
+### Changed
+- **A hand-back conflict is reported once and can be settled in the app (T-000206).** Two repos handing one skill back with different text used to be refused on every sync, in a toast that lived a few seconds and left no trace. Now the conflict opens once:
+  - sync reports it in one line that says where to resolve it, and the repeat passes stay quiet;
+  - a `<skill>.md.conflict` file beside each marker tells the agent in that repo why its edit was not taken, so it does not retry;
+  - on the Rules screen the owner accepts one side's text or rejects all, and the decision goes into the rule's history;
+  - a conflict closes only after every side has been read again, so a repo that is offline for a while cannot be resolved by mistake.
+- **Rule toasts stay until closed (T-000211).** "Rules taken up" and "edit deferred" faded after five seconds like any info toast, although a taken-up rule rewrites copies across the portfolio. They now stay until closed. Every toast also got copy and close buttons.
+- **Three approved hand-backs joined the canon.** Agents in other repositories handed back one line each, approved by the owner:
+  - `sdh-debugging`: an intermittent, order-dependent failure is diagnosed by measuring the shared state at the failure point, not by exclusion bisection;
+  - `sdh-release-closure`: closure also closes any open REQ pair with a final receipt that no task depends on any more;
+  - `sdh-visual-mockups`: a donor the owner points to is copied in every visible property, and any property not taken is named.
+
+  The bundle now carries these texts, so the forked rows heal.
+- **A project without a server is not a sync problem.** A project with no repository in the server role, or none in the client role, is a valid shape. Sync no longer warns about it.
+
+### Fixed
+- **Reset re-renders the copies (T-000212).** Resetting a skill in App defaults changed only the database row. The 47 repo copies and `~/.claude/skills` kept the old text until the next sync. A reset now renders everywhere, as a save does. A pending hand-back of the same skill is superseded first, so the same pass cannot bring the agent's text straight back.
+- **A done event is dated by its `done.md` day (T-000202).** A task created and closed between two syncs got its done event dated by the sync that first saw it. Over 30 days that was 1527 of 2266 done events, and 1369 of them landed 1 to 30+ days late. A row under a past `## YYYY-MM-DD` heading is now dated by that day. Existing events are not rewritten.
+- **Unit tests no longer touch the real data key.** The secret-encryption tests read, and on a fresh machine created, the owner's data key in the OS keyring. They now use a key generated in the test process.
+
+### Notes
+- Linux has not yet been probed on a live machine for:
+  - the token and secret values surviving a restart;
+  - a `.deb` updating itself: v1.19.0 is the first release whose `latest.json` carries a Linux entry.
+
+  The same check found two window defects on Linux: the close button disappears when the window is narrowed, and repositories without a project sit at the very bottom of the sidebar. Both go to v1.20.0 (T-000215).
+
+### Tests
+- 622 Rust (+48 over the 574 of v1.18.0: rule events and conflicts, quiet repeat passes, closing a conflict only after every side is read, accept / reject, the rule lock, reset with supersede, the done-event date; 1 ignored: the schema-export generator), 124 vitest (+25 in 14 files: the rule diff, the Rules screen helpers, persistent toasts), svelte-check clean. Linux CI runs the same Rust suite. Numbers from `9b5a9fc`.
+
 ## [1.18.0] — 2026-10-17
 
 Rules and sync tell the truth: an approved rule edit is never lost without a word, a sync problem is reported in the interface language, and the rules themselves got less than half as long.

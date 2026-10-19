@@ -79,6 +79,11 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         "collapse_phantom_task_events",
         mig_v32_collapse_phantom_task_events,
     ),
+    (
+        33,
+        "rule_events_and_conflicts",
+        mig_v33_rule_events_and_conflicts,
+    ),
 ];
 
 impl AppDb {
@@ -1027,6 +1032,45 @@ fn mig_v32_collapse_phantom_task_events(conn: &Connection) -> SqlResult<()> {
          PRAGMA user_version = 32;",
     )
 }
+
+fn mig_v33_rule_events_and_conflicts(conn: &Connection) -> SqlResult<()> {
+    // T-000174 (v1.19.0): the workflow rules (the `sdh-*` skills and the global
+    // CLAUDE.md section) get a history. Until now the only record of where a
+    // rule's current text came from - an agent's hand-back, an owner's save, a
+    // reset - was a toast that vanished in seconds, so "who changed this rule"
+    // had no answer once it closed.
+    //
+    // `rule_events` is append-only and keyed by the rule NAME, not a templates
+    // row id: a rule is identified by its name across the bundle, the repo
+    // copies and `~/.claude/skills/`, and a re-seed must not orphan its history.
+    // `repo` is the `rule_copy_label` of the copy involved (owner/name, or the
+    // path of a local-only repo), NULL for an edit made in the app.
+    //
+    // `rule_conflicts` holds one row per rule whose hand-backs currently
+    // conflict, so a repeated pass can tell a conflict it already reported from
+    // a new one instead of raising the same error on every sync. `repo_ids` (a
+    // JSON array of repository ids) names its sides: a conflict closes only once
+    // every side still in the portfolio has been read again, and ids - unlike
+    // labels - survive a rename (T-000206).
+    conn.execute_batch(
+        "CREATE TABLE rule_events (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule TEXT NOT NULL,
+             kind TEXT NOT NULL CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved')),
+             repo TEXT,
+             note TEXT,
+             created_at TEXT NOT NULL
+         );
+         CREATE INDEX idx_rule_events_rule ON rule_events(rule, created_at);
+         CREATE TABLE rule_conflicts (
+             rule TEXT PRIMARY KEY,
+             opened_at TEXT NOT NULL,
+             repo_ids TEXT NOT NULL
+         );
+         PRAGMA user_version = 33;",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1177,6 +1221,51 @@ mod tests {
         assert_eq!(after, 3);
     }
 
+    /// T-000174: v33 gives the rules a history and a conflict state, and the
+    /// vocabulary of the history is closed — a misspelt kind is refused by the
+    /// database rather than written as an event nobody can display.
+    #[test]
+    fn test_db_migration_v33_rule_tables_with_a_closed_kind_vocabulary() {
+        let db = make_db();
+        let conn = db.conn.lock().unwrap();
+        let tables: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                 AND name IN ('rule_events','rule_conflicts')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 2);
+
+        conn.execute(
+            "INSERT INTO rule_events (rule, kind, created_at) \
+             VALUES ('sdh-retro', 'taken', '2026-10-19T00:00:00+00:00')",
+            [],
+        )
+        .expect("a known kind is accepted");
+        let refused = conn.execute(
+            "INSERT INTO rule_events (rule, kind, created_at) \
+             VALUES ('sdh-retro', 'edited', '2026-10-19T00:00:00+00:00')",
+            [],
+        );
+        assert!(refused.is_err(), "an unknown kind must be rejected");
+
+        conn.execute(
+            "INSERT INTO rule_conflicts (rule, opened_at, repo_ids) VALUES ('sdh-retro', 'x', '[1,2]')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO rule_conflicts (rule, opened_at, repo_ids) VALUES ('sdh-retro', 'y', '[3]')",
+                [],
+            )
+            .is_err(),
+            "one open conflict per rule"
+        );
+    }
+
     #[test]
     fn test_db_migration_version() {
         let db = make_db();
@@ -1185,7 +1274,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         // Update this when a new migration is added.
-        assert!(version >= 32);
+        assert!(version >= 33);
     }
 
     #[test]
@@ -1533,11 +1622,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v32 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v33 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
 
         drop(conn);
         let _ = repo;
@@ -1604,7 +1693,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
     }
 
     #[test]

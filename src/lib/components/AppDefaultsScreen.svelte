@@ -2,12 +2,13 @@
   import { currentScreen } from '$lib/stores/ui';
   import { tStore } from '$lib/i18n';
   import TemplateEditor from './TemplateEditor.svelte';
+  import { isRuleFile } from '$lib/utils/rules';
 
-  // P9 review-fix: stable reference so TemplateEditor's $effect tracking
-  // `excludeFiles` doesn't re-fire on every parent render (theme toggle,
-  // i18n change). Inline array literal `{['x']}` allocates a new array
-  // every render — same content, different identity.
-  const excludeFiles = ['claude.md.global.tmpl'];
+  // T-000174: rule files (skills + the global section) live on the Rules screen.
+  // P9 review-fix: the predicate is a module-level reference, so TemplateEditor's
+  // $effect tracking `exclude` doesn't re-fire on every parent render (theme
+  // toggle, i18n change) — an inline arrow would get a new identity each time.
+  const exclude = isRuleFile;
 
   function back() {
     currentScreen.set({ name: 'settings' });
@@ -23,7 +24,7 @@
   </div>
 
   <div class="body">
-    <TemplateEditor languageKey="_global" {excludeFiles} />
+    <TemplateEditor languageKey="_global" {exclude} />
   </div>
 </div>
 

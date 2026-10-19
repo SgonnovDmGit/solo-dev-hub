@@ -1,6 +1,8 @@
 <script lang="ts">
-  import { formatSyncIssues } from '$lib/utils/sync-issues';
-  import { toastRulesFindings } from '$lib/utils/rules-report';
+  import { onMount } from "svelte";
+  import { ruleSummary, firstConflictRule } from "$lib/utils/rules-view";
+  import { syncRulesFromApp } from "$lib/utils/rules-actions";
+  import type { RulesOverview } from "$lib/types";
   import { open } from "@tauri-apps/plugin-dialog";
   import {
     hasPat,
@@ -24,7 +26,7 @@
   import {
     scanWorkspaceForRepos,
     setRepoLocalPath,
-    syncGlobalClaudeMd,
+    listRules,
   } from "$lib/api/tauri-commands";
   import { currentScreen } from "$lib/stores/ui";
   import { addToast } from "$lib/stores/ui";
@@ -91,7 +93,23 @@
 
   function openTemplates() { currentScreen.set({ name: "templates" }); }
   function openAppDefaults() { currentScreen.set({ name: "app_defaults" }); }
-  function openGlobalClaudeEditor() { currentScreen.set({ name: "global_claude_editor" }); }
+  function openRules(rule?: string) {
+    currentScreen.set(rule ? { name: "rules", params: { rule } } : { name: "rules" });
+  }
+
+  // T-000174: the card shows the rules summary; a failed read just hides the line.
+  let rulesOverview = $state<RulesOverview | null>(null);
+  const conflictRule = $derived(rulesOverview ? firstConflictRule(rulesOverview) : null);
+
+  async function loadRulesOverview() {
+    try {
+      rulesOverview = await listRules();
+    } catch (err) {
+      console.warn("list_rules failed", err);
+    }
+  }
+
+  onMount(() => { void loadRulesOverview(); });
 
   let syncing = $state(false);
 
@@ -99,16 +117,7 @@
     if (syncing) return;
     syncing = true;
     try {
-      const result = await syncGlobalClaudeMd();
-      aiRulesLastSyncAt.set(result.synced_at);
-      // T-000207: the render collected pending hand-backs first — name them.
-      toastRulesFindings(result.rules);
-      if (result.rules.errors.length > 0) {
-        addToast($tStore('toast.ruleApplyErrors' as any).replace('{0}', formatSyncIssues(result.rules.errors)), 'error');
-      }
-      addToast($tStore('appDefaults.syncGlobalDone' as any).replace('{0}', result.path), 'success');
-    } catch (err) {
-      addToast(String(err), 'error');
+      if (await syncRulesFromApp()) await loadRulesOverview();
     } finally {
       syncing = false;
     }
@@ -230,7 +239,7 @@
     <div class="card-title-tab">{$tStore("settings.aiRulesCard" as any)}</div>
     <div class="row">
       <div class="row-control" style="grid-column: 1 / -1; justify-content:flex-start; gap: 8px;">
-        <button onclick={openGlobalClaudeEditor} type="button">{$tStore("settings.aiRulesOpenTemplate" as any)}</button>
+        <button onclick={() => openRules()} type="button">{$tStore("rules.openRules")}</button>
         <button onclick={handleSyncFromCard} disabled={syncing} type="button">{syncing ? '...' : $tStore("settings.aiRulesSync" as any)}</button>
         <span class="sync-status" style="margin-left: auto;">
           {$aiRulesLastSyncAt
@@ -239,6 +248,14 @@
         </span>
       </div>
     </div>
+    {#if rulesOverview}
+      <div class="ai-rules-summary">
+        <span>{ruleSummary(rulesOverview)}</span>
+        {#if conflictRule}
+          <button class="link-btn" onclick={() => openRules(conflictRule)} type="button">{$tStore("rules.resolveConflict")}</button>
+        {/if}
+      </div>
+    {/if}
     <div class="ai-rules-hint">{$tStore("settings.aiRulesSkillsHint" as any)}</div>
   </section>
 
@@ -365,5 +382,8 @@
   .autosync-check { width: 16px; height: 16px; cursor: pointer; flex: none; }
   .autosync-interval { flex: none !important; width: 80px; }
   .autosync-hint { font-size: 11px; color: var(--text-muted); }
+  .ai-rules-summary { font-size: 12px; margin-top: 4px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .link-btn { background: none; border: none; padding: 0; font-size: 12px; color: var(--accent); cursor: pointer; text-decoration: underline; }
+  .link-btn:hover { color: var(--accent-hover); }
   .ai-rules-hint { font-size: 11px; color: var(--text-muted); margin-top: 6px; line-height: 1.4; }
 </style>

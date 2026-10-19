@@ -1,5 +1,4 @@
 export const ru = {
-  'toast.clickToDismiss': 'Нажмите, чтобы закрыть',
   'toast.copy': 'Копировать',
   'toast.copied': 'Скопировано',
   'toast.dismiss': 'Закрыть',
@@ -75,7 +74,6 @@ export const ru = {
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
-  'toast.clickToDismiss': 'Click to dismiss',
   'toast.copy': 'Copy',
   'toast.copied': 'Copied',
   'toast.dismiss': 'Dismiss',

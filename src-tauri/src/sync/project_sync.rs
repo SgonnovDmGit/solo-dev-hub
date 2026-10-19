@@ -181,6 +181,7 @@ fn write_repo_skeletons(
     base: &Path,
     repo: &Repository,
     tpl: &SkeletonTemplates,
+    quiet_conflicts: &[String],
     c: &mut SyncCounters,
 ) {
     let role = repo.role.as_deref();
@@ -202,9 +203,10 @@ fn write_repo_skeletons(
     // Runs only after `refresh_rules` collected across the portfolio (see
     // `run_project_sync_in`); a copy still flagged after that is held, not written.
     // After an uptake the refresh has already rendered and reported this repo;
-    // `push` keeps each held copy to one line.
+    // `push` keeps each held copy to one line. T-000206: copies of a conflict
+    // already reported by an earlier pass stay quiet here too.
     match sync::render_skills_to_repo(db, base) {
-        Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo))),
+        Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
         Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
     }
     if let Err(e) = sync::sync_gitignore_section(&tpl.gitignore, base) {
@@ -1032,6 +1034,7 @@ pub(crate) fn run_project_sync_in(
     c.extend(rules.errors);
     c.rules_taken = rules.taken;
     c.rules_lost = rules.lost;
+    let quiet_conflicts = rules.quiet_conflicts;
 
     // 0.10.0 pre-phase: write project.md + CLAUDE.md section + .gitignore + .gitattributes to all repos.
     // 0.11.0 extends with todo.md + bug-reports.md skeletons.
@@ -1049,7 +1052,7 @@ pub(crate) fn run_project_sync_in(
             c.push(root_missing(repo));
             continue;
         }
-        write_repo_skeletons(db, project_id, base, repo, &tpl, &mut c);
+        write_repo_skeletons(db, project_id, base, repo, &tpl, &quiet_conflicts, &mut c);
     }
     for ms_id in &microservice_ids {
         let Ok(ms_server) = db.server_repo_of_microservice(*ms_id) else {
@@ -1065,32 +1068,21 @@ pub(crate) fn run_project_sync_in(
             c.push(root_missing(&ms_server));
             continue;
         }
-        write_repo_skeletons(db, *ms_id, base, &ms_server, &tpl, &mut c);
+        write_repo_skeletons(db, *ms_id, base, &ms_server, &tpl, &quiet_conflicts, &mut c);
     }
 
-    // Server/client checks only matter for `standard` project type. A
-    // `microservice` project intentionally has neither — surfacing those as
-    // errors produces false-positive warning toasts on every sync.
-    let project = db.get_project(project_id).ok();
-    let project_name = project
-        .as_ref()
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| format!("#{}", project_id));
-    let project_type = project
+    // A project without a server (or a server without clients yet) is not an
+    // error: the user knows their own project shape, and a warning on every
+    // sync only trains them to ignore warnings. Owner's decision, 2026-10-19
+    // ("no server - so what, who cares"); the "no client" case was softened
+    // for the same reason earlier. Real delivery failures (connected
+    // microservice without a server repo, parent project without a server,
+    // codex consumer without a matching role) still raise MissingCounterpart.
+    let project_type = db
+        .get_project(project_id)
+        .ok()
         .map(|p| p.project_type)
         .unwrap_or_else(|| "standard".to_string());
-    if project_type == "standard" {
-        // P6 review-fix: "No clients" is only relevant once the server is
-        // in place. Server-only build-out phase (server first, clients
-        // later) shouldn't generate a warning toast on every sync — that
-        // trains the user to ignore them. The "No server" case stays a
-        // warning because the server is the core of the standard flow.
-        if server.is_none() {
-            c.push(SyncIssue::new(Code::MissingCounterpart, project_name.clone()).target("server"));
-        } else if clients.is_empty() {
-            c.push(SyncIssue::new(Code::MissingCounterpart, project_name.clone()).target("client"));
-        }
-    }
 
     if let Some(srv) = server {
         if srv.local_path.is_none() {
@@ -1260,6 +1252,42 @@ mod tests {
         );
     }
 
+    /// Owner's decision 2026-10-19: a standard project with no server repo is
+    /// not an error. The rest of the pass still runs (skeletons are written to
+    /// the repos it does have), it just raises no MissingCounterpart.
+    #[test]
+    fn test_standard_project_without_server_raises_no_missing_counterpart() {
+        let db_dir = TempDir::new().unwrap();
+        let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let project = db.create_project("NoServer", None, "standard").unwrap();
+        db.insert_local_repository(
+            &repo_dir.path().to_string_lossy(),
+            "only-tool",
+            Some(project.id),
+            Some("tool"),
+        )
+        .unwrap();
+
+        let result = run_project_sync_in(&db, project.id, Some(home.path().to_path_buf())).unwrap();
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.code == crate::models::SyncIssueCode::MissingCounterpart),
+            "no server is not an error: {:?}",
+            result.errors
+        );
+        assert!(
+            repo_dir.path().join("docs").join("sdh_skills").is_dir(),
+            "the rest of the pass still ran for the repo that exists"
+        );
+    }
+
     // ── T-000207: hand-backs are collected across the whole portfolio ───────
 
     /// A seeded, file-backed DB plus a sandbox home. The TempDir guards are
@@ -1421,6 +1449,45 @@ mod tests {
             .filter(|e| e.code == Code::RuleHeld)
             .collect();
         assert_eq!(held.len(), 3, "one per held copy: {:?}", held);
+    }
+
+    /// T-000206: a conflict is reported by the project sync that opens it —
+    /// the conflict itself and every held copy — and by none after it. The
+    /// skeleton render is the second reader of held copies in a project sync,
+    /// so it has to honour the quiet list as well.
+    #[test]
+    fn test_a_conflict_is_quiet_on_the_second_project_sync() {
+        let (db, _db_dir, home) = seeded_db();
+        let dirs = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        let p = db.create_project("P", None, "standard").unwrap();
+        for (i, dir) in dirs.iter().enumerate() {
+            db.insert_local_repository(
+                &dir.path().to_string_lossy(),
+                &format!("r{}", i),
+                Some(p.id),
+                Some("tool"),
+            )
+            .unwrap();
+            sync::render_skills_to_repo(&db, dir.path()).unwrap();
+            hand_back_edit(dir.path(), "sdh-retro");
+        }
+        let count = |result: &SyncResult, code: Code| {
+            result.errors.iter().filter(|e| e.code == code).count()
+        };
+
+        let first = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
+        let second = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
+
+        assert_eq!(count(&first, Code::RuleConflict), 1, "{:?}", first.errors);
+        assert_eq!(count(&first, Code::RuleHeld), 2, "{:?}", first.errors);
+        assert_eq!(count(&second, Code::RuleConflict), 0, "{:?}", second.errors);
+        assert_eq!(count(&second, Code::RuleHeld), 0, "{:?}", second.errors);
+        for dir in &dirs {
+            assert!(dir
+                .path()
+                .join("docs/sdh_skills/sdh-retro.md.conflict")
+                .exists());
+        }
     }
 
     /// T-000198 review: a flat REQ on the microservice side with no matching

@@ -77,6 +77,14 @@ git checkout dev && git rebase master   # подтягиваем хотфикс 
 3. `tauri-apps/tauri-action@v0` — компиляция, подпись (`TAURI_SIGNING_PRIVATE_KEY`, опционально + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` если ключ зашифрован — текущий ключ solo-dev-hub без пароля), сборка NSIS installer'а, генерация `latest.json`, публикация Release с артефактами.
 4. Endpoint у installed apps настроен на `https://github.com/SgonnovDmGit/solo-dev-hub/releases/latest/download/latest.json` — GitHub редиректит на актуальный релиз автоматически. Репозиторий приватный до v1.0.0 public-flip'а — `latest.json` без auth не отдаётся, autoupdate фактически приостановлен на v0.25.x.
 
+### Linux
+
+`release.yml` собирает матрицей `windows-latest` + `ubuntu-22.04` (`fail-fast: false`); оба job'а публикуют в один и тот же Release.
+- Linux-цели задаются аргументом `--bundles appimage,deb` у `tauri-action` (не в `tauri.conf.json`, чтобы локальная Windows-сборка не менялась). Подписанный AppImage даёт запись `linux-x86_64` в `latest.json`.
+- Автообновление работает только у AppImage. `.deb` ставится вручную и сам не обновляется.
+- Хранилище секретов на Linux — Secret Service по D-Bus (GNOME Keyring / KWallet), фича `sync-secret-service` в `Cargo.toml` (target-specific). Без запущенного демона PAT и ключ шифрования секретов сохранить нельзя: UI получит строку ошибки от keyring.
+- `.github/workflows/linux-build.yml` (push в `dev` и ручной запуск): `cargo test --lib` и сборка AppImage + deb **без публикации**; артефакты `solo-dev-hub-linux-<sha>` хранятся 14 дней. Используется для проверки Linux-сборки до тега.
+
 ## GitHub Actions secrets (один раз настраиваются)
 
 В Repo Settings → Secrets and variables → Actions:

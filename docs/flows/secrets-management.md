@@ -115,7 +115,7 @@ Multiline flag из meta.json используется как подсказка
 
 ## Безопасность
 
-- **PAT хранится в Windows Credential Manager** (через Rust keyring crate), не в SQLite и не в plaintext файлах
+- **PAT хранится в системном хранилище ключей** — Windows Credential Manager, в Linux Secret Service (через Rust keyring crate), не в SQLite и не в plaintext файлах
 - **Значения секретов не хранятся локально** — вводятся пользователем, шифруются и сразу идут на GitHub. SecretsPanel не персистентен.
 - **Шифрование происходит в браузерном контексте** (WebView2), plaintext value никогда не покидает локальный процесс в открытом виде
 

@@ -1898,6 +1898,136 @@
         }
       ],
       "def": "CREATE TABLE peer_links (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             repo_a_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             repo_b_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             created_at TEXT NOT NULL,\n             CHECK (repo_a_id \u003c\u003e repo_b_id),\n             CHECK (repo_a_id \u003c repo_b_id),\n             UNIQUE (repo_a_id, repo_b_id)\n         )"
+    },
+    {
+      "name": "rule_events",
+      "type": "table",
+      "comment": "v33 (T-000174) — append-only history of the workflow rules: the sdh-* skills and the global CLAUDE.md section. Answers where a rule's current text came from, which until v1.19.0 lived only in a toast. Keyed by the rule name, not a templates row, so a re-seed never orphans the history.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "rule",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "Skill name (sdh-retro) or 'claude.md.global' for the global CLAUDE.md section."
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "taken / saved / reset / superseded / lost / conflict / conflict_resolved, enforced by a CHECK. taken, saved, reset and a conflict_resolved with repo set wrote the text (the rule's origin); the others left it alone."
+        },
+        {
+          "name": "repo",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "The repo copy involved, as owner/name or the checkout path of a local-only repo; NULL for an edit made in the app. On conflict_resolved, set = the text from this repo was accepted, NULL = nothing was accepted."
+        },
+        {
+          "name": "note",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "The approval line from the hand-back marker (taken), or how a conflict was resolved (conflict_resolved)."
+        },
+        {
+          "name": "created_at",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "RFC 3339 UTC."
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_rule_events_rule",
+          "def": "CREATE INDEX idx_rule_events_rule ON rule_events(rule, created_at)",
+          "table": "rule_events",
+          "columns": [
+            "rule",
+            "created_at"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (id)",
+          "table": "rule_events",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved'))",
+          "table": "rule_events",
+          "columns": [
+            "kind"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE rule_events (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             rule TEXT NOT NULL,\n             kind TEXT NOT NULL CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved')),\n             repo TEXT,\n             note TEXT,\n             created_at TEXT NOT NULL\n         )"
+    },
+    {
+      "name": "rule_conflicts",
+      "type": "table",
+      "comment": "v33 (T-000206) — one row per rule whose hand-backs currently conflict (two repos handed back different texts). Lets a repeated pass tell a conflict it already reported from a new one instead of raising the same error on every sync. The conflicting texts are not stored: they stay in the repo copies.",
+      "columns": [
+        {
+          "name": "rule",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "Skill name; the primary key, so a rule has at most one open conflict."
+        },
+        {
+          "name": "opened_at",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "RFC 3339 UTC, when the conflict was first seen."
+        },
+        {
+          "name": "repo_ids",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "JSON array of repositories.id, sorted: the sides of the conflict. Only grows while the conflict is open (a repo joining is added). The conflict closes only once every side still in the portfolio with a local path has been read again; ids, unlike labels, survive a rename."
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_rule_conflicts_1",
+          "def": "PRIMARY KEY (rule)",
+          "table": "rule_conflicts",
+          "columns": [
+            "rule"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "rule",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (rule)",
+          "table": "rule_conflicts",
+          "columns": [
+            "rule"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_rule_conflicts_1",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (rule)",
+          "table": "rule_conflicts",
+          "columns": [
+            "rule"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE rule_conflicts (\n             rule TEXT PRIMARY KEY,\n             opened_at TEXT NOT NULL,\n             repo_ids TEXT NOT NULL\n         )"
     }
   ],
   "relations": [
@@ -2138,6 +2268,6 @@
   ],
   "driver": {
     "name": "sqlite",
-    "database_version": "3.53.2"
+    "database_version": "3.53.4"
   }
 }

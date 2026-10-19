@@ -68,7 +68,7 @@ describe('auto-sync rule findings', () => {
     );
     await runOneTick();
     expect(syncProject).toHaveBeenCalledWith(7);
-    expect(addToast).toHaveBeenCalledWith('toast.rulesTaken: sdh-retro', 'info');
+    expect(addToast).toHaveBeenCalledWith('toast.rulesTaken: sdh-retro', 'info', { persist: true });
     expect(addToast).toHaveBeenCalledWith('toast.rulesLost: sdh-debugging (beta)', 'warning');
   });
 

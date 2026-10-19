@@ -16,6 +16,7 @@ export const SYNC_ISSUE_CODES = [
   'managed_file_failed',
   'peer_channel_failed',
   'version_conflict',
+  'rule_conflict',
   'req_auto_close_failed',
   'migration_failed',
   'migration_left_in_place',

@@ -32,6 +32,7 @@ A bug is in hand; this is where to look first. `superpowers:systematic-debugging
 | A value arrives subtly wrong (space, case, date) | print the exact bytes sent, read the conversion | who calls whom |
 | "X stays selected / dirty" | grep every write to that state | only the user's path |
 | Partial state, no repro | read the order of steps — the survivor is an oracle | guessing where it aborted |
+| Intermittent failure that does not reproduce alone (order-dependent suite) | measure the shared state at the failure point (thread, dispatcher, singleton) and log the exception that broke it | exclusion bisection over two or three runs — at a failure rate near one half that is noise |
 | Your own write reverts | grep write / regen / sync / refresh paths | repeating the write |
 | Breaks while a sibling app on the same stack works | diff manifest, lockfile, config, binary assets | design or config variants |
 | Fixed the reported path, symptom back elsewhere | grep the predicate by field name across sibling transports; fix all copies in one commit | closing on the named path |
