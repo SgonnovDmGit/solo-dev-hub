@@ -665,6 +665,33 @@ pub fn show_file(
     Ok(Some(out.stdout))
 }
 
+/// Like `show_file`, but refuses a blob larger than `max_len` bytes (checked
+/// with `git cat-file -s` before the content is read), so untrusted refs
+/// cannot make the app load an arbitrary amount of data.
+pub fn show_file_capped(
+    git: &GitBinary,
+    repo: &Path,
+    rev: &str,
+    path: impl AsRef<Path>,
+    max_len: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(sha) = blob_sha_at(git, repo, rev, path)? else {
+        return Ok(None);
+    };
+    let size = run_ok(git, repo, &["cat-file", "-s", sha.as_str()])?;
+    let size: u64 = stdout_text(&size)
+        .parse()
+        .map_err(|e| format!("git cat-file -s: bad size: {}", e))?;
+    if size > max_len {
+        return Err(format!(
+            "blob is too large ({} bytes, limit {})",
+            size, max_len
+        ));
+    }
+    let out = run_ok(git, repo, &["cat-file", "blob", sha.as_str()])?;
+    Ok(Some(out.stdout))
+}
+
 // ---------------------------------------------------------------------------
 // Ref updates
 // ---------------------------------------------------------------------------

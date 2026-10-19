@@ -17,7 +17,12 @@ export function shouldBackfillAutocommit(
   if (!githubName || !githubName.includes('/')) return false;
   const role = shared?.shared_role ?? null;
   if (role === 'contributor' || role === 'pending') return false;
+  // The owner's own shared repo: this install is main, the owner check is moot
+  // (e.g. a repo in an organisation the owner belongs to).
+  if (role === 'main') return true;
   const me = (login ?? '').trim();
+  // Unknown login: ownership cannot be judged, so a repo without a shared role
+  // keeps the old behaviour (it is not known to be somebody else's).
   if (me === '') return true;
   const owner = githubName.split('/')[0] ?? '';
   return owner.toLowerCase() === me.toLowerCase();

@@ -117,6 +117,20 @@ pub fn is_valid_login(login: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
+/// A login that may be used as a request file name: a valid login that is not
+/// a Windows reserved device name (`con`, `nul`, `com1`, ...).
+pub fn is_valid_request_login(login: &str) -> bool {
+    if !is_valid_login(login) {
+        return false;
+    }
+    let l = login.to_ascii_lowercase();
+    let reserved = matches!(l.as_str(), "con" | "prn" | "aux" | "nul")
+        || ((l.starts_with("com") || l.starts_with("lpt"))
+            && l.len() == 4
+            && matches!(l.as_bytes()[3], b'1'..=b'9'));
+    !reserved
+}
+
 pub fn logins_equal(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -130,32 +144,220 @@ pub fn repo_owner_is(github_name: &str, login: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Structure file
+// Validation of untrusted input
+// ---------------------------------------------------------------------------
+
+/// Largest structure file / blob that is read.
+pub const MAX_STRUCTURE_BYTES: u64 = 256 * 1024;
+/// Largest request file that is read.
+const MAX_REQUEST_BYTES: u64 = 16 * 1024;
+/// At most this many request files are looked at.
+pub const MAX_REQUEST_FILES: usize = 50;
+
+/// The repositories.role CHECK set (db/migrations.rs).
+const REPO_ROLES: &[&str] = &[
+    "server",
+    "client",
+    "test_client",
+    "admin_client",
+    "microservice",
+    "landing",
+    "tool",
+    "other",
+];
+/// The project types `update_project_type` accepts.
+const PROJECT_TYPES: &[&str] = &["standard", "microservice", "codex"];
+
+/// A branch name safe to hand to git and to use as a ref: non-empty, trimmed,
+/// no leading `-` / `/` / `.` per component, no whitespace, control or
+/// ref-special characters, no `..`, `//`, `@{`, not ending in `.lock`, `/` or
+/// `.`, not `HEAD`, and never `master` / `main`.
+pub fn is_valid_branch_name(name: &str) -> bool {
+    if name.is_empty() || name != name.trim() || name.len() > 200 {
+        return false;
+    }
+    if name.starts_with('-') || name.starts_with('/') || name.ends_with('/') || name.ends_with('.')
+    {
+        return false;
+    }
+    if name.ends_with(".lock") || name == "@" || name.eq_ignore_ascii_case("HEAD") {
+        return false;
+    }
+    if name.contains("..") || name.contains("//") || name.contains("@{") {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
+    {
+        return false;
+    }
+    if name
+        .split('/')
+        .any(|part| part.starts_with('.') || part.ends_with(".lock"))
+    {
+        return false;
+    }
+    !git_sync::is_protected_branch(name)
+}
+
+fn is_valid_repo_full_name(github: &str) -> bool {
+    let Some((owner, name)) = github.split_once('/') else {
+        return false;
+    };
+    is_valid_login(owner)
+        && !name.is_empty()
+        && name.len() <= 100
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+fn is_valid_free_text(s: &str) -> bool {
+    !s.trim().is_empty() && s.len() <= 200 && !s.chars().any(|c| c.is_control())
+}
+
+fn is_valid_band_start(b: u32) -> bool {
+    b >= FIRST_PARTICIPANT_BAND
+        && b % BAND_SIZE == 0
+        && (b - FIRST_PARTICIPANT_BAND) / BAND_SIZE < MAX_PARTICIPANTS
+}
+
+/// Trust check for a structure read from a working tree or a ref. The
+/// structure is accepted only if its `main.login` is the owner of the repo it
+/// was found in, and every field is well-formed and in range.
+pub fn validate_structure(s: &ProjectStructure, github_name: &str) -> Result<(), String> {
+    if s.format != STRUCTURE_FORMAT {
+        return Err(format!("unsupported format {}", s.format));
+    }
+    if !is_valid_login(&s.main.login) {
+        return Err("main.login is not a valid GitHub login".to_string());
+    }
+    if !repo_owner_is(github_name, &s.main.login) {
+        return Err(format!(
+            "main is not the repo owner (main.login '{}', repo '{}')",
+            s.main.login, github_name
+        ));
+    }
+    if !is_valid_branch_name(&s.main.dev_branch) {
+        return Err("main.dev_branch is not a usable branch name".to_string());
+    }
+    if !is_valid_free_text(&s.project.name) {
+        return Err("project.name is empty or malformed".to_string());
+    }
+    if !PROJECT_TYPES.contains(&s.project.project_type.as_str()) {
+        return Err(format!("unknown project type '{}'", s.project.project_type));
+    }
+    if s.repos.len() > 200 || s.microservices.len() > 200 {
+        return Err("too many repos or microservices".to_string());
+    }
+    for r in &s.repos {
+        if !is_valid_repo_full_name(&r.github) {
+            return Err(format!("repo '{}' is not owner/name", r.github));
+        }
+        if !REPO_ROLES.contains(&r.role.as_str()) {
+            return Err(format!("unknown repo role '{}'", r.role));
+        }
+    }
+    if s.microservices.iter().any(|m| !is_valid_free_text(m)) {
+        return Err("a microservice name is empty or malformed".to_string());
+    }
+    if s.participants.len() > MAX_PARTICIPANTS as usize {
+        return Err("too many participants".to_string());
+    }
+    for (i, p) in s.participants.iter().enumerate() {
+        if !is_valid_login(&p.login) {
+            return Err(format!("participant login '{}' is invalid", p.login));
+        }
+        if logins_equal(&p.login, &s.main.login) {
+            return Err("main is listed as a participant".to_string());
+        }
+        if !is_valid_branch_name(&p.branch) {
+            return Err(format!("participant '{}' has an unusable branch", p.login));
+        }
+        if !is_valid_band_start(p.band_start) {
+            return Err(format!(
+                "participant '{}' has an invalid band {}",
+                p.login, p.band_start
+            ));
+        }
+        for q in &s.participants[..i] {
+            if logins_equal(&q.login, &p.login) {
+                return Err(format!("participant '{}' is listed twice", p.login));
+            }
+            if q.band_start == p.band_start {
+                return Err(format!("band {} is used twice", p.band_start));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Files
 // ---------------------------------------------------------------------------
 
 fn structure_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".sdh").join("project.json")
 }
 
-fn parse_structure(bytes: &[u8]) -> Result<ProjectStructure, String> {
-    let s: ProjectStructure = serde_json::from_slice(bytes)
-        .map_err(|e| format!("{}: invalid JSON: {}", STRUCTURE_REL_PATH, e))?;
-    if s.format != STRUCTURE_FORMAT {
-        return Err(format!(
-            "{}: unsupported format {} (this build reads {})",
-            STRUCTURE_REL_PATH, s.format, STRUCTURE_FORMAT
-        ));
+/// Refuse a path that is a symlink (an existing path only).
+fn ensure_not_symlink(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(format!(
+            "{} is a symlink, refusing to use it",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {}", path.display(), e)),
     }
-    Ok(s)
 }
 
-/// `None` when the file does not exist; `Err` when it exists but is unusable.
-pub fn read_structure_file(repo_root: &Path) -> Result<Option<ProjectStructure>, String> {
+fn ensure_sdh_dir_safe(repo_root: &Path) -> Result<(), String> {
+    ensure_not_symlink(&repo_root.join(".sdh"))
+}
+
+fn parse_structure(bytes: &[u8]) -> Result<ProjectStructure, String> {
+    serde_json::from_slice(bytes)
+        .map_err(|e| format!("{}: invalid JSON: {}", STRUCTURE_REL_PATH, e))
+}
+
+/// Unvalidated read of the working-tree file: `None` when absent.
+fn read_structure_raw(repo_root: &Path) -> Result<Option<ProjectStructure>, String> {
+    ensure_sdh_dir_safe(repo_root)?;
     let path = structure_path(repo_root);
-    match fs::read(&path) {
-        Ok(bytes) => parse_structure(&bytes).map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{}: {}", path.display(), e)),
+    ensure_not_symlink(&path)?;
+    let meta = match fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {}", path.display(), e)),
+    };
+    if meta.len() > MAX_STRUCTURE_BYTES {
+        return Err(format!(
+            "{} is too large ({} bytes)",
+            STRUCTURE_REL_PATH,
+            meta.len()
+        ));
+    }
+    let bytes = fs::read(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    parse_structure(&bytes).map(Some)
+}
+
+/// The working-tree structure of the repo `github_name`, validated: `None` when
+/// the file does not exist, `Err` when it exists but is unusable or untrusted.
+pub fn read_structure_file(
+    repo_root: &Path,
+    github_name: &str,
+) -> Result<Option<ProjectStructure>, String> {
+    match read_structure_raw(repo_root)? {
+        Some(s) => {
+            validate_structure(&s, github_name)?;
+            Ok(Some(s))
+        }
+        None => Ok(None),
     }
 }
 
@@ -181,26 +383,42 @@ pub fn serialize_structure(s: &ProjectStructure) -> String {
     out
 }
 
+/// Write `content` unless the file already holds it (line endings compared
+/// after CRLF -> LF, so an autocrlf checkout does not churn). The write goes
+/// through a temp file and a rename, so a reader never sees a partial file.
 fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
+    ensure_not_symlink(path)?;
     if let Ok(existing) = fs::read(path) {
-        if existing == content.as_bytes() {
+        let norm = String::from_utf8_lossy(&existing).replace("\r\n", "\n");
+        if norm == content {
             return Ok(false);
         }
     }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
     }
-    fs::write(path, content).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{}.{}.tmp", name, std::process::id()));
+    fs::write(&tmp, content).map_err(|e| format!("{}: {}", tmp.display(), e))?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("{}: {}", path.display(), e));
+    }
     Ok(true)
 }
 
 /// `Ok(true)` when the file was written, `Ok(false)` when it was already identical.
 pub fn write_structure_if_changed(repo_root: &Path, s: &ProjectStructure) -> Result<bool, String> {
+    ensure_sdh_dir_safe(repo_root)?;
     write_if_changed(&structure_path(repo_root), &serialize_structure(s))
 }
 
 /// Main side: build the structure of the project a shared repo belongs to.
-/// Participants are carried over from `existing` unchanged.
+/// The repo must be owned by `main_login`. Participants are carried over from
+/// `existing` unchanged. The result is validated before it is returned.
 pub fn build_structure(
     db: &AppDb,
     repo_id: i64,
@@ -211,6 +429,16 @@ pub fn build_structure(
         return Err(format!("invalid GitHub login '{}'", main_login));
     }
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let github_name = repo
+        .github_name
+        .clone()
+        .ok_or_else(|| "shared mode needs a GitHub repository".to_string())?;
+    if !repo_owner_is(&github_name, main_login) {
+        return Err(format!(
+            "shared mode can only be switched on by the repo owner ({} is not {})",
+            main_login, github_name
+        ));
+    }
     let project_id = repo
         .project_id
         .ok_or_else(|| "shared mode needs the repository to belong to a project".to_string())?;
@@ -232,7 +460,7 @@ pub fn build_structure(
         .filter_map(|r| {
             let github = r.github_name?;
             let role = r.role?;
-            if github.trim().is_empty() || role.trim().is_empty() {
+            if !is_valid_repo_full_name(&github) || role.trim().is_empty() {
                 return None;
             }
             Some(StructRepo { github, role })
@@ -247,7 +475,7 @@ pub fn build_structure(
         microservices.push(db.get_project(ms_id).map_err(|e| e.to_string())?.name);
     }
 
-    Ok(ProjectStructure {
+    let built = ProjectStructure {
         format: STRUCTURE_FORMAT,
         project: StructProject {
             name: project.name,
@@ -260,7 +488,9 @@ pub fn build_structure(
         repos,
         microservices,
         participants: existing.map(|e| e.participants.clone()).unwrap_or_default(),
-    })
+    };
+    validate_structure(&built, &github_name)?;
+    Ok(built)
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +511,7 @@ pub fn derive_role(structure: Option<&ProjectStructure>, my_login: Option<&str>)
 
 /// Inclusive id range of `login`: main owns everything below the lowest
 /// participant band, a participant owns `BAND_SIZE` ids from its start.
+/// Arithmetic saturates, so a malformed structure cannot overflow.
 pub fn band_for(structure: &ProjectStructure, login: &str) -> Option<(u32, u32)> {
     if logins_equal(&structure.main.login, login) {
         let top = structure
@@ -288,7 +519,7 @@ pub fn band_for(structure: &ProjectStructure, login: &str) -> Option<(u32, u32)>
             .iter()
             .map(|p| p.band_start)
             .min()
-            .map(|b| b - 1)
+            .map(|b| b.saturating_sub(1))
             .unwrap_or(MAIN_BAND_CEILING);
         return Some((1, top));
     }
@@ -296,21 +527,22 @@ pub fn band_for(structure: &ProjectStructure, login: &str) -> Option<(u32, u32)>
         .participants
         .iter()
         .find(|p| logins_equal(&p.login, login))
-        .map(|p| (p.band_start, p.band_start + BAND_SIZE - 1))
+        .map(|p| (p.band_start, p.band_start.saturating_add(BAND_SIZE - 1)))
 }
 
 // ---------------------------------------------------------------------------
 // Join requests
 // ---------------------------------------------------------------------------
 
+fn requests_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".sdh").join("requests")
+}
+
 fn request_path(repo_root: &Path, login: &str) -> Result<PathBuf, String> {
-    if !is_valid_login(login) {
+    if !is_valid_request_login(login) {
         return Err(format!("invalid GitHub login '{}'", login));
     }
-    Ok(repo_root
-        .join(".sdh")
-        .join("requests")
-        .join(format!("{}.json", login)))
+    Ok(requests_dir(repo_root).join(format!("{}.json", login)))
 }
 
 pub fn serialize_request(r: &JoinRequest) -> String {
@@ -319,30 +551,56 @@ pub fn serialize_request(r: &JoinRequest) -> String {
     out
 }
 
-/// Pending requests of the working tree, sorted by login. Skips unparsable
-/// files, files whose name is not a valid login or does not match the login
-/// inside, and requests of the main owner or of an existing participant.
-pub fn list_requests(repo_root: &Path) -> Vec<JoinRequest> {
-    let structure = read_structure_file(repo_root).ok().flatten();
-    let dir = repo_root.join(".sdh").join("requests");
+/// Pending requests of the working tree of the repo `github_name`, sorted by
+/// login. Looks at no more than `MAX_REQUEST_FILES` files (by file name).
+/// Skips unparsable, oversized or symlinked files, names that are not usable
+/// logins, a name that does not match the login inside, an unusable branch,
+/// later duplicates of a login (case-insensitive), and requests of the main
+/// owner or of an existing participant (when the structure file is valid).
+pub fn list_requests(repo_root: &Path, github_name: &str) -> Vec<JoinRequest> {
+    if ensure_sdh_dir_safe(repo_root).is_err() {
+        return Vec::new();
+    }
+    let dir = requests_dir(repo_root);
+    if ensure_not_symlink(&dir).is_err() {
+        return Vec::new();
+    }
+    let structure = read_structure_file(repo_root, github_name).ok().flatten();
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    names.sort();
+    names.truncate(MAX_REQUEST_FILES);
+
     let mut out: Vec<JoinRequest> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
+    for name in names {
         let Some(stem) = name.strip_suffix(".json") else {
             continue;
         };
-        if !is_valid_login(stem) || !path.is_file() {
+        if !is_valid_request_login(stem) {
+            continue;
+        }
+        let path = dir.join(&name);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() || meta.len() > MAX_REQUEST_BYTES {
             continue;
         }
         let Ok(bytes) = fs::read(&path) else { continue };
-        let Ok(req) = serde_json::from_slice::<JoinRequest>(&bytes) else {
+        let Ok(mut req) = serde_json::from_slice::<JoinRequest>(&bytes) else {
             continue;
         };
-        if !logins_equal(&req.login, stem) || req.branch.trim().is_empty() {
+        req.branch = req.branch.trim().to_string();
+        if !logins_equal(&req.login, stem) || !is_valid_branch_name(&req.branch) {
+            continue;
+        }
+        if out.iter().any(|r| logins_equal(&r.login, &req.login)) {
             continue;
         }
         if let Some(s) = &structure {
@@ -360,13 +618,21 @@ pub fn list_requests(repo_root: &Path) -> Vec<JoinRequest> {
     out
 }
 
-/// `Ok(true)` when written, `Ok(false)` when already identical.
+/// `Ok(true)` when written, `Ok(false)` when already identical. The branch is
+/// trimmed and must be a usable branch name.
 pub fn write_request_if_changed(repo_root: &Path, req: &JoinRequest) -> Result<bool, String> {
-    if req.branch.trim().is_empty() {
-        return Err("a join request needs a branch".to_string());
+    let branch = req.branch.trim();
+    if !is_valid_branch_name(branch) {
+        return Err(format!("'{}' is not a usable branch name", branch));
     }
     let path = request_path(repo_root, &req.login)?;
-    write_if_changed(&path, &serialize_request(req))
+    ensure_sdh_dir_safe(repo_root)?;
+    ensure_not_symlink(&requests_dir(repo_root))?;
+    let clean = JoinRequest {
+        login: req.login.clone(),
+        branch: branch.to_string(),
+    };
+    write_if_changed(&path, &serialize_request(&clean))
 }
 
 /// Main side: the structure with `req` added as a participant in the lowest
@@ -375,11 +641,12 @@ pub fn approve_request(
     structure: &ProjectStructure,
     req: &JoinRequest,
 ) -> Result<ProjectStructure, String> {
-    if !is_valid_login(&req.login) {
+    if !is_valid_request_login(&req.login) {
         return Err(format!("invalid GitHub login '{}'", req.login));
     }
-    if req.branch.trim().is_empty() {
-        return Err("a join request needs a branch".to_string());
+    let branch = req.branch.trim();
+    if !is_valid_branch_name(branch) {
+        return Err(format!("'{}' is not a usable branch name", branch));
     }
     if logins_equal(&structure.main.login, &req.login)
         || structure
@@ -398,7 +665,7 @@ pub fn approve_request(
     let mut next = structure.clone();
     next.participants.push(Participant {
         login: req.login.clone(),
-        branch: req.branch.clone(),
+        branch: branch.to_string(),
         band_start: FIRST_PARTICIPANT_BAND + k * BAND_SIZE,
     });
     next.participants.sort_by_key(|p| p.band_start);
@@ -408,24 +675,6 @@ pub fn approve_request(
 // ---------------------------------------------------------------------------
 // Contributor-side discovery
 // ---------------------------------------------------------------------------
-
-fn commit_time(git: &GitBinary, repo_root: &Path, rev: &str) -> Result<i64, String> {
-    let out = spawn_cmd(&git.0)
-        .args(["log", "-1", "--format=%ct", rev])
-        .current_dir(repo_root)
-        .output()
-        .map_err(|e| format!("git log failed to start: {}", e))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git log failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<i64>()
-        .map_err(|e| format!("git log: bad commit time: {}", e))
-}
 
 fn list_origin_refs(git: &GitBinary, repo_root: &Path) -> Result<Vec<String>, String> {
     let out = spawn_cmd(&git.0)
@@ -448,50 +697,76 @@ fn list_origin_refs(git: &GitBinary, repo_root: &Path) -> Result<Vec<String>, St
     Ok(refs)
 }
 
-/// Find the structure of a repo owned by someone else.
+/// Result of `discover_structure`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoverOutcome {
+    /// A trusted structure and where it came from: `SOURCE_WORKTREE` or e.g.
+    /// `origin/dev`.
+    Found(ProjectStructure, String),
+    /// No structure file anywhere.
+    NotFound,
+    /// A structure was found but failed validation; the text says why (e.g.
+    /// "main is not the repo owner ..."). Nothing from it may be used.
+    Untrusted(String),
+}
+
+/// Find the trusted structure of the repo `github_name` (`owner/name`).
 ///
-/// Meant for a contributor's repos only (the caller checks
-/// `!repo_owner_is(github_name, my_login)`) and only after a fetch: a
-/// not-yet-approved helper has no file in the working tree, so the owner's
-/// published copy is looked up in the remote-tracking refs. A ref qualifies
-/// when its short name equals the `main.dev_branch` written in its own file
-/// (that is main's copy, not someone's stale or edited copy); of several, the
-/// ref with the newest commit wins. Structures naming `my_login` as main are
-/// ignored on refs: the owner reads its own working tree.
+/// Meant for a contributor's repos only (the caller checks the owner is not
+/// this install's login) and only after a fetch: a not-yet-approved helper has
+/// no file in the working tree, so the owner's published copy is looked up in
+/// the remote-tracking refs.
 ///
-/// Returns the structure and its source: `SOURCE_WORKTREE` or e.g. `origin/dev`.
+/// Trust anchor: a structure is accepted only if `validate_structure` passes,
+/// i.e. its `main.login` is the repo's owner. On remote refs a candidate must
+/// also sit on the ref named exactly `origin/<main.dev_branch>` (there is at
+/// most one such ref), so a helper's own branch carrying a copy is ignored.
+/// A worktree file that fails validation does not stop the search of the refs.
 pub fn discover_structure(
     git: &GitBinary,
     repo_root: &Path,
-    my_login: &str,
-) -> Result<Option<(ProjectStructure, String)>, String> {
-    if let Some(s) = read_structure_file(repo_root)? {
-        return Ok(Some((s, SOURCE_WORKTREE.to_string())));
+    github_name: &str,
+) -> Result<DiscoverOutcome, String> {
+    let mut untrusted: Option<String> = None;
+    match read_structure_raw(repo_root) {
+        Ok(Some(s)) => match validate_structure(&s, github_name) {
+            Ok(()) => return Ok(DiscoverOutcome::Found(s, SOURCE_WORKTREE.to_string())),
+            Err(reason) => untrusted = Some(format!("{}: {}", STRUCTURE_REL_PATH, reason)),
+        },
+        Ok(None) => {}
+        Err(reason) => untrusted = Some(reason),
     }
-    let mut best: Option<(i64, ProjectStructure, String)> = None;
     for full in list_origin_refs(git, repo_root)? {
         let Some(branch) = full.strip_prefix("refs/remotes/origin/") else {
             continue;
         };
-        let bytes = match git_sync::show_file(git, repo_root, &full, STRUCTURE_REL_PATH) {
+        let bytes = match git_sync::show_file_capped(
+            git,
+            repo_root,
+            &full,
+            STRUCTURE_REL_PATH,
+            MAX_STRUCTURE_BYTES,
+        ) {
             Ok(Some(b)) => b,
             _ => continue,
         };
         let Ok(s) = parse_structure(&bytes) else {
             continue;
         };
-        if !logins_equal(&s.main.dev_branch, branch) || logins_equal(&s.main.login, my_login) {
+        if s.main.dev_branch != branch {
             continue;
         }
-        let Ok(ts) = commit_time(git, repo_root, &full) else {
-            continue;
-        };
-        // Strictly newer wins; ties keep the first ref in name order.
-        if best.as_ref().map_or(true, |(t, _, _)| ts > *t) {
-            best = Some((ts, s, format!("origin/{}", branch)));
+        match validate_structure(&s, github_name) {
+            Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", branch))),
+            Err(reason) => {
+                untrusted.get_or_insert(format!("origin/{}: {}", branch, reason));
+            }
         }
     }
-    Ok(best.map(|(_, s, r)| (s, r)))
+    Ok(match untrusted {
+        Some(reason) => DiscoverOutcome::Untrusted(reason),
+        None => DiscoverOutcome::NotFound,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -499,14 +774,35 @@ pub fn discover_structure(
 // ---------------------------------------------------------------------------
 
 /// Make the local DB reflect the structure: find or create the project by name,
-/// assign this repo and every other local repo named in the structure with the
-/// structure's role, connect microservice projects that exist locally.
-/// Never deletes anything; a second call with the same input changes nothing.
+/// assign this repo and every other local repo named in the structure and owned
+/// by `main.login`, connect microservice projects that exist locally.
+///
+/// The whole structure is validated against the called repo before anything is
+/// written. Never deletes anything; a second call with the same input changes
+/// nothing. A repo owned by this install's own GitHub login is never moved
+/// (and the called repo must not be one). A microservice that cannot be
+/// connected (a cycle, a wrong type) is skipped.
 pub fn apply_structure_locally(
     db: &AppDb,
     repo_id: i64,
     s: &ProjectStructure,
 ) -> Result<(), String> {
+    let called = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let called_name = called
+        .github_name
+        .clone()
+        .ok_or_else(|| "the repository has no GitHub name".to_string())?;
+    validate_structure(s, &called_name)?;
+    let my_login = db.github_login();
+    let mine = |github: &str| {
+        my_login
+            .as_deref()
+            .is_some_and(|l| repo_owner_is(github, l))
+    };
+    if mine(&called_name) {
+        return Err("this install owns the repository: nothing to apply as a contributor".into());
+    }
+
     let projects = db.list_projects().map_err(|e| e.to_string())?;
     let project = match projects
         .iter()
@@ -519,12 +815,17 @@ pub fn apply_structure_locally(
     };
 
     for repo in db.list_all_repos().map_err(|e| e.to_string())? {
-        let listed_role = repo.github_name.as_deref().and_then(|github| {
-            s.repos
-                .iter()
-                .find(|r| r.github.eq_ignore_ascii_case(github))
-                .map(|r| r.role.clone())
-        });
+        let Some(github) = repo.github_name.as_deref() else {
+            continue;
+        };
+        if !repo_owner_is(github, &s.main.login) || mine(github) {
+            continue;
+        }
+        let listed_role = s
+            .repos
+            .iter()
+            .find(|r| r.github.eq_ignore_ascii_case(github))
+            .map(|r| r.role.clone());
         match listed_role {
             Some(role) => assign_if_needed(db, &repo, project.id, Some(role))?,
             // This repo carries the file, so it belongs to the project even if
@@ -542,7 +843,8 @@ pub fn apply_structure_locally(
             .find(|p| p.name.eq_ignore_ascii_case(name) && p.project_type == "microservice");
         if let Some(ms) = ms {
             if ms.id != project.id {
-                db.connect_microservice(project.id, ms.id)?;
+                // A cycle or a stale type must not abort the rest.
+                let _ = db.connect_microservice(project.id, ms.id);
             }
         }
     }
@@ -692,7 +994,9 @@ mod tests {
         assert_eq!(text, serialize_structure(&shuffled));
 
         assert!(write_structure_if_changed(tmp.path(), &s).unwrap());
-        let back = read_structure_file(tmp.path()).unwrap().unwrap();
+        let back = read_structure_file(tmp.path(), "Owner/web")
+            .unwrap()
+            .unwrap();
         assert_eq!(serialize_structure(&back), text);
         assert_eq!(back.project.project_type, "standard");
     }
@@ -715,10 +1019,10 @@ mod tests {
     #[test]
     fn read_structure_file_absent_garbage_and_wrong_format() {
         let tmp = TempDir::new().unwrap();
-        assert_eq!(read_structure_file(tmp.path()).unwrap(), None);
+        assert_eq!(read_structure_file(tmp.path(), "Owner/web").unwrap(), None);
         fs::create_dir_all(tmp.path().join(".sdh")).unwrap();
         fs::write(tmp.path().join(".sdh/project.json"), "not json").unwrap();
-        assert!(read_structure_file(tmp.path()).is_err());
+        assert!(read_structure_file(tmp.path(), "Owner/web").is_err());
         let mut s = sample();
         s.format = 2;
         fs::write(
@@ -726,7 +1030,7 @@ mod tests {
             serde_json::to_string(&s).unwrap(),
         )
         .unwrap();
-        assert!(read_structure_file(tmp.path())
+        assert!(read_structure_file(tmp.path(), "Owner/web")
             .unwrap_err()
             .contains("unsupported format"));
     }
@@ -880,7 +1184,7 @@ mod tests {
     fn requests_write_list_and_filter() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        assert!(list_requests(root).is_empty());
+        assert!(list_requests(root, "Owner/web").is_empty());
 
         assert!(write_request_if_changed(root, &req("zed")).unwrap());
         assert!(!write_request_if_changed(root, &req("zed")).unwrap());
@@ -910,7 +1214,10 @@ mod tests {
         )
         .unwrap();
 
-        let logins: Vec<_> = list_requests(root).into_iter().map(|r| r.login).collect();
+        let logins: Vec<_> = list_requests(root, "Owner/web")
+            .into_iter()
+            .map(|r| r.login)
+            .collect();
         assert_eq!(logins, vec!["amy", "zed"]);
 
         // main and existing participants are filtered out
@@ -918,7 +1225,10 @@ mod tests {
         s.participants.push(participant("AMY", 500_000));
         write_structure_if_changed(root, &s).unwrap();
         write_request_if_changed(root, &req("owner")).unwrap();
-        let logins: Vec<_> = list_requests(root).into_iter().map(|r| r.login).collect();
+        let logins: Vec<_> = list_requests(root, "Owner/web")
+            .into_iter()
+            .map(|r| r.login)
+            .collect();
         assert_eq!(logins, vec!["zed"]);
     }
 
@@ -948,19 +1258,23 @@ mod tests {
         Fx { tmp, remote, a }
     }
 
-    /// Commit `.sdh/project.json` (naming `dev_branch`) onto branch `name`,
-    /// forked from the init commit, at commit time `date`, and push it.
-    fn publish(fx: &Fx, name: &str, dev_branch: &str, date: &str) {
+    /// Commit `st` as `.sdh/project.json` onto branch `name`, forked from the
+    /// init commit, at commit time `date`, and push it.
+    fn publish_struct(fx: &Fx, name: &str, st: &ProjectStructure, date: &str) {
         g(&fx.a, &["checkout", "-q", "-B", name, "HEAD"]);
-        let mut s = sample();
-        s.main.dev_branch = dev_branch.to_string();
-        write_structure_if_changed(&fx.a, &s).unwrap();
+        write_structure_if_changed(&fx.a, st).unwrap();
         g(&fx.a, &["add", ".sdh"]);
         g_env(&fx.a, &["commit", "-q", "-m", "structure"], Some(date));
         g(&fx.a, &["push", "-q", "origin", name]);
         // back to a structure-free base for the next branch
         let base = g(&fx.a, &["rev-list", "--max-parents=0", "HEAD"]);
         g(&fx.a, &["checkout", "-q", "--detach", &base]);
+    }
+
+    fn publish(fx: &Fx, name: &str, dev_branch: &str, date: &str) {
+        let mut st = sample();
+        st.main.dev_branch = dev_branch.to_string();
+        publish_struct(fx, name, &st, date);
     }
 
     /// A contributor clone that fetched everything but checked nothing out.
@@ -977,11 +1291,20 @@ mod tests {
         c
     }
 
+    const REPO: &str = "Owner/web";
+
+    fn found(o: DiscoverOutcome) -> (ProjectStructure, String) {
+        match o {
+            DiscoverOutcome::Found(s, src) => (s, src),
+            other => panic!("expected Found, got {:?}", other),
+        }
+    }
+
     #[test]
     fn discover_prefers_working_tree() {
         let fx = fx();
         write_structure_if_changed(&fx.a, &sample()).unwrap();
-        let (s, src) = discover_structure(&gb(), &fx.a, "helper").unwrap().unwrap();
+        let (s, src) = found(discover_structure(&gb(), &fx.a, REPO).unwrap());
         assert_eq!(src, SOURCE_WORKTREE);
         assert_eq!(s.project.name, "Acme");
     }
@@ -991,7 +1314,10 @@ mod tests {
         let fx = fx();
         g(&fx.a, &["push", "-q", "origin", "dev"]);
         let c = contributor(&fx);
-        assert!(discover_structure(&gb(), &c, "helper").unwrap().is_none());
+        assert_eq!(
+            discover_structure(&gb(), &c, REPO).unwrap(),
+            DiscoverOutcome::NotFound
+        );
     }
 
     #[test]
@@ -999,7 +1325,7 @@ mod tests {
         let fx = fx();
         publish(&fx, "dev", "dev", "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
-        let (s, src) = discover_structure(&gb(), &c, "helper").unwrap().unwrap();
+        let (s, src) = found(discover_structure(&gb(), &c, REPO).unwrap());
         assert_eq!(src, "origin/dev");
         assert_eq!(s.main.dev_branch, "dev");
     }
@@ -1010,27 +1336,86 @@ mod tests {
         // someone's branch carrying a copy that names another dev branch
         publish(&fx, "helper-branch", "dev", "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
-        assert!(discover_structure(&gb(), &c, "helper").unwrap().is_none());
+        assert_eq!(
+            discover_structure(&gb(), &c, REPO).unwrap(),
+            DiscoverOutcome::NotFound
+        );
     }
 
     #[test]
-    fn discover_chooses_newest_of_several_matches() {
+    fn discover_compares_dev_branch_and_ref_name_exactly() {
         let fx = fx();
         publish(&fx, "dev", "DEV", "2026-01-01T00:00:00Z");
-        publish(&fx, "next", "next", "2026-03-01T00:00:00Z");
-        publish(&fx, "old", "old", "2025-01-01T00:00:00Z");
         let c = contributor(&fx);
-        let (s, src) = discover_structure(&gb(), &c, "helper").unwrap().unwrap();
-        assert_eq!(src, "origin/next");
-        assert_eq!(s.main.dev_branch, "next");
+        assert_eq!(
+            discover_structure(&gb(), &c, REPO).unwrap(),
+            DiscoverOutcome::NotFound
+        );
     }
 
     #[test]
-    fn discover_skips_refs_of_the_install_own_main() {
+    fn discover_rejects_a_forged_self_consistent_structure() {
         let fx = fx();
-        publish(&fx, "dev", "dev", "2026-01-01T00:00:00Z");
+        // a helper pushes origin/helper claiming to be main of the repo
+        let mut forged = sample();
+        forged.main = StructMain {
+            login: "helper".into(),
+            dev_branch: "helper".into(),
+        };
+        publish_struct(&fx, "helper", &forged, "2026-06-01T00:00:00Z");
         let c = contributor(&fx);
-        assert!(discover_structure(&gb(), &c, "OWNER").unwrap().is_none());
+        match discover_structure(&gb(), &c, REPO).unwrap() {
+            DiscoverOutcome::Untrusted(reason) => {
+                assert!(reason.contains("main is not the repo owner"), "{}", reason)
+            }
+            other => panic!("expected Untrusted, got {:?}", other),
+        }
+
+        // the legitimate copy is still found, however old
+        publish(&fx, "dev", "dev", "2020-01-01T00:00:00Z");
+        g(&c, &["fetch", "-q", "origin"]);
+        let (s, src) = found(discover_structure(&gb(), &c, REPO).unwrap());
+        assert_eq!(src, "origin/dev");
+        assert_eq!(s.main.login, "Owner");
+    }
+
+    #[test]
+    fn discover_untrusted_worktree_file_still_checks_refs() {
+        let fx = fx();
+        let c = contributor(&fx);
+        let mut forged = sample();
+        forged.main.login = "helper".into();
+        write_structure_if_changed(&c, &forged).unwrap();
+        assert!(matches!(
+            discover_structure(&gb(), &c, REPO).unwrap(),
+            DiscoverOutcome::Untrusted(_)
+        ));
+        publish(&fx, "dev", "dev", "2026-01-01T00:00:00Z");
+        g(&c, &["fetch", "-q", "origin"]);
+        let (_, src) = found(discover_structure(&gb(), &c, REPO).unwrap());
+        assert_eq!(src, "origin/dev");
+    }
+
+    #[test]
+    fn discover_refuses_an_oversized_blob() {
+        let fx = fx();
+        let mut big = sample();
+        big.microservices = vec!["x".repeat(200); 200];
+        big.project.name = "y".repeat(200);
+        // pad past the cap with many long repo entries
+        big.repos = (0..3000)
+            .map(|i| StructRepo {
+                github: format!("Owner/{}-{}", "r".repeat(90), i),
+                role: "tool".into(),
+            })
+            .collect();
+        assert!(serialize_structure(&big).len() as u64 > MAX_STRUCTURE_BYTES);
+        publish_struct(&fx, "dev", &big, "2026-01-01T00:00:00Z");
+        let c = contributor(&fx);
+        assert_eq!(
+            discover_structure(&gb(), &c, REPO).unwrap(),
+            DiscoverOutcome::NotFound
+        );
     }
 
     // ----- apply locally -----------------------------------------------------
@@ -1090,6 +1475,338 @@ mod tests {
         assert_eq!(
             db.get_repository(web).unwrap().project_id,
             Some(existing.id)
+        );
+    }
+
+    // ----- review follow-up (C1, C2, I1, I2, M*) --------------------------------
+
+    #[test]
+    fn validate_accepts_the_sample_and_rejects_foreign_main() {
+        assert!(validate_structure(&sample(), "Owner/web").is_ok());
+        assert!(validate_structure(&sample(), "owner/web").is_ok());
+        let err = validate_structure(&sample(), "Other/web").unwrap_err();
+        assert!(err.contains("main is not the repo owner"), "{}", err);
+        assert!(validate_structure(&sample(), "web").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_fields() {
+        let check = |f: &dyn Fn(&mut ProjectStructure)| {
+            let mut s = sample();
+            f(&mut s);
+            validate_structure(&s, "Owner/web")
+        };
+        assert!(check(&|s| s.format = 2).is_err());
+        assert!(check(&|s| s.main.login = "a/b".into()).is_err());
+        assert!(check(&|s| s.main.dev_branch = "-x".into()).is_err());
+        assert!(check(&|s| s.main.dev_branch = "main".into()).is_err());
+        assert!(check(&|s| s.project.project_type = "weird".into()).is_err());
+        assert!(check(&|s| s.project.name = "  ".into()).is_err());
+        assert!(check(&|s| s.repos[0].role = "boss".into()).is_err());
+        assert!(check(&|s| s.repos[0].github = "noslash".into()).is_err());
+        assert!(check(&|s| s.repos[0].github = "a/../b".into()).is_err());
+        assert!(check(&|s| s.microservices.push("".into())).is_err());
+        // participants
+        for band in [0u32, 1, 499_999, 550_000, 1_000_000, u32::MAX] {
+            assert!(
+                check(&|s| s.participants.push(participant("h", band))).is_err(),
+                "band {}",
+                band
+            );
+        }
+        assert!(check(&|s| s.participants.push(participant("h", 500_000))).is_ok());
+        assert!(check(&|s| {
+            let mut p = participant("h", 500_000);
+            p.branch = "bad branch".into();
+            s.participants.push(p);
+        })
+        .is_err());
+        assert!(check(&|s| s.participants.push(participant("owner", 500_000))).is_err());
+        assert!(check(&|s| {
+            s.participants.push(participant("h", 500_000));
+            s.participants.push(participant("H", 600_000));
+        })
+        .is_err());
+        assert!(check(&|s| {
+            s.participants.push(participant("h", 500_000));
+            s.participants.push(participant("i", 500_000));
+        })
+        .is_err());
+        assert!(check(&|s| {
+            for i in 0..6 {
+                s.participants
+                    .push(participant(&format!("u{}", i), 500_000 + i * 100_000));
+            }
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn read_structure_file_validates_ownership() {
+        let tmp = TempDir::new().unwrap();
+        write_structure_if_changed(tmp.path(), &sample()).unwrap();
+        assert!(read_structure_file(tmp.path(), "Owner/web")
+            .unwrap()
+            .is_some());
+        assert!(read_structure_file(tmp.path(), "Other/web")
+            .unwrap_err()
+            .contains("main is not the repo owner"));
+    }
+
+    #[test]
+    fn branch_name_validation() {
+        for ok in ["dev", "feature/x", "helper-1", "Dev_2", "a.b"] {
+            assert!(is_valid_branch_name(ok), "{}", ok);
+        }
+        for bad in [
+            "",
+            " dev",
+            "dev ",
+            "-x",
+            "a b",
+            "a..b",
+            "x.lock",
+            "x/",
+            "/x",
+            "a//b",
+            "HEAD",
+            "head",
+            "master",
+            "Main",
+            "a\tb",
+            "a~b",
+            "a^b",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a@{b",
+            "x.",
+            "a/.hidden",
+            "@",
+            "a\nb",
+        ] {
+            assert!(!is_valid_branch_name(bad), "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn band_for_saturates_on_malformed_input() {
+        let mut s = sample();
+        s.participants = vec![participant("a", 0), participant("b", u32::MAX)];
+        assert_eq!(band_for(&s, "owner"), Some((1, 0)));
+        assert_eq!(band_for(&s, "a"), Some((0, 99_999)));
+        assert_eq!(band_for(&s, "b"), Some((u32::MAX, u32::MAX)));
+    }
+
+    #[test]
+    fn reserved_device_names_are_not_request_logins() {
+        for bad in [
+            "con", "CON", "prn", "Aux", "nul", "com1", "COM9", "lpt1", "LPT9",
+        ] {
+            assert!(is_valid_login(bad));
+            assert!(!is_valid_request_login(bad), "{}", bad);
+        }
+        for ok in ["com0", "com10", "console", "lpt", "conn"] {
+            assert!(is_valid_request_login(ok), "{}", ok);
+        }
+        let tmp = TempDir::new().unwrap();
+        assert!(write_request_if_changed(tmp.path(), &req("nul")).is_err());
+        assert!(approve_request(&sample(), &req("aux")).is_err());
+    }
+
+    fn req_branch(login: &str, branch: &str) -> JoinRequest {
+        JoinRequest {
+            login: login.into(),
+            branch: branch.into(),
+        }
+    }
+
+    #[test]
+    fn request_branch_is_trimmed_and_validated() {
+        let tmp = TempDir::new().unwrap();
+        assert!(write_request_if_changed(tmp.path(), &req_branch("amy", "  amy-dev ")).unwrap());
+        assert_eq!(list_requests(tmp.path(), REPO)[0].branch, "amy-dev");
+        for bad in ["main", "-x", "a b", "HEAD", ""] {
+            let r = req_branch("amy", bad);
+            assert!(write_request_if_changed(tmp.path(), &r).is_err(), "{}", bad);
+            assert!(approve_request(&sample(), &r).is_err(), "{}", bad);
+        }
+        let ok = approve_request(&sample(), &req_branch("xavier", " x-dev ")).unwrap();
+        assert_eq!(ok.participants[0].branch, "x-dev");
+    }
+
+    #[test]
+    fn list_requests_caps_files_and_skips_bad_branches_and_big_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for i in 10..70 {
+            write_request_if_changed(root, &req(&format!("u{}", i))).unwrap();
+        }
+        assert_eq!(list_requests(root, REPO).len(), MAX_REQUEST_FILES);
+        let dir = root.join(".sdh/requests");
+        // u10 becomes unusable (protected branch), u11 oversized
+        fs::write(dir.join("u10.json"), r#"{"login":"u10","branch":"main"}"#).unwrap();
+        fs::write(
+            dir.join("u11.json"),
+            format!(r#"{{"login":"u11","branch":"{}"}}"#, "a".repeat(20_000)),
+        )
+        .unwrap();
+        let logins: Vec<_> = list_requests(root, REPO)
+            .into_iter()
+            .map(|r| r.login)
+            .collect();
+        assert!(!logins.contains(&"u10".to_string()));
+        assert!(!logins.contains(&"u11".to_string()));
+        assert!(logins.contains(&"u12".to_string()));
+    }
+
+    #[test]
+    fn list_requests_dedupes_by_lowercased_login() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".sdh/requests");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Amy.json"), r#"{"login":"Amy","branch":"a1"}"#).unwrap();
+        fs::write(dir.join("amy.json"), r#"{"login":"amy","branch":"a2"}"#).unwrap();
+        // on a case-insensitive filesystem the second write replaced the first
+        assert_eq!(list_requests(tmp.path(), REPO).len(), 1);
+    }
+
+    #[test]
+    fn write_if_changed_ignores_crlf_and_leaves_no_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let s = sample();
+        write_structure_if_changed(tmp.path(), &s).unwrap();
+        let p = tmp.path().join(".sdh/project.json");
+        let lf = fs::read_to_string(&p).unwrap();
+        fs::write(&p, lf.replace('\n', "\r\n")).unwrap();
+        assert!(!write_structure_if_changed(tmp.path(), &s).unwrap());
+        // a real change rewrites the file and leaves only project.json behind
+        let mut changed = s;
+        changed.microservices.push("zzz".into());
+        assert!(write_structure_if_changed(tmp.path(), &changed).unwrap());
+        let names: Vec<_> = fs::read_dir(tmp.path().join(".sdh"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["project.json"]);
+    }
+
+    #[test]
+    fn oversized_structure_file_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(".sdh")).unwrap();
+        fs::write(
+            tmp.path().join(".sdh/project.json"),
+            vec![b' '; MAX_STRUCTURE_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(read_structure_file(tmp.path(), REPO)
+            .unwrap_err()
+            .contains("too large"));
+    }
+
+    fn try_symlink_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        let r = std::os::windows::fs::symlink_dir(target, link);
+        #[cfg(unix)]
+        let r = std::os::unix::fs::symlink(target, link);
+        r.is_ok()
+    }
+
+    #[test]
+    fn symlinked_sdh_dirs_are_refused() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        if !try_symlink_dir(&outside, &root.join(".sdh")) {
+            return; // no symlink privilege on this machine
+        }
+        assert!(write_structure_if_changed(&root, &sample()).is_err());
+        assert!(read_structure_file(&root, REPO).is_err());
+        assert!(write_request_if_changed(&root, &req("amy")).is_err());
+        assert!(list_requests(&root, REPO).is_empty());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        let root2 = tmp.path().join("repo2");
+        fs::create_dir_all(root2.join(".sdh")).unwrap();
+        if !try_symlink_dir(&outside, &root2.join(".sdh/requests")) {
+            return;
+        }
+        assert!(write_request_if_changed(&root2, &req("amy")).is_err());
+        assert!(list_requests(&root2, REPO).is_empty());
+    }
+
+    #[test]
+    fn build_structure_requires_the_owner_to_be_main() {
+        let db = make_db();
+        let (api_id, _) = seeded(&db);
+        db.set_autocommit_branch(api_id, Some("dev")).unwrap();
+        let err = build_structure(&db, api_id, "someone-else", None).unwrap_err();
+        assert!(err.contains("repo owner"), "{}", err);
+        assert!(build_structure(&db, api_id, "owner", None).is_ok());
+    }
+
+    #[test]
+    fn apply_rejects_an_invalid_structure_before_writing_anything() {
+        let db = make_db();
+        let web = local_repo(&db, "Owner/web");
+        let mut bad = sample();
+        bad.repos[0].role = "boss".into();
+        assert!(apply_structure_locally(&db, web, &bad).is_err());
+        let mut foreign = sample();
+        foreign.main.login = "intruder".into();
+        assert!(apply_structure_locally(&db, web, &foreign).is_err());
+        assert!(db.list_projects().unwrap().is_empty());
+        assert_eq!(db.get_repository(web).unwrap().project_id, None);
+    }
+
+    #[test]
+    fn apply_touches_only_repos_of_the_main_owner() {
+        let db = make_db();
+        let web = local_repo(&db, "Owner/web");
+        let foreign = local_repo(&db, "Stranger/api");
+        let mut s = sample();
+        s.repos.push(StructRepo {
+            github: "Stranger/api".into(),
+            role: "server".into(),
+        });
+        apply_structure_locally(&db, web, &s).unwrap();
+        assert!(db.get_repository(web).unwrap().project_id.is_some());
+        assert_eq!(db.get_repository(foreign).unwrap().project_id, None);
+    }
+
+    #[test]
+    fn apply_never_moves_repos_of_this_installs_own_login() {
+        let db = make_db();
+        db.set_setting("github_login", "Owner").unwrap();
+        let web = local_repo(&db, "Owner/web");
+        assert!(apply_structure_locally(&db, web, &sample())
+            .unwrap_err()
+            .contains("owns the repository"));
+        assert_eq!(db.get_repository(web).unwrap().project_id, None);
+        assert!(db.list_projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_skips_a_microservice_that_cannot_be_connected() {
+        let db = make_db();
+        let web = local_repo(&db, "Owner/web");
+        // Acme is itself a microservice that Mailer depends on; connecting
+        // Mailer to Acme would close a cycle and must be skipped quietly.
+        let acme = db.create_project("Acme", None, "microservice").unwrap();
+        let mailer = db.create_project("Mailer", None, "microservice").unwrap();
+        let other = db.create_project("Other", None, "microservice").unwrap();
+        db.connect_microservice(mailer.id, acme.id).unwrap();
+        let mut s = sample();
+        s.project.project_type = "microservice".into();
+        s.microservices = vec!["Mailer".into(), "Other".into()];
+        apply_structure_locally(&db, web, &s).unwrap();
+        assert_eq!(
+            db.list_project_microservices(acme.id).unwrap(),
+            vec![other.id]
         );
     }
 }

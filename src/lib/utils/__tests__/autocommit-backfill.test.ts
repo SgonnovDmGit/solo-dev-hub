@@ -17,6 +17,10 @@ describe('shouldBackfillAutocommit', () => {
     expect(shouldBackfillAutocommit('me/app', shared('main'), 'me')).toBe(true);
   });
 
+  it('role main wins over the owner check', () => {
+    expect(shouldBackfillAutocommit('org/app', shared('main'), 'me')).toBe(true);
+  });
+
   it('skips contributor and pending repos', () => {
     expect(shouldBackfillAutocommit('me/app', shared('contributor'), 'me')).toBe(false);
     expect(shouldBackfillAutocommit('me/app', shared('pending'), 'me')).toBe(false);
