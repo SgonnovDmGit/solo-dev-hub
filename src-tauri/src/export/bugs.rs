@@ -47,8 +47,25 @@ pub fn parse_bug_reports(content: &str) -> (Vec<FileBugNote>, Vec<String>) {
     let mut bugs = Vec::new();
     let mut warnings = Vec::new();
 
+    // Rows inside an HTML comment are documentation (the scaffold's example row
+    // lives in one), not bugs. A comment block is only recognised when its
+    // opening `<!--` starts a line, so a real row that merely mentions `<!--`
+    // in its description is never swallowed.
+    let mut in_comment = false;
     for line in content.lines() {
         let trimmed = line.trim();
+        if in_comment {
+            if trimmed.contains("-->") {
+                in_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("<!--") {
+            if !trimmed.contains("-->") {
+                in_comment = true;
+            }
+            continue;
+        }
         let rest_opt = trimmed.strip_prefix("- [ ] ").or_else(|| {
             trimmed
                 .strip_prefix("- ")
@@ -241,5 +258,45 @@ mod tests {
         assert!(md.contains("B-001"));
         assert!(md.contains("B-002"));
         assert!(md.contains("Confirmed bug"));
+    }
+
+    #[test]
+    fn test_scaffold_template_yields_no_bugs() {
+        // The example row of the shipped template sits inside an HTML comment.
+        let tpl = include_str!("../../templates/_global/bug-reports.md.tmpl");
+        assert!(
+            tpl.contains("B-001 |"),
+            "the template still carries its example"
+        );
+        let (bugs, warnings) = parse_bug_reports(tpl);
+        assert!(bugs.is_empty(), "{:?}", bugs);
+        assert!(warnings.is_empty(), "{:?}", warnings);
+    }
+
+    #[test]
+    fn test_rows_inside_html_comments_are_ignored_rows_around_them_are_not() {
+        let row = |id: &str| {
+            format!(
+                "- {} | 2026-03-29 | text | major | auth | created | 0 |",
+                id
+            )
+        };
+        let md = format!(
+            "## Open bugs\n\n{}\n<!-- one line {} -->\n<!--\n{}\n{}\n-->\n{}\n",
+            row("B-001"),
+            row("B-002"),
+            row("B-003"),
+            row("B-004"),
+            row("B-005")
+        );
+        let ids: Vec<String> = parse_bug_reports(&md).0.into_iter().map(|b| b.id).collect();
+        assert_eq!(ids, vec!["B-001", "B-005"]);
+    }
+
+    #[test]
+    fn test_a_row_that_mentions_a_comment_marker_is_still_a_bug() {
+        let md = "- B-001 | 2026-03-29 | uses <!-- in html | major | ui_ux | created | 0 |\n- B-002 | 2026-03-29 | next | major | ui_ux | created | 0 |\n";
+        let (bugs, _) = parse_bug_reports(md);
+        assert_eq!(bugs.len(), 2);
     }
 }
