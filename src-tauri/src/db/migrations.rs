@@ -1066,6 +1066,7 @@ fn mig_v33_rule_events_and_conflicts(conn: &Connection) -> SqlResult<()> {
          PRAGMA user_version = 33;",
     )
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

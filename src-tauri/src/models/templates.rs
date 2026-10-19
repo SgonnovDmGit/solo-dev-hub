@@ -56,6 +56,12 @@ pub struct RulesRefresh {
     pub skills: usize,
     /// Repos whose `docs/sdh_skills/` was rendered.
     pub repos: usize,
+    /// T-000206: skills whose hand-back conflict was already open before this
+    /// pass. It was reported once, when it opened; a repeat is not reported
+    /// again — neither as `VersionConflict` nor as `RuleHeld` for its held
+    /// copies — so a conflict no longer fires a toast on every sync.
+    #[serde(default)]
+    pub quiet_conflicts: Vec<String>,
 }
 
 impl RulesRefresh {

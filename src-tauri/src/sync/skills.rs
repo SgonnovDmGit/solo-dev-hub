@@ -3,7 +3,7 @@
 // (`~/.claude/skills/<name>/SKILL.md`) and per-repo reference copies
 // (`<repo>/docs/sdh_skills/<name>.md`). Single source -> two render targets.
 
-use crate::db::{rule_event, AppDb};
+use crate::db::{conflict_note, rule_event, AppDb};
 use crate::models::{lookup, Repository, RulesRefresh, SyncIssue, SyncIssueCode};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -102,9 +102,15 @@ pub struct RepoRender {
 
 impl RepoRender {
     /// The held copies as issues, keyed by `label` (the repo).
-    pub fn held_issues(&self, label: &str) -> Vec<SyncIssue> {
+    ///
+    /// T-000206: copies of a skill in `quiet` (`RulesRefresh::quiet_conflicts`)
+    /// are left out. Their conflict was reported, held copies included, by the
+    /// pass that opened it; repeating them on every sync is the noise this
+    /// filter exists to stop. Every reader of held copies goes through here.
+    pub fn held_issues(&self, label: &str, quiet: &[String]) -> Vec<SyncIssue> {
         self.held
             .iter()
+            .filter(|name| !quiet.contains(name))
             .map(|name| SyncIssue::new(SyncIssueCode::RuleHeld, label).target(name.clone()))
             .collect()
     }
@@ -182,6 +188,13 @@ fn rules_guard() -> std::sync::MutexGuard<'static, ()> {
 /// touches `sdh-*.md` — leaves it alone.
 const APPROVED_SUFFIX: &str = ".approved";
 
+/// T-000206: reason file dropped beside a copy whose hand-back is in conflict,
+/// `<name>.md.conflict`, telling the agent in that repo why its edit was not
+/// taken. Like the marker it goes AFTER `.md`, so neither the prune pass (which
+/// only touches `*.md`) nor the collection (which only reads `*.approved`)
+/// ever mistakes it for a copy or a marker.
+const CONFLICT_SUFFIX: &str = ".conflict";
+
 /// What one collection pass found beside the repo copies.
 #[derive(Debug, Default)]
 struct Collected {
@@ -189,19 +202,176 @@ struct Collected {
     lost: Vec<String>,
     superseded: Vec<String>,
     errors: Vec<SyncIssue>,
+    /// T-000206: see `RulesRefresh::quiet_conflicts`.
+    quiet_conflicts: Vec<String>,
 }
 
 impl Collected {
     /// T-000174: append an outcome to the rule's history. A failure is one
     /// more `RuleFailed` issue, never a reason to stop the pass.
-    fn record(&mut self, db: &AppDb, rule: &str, kind: &str, repo: &str, note: Option<&str>) {
-        if let Err(e) = db.insert_rule_event(rule, kind, Some(repo), note) {
+    fn record(
+        &mut self,
+        db: &AppDb,
+        rule: &str,
+        kind: &str,
+        repo: Option<&str>,
+        note: Option<&str>,
+    ) {
+        if let Err(e) = db.insert_rule_event(rule, kind, repo, note) {
+            let target = match repo {
+                Some(repo) => format!("{}: rule_events", repo),
+                None => "rule_events".to_string(),
+            };
             self.errors.push(
                 SyncIssue::new(SyncIssueCode::RuleFailed, rule)
-                    .target(format!("{}: rule_events", repo))
+                    .target(target)
                     .detail(e),
             );
         }
+    }
+
+    /// A file step of the conflict bookkeeping failed: reported, never fatal.
+    fn file_failed(&mut self, rule: &str, target: String, e: impl std::fmt::Display) {
+        self.errors.push(
+            SyncIssue::new(SyncIssueCode::RuleFailed, rule)
+                .target(target)
+                .detail(e),
+        );
+    }
+
+    /// T-000206: the hand-backs of `name` disagree. Reported in full only by
+    /// the pass that opens the conflict (`already_open` false); a repeat goes to
+    /// `quiet_conflicts` instead, so it no longer fires a toast on every sync.
+    /// Either way each repo of the conflict gets the reason file, rewritten only
+    /// when its content changed, and a repo that has left the conflict loses it.
+    fn conflict(
+        &mut self,
+        db: &AppDb,
+        repos: &[Repository],
+        name: &str,
+        copies: &[HandedCopy],
+        other: &HandedCopy,
+        already_open: bool,
+    ) {
+        if already_open {
+            self.quiet_conflicts.push(name.to_string());
+        } else {
+            if let Err(e) = db.open_rule_conflict(name) {
+                self.file_failed(name, "rule_conflicts".to_string(), e);
+            }
+            let labels: Vec<&str> = copies.iter().map(|c| c.label.as_str()).collect();
+            self.record(
+                db,
+                name,
+                rule_event::CONFLICT,
+                Some(&labels.join(", ")),
+                None,
+            );
+            self.errors.push(
+                SyncIssue::new(SyncIssueCode::VersionConflict, name)
+                    .target(format!("{}, {}", copies[0].label, other.label)),
+            );
+        }
+
+        let reason = conflict_reason(name, copies);
+        let mut involved = HashSet::new();
+        for copy in copies {
+            let Some(dir) = copy.marker.parent() else {
+                continue;
+            };
+            involved.insert(dir.to_path_buf());
+            let path = dir.join(format!("{}.md{}", name, CONFLICT_SUFFIX));
+            if let Err(e) = write_if_changed(&path, &reason) {
+                self.file_failed(
+                    name,
+                    format!("{}: {}.md{}", copy.label, name, CONFLICT_SUFFIX),
+                    e,
+                );
+            }
+        }
+        self.remove_reason_files(repos, name, &involved);
+    }
+
+    /// T-000206: a conflict that was open before this pass and is not one any
+    /// more — a marker went away, or the texts became equal. Closed, recorded
+    /// with how it went away, and its reason files removed everywhere. The
+    /// collection then goes on as usual: what is still handed back is taken.
+    fn close_conflict(
+        &mut self,
+        db: &AppDb,
+        repos: &[Repository],
+        name: &str,
+        settings_edit: Option<&str>,
+    ) {
+        if let Err(e) = db.close_rule_conflict(name) {
+            self.file_failed(name, "rule_conflicts".to_string(), e);
+        }
+        let note = if settings_edit == Some(name) {
+            // The owner's own save or reset set both markers aside this pass.
+            conflict_note::SUPERSEDED_BY_OWNER
+        } else {
+            conflict_note::RESOLVED_OUTSIDE
+        };
+        self.record(db, name, rule_event::CONFLICT_RESOLVED, None, Some(note));
+        self.remove_reason_files(repos, name, &HashSet::new());
+    }
+
+    /// Remove `<name>.md.conflict` from every repo of the portfolio except the
+    /// `keep` skill dirs. Missing is the normal case, not an error.
+    fn remove_reason_files(&mut self, repos: &[Repository], name: &str, keep: &HashSet<PathBuf>) {
+        for repo in repos {
+            let Some(path) = repo.local_path.as_deref() else {
+                continue;
+            };
+            let dir = Path::new(path).join("docs").join("sdh_skills");
+            if keep.contains(&dir) {
+                continue;
+            }
+            let file = dir.join(format!("{}.md{}", name, CONFLICT_SUFFIX));
+            if let Err(e) = clear_marker(&file) {
+                self.file_failed(
+                    name,
+                    format!("{}: {}.md{}", rule_copy_label(repo), name, CONFLICT_SUFFIX),
+                    e,
+                );
+            }
+        }
+    }
+}
+
+/// T-000206: the text of the reason file — English, because the agent working
+/// in that repo is its reader. It names every repo of the conflict with the
+/// time its marker was dropped, so the agent can tell which edit is its own.
+fn conflict_reason(name: &str, copies: &[HandedCopy]) -> String {
+    let sides: String = copies
+        .iter()
+        .map(|copy| {
+            format!(
+                "- {} \u{2014} marker {}\n",
+                copy.label,
+                marker_time(&copy.marker)
+            )
+        })
+        .collect();
+    format!(
+        "# Hand-back not taken: conflict\n\n\
+         Your edited copy of `{name}` was NOT taken up.\n\
+         Another repo handed back a different text for the same skill:\n\n\
+         {sides}\n\
+         Nothing is lost: both markers and both copies stay as they are.\n\
+         The owner chooses one text in Solo Dev Hub \u{2192} Rules.\n\n\
+         Do not edit this copy again, re-create the marker or delete this file.\n\
+         Sync removes it once the owner has decided.\n"
+    )
+}
+
+/// A marker's mtime as `YYYY-MM-DD HH:MM`, local time.
+fn marker_time(marker: &Path) -> String {
+    match fs::metadata(marker).and_then(|m| m.modified()) {
+        Ok(t) => chrono::DateTime::<chrono::Local>::from(t)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+        Err(_) => "unknown".to_string(),
     }
 }
 
@@ -260,6 +430,15 @@ fn collect_approved_skill_edits(
     settings_edit: Option<&str>,
 ) -> Collected {
     let mut out = Collected::default();
+    // T-000206: read BEFORE scanning, so the pass that opens a conflict still
+    // reports it in full and only the passes after it keep quiet.
+    let open = match db.open_rule_conflicts() {
+        Ok(open) => open,
+        Err(e) => {
+            out.file_failed("", "rule_conflicts".to_string(), e);
+            HashSet::new()
+        }
+    };
     let known: HashMap<String, String> = match list_skill_templates(db) {
         Ok(v) => v.into_iter().collect(),
         Err(e) => {
@@ -304,7 +483,7 @@ fn collect_approved_skill_edits(
                 match clear_marker(&entry.path()) {
                     Ok(()) => {
                         out.superseded.push(format!("{} ({})", name, label));
-                        out.record(db, name, rule_event::SUPERSEDED, &label, None);
+                        out.record(db, name, rule_event::SUPERSEDED, Some(&label), None);
                     }
                     Err(e) => out.errors.push(
                         SyncIssue::new(SyncIssueCode::RuleFailed, name)
@@ -319,7 +498,7 @@ fn collect_approved_skill_edits(
                 Ok(content) if content == *current => match clear_marker(&entry.path()) {
                     Ok(()) => {
                         out.lost.push(format!("{} ({})", name, label));
-                        out.record(db, name, rule_event::LOST, &label, None);
+                        out.record(db, name, rule_event::LOST, Some(&label), None);
                     }
                     Err(e) => out.errors.push(
                         SyncIssue::new(SyncIssueCode::RuleFailed, name)
@@ -357,13 +536,33 @@ fn collect_approved_skill_edits(
         }
     }
 
+    // Sorted, so the reason file and the reports read the same on every pass.
+    let mut handed: Vec<(String, Vec<HandedCopy>)> = handed.into_iter().collect();
+    handed.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, copies) in &mut handed {
+        copies.sort_by(|a, b| a.label.cmp(&b.label));
+    }
+    let in_conflict = |copies: &[HandedCopy]| copies.iter().any(|c| c.content != copies[0].content);
+
+    // A conflict open before this pass and gone now is closed first, so its
+    // `conflict_resolved` reads before whatever this pass then takes up.
+    let mut gone: Vec<&String> = open
+        .iter()
+        .filter(|rule| {
+            !handed
+                .iter()
+                .any(|(name, copies)| name == *rule && in_conflict(copies))
+        })
+        .collect();
+    gone.sort();
+    for rule in gone {
+        out.close_conflict(db, repos, rule, settings_edit);
+    }
+
     for (name, copies) in handed {
         let first = &copies[0].content;
         if let Some(other) = copies.iter().find(|copy| copy.content != *first) {
-            out.errors.push(
-                SyncIssue::new(SyncIssueCode::VersionConflict, name.clone())
-                    .target(format!("{}, {}", copies[0].label, other.label)),
-            );
+            out.conflict(db, repos, &name, &copies, other, open.contains(&name));
             continue; // markers stay put: nobody's edit is thrown away
         }
         let file_name = format!("{}{}{}", SKILL_PREFIX, name, SKILL_SUFFIX);
@@ -382,7 +581,7 @@ fn collect_approved_skill_edits(
                 db,
                 &name,
                 rule_event::TAKEN,
-                &copy.label,
+                Some(&copy.label),
                 copy.note.as_deref(),
             );
             let marker = &copy.marker;
@@ -402,6 +601,7 @@ fn collect_approved_skill_edits(
     out.taken.sort();
     out.lost.sort();
     out.superseded.sort();
+    out.quiet_conflicts.sort();
     out
 }
 
@@ -471,7 +671,8 @@ fn render_scope(
 ) {
     let everywhere = everywhere || matches!(scope, RenderScope::Everywhere);
     if everywhere {
-        let (skills, touched, errors) = render_skills_everywhere(db, claude_dir, repos);
+        let (skills, touched, errors) =
+            render_skills_everywhere(db, claude_dir, repos, &report.quiet_conflicts);
         report.skills = skills;
         report.repos = touched;
         report.errors.extend(errors);
@@ -489,9 +690,9 @@ fn render_scope(
                 Ok(_) if everywhere => {}
                 Ok(r) => {
                     report.repos = 1;
-                    report
-                        .errors
-                        .extend(r.held_issues(&base.display().to_string()));
+                    report.errors.extend(
+                        r.held_issues(&base.display().to_string(), &report.quiet_conflicts),
+                    );
                 }
                 Err(e) => report.errors.push(
                     SyncIssue::new(SyncIssueCode::ManagedFileFailed, base.display().to_string())
@@ -514,6 +715,7 @@ impl RulesRefresh {
         self.taken = collected.taken;
         self.lost = collected.lost;
         self.superseded = collected.superseded;
+        self.quiet_conflicts = collected.quiet_conflicts;
         self.errors.extend(collected.errors);
     }
 }
@@ -535,6 +737,7 @@ fn render_skills_everywhere(
     db: &AppDb,
     claude_dir: Option<&Path>,
     repos: &[Repository],
+    quiet: &[String],
 ) -> (usize, usize, Vec<SyncIssue>) {
     let mut errors = Vec::new();
     let skills = match claude_dir.map(|dir| render_skills_global(db, dir)) {
@@ -563,7 +766,7 @@ fn render_skills_everywhere(
         match render_skills_to_repo(db, base) {
             Ok(r) => {
                 touched += 1;
-                errors.extend(r.held_issues(&label));
+                errors.extend(r.held_issues(&label, quiet));
             }
             Err(e) => errors.push(
                 SyncIssue::new(SyncIssueCode::ManagedFileFailed, label)
@@ -716,6 +919,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::db::conflict_note;
+    use crate::db::rules::rule_history;
     use tempfile::TempDir;
 
     fn db_with_skill() -> AppDb {
@@ -1092,18 +1297,6 @@ mod tests {
 
     // ── T-000174: the collection leaves a history behind ─────────────────────
 
-    /// `(kind, repo, note)` of a rule's history, oldest first.
-    fn history(db: &AppDb, rule: &str) -> Vec<(String, Option<String>, Option<String>)> {
-        let mut events: Vec<_> = db
-            .list_rule_events(rule)
-            .unwrap()
-            .into_iter()
-            .map(|e| (e.kind, e.repo, e.note))
-            .collect();
-        events.reverse();
-        events
-    }
-
     /// One `taken` per repo whose copy was taken, carrying that repo's approval
     /// line — the toast that used to be the only trace is gone in seconds.
     #[test]
@@ -1127,7 +1320,10 @@ mod tests {
 
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
         assert_eq!(taken, vec!["sdh-beta".to_string()]);
-        let mut events = history(&db, "sdh-beta");
+        let mut events: Vec<_> = rule_history(&db, "sdh-beta")
+            .into_iter()
+            .map(|e| (e.kind, e.repo, e.note))
+            .collect();
         events.sort();
         let mut expected = vec![
             (
@@ -1140,7 +1336,7 @@ mod tests {
         expected.sort();
         assert_eq!(events, expected);
         assert!(
-            history(&db, "sdh-alpha").is_empty(),
+            rule_history(&db, "sdh-alpha").is_empty(),
             "nothing else recorded"
         );
     }
@@ -1157,9 +1353,15 @@ mod tests {
         let Collected { lost, .. } = collect_approved_skill_edits(&db, &[repo], None);
 
         assert_eq!(lost.len(), 1);
+        let events = rule_history(&db, "sdh-alpha");
+        assert_eq!(events.len(), 1);
         assert_eq!(
-            history(&db, "sdh-alpha"),
-            vec![("lost".to_string(), Some(label), None)]
+            (
+                events[0].kind.as_str(),
+                events[0].repo.as_deref(),
+                events[0].note.as_deref()
+            ),
+            ("lost", Some(label.as_str()), None)
         );
     }
 
@@ -1177,10 +1379,218 @@ mod tests {
 
         assert_eq!(superseded.len(), 1);
         assert!(taken.is_empty());
+        let events = rule_history(&db, "sdh-alpha");
+        assert_eq!(events.len(), 1);
         assert_eq!(
-            history(&db, "sdh-alpha"),
-            vec![("superseded".to_string(), Some(label), None)]
+            (
+                events[0].kind.as_str(),
+                events[0].repo.as_deref(),
+                events[0].note.as_deref()
+            ),
+            ("superseded", Some(label.as_str()), None)
         );
+    }
+
+    // ── T-000206: a conflict is reported once and explained to the agent ─────
+
+    /// Two stored repos handing back different texts of `sdh-alpha`. Returns
+    /// their checkouts and labels.
+    fn conflicting_repos(db: &AppDb) -> (TempDir, TempDir, String, String) {
+        let one = TempDir::new().unwrap();
+        let two = TempDir::new().unwrap();
+        let (r1, s1) = rendered_repo(db, &one, "one");
+        let (r2, s2) = rendered_repo(db, &two, "two");
+        hand_back(&s1, "sdh-alpha", "VERSION ONE", "");
+        hand_back(&s2, "sdh-alpha", "VERSION TWO", "");
+        let (l1, l2) = (rule_copy_label(&r1), rule_copy_label(&r2));
+        (one, two, l1, l2)
+    }
+
+    fn reason_file(repo: &TempDir, name: &str) -> PathBuf {
+        repo.path()
+            .join("docs/sdh_skills")
+            .join(format!("{}.md{}", name, CONFLICT_SUFFIX))
+    }
+
+    /// Issues of `code` about `skill` — as their subject (a conflict) or their
+    /// target (a held copy).
+    fn count(errors: &[SyncIssue], code: SyncIssueCode, skill: &str) -> usize {
+        errors
+            .iter()
+            .filter(|e| {
+                e.code == code && (e.subject == skill || e.target.as_deref() == Some(skill))
+            })
+            .count()
+    }
+
+    /// The conflict used to fire a `VersionConflict` toast, plus a `RuleHeld`
+    /// line per held copy, on EVERY sync, and lived nowhere else. Now the pass
+    /// that opens it reports it in full, records it, and leaves each agent a
+    /// note; every later pass keeps quiet about it.
+    #[test]
+    fn test_a_conflict_is_reported_once_then_kept_quiet() {
+        let db = db_with_skill();
+        let home = TempDir::new().unwrap();
+        let (one, two, l1, l2) = conflicting_repos(&db);
+
+        let first = refresh_rules(&db, Some(home.path()), RenderScope::Everywhere, None);
+
+        assert_eq!(
+            count(&first.errors, SyncIssueCode::VersionConflict, "sdh-alpha"),
+            1,
+            "{:?}",
+            first.errors
+        );
+        assert_eq!(
+            count(&first.errors, SyncIssueCode::RuleHeld, "sdh-alpha"),
+            2,
+            "the opening pass reports the held copies too: {:?}",
+            first.errors
+        );
+        assert!(first.quiet_conflicts.is_empty());
+        assert!(db.open_rule_conflicts().unwrap().contains("sdh-alpha"));
+        let events = rule_history(&db, "sdh-alpha");
+        assert_eq!(events.len(), 1, "{:?}", events);
+        assert_eq!(events[0].kind, "conflict");
+        let repos = events[0].repo.clone().unwrap();
+        assert!(repos.contains(&l1) && repos.contains(&l2), "{}", repos);
+        for repo in [&one, &two] {
+            let reason = fs::read_to_string(reason_file(repo, "sdh-alpha")).unwrap();
+            assert!(reason.starts_with("# Hand-back not taken: conflict\n"));
+            assert!(reason.contains("`sdh-alpha`"), "{}", reason);
+            assert!(
+                reason.contains(&format!("- {} — marker ", l1))
+                    && reason.contains(&format!("- {} — marker ", l2)),
+                "{}",
+                reason
+            );
+        }
+
+        let second = refresh_rules(&db, Some(home.path()), RenderScope::Everywhere, None);
+
+        assert_eq!(
+            count(&second.errors, SyncIssueCode::VersionConflict, "sdh-alpha"),
+            0,
+            "{:?}",
+            second.errors
+        );
+        assert_eq!(
+            count(&second.errors, SyncIssueCode::RuleHeld, "sdh-alpha"),
+            0,
+            "{:?}",
+            second.errors
+        );
+        assert_eq!(second.quiet_conflicts, vec!["sdh-alpha".to_string()]);
+        assert_eq!(rule_history(&db, "sdh-alpha").len(), 1, "no second event");
+        // Still in conflict: nothing taken, nothing thrown away.
+        assert!(reason_file(&one, "sdh-alpha").exists());
+        assert_eq!(
+            fs::read_to_string(one.path().join("docs/sdh_skills/sdh-alpha.md")).unwrap(),
+            "VERSION ONE"
+        );
+    }
+
+    /// The owner may settle the conflict by hand - delete one marker. The next
+    /// pass closes it, takes the hand-back that is left, and tidies up after
+    /// itself in every repo.
+    #[test]
+    fn test_a_conflict_resolved_outside_the_app_is_closed_and_the_rest_taken() {
+        let db = db_with_skill();
+        let (one, two, _, l2) = conflicting_repos(&db);
+        let repos = db.list_repos_with_local_path(None).unwrap();
+        collect_approved_skill_edits(&db, &repos, None);
+        assert!(reason_file(&one, "sdh-alpha").exists());
+        fs::remove_file(one.path().join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap();
+
+        let Collected {
+            taken,
+            errors,
+            quiet_conflicts,
+            ..
+        } = collect_approved_skill_edits(&db, &repos, None);
+
+        assert!(errors.is_empty(), "{:?}", errors);
+        assert!(quiet_conflicts.is_empty());
+        assert_eq!(taken, vec!["sdh-alpha".to_string()]);
+        assert_eq!(
+            db.get_template_file("_global", "skill.sdh-alpha.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            "VERSION TWO"
+        );
+        assert!(db.open_rule_conflicts().unwrap().is_empty());
+        assert!(!reason_file(&one, "sdh-alpha").exists());
+        assert!(!reason_file(&two, "sdh-alpha").exists());
+        let events: Vec<_> = rule_history(&db, "sdh-alpha")
+            .into_iter()
+            .map(|e| (e.kind, e.repo, e.note))
+            .collect();
+        assert_eq!(
+            events[1..],
+            [
+                (
+                    "conflict_resolved".to_string(),
+                    None,
+                    Some(conflict_note::RESOLVED_OUTSIDE.to_string())
+                ),
+                ("taken".to_string(), Some(l2), None),
+            ]
+        );
+    }
+
+    /// The reason file sits in `docs/sdh_skills/` beside the copies, so both
+    /// passes that read that folder must leave it alone.
+    #[test]
+    fn test_a_reason_file_survives_the_prune_and_is_not_a_marker() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        let known = skills.join(format!("sdh-alpha.md{}", CONFLICT_SUFFIX));
+        let unknown = skills.join(format!("sdh-obsolete.md{}", CONFLICT_SUFFIX));
+        fs::write(&known, "reason").unwrap();
+        fs::write(&unknown, "reason").unwrap();
+
+        let rendered = render_skills_to_repo(&db, tmp.path()).unwrap();
+        let collected = collect_approved_skill_edits(&db, &[repo], None);
+
+        assert!(known.exists() && unknown.exists(), "the prune left them");
+        assert!(
+            rendered.held.is_empty(),
+            "not a marker: {:?}",
+            rendered.held
+        );
+        assert!(collected.taken.is_empty() && collected.lost.is_empty());
+        assert!(collected.errors.is_empty(), "{:?}", collected.errors);
+    }
+
+    /// The history is a record of what happened, never a precondition for it:
+    /// a broken `rule_events` must not stop an uptake.
+    #[test]
+    fn test_a_failed_history_write_does_not_block_an_uptake() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        hand_back(&skills, "sdh-alpha", "ALPHA REVISED", "approved");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE rule_events")
+            .unwrap();
+
+        let Collected { taken, errors, .. } = collect_approved_skill_edits(&db, &[repo], None);
+
+        assert_eq!(taken, vec!["sdh-alpha".to_string()]);
+        assert_eq!(
+            db.get_template_file("_global", "skill.sdh-alpha.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            "ALPHA REVISED"
+        );
+        assert!(!skills.join("sdh-alpha.md.approved").exists());
+        assert_eq!(errors.len(), 1, "{:?}", errors);
+        assert_eq!(errors[0].code, SyncIssueCode::RuleFailed);
     }
 
     #[test]

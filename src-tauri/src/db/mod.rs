@@ -26,7 +26,7 @@ pub mod stats;
 pub mod tasks_events;
 pub mod timeline;
 
-pub use rules::rule_event;
+pub use rules::{conflict_note, rule_event};
 
 pub struct AppDb {
     pub conn: Mutex<Connection>,

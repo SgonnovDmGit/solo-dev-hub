@@ -73,6 +73,14 @@ fn save_template_file_in(
     file_name: &str,
     content: &str,
 ) -> Result<TemplateSaveOutcome, String> {
+    // T-000206: a save of the very text already stored changes nothing, so it
+    // is no event of the rule's history. Compared before the write, which is
+    // what replaces the old text. An unreadable old row counts as a change:
+    // recording one save too many beats losing one.
+    let unchanged = matches!(
+        db.get_template_file(language_key, file_name),
+        Ok(Some(old)) if old.content == content
+    );
     // The DB write goes first and is the only fatal failure here: a rule the
     // owner has just agreed on must never be lost because a render target
     // happened to be unwritable.
@@ -83,7 +91,7 @@ fn save_template_file_in(
         home,
         language_key,
         file_name,
-        rule_event::SAVED,
+        (!unchanged).then_some(rule_event::SAVED),
     ))
 }
 
@@ -99,7 +107,8 @@ fn rule_of<'a>(language_key: &str, file_name: &'a str) -> Option<&'a str> {
 /// What follows a successful DB write of a template by the owner (a save or a
 /// reset), shared so the two can never drift apart:
 /// - an ordinary template: nothing;
-/// - a rule (T-000174): `kind` goes to its history;
+/// - a rule (T-000174): `kind` goes to its history — `None` for a save that
+///   changed nothing (T-000206); a reset always records;
 /// - a skill: additionally delivered everywhere at once (below).
 ///
 /// The global CLAUDE.md section is recorded but not rendered — it goes out
@@ -109,7 +118,7 @@ fn after_rule_write(
     home: Option<PathBuf>,
     language_key: &str,
     file_name: &str,
-    kind: &str,
+    kind: Option<&str>,
 ) -> TemplateSaveOutcome {
     let Some(rule) = rule_of(language_key, file_name) else {
         return TemplateSaveOutcome::default();
@@ -118,7 +127,7 @@ fn after_rule_write(
     // reads after the edit that superseded it. A failed history write must not
     // turn a stored edit into a failed one: it is reported, nothing more.
     let mut errors = Vec::new();
-    if let Err(e) = db.insert_rule_event(rule, kind, None, None) {
+    if let Err(e) = kind.map_or(Ok(()), |kind| db.insert_rule_event(rule, kind, None, None)) {
         errors.push(
             SyncIssue::new(SyncIssueCode::RuleFailed, rule)
                 .target("rule_events")
@@ -208,13 +217,15 @@ fn reset_template_file_in(
         home,
         language_key,
         file_name,
-        rule_event::RESET,
+        Some(rule_event::RESET),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::conflict_note;
+    use crate::db::rules::rule_history;
     use crate::sync::skills::test_support::hand_back_edit;
     use std::fs;
     use tempfile::TempDir;
@@ -299,14 +310,10 @@ mod tests {
 
     /// `(kind, repo)` of a rule's history, oldest first.
     fn history(db: &AppDb, rule: &str) -> Vec<(String, Option<String>)> {
-        let mut events: Vec<_> = db
-            .list_rule_events(rule)
-            .unwrap()
+        rule_history(db, rule)
             .into_iter()
             .map(|e| (e.kind, e.repo))
-            .collect();
-        events.reverse();
-        events
+            .collect()
     }
 
     /// T-000212: a reset used to touch the database only, so every repo copy
@@ -518,5 +525,140 @@ mod tests {
             "the set-aside hand-back is reported, not dropped silently"
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    }
+
+    /// T-000206: the owner saving a skill whose hand-backs are in conflict is a
+    /// decision too — both markers are set aside, so the conflict is closed and
+    /// says why, and the agents' reason files go with it.
+    #[test]
+    fn test_saving_a_skill_in_conflict_closes_the_conflict() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let dirs = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        for (i, dir) in dirs.iter().enumerate() {
+            db.insert_local_repository(
+                &dir.path().to_string_lossy(),
+                &format!("r{}", i),
+                None,
+                None,
+            )
+            .unwrap();
+            sync::render_skills_to_repo(&db, dir.path()).unwrap();
+            hand_back_edit(dir.path(), "sdh-debugging");
+        }
+        let skills = |dir: &TempDir| dir.path().join("docs/sdh_skills");
+        // Any pass opens the conflict — here the save of another skill.
+        save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "skill.sdh-retro.md.tmpl",
+            "OTHER",
+        )
+        .unwrap();
+        assert!(db.open_rule_conflicts().unwrap().contains("sdh-debugging"));
+        assert!(skills(&dirs[0]).join("sdh-debugging.md.conflict").exists());
+
+        let outcome = save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "skill.sdh-debugging.md.tmpl",
+            "OWNER DECIDES",
+        )
+        .unwrap();
+
+        assert!(db.open_rule_conflicts().unwrap().is_empty());
+        for dir in &dirs {
+            assert!(!skills(dir).join("sdh-debugging.md.approved").exists());
+            assert!(!skills(dir).join("sdh-debugging.md.conflict").exists());
+            assert_eq!(
+                fs::read_to_string(skills(dir).join("sdh-debugging.md")).unwrap(),
+                "OWNER DECIDES"
+            );
+        }
+        let resolved: Vec<_> = rule_history(&db, "sdh-debugging")
+            .into_iter()
+            .filter(|e| e.kind == rule_event::CONFLICT_RESOLVED)
+            .collect();
+        assert_eq!(resolved.len(), 1, "{:?}", resolved);
+        assert_eq!(resolved[0].repo, None);
+        assert_eq!(
+            resolved[0].note.as_deref(),
+            Some(conflict_note::SUPERSEDED_BY_OWNER)
+        );
+        assert_eq!(outcome.superseded.len(), 2, "{:?}", outcome.superseded);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    }
+
+    /// Saving the text that is already stored changes nothing, so it is not an
+    /// event of the rule's history either.
+    #[test]
+    fn test_a_save_that_changes_nothing_records_no_event() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let save = |text: &str| {
+            save_template_file_in(
+                &db,
+                Some(home.path().to_path_buf()),
+                "_global",
+                "skill.sdh-retro.md.tmpl",
+                text,
+            )
+            .unwrap()
+        };
+
+        save("OWNER TEXT");
+        save("OWNER TEXT");
+
+        assert_eq!(history(&db, "sdh-retro"), vec![("saved".to_string(), None)]);
+    }
+
+    /// The history is a record, never a precondition: with `rule_events` broken
+    /// a save and a reset still store the text, and say what failed.
+    #[test]
+    fn test_a_failed_history_write_does_not_block_a_save_or_a_reset() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE rule_events")
+            .unwrap();
+        let stored = || {
+            db.get_template_file("_global", "skill.sdh-retro.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content
+        };
+        let failed = |o: &TemplateSaveOutcome| {
+            o.errors
+                .iter()
+                .any(|e| e.code == SyncIssueCode::RuleFailed && e.subject == "sdh-retro")
+        };
+
+        let saved = save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "skill.sdh-retro.md.tmpl",
+            "OWNER TEXT",
+        )
+        .unwrap();
+        assert_eq!(stored(), "OWNER TEXT");
+        assert!(failed(&saved), "{:?}", saved.errors);
+
+        let reset = reset_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "skill.sdh-retro.md.tmpl",
+        )
+        .unwrap();
+        assert_eq!(
+            stored(),
+            template_seeder::bundled_file_content("_global", "skill.sdh-retro.md.tmpl").unwrap()
+        );
+        assert!(failed(&reset), "{:?}", reset.errors);
     }
 }

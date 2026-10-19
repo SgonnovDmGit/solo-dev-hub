@@ -36,6 +36,19 @@ pub mod rule_event {
     pub const CONFLICT_RESOLVED: &str = "conflict_resolved";
 }
 
+/// T-000206: the `note` of a `conflict_resolved` event the app writes itself
+/// when a conflict goes away without the owner picking a side. Stored as plain
+/// English; the frontend translates them by value, so the wording here is a
+/// contract — change it only together with those translations.
+pub mod conflict_note {
+    /// The owner saved or reset the rule while its hand-backs were in conflict:
+    /// the explicit edit set both markers aside.
+    pub const SUPERSEDED_BY_OWNER: &str = "superseded by the owner's edit";
+    /// The conflict vanished on its own — a marker was removed, or the texts
+    /// became equal — before anyone decided it in the app.
+    pub const RESOLVED_OUTSIDE: &str = "resolved outside the app";
+}
+
 fn rule_event_from_row(row: &Row) -> SqlResult<RuleEvent> {
     Ok(RuleEvent {
         id: row.get(0)?,
@@ -127,6 +140,15 @@ impl AppDb {
         let removed = conn.execute("DELETE FROM rule_conflicts WHERE rule = ?1", [rule])?;
         Ok(removed == 1)
     }
+}
+
+/// Test support: a rule's whole history, OLDEST first — the order the events
+/// happened in, which is what a test asserts against.
+#[cfg(test)]
+pub(crate) fn rule_history(db: &AppDb, rule: &str) -> Vec<RuleEvent> {
+    let mut events = db.list_rule_events(rule).unwrap();
+    events.reverse();
+    events
 }
 
 #[cfg(test)]

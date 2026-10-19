@@ -32,6 +32,9 @@ export interface RulesRefresh {
   errors: SyncIssue[];
   skills: number;
   repos: number;
+  /** T-000206: skills whose conflict was already open before this pass —
+   *  reported once when it opened, silent on every repeat. */
+  quiet_conflicts?: string[];
 }
 
 export interface TemplateLanguage {

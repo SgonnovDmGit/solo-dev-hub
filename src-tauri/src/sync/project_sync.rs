@@ -181,6 +181,7 @@ fn write_repo_skeletons(
     base: &Path,
     repo: &Repository,
     tpl: &SkeletonTemplates,
+    quiet_conflicts: &[String],
     c: &mut SyncCounters,
 ) {
     let role = repo.role.as_deref();
@@ -202,9 +203,10 @@ fn write_repo_skeletons(
     // Runs only after `refresh_rules` collected across the portfolio (see
     // `run_project_sync_in`); a copy still flagged after that is held, not written.
     // After an uptake the refresh has already rendered and reported this repo;
-    // `push` keeps each held copy to one line.
+    // `push` keeps each held copy to one line. T-000206: copies of a conflict
+    // already reported by an earlier pass stay quiet here too.
     match sync::render_skills_to_repo(db, base) {
-        Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo))),
+        Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
         Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
     }
     if let Err(e) = sync::sync_gitignore_section(&tpl.gitignore, base) {
@@ -1032,6 +1034,7 @@ pub(crate) fn run_project_sync_in(
     c.extend(rules.errors);
     c.rules_taken = rules.taken;
     c.rules_lost = rules.lost;
+    let quiet_conflicts = rules.quiet_conflicts;
 
     // 0.10.0 pre-phase: write project.md + CLAUDE.md section + .gitignore + .gitattributes to all repos.
     // 0.11.0 extends with todo.md + bug-reports.md skeletons.
@@ -1049,7 +1052,7 @@ pub(crate) fn run_project_sync_in(
             c.push(root_missing(repo));
             continue;
         }
-        write_repo_skeletons(db, project_id, base, repo, &tpl, &mut c);
+        write_repo_skeletons(db, project_id, base, repo, &tpl, &quiet_conflicts, &mut c);
     }
     for ms_id in &microservice_ids {
         let Ok(ms_server) = db.server_repo_of_microservice(*ms_id) else {
@@ -1065,7 +1068,7 @@ pub(crate) fn run_project_sync_in(
             c.push(root_missing(&ms_server));
             continue;
         }
-        write_repo_skeletons(db, *ms_id, base, &ms_server, &tpl, &mut c);
+        write_repo_skeletons(db, *ms_id, base, &ms_server, &tpl, &quiet_conflicts, &mut c);
     }
 
     // Server/client checks only matter for `standard` project type. A
@@ -1421,6 +1424,55 @@ mod tests {
             .filter(|e| e.code == Code::RuleHeld)
             .collect();
         assert_eq!(held.len(), 3, "one per held copy: {:?}", held);
+    }
+
+    /// T-000206: a conflict is reported by the project sync that opens it —
+    /// the conflict itself and every held copy — and by none after it. The
+    /// skeleton render is the second reader of held copies in a project sync,
+    /// so it has to honour the quiet list as well.
+    #[test]
+    fn test_a_conflict_is_quiet_on_the_second_project_sync() {
+        let (db, _db_dir, home) = seeded_db();
+        let dirs = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        let p = db.create_project("P", None, "standard").unwrap();
+        for (i, dir) in dirs.iter().enumerate() {
+            db.insert_local_repository(
+                &dir.path().to_string_lossy(),
+                &format!("r{}", i),
+                Some(p.id),
+                Some("tool"),
+            )
+            .unwrap();
+            sync::render_skills_to_repo(&db, dir.path()).unwrap();
+            hand_back_edit(dir.path(), "sdh-retro");
+        }
+        let count = |result: &SyncResult, code: Code| {
+            result.errors.iter().filter(|e| e.code == code).count()
+        };
+
+        let first = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
+        let second = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
+
+        assert_eq!(
+            count(&first, Code::VersionConflict),
+            1,
+            "{:?}",
+            first.errors
+        );
+        assert_eq!(count(&first, Code::RuleHeld), 2, "{:?}", first.errors);
+        assert_eq!(
+            count(&second, Code::VersionConflict),
+            0,
+            "{:?}",
+            second.errors
+        );
+        assert_eq!(count(&second, Code::RuleHeld), 0, "{:?}", second.errors);
+        for dir in &dirs {
+            assert!(dir
+                .path()
+                .join("docs/sdh_skills/sdh-retro.md.conflict")
+                .exists());
+        }
     }
 
     /// T-000198 review: a flat REQ on the microservice side with no matching

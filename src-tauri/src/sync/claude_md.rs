@@ -95,7 +95,7 @@ pub fn update_claude_md_section(
 /// Uses `claude.md.global.tmpl`. No placeholders — content is inserted verbatim between markers.
 pub fn update_claude_md_global(db: &AppDb, claude_md_path: &Path) -> Result<(), String> {
     let template_opt = db
-        .get_template_file("_global", "claude.md.global.tmpl")
+        .get_template_file("_global", super::GLOBAL_SECTION_FILE)
         .map_err(|e| e.to_string())?;
     let template = match template_opt {
         Some(t) => t.content,
