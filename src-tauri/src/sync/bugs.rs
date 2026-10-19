@@ -62,7 +62,7 @@ pub fn valid_transition(from: &str, to: &str) -> bool {
 /// Convert a DB row to the MD-facing 8-field `FileBugNote`. `created_at` ISO
 /// timestamp is truncated to `YYYY-MM-DD` (first 10 chars) to match the MD
 /// contract. `confirmed_at` is not in MD — lives in DB only.
-fn bug_to_file_note(bug: &Bug) -> FileBugNote {
+pub fn bug_to_file_note(bug: &Bug) -> FileBugNote {
     let date = bug
         .created_at
         .get(..10)
@@ -359,6 +359,228 @@ pub fn reconcile_bugs_for_repo(db: &AppDb, repo_id: i64) -> Result<(), String> {
     // appear if not yet LLM-acknowledged; otherwise excluded.
     regenerate_bugs_md(db, repo_id)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// F-000044 / T-000221: bugs that ARRIVED BY COMMIT (spec R11 step 1)
+// ---------------------------------------------------------------------------
+
+const SEVERITIES: [&str; 4] = ["critical", "major", "medium", "minor"];
+const CATEGORIES: [&str; 9] = [
+    "ui_ux",
+    "ux_flow",
+    "logic",
+    "auth",
+    "database",
+    "performance",
+    "security",
+    "integration",
+    "other",
+];
+const STATUSES: [&str; 5] = ["created", "in-progress", "testing", "rejected", "confirmed"];
+
+fn same_note(a: &FileBugNote, b: &FileBugNote) -> bool {
+    a.id == b.id
+        && a.date == b.date
+        && a.description == b.description
+        && a.severity == b.severity
+        && a.category == b.category
+        && a.status == b.status
+        && a.fix_attempts == b.fix_attempts
+        && a.comment.as_deref().filter(|s| !s.is_empty())
+            == b.comment.as_deref().filter(|s| !s.is_empty())
+}
+
+/// Events a committed change `from -> to` stands for, given how many fix
+/// attempts it added. The commit is truth, so an unusual transition is still
+/// accepted; the event is then the closest one, or none:
+///   * `entered_testing` x `added_attempts` (keeps `COUNT(entered_testing) ==
+///     fix_attempts`); the first one carries the real `from` status;
+///   * to `in-progress`: `taken` from `created`, `reopened` from anything else;
+///   * to `testing` without a new attempt: `reopened` from `confirmed` /
+///     `rejected` (an undone verdict), nothing otherwise;
+///   * to `confirmed` / `rejected`: the event of the same name;
+///   * to `created`: nothing.
+fn events_for_change(
+    from: &str,
+    to: &str,
+    added_attempts: i32,
+) -> Vec<(&'static str, String, String)> {
+    let mut out: Vec<(&'static str, String, String)> = Vec::new();
+    for i in 0..added_attempts.max(0) {
+        let f = if i == 0 { from } else { "in-progress" };
+        out.push(("entered_testing", f.to_string(), "testing".to_string()));
+    }
+    if from == to {
+        return out;
+    }
+    let status_event = match to {
+        "in-progress" if from == "created" => Some("taken"),
+        "in-progress" => Some("reopened"),
+        "testing" if added_attempts <= 0 && (from == "confirmed" || from == "rejected") => {
+            Some("reopened")
+        }
+        "confirmed" => Some("confirmed"),
+        "rejected" => Some("rejected"),
+        _ => None,
+    };
+    if let Some(ev) = status_event {
+        out.push((ev, from.to_string(), to.to_string()));
+    }
+    out
+}
+
+/// Apply to the database what arrived by commit in `docs/bug-reports.md`.
+///
+/// `prev` is the file as this install last imported / committed it, `head` the
+/// committed file now. Only the rows that DIFFER between the two are applied -
+/// not HEAD against the database - so a bug created in the UI and not committed
+/// yet is left alone. A new row is inserted (number, date, status, attempts and
+/// comment from the row), a changed row overwrites every field including the
+/// protected ones; events are written with `author_of(numeric id)`. A row that
+/// disappeared from the file is archived when the database holds it as
+/// `confirmed` (the other side acknowledged the verdict); any other bug never
+/// legitimately disappears, so it stays and the next regen puts it back. Rows
+/// with an unparseable id or a value the schema refuses are skipped.
+/// Returns the number of rows inserted or changed.
+pub fn import_bug_delta(
+    db: &AppDb,
+    repo_id: i64,
+    prev: &str,
+    head: &str,
+    author_of: &dyn Fn(i64) -> Option<String>,
+) -> Result<u32, String> {
+    let (prev_notes, _) = export::parse_bug_reports(prev);
+    let (head_notes, warnings) = export::parse_bug_reports(head);
+    for w in &warnings {
+        eprintln!("[import_bugs repo={}] parse warn: {}", repo_id, w);
+    }
+    let prev_by: std::collections::HashMap<i64, &FileBugNote> = prev_notes
+        .iter()
+        .filter_map(|n| parse_numeric_id(&n.id).map(|nid| (nid, n)))
+        .collect();
+    let db_bugs = db
+        .list_bugs_by_repo(repo_id, true)
+        .map_err(|e| e.to_string())?;
+    let mut db_by_nid: std::collections::HashMap<i64, Bug> =
+        db_bugs.into_iter().map(|b| (b.numeric_id, b)).collect();
+    let now = db::utc_now_rfc3339();
+    let mut head_ids = std::collections::HashSet::new();
+    let mut applied = 0u32;
+
+    // Reversed, so that with a repeated id the LAST row of the file wins.
+    for note in head_notes.iter().rev() {
+        let Some(nid) = parse_numeric_id(&note.id) else {
+            eprintln!(
+                "[import_bugs repo={}] unparseable id '{}' - skipped",
+                repo_id, note.id
+            );
+            continue;
+        };
+        if !head_ids.insert(nid) {
+            continue;
+        }
+        if prev_by.get(&nid).is_some_and(|p| same_note(p, note)) {
+            continue;
+        }
+        if !SEVERITIES.contains(&note.severity.as_str())
+            || !CATEGORIES.contains(&note.category.as_str())
+            || !STATUSES.contains(&note.status.as_str())
+        {
+            eprintln!(
+                "[import_bugs repo={}] {} has a value the schema refuses - skipped",
+                repo_id, note.id
+            );
+            continue;
+        }
+        let author = author_of(nid);
+        let author = author.as_deref();
+        let comment = note.comment.as_deref().filter(|s| !s.is_empty());
+        let created_at = if note.date.len() >= 10 && note.date.is_char_boundary(10) {
+            Some(format!("{}T00:00:00Z", &note.date[..10]))
+        } else {
+            None
+        };
+        let attempts = note.fix_attempts.max(0);
+
+        match db_by_nid.remove(&nid) {
+            None => {
+                let created = created_at.clone().unwrap_or_else(|| now.clone());
+                let confirmed_at = (note.status == "confirmed").then_some(now.as_str());
+                let bug = db
+                    .insert_bug(
+                        repo_id,
+                        nid,
+                        &created,
+                        &note.description,
+                        &note.severity,
+                        &note.category,
+                        &note.status,
+                        attempts,
+                        comment,
+                        confirmed_at,
+                    )
+                    .map_err(|e| e.to_string())?;
+                db.insert_bug_event_by(bug.id, "created", None, Some("created"), &created, author)
+                    .map_err(|e| e.to_string())?;
+                for (ev, from, to) in events_for_change("created", &note.status, attempts) {
+                    db.insert_bug_event_by(bug.id, ev, Some(&from), Some(&to), &now, author)
+                        .map_err(|e| e.to_string())?;
+                }
+                applied += 1;
+            }
+            Some(old) => {
+                let new_created = created_at
+                    .as_deref()
+                    .filter(|c| old.created_at.get(..10) != c.get(..10));
+                let unchanged = new_created.is_none()
+                    && old.description == note.description
+                    && old.severity == note.severity
+                    && old.category == note.category
+                    && old.status == note.status
+                    && old.fix_attempts == attempts
+                    && old.comment.as_deref().filter(|s| !s.is_empty()) == comment;
+                if unchanged {
+                    continue;
+                }
+                let confirmed_at = (note.status == "confirmed" && old.status != "confirmed")
+                    .then_some(now.as_str());
+                db.overwrite_bug_from_commit(
+                    old.id,
+                    new_created,
+                    &note.description,
+                    &note.severity,
+                    &note.category,
+                    &note.status,
+                    attempts,
+                    comment,
+                    confirmed_at,
+                )
+                .map_err(|e| e.to_string())?;
+                for (ev, from, to) in
+                    events_for_change(&old.status, &note.status, attempts - old.fix_attempts)
+                {
+                    db.insert_bug_event_by(old.id, ev, Some(&from), Some(&to), &now, author)
+                        .map_err(|e| e.to_string())?;
+                }
+                applied += 1;
+            }
+        }
+    }
+
+    // Rows that left the file: only a confirmed verdict may go.
+    for nid in prev_by.keys() {
+        if head_ids.contains(nid) {
+            continue;
+        }
+        if let Some(b) = db_by_nid.get(nid) {
+            if b.status == "confirmed" && b.archived_from_md_at.is_none() {
+                db.mark_bug_archived_from_md(b.id)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(applied)
 }
 
 #[cfg(test)]
@@ -1028,5 +1250,162 @@ mod tests {
             "created→testing transition bumped fix_attempts"
         );
         assert_eq!(b1.comment.as_deref(), Some("done"));
+    }
+
+    // ----- T-000221: bugs that arrived by commit ---------------------------------
+
+    fn md_of(rows: &[(&str, &str, &str, i32)]) -> String {
+        let notes: Vec<FileBugNote> = rows
+            .iter()
+            .map(|(id, desc, status, attempts)| FileBugNote {
+                id: id.to_string(),
+                date: "2026-10-01".into(),
+                description: desc.to_string(),
+                severity: "major".into(),
+                category: "logic".into(),
+                status: status.to_string(),
+                fix_attempts: *attempts,
+                comment: None,
+            })
+            .collect();
+        export::generate_bug_reports(&notes)
+    }
+
+    fn count_events(db: &AppDb, repo_id: i64, display_id: &str, kind: &str) -> usize {
+        let b = db
+            .get_bug_by_display_id(repo_id, display_id)
+            .unwrap()
+            .unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM bug_events WHERE bug_id = ?1 AND event_type = ?2",
+            rusqlite::params![b.id, kind],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap() as usize
+    }
+
+    #[test]
+    fn events_for_change_maps_transitions_and_keeps_the_attempts_invariant() {
+        let ev = |f, t, a| -> Vec<&'static str> {
+            events_for_change(f, t, a)
+                .into_iter()
+                .map(|e| e.0)
+                .collect()
+        };
+        assert_eq!(ev("created", "in-progress", 0), vec!["taken"]);
+        assert_eq!(ev("in-progress", "testing", 1), vec!["entered_testing"]);
+        assert_eq!(ev("created", "testing", 1), vec!["entered_testing"]);
+        assert_eq!(ev("testing", "confirmed", 0), vec!["confirmed"]);
+        assert_eq!(ev("testing", "rejected", 0), vec!["rejected"]);
+        assert_eq!(ev("rejected", "in-progress", 0), vec!["reopened"]);
+        assert_eq!(ev("confirmed", "testing", 0), vec!["reopened"]);
+        // collapsed sequence: two attempts and the verdict in one commit
+        assert_eq!(
+            ev("in-progress", "confirmed", 2),
+            vec!["entered_testing", "entered_testing", "confirmed"]
+        );
+        // unusual: back to created, testing without an attempt from in-progress
+        assert!(ev("testing", "created", 0).is_empty());
+        assert!(ev("in-progress", "testing", 0).is_empty());
+        // same status, one more attempt
+        assert_eq!(ev("testing", "testing", 1), vec!["entered_testing"]);
+    }
+
+    #[test]
+    fn import_bug_delta_inserts_updates_and_archives_with_the_author() {
+        let (db, _tmp, rid) = setup_repo_with_dir();
+        let author = |_n: i64| Some("helper".to_string());
+        let prev = md_of(&[]);
+
+        // a new row: number, date, status, attempts and comment from the row
+        let head = md_of(&[("B-500000", "from helper", "testing", 2)]);
+        assert_eq!(
+            import_bug_delta(&db, rid, &prev, &head, &author).unwrap(),
+            1
+        );
+        let b = db.get_bug_by_display_id(rid, "B-500000").unwrap().unwrap();
+        assert_eq!((b.status.as_str(), b.fix_attempts), ("testing", 2));
+        assert_eq!(b.created_at, "2026-10-01T00:00:00Z");
+        assert_eq!(count_events(&db, rid, "B-500000", "created"), 1);
+        assert_eq!(count_events(&db, rid, "B-500000", "entered_testing"), 2);
+
+        // the same content again: nothing happens
+        assert_eq!(
+            import_bug_delta(&db, rid, &head, &head, &author).unwrap(),
+            0
+        );
+        assert_eq!(count_events(&db, rid, "B-500000", "entered_testing"), 2);
+
+        // a changed row: protected fields and a verdict
+        let head2 = md_of(&[("B-500000", "reworded by helper", "confirmed", 2)]);
+        assert_eq!(
+            import_bug_delta(&db, rid, &head, &head2, &author).unwrap(),
+            1
+        );
+        let b = db.get_bug_by_display_id(rid, "B-500000").unwrap().unwrap();
+        assert_eq!(b.description, "reworded by helper");
+        assert_eq!(b.status, "confirmed");
+        assert!(b.confirmed_at.is_some());
+        assert_eq!(count_events(&db, rid, "B-500000", "confirmed"), 1);
+
+        // the row leaves the file: a confirmed verdict is archived
+        assert_eq!(
+            import_bug_delta(&db, rid, &head2, &md_of(&[]), &author).unwrap(),
+            0
+        );
+        let b = db.get_bug_by_display_id(rid, "B-500000").unwrap().unwrap();
+        assert!(b.archived_from_md_at.is_some());
+    }
+
+    #[test]
+    fn import_bug_delta_keeps_a_live_bug_that_left_the_file_and_skips_bad_rows() {
+        let (db, _tmp, rid) = setup_repo_with_dir();
+        let nobody = |_n: i64| None;
+        db.insert_bug(
+            rid,
+            7,
+            "2026-10-01T00:00:00Z",
+            "mine",
+            "major",
+            "logic",
+            "testing",
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        let prev = md_of(&[("B-000007", "mine", "testing", 1)]);
+        import_bug_delta(&db, rid, &prev, &md_of(&[]), &nobody).unwrap();
+        let b = db.get_bug_by_display_id(rid, "B-000007").unwrap().unwrap();
+        assert_eq!(b.archived_from_md_at, None);
+        assert_eq!(b.status, "testing");
+
+        // a value the schema refuses, an unparseable id: skipped, no error
+        let bad = "## Open bugs\n- B-000008 | 2026-10-01 | x | huge | logic | created | 0 |\n- B-xyz | 2026-10-01 | y | major | logic | created | 0 |\n";
+        assert_eq!(import_bug_delta(&db, rid, "", bad, &nobody).unwrap(), 0);
+        assert!(db.get_bug_by_display_id(rid, "B-000008").unwrap().is_none());
+
+        // an uncommitted local bug (DB only) is not touched by an unrelated delta
+        db.insert_bug(
+            rid,
+            9,
+            "2026-10-02T00:00:00Z",
+            "ui only",
+            "minor",
+            "other",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let head = md_of(&[
+            ("B-000007", "mine", "testing", 1),
+            ("B-000010", "new", "created", 0),
+        ]);
+        import_bug_delta(&db, rid, &prev, &head, &nobody).unwrap();
+        assert!(db.get_bug_by_display_id(rid, "B-000009").unwrap().is_some());
+        assert!(db.get_bug_by_display_id(rid, "B-000010").unwrap().is_some());
     }
 }

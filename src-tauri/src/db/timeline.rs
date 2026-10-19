@@ -64,6 +64,21 @@ impl AppDb {
             }
         }
 
+        // F-000044 / T-000221: author of the event. `"me"` = events of this
+        // install (author IS NULL); anything else is a GitHub login. A value that
+        // is not a valid login matches nothing; valid logins are inlined (the
+        // charset is [A-Za-z0-9-], nothing to escape).
+        if let Some(ref a) = filter.author {
+            let a = a.trim();
+            if a.eq_ignore_ascii_case("me") {
+                where_extra.push_str(" AND author IS NULL");
+            } else if crate::sync::shared_structure::is_valid_login(a) {
+                where_extra.push_str(&format!(" AND author = '{}' COLLATE NOCASE", a));
+            } else if !a.is_empty() {
+                where_extra.push_str(" AND 0");
+            }
+        }
+
         // T-000103 Task 6: every UNION leg now projects a 14th `details` column
         // so sync_event rows can carry their `details` JSON to the frontend
         // (currently only `sync_type='migration'` populates this; other legs
@@ -86,7 +101,8 @@ impl AppDb {
                 NULL AS sync_type, NULL AS deploy_action, NULL AS deploy_env_name,
                 NULL AS change_count,
                 NULL AS details,
-                r.project_id AS project_id
+                r.project_id AS project_id,
+                be.author AS author
               FROM bug_events be
               JOIN bugs b ON b.id = be.bug_id
               LEFT JOIN repositories r ON r.id = b.repository_id
@@ -104,7 +120,7 @@ impl AppDb {
                 rr.old_canonical, rr.new_canonical,
                 NULL, NULL, NULL, NULL,
                 NULL,
-                r.project_id
+                r.project_id, NULL
               FROM repo_renames rr
               LEFT JOIN repositories r ON r.id = rr.repository_id
 
@@ -121,7 +137,7 @@ impl AppDb {
                 NULL, NULL,
                 NULL, NULL, NULL, NULL,
                 NULL,
-                r.project_id
+                r.project_id, te.author
               FROM task_events te
               JOIN tasks t ON t.id = te.task_id
               LEFT JOIN repositories r ON r.id = t.repository_id
@@ -139,7 +155,7 @@ impl AppDb {
                 NULL, NULL,
                 se.sync_type, NULL, NULL, se.change_count,
                 se.details,
-                r.project_id
+                r.project_id, NULL
               FROM sync_events se
               LEFT JOIN repositories r ON r.id = se.repository_id
 
@@ -156,7 +172,7 @@ impl AppDb {
                 NULL, NULL,
                 NULL, de.action, e.name, NULL,
                 NULL,
-                r.project_id
+                r.project_id, NULL
               FROM deploy_events de
               LEFT JOIN repositories r ON r.id = de.repository_id
               LEFT JOIN deploy_environments e ON e.id = de.deploy_env_id
@@ -189,6 +205,7 @@ impl AppDb {
                     row.get::<_, Option<i64>>(12)?,    // change_count
                     row.get::<_, Option<String>>(13)?, // details (T-000103 Task 6)
                     row.get::<_, Option<i64>>(14)?,    // project_id
+                    row.get::<_, Option<String>>(15)?, // author (F-000044)
                 ))
             },
         )?;
@@ -211,6 +228,7 @@ impl AppDb {
                 change_c,
                 details_v,
                 _project_id,
+                author,
             ) = row?;
 
             // kind / repo_ids / project_ids are now filtered in SQL (above) —
@@ -246,6 +264,7 @@ impl AppDb {
                 deploy_env_name: deploy_e,
                 change_count: change_c,
                 details: details_v,
+                author,
             });
         }
         Ok(out)
@@ -472,6 +491,7 @@ mod tests {
             project_ids: None,
             repo_ids: None,
             search: None,
+            author: None,
         };
         let events = db.read_timeline_filtered(&filter, 0, 50).unwrap();
         assert_eq!(
@@ -518,6 +538,7 @@ mod tests {
             project_ids: None,
             repo_ids: None,
             search: None,
+            author: None,
         };
         let page1 = db.read_timeline_filtered(&filter, 0, 10).unwrap();
         let page2 = db.read_timeline_filtered(&filter, 10, 10).unwrap();
@@ -592,5 +613,106 @@ mod tests {
         assert!(kinds.contains("task_event"));
         assert_eq!(activity.len(), 4);
         assert_eq!(activity[0].kind, "task_event");
+    }
+
+    #[test]
+    fn timeline_returns_the_author_and_filters_by_it() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/r1", "r1", None, None)
+            .unwrap();
+        let task = db
+            .insert_task(
+                repo.id,
+                "T-001",
+                "T",
+                "Task A",
+                None,
+                None,
+                Some("open"),
+                None,
+                "todo",
+                "2026-04-24",
+            )
+            .unwrap();
+        db.insert_task_event(
+            task.id,
+            "created",
+            "2026-04-25T00:00:00Z",
+            None,
+            Some("open"),
+        )
+        .unwrap();
+        db.insert_task_event_by(
+            task.id,
+            "taken",
+            "2026-04-26T00:00:00Z",
+            Some("open"),
+            Some("in-progress"),
+            Some("helper"),
+        )
+        .unwrap();
+        let bug = db
+            .insert_bug(
+                repo.id,
+                1,
+                "2026-04-20T00:00:00Z",
+                "d",
+                "minor",
+                "other",
+                "created",
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        db.insert_bug_event_by(
+            bug.id,
+            "created",
+            None,
+            Some("created"),
+            "2026-04-27T00:00:00Z",
+            Some("Helper"),
+        )
+        .unwrap();
+        db.insert_sync_event(Some(repo.id), "tasks", "2026-04-28T00:00:00Z", 1, None)
+            .unwrap();
+
+        let mk = |author: Option<&str>| crate::models::TimelineFilter {
+            start_date: "2026-04-01".into(),
+            end_date: "2026-04-30".into(),
+            event_kinds: None,
+            project_ids: None,
+            repo_ids: None,
+            search: None,
+            author: author.map(String::from),
+        };
+        let all = db.read_timeline_filtered(&mk(None), 0, 50).unwrap();
+        assert_eq!(all.len(), 4);
+        let taken = all.iter().find(|e| e.event_type == "taken").unwrap();
+        assert_eq!(taken.author.as_deref(), Some("helper"));
+        let created = all
+            .iter()
+            .find(|e| e.event_type == "created" && e.kind == "task_event")
+            .unwrap();
+        assert_eq!(created.author, None);
+
+        let helper = db
+            .read_timeline_filtered(&mk(Some("HELPER")), 0, 50)
+            .unwrap();
+        let types: Vec<&str> = helper.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            helper.len(),
+            2,
+            "task + bug event of the helper: {:?}",
+            types
+        );
+        let me = db.read_timeline_filtered(&mk(Some("me")), 0, 50).unwrap();
+        assert_eq!(me.len(), 2, "own task event + the sync event");
+        assert!(me.iter().all(|e| e.author.is_none()));
+        let bad = db
+            .read_timeline_filtered(&mk(Some("x' OR 1=1 --")), 0, 50)
+            .unwrap();
+        assert!(bad.is_empty(), "an invalid login matches nothing");
     }
 }

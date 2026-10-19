@@ -487,12 +487,79 @@ impl AppDb {
         to_status: Option<&str>,
         ts: &str,
     ) -> SqlResult<()> {
+        self.insert_bug_event_by(bug_id, event_type, from_status, to_status, ts, None)
+    }
+
+    /// Same as `insert_bug_event`, with the author of the event (F-000044: the
+    /// GitHub login of the participant whose commit caused it; `None` = this
+    /// install).
+    pub fn insert_bug_event_by(
+        &self,
+        bug_id: i64,
+        event_type: &str,
+        from_status: Option<&str>,
+        to_status: Option<&str>,
+        ts: &str,
+        author: Option<&str>,
+    ) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![bug_id, event_type, ts, from_status, to_status],
+            "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status, author)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![bug_id, event_type, ts, from_status, to_status, author],
         )?;
+        Ok(())
+    }
+
+    /// F-000044 / T-000221: overwrite every mutable column of a bug with what a
+    /// commit brought (the committed file is truth, protected fields included).
+    /// `created_at` is touched only when it is `Some`. A status other than
+    /// `confirmed` clears `confirmed_at` and `archived_from_md_at`; for
+    /// `confirmed`, `confirmed_at` is set when it is `Some`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn overwrite_bug_from_commit(
+        &self,
+        bug_id: i64,
+        created_at: Option<&str>,
+        description: &str,
+        severity: &str,
+        category: &str,
+        status: &str,
+        fix_attempts: i32,
+        comment: Option<&str>,
+        confirmed_at: Option<&str>,
+    ) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE bugs SET description = ?1, severity = ?2, category = ?3, status = ?4,
+                    fix_attempts = ?5, comment = ?6 WHERE id = ?7",
+            rusqlite::params![
+                description,
+                severity,
+                category,
+                status,
+                fix_attempts,
+                comment,
+                bug_id
+            ],
+        )?;
+        if let Some(c) = created_at {
+            conn.execute(
+                "UPDATE bugs SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![c, bug_id],
+            )?;
+        }
+        if status != "confirmed" {
+            conn.execute(
+                "UPDATE bugs SET confirmed_at = NULL, archived_from_md_at = NULL WHERE id = ?1",
+                rusqlite::params![bug_id],
+            )?;
+        } else if let Some(c) = confirmed_at {
+            conn.execute(
+                "UPDATE bugs SET confirmed_at = ?1 WHERE id = ?2",
+                rusqlite::params![c, bug_id],
+            )?;
+        }
         Ok(())
     }
 

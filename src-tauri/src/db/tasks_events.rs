@@ -17,6 +17,7 @@ impl AppDb {
             project_ids: None,
             repo_ids: None,
             search: None,
+            author: None,
         };
         self.read_timeline_filtered(&filter, 0, limit)
     }
@@ -132,6 +133,7 @@ impl AppDb {
         rows.collect()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // production code goes through insert_task_event_by
     pub fn insert_task_event(
         &self,
         task_id: i64,
@@ -140,11 +142,26 @@ impl AppDb {
         from_status: Option<&str>,
         to_status: Option<&str>,
     ) -> SqlResult<()> {
+        self.insert_task_event_by(task_id, event_type, ts, from_status, to_status, None)
+    }
+
+    /// Same as `insert_task_event`, with the author of the event (F-000044: the
+    /// GitHub login of the participant whose commit caused it; `None` = this
+    /// install).
+    pub fn insert_task_event_by(
+        &self,
+        task_id: i64,
+        event_type: &str,
+        ts: &str,
+        from_status: Option<&str>,
+        to_status: Option<&str>,
+        author: Option<&str>,
+    ) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO task_events (task_id, event_type, ts, from_status, to_status)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![task_id, event_type, ts, from_status, to_status],
+            "INSERT INTO task_events (task_id, event_type, ts, from_status, to_status, author)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![task_id, event_type, ts, from_status, to_status, author],
         )?;
         Ok(())
     }

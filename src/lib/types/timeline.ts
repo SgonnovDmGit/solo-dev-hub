@@ -6,4 +6,6 @@ export interface TimelineFilter {
   project_ids?: number[];
   repo_ids?: number[];
   search?: string;
+  /** F-000044: `"me"` = events of this install, otherwise a GitHub login. */
+  author?: string;
 }

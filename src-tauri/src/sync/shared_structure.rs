@@ -566,6 +566,19 @@ pub fn band_for(structure: &ProjectStructure, login: &str) -> Option<(u32, u32)>
         .map(|p| (p.band_start, p.band_start.saturating_add(BAND_SIZE - 1)))
 }
 
+/// The login that owns the number `n` (any prefix): the participant whose band
+/// holds it, otherwise main (everything below the first participant band).
+pub fn band_owner(structure: &ProjectStructure, n: i64) -> String {
+    for p in &structure.participants {
+        if let Some((lo, hi)) = band_for(structure, &p.login) {
+            if n >= lo as i64 && n <= hi as i64 {
+                return p.login.clone();
+            }
+        }
+    }
+    structure.main.login.clone()
+}
+
 // ---------------------------------------------------------------------------
 // Bug number bands (Р12)
 // ---------------------------------------------------------------------------
@@ -871,8 +884,12 @@ pub enum DiscoverOutcome {
 
 /// What this install remembers about the shared files of a repo, stored as JSON
 /// in `repositories.shared_import`. `pinned_dev_branch` is the trust-on-first-use
-/// pin of the owner's dev branch; `blobs` is reserved for the last-imported blob
-/// shas (T-000221) and stays empty for now. Parsing is tolerant.
+/// pin of the owner's dev branch. `blobs` maps a repo-relative path of a shared
+/// task file (`docs/todo.md`, `docs/done.md`, `docs/bug-reports.md`) to
+/// `"<blob sha>@<commit sha>"`: the version of that file this install last
+/// imported or committed itself, and the HEAD commit it was taken at (T-000221;
+/// the commit bounds the `git log` that finds the authors of what arrived since).
+/// Parsing is tolerant.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedImport {
     #[serde(default)]

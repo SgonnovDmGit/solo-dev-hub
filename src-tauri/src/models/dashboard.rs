@@ -92,4 +92,7 @@ pub struct ActivityEvent {
     /// Other sync_type values may add structured payload here later.
     /// `None` for non-sync events and for older sync_events with NULL details.
     pub details: Option<String>,
+    /// F-000044: GitHub login of the participant whose commit caused a
+    /// bug / task event; `None` = this install (and every non-bug/task event).
+    pub author: Option<String>,
 }

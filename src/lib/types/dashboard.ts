@@ -80,4 +80,6 @@ export interface ActivityEvent {
    * `null` for non-sync events, and for older sync_events with NULL details.
    */
   details: string | null;
+  /** F-000044: GitHub login of the participant whose commit caused a bug / task event; `null` = this install. */
+  author: string | null;
 }

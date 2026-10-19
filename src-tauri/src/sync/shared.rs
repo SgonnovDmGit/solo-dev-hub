@@ -668,21 +668,355 @@ fn plumb_into_branch(
 }
 
 // ---------------------------------------------------------------------------
-// T-000221 hook
+// T-000221: import what arrived by commit (spec R11, R14)
 // ---------------------------------------------------------------------------
+
+const TODO_REL: &str = "docs/todo.md";
+const DONE_REL: &str = "docs/done.md";
+const BUGS_REL: &str = "docs/bug-reports.md";
+/// The task files whose committed content is imported as truth.
+const IMPORT_FILES: [&str; 3] = [TODO_REL, DONE_REL, BUGS_REL];
+
+/// `"<blob>@<commit>"` as stored in `SharedImport::blobs`.
+fn stored_pair(imp: &ss::SharedImport, path: &str) -> Option<(String, Option<String>)> {
+    let v = imp.blobs.get(path)?;
+    Some(match v.split_once('@') {
+        Some((b, c)) => (b.to_string(), Some(c.to_string()).filter(|c| !c.is_empty())),
+        None => (v.clone(), None),
+    })
+}
+
+fn store_pair(imp: &mut ss::SharedImport, path: &str, blob: &str, commit: &str) {
+    imp.blobs
+        .insert(path.to_string(), format!("{}@{}", blob, commit));
+}
+
+fn blob_text(git: &GitBinary, root: &Path, sha: &str) -> Result<String, String> {
+    Ok(String::from_utf8_lossy(&cat_blob(git, root, sha)?).into_owned())
+}
+
+/// Whose events a committed change causes (spec R14).
+enum AuthorRule {
+    /// One answer for everything (`None` = this install).
+    Fixed(Option<String>),
+    /// Per entity: the owner of the band its id lies in.
+    ByBand,
+}
+
+struct Authors {
+    me: String,
+    structure: Option<ProjectStructure>,
+}
+
+impl Authors {
+    /// The `SDH-Participant:` logins of the commits in `from..HEAD` that touched
+    /// `path`. `None` when the range cannot be used (no recorded commit, or it
+    /// is no longer an ancestor of HEAD).
+    fn trailer_logins(
+        git: &GitBinary,
+        root: &Path,
+        from: Option<&str>,
+        path: &str,
+    ) -> Option<Vec<String>> {
+        let from = from?;
+        if !git_sync::is_ancestor(git, root, from, "HEAD").unwrap_or(false) {
+            return None;
+        }
+        let out = spawn_cmd(&git.0)
+            .args([
+                "log",
+                "--format=%(trailers:key=SDH-Participant,valueonly)",
+                &format!("{}..HEAD", from),
+                "--",
+                path,
+            ])
+            .current_dir(root)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| ss::is_valid_login(l))
+                .map(String::from)
+                .collect(),
+        )
+    }
+
+    /// Exactly one distinct login that is not this install's -> that login; no
+    /// login or only this install's -> `None`; several (or an unusable range)
+    /// -> decided per entity by band.
+    fn rule(&self, logins: Option<Vec<String>>) -> AuthorRule {
+        let Some(logins) = logins else {
+            return AuthorRule::ByBand;
+        };
+        let mut distinct: Vec<String> = Vec::new();
+        for l in logins {
+            if !distinct.iter().any(|d| ss::logins_equal(d, &l)) {
+                distinct.push(l);
+            }
+        }
+        match distinct.len() {
+            0 => AuthorRule::Fixed(None),
+            1 if ss::logins_equal(&distinct[0], &self.me) => AuthorRule::Fixed(None),
+            1 => AuthorRule::Fixed(distinct.pop()),
+            _ => AuthorRule::ByBand,
+        }
+    }
+
+    fn resolve(&self, rule: &AuthorRule, number: Option<i64>) -> Option<String> {
+        match rule {
+            AuthorRule::Fixed(a) => a.clone(),
+            AuthorRule::ByBand => {
+                let (s, n) = (self.structure.as_ref()?, number?);
+                let owner = ss::band_owner(s, n);
+                (!ss::logins_equal(&owner, &self.me)).then_some(owner)
+            }
+        }
+    }
+}
+
+/// `T-500001` / `B-000042` -> the number.
+fn id_number(id: &str) -> Option<i64> {
+    id.split_once('-')?.1.parse().ok()
+}
 
 /// Import what arrived by commit into the local database (spec R11 step 1).
 ///
 /// Called by phase A once the recipient branches have been fast-forwarded, for
-/// every shared repo. T-000221 fills it in; until then it does nothing, so the
-/// shared files that arrive are read by the existing MD <-> DB sync only.
+/// every shared repo. For each of `todo.md`, `done.md` and `bug-reports.md`
+/// whose blob in HEAD differs from the one this install last imported or
+/// committed (`SharedImport::blobs`), the difference "stored -> HEAD" is applied
+/// to the database as truth, protected fields and new rows included, with the
+/// author of Р14. The bugs file is then reconciled against the work tree like
+/// always, so an UNCOMMITTED local edit of a protected field is restored while a
+/// committed one sticks.
+///
+/// The first sync (nothing stored yet) is the baseline: tasks apply nothing and
+/// leave it to the ordinary disk run; bugs run the one-time migration when it
+/// has not happened, otherwise only the rows that differ from what the database
+/// renders are applied. A file that fails to import keeps its old stored blob,
+/// so the next sync retries it.
 pub fn import_incoming(
-    _db: &AppDb,
-    _git: &GitBinary,
-    _repo_id: i64,
-    _root: &Path,
+    db: &AppDb,
+    git: &GitBinary,
+    repo_id: i64,
+    root: &Path,
 ) -> Result<(), String> {
+    let Some(head) = git_sync::rev_parse(git, root, "HEAD")? else {
+        return Ok(());
+    };
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let imp = ss::read_shared_import(db, repo_id);
+    let authors = Authors {
+        me: db.github_login().unwrap_or_default(),
+        structure: repo
+            .github_name
+            .as_deref()
+            .and_then(|gh| ss::read_structure_file(root, gh).ok().flatten()),
+    };
+    let mut head_blob: BTreeMap<&str, Option<String>> = BTreeMap::new();
+    for p in IMPORT_FILES {
+        head_blob.insert(p, git_sync::blob_sha_at(git, root, "HEAD", p)?);
+    }
+    let pending = |imp: &ss::SharedImport, p: &str| -> bool {
+        match (&head_blob[p], stored_pair(imp, p)) {
+            (Some(h), Some((s, _))) => *h != s,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    };
+    let mut errors: Vec<String> = Vec::new();
+    let mut done: Vec<&str> = Vec::new();
+
+    // Tasks.
+    if pending(&imp, TODO_REL) || pending(&imp, DONE_REL) {
+        match import_tasks(db, git, root, repo_id, &imp, &head_blob, &authors) {
+            Ok(()) => done.extend([TODO_REL, DONE_REL]),
+            Err(e) => errors.push(format!("tasks: {}", e)),
+        }
+    }
+    // Bugs.
+    if pending(&imp, BUGS_REL) {
+        match import_bugs(db, git, root, repo_id, &imp, &head_blob, &authors) {
+            Ok(()) => done.push(BUGS_REL),
+            Err(e) => errors.push(format!("bugs: {}", e)),
+        }
+    }
+    if !done.is_empty() {
+        let mut fresh = ss::read_shared_import(db, repo_id);
+        for p in done {
+            if let Some(Some(h)) = head_blob.get(p) {
+                store_pair(&mut fresh, p, h, &head);
+            }
+        }
+        ss::write_shared_import(db, repo_id, &fresh)?;
+    }
+
+    // The work-tree diff against what is in the database now: local AI edits.
+    if db
+        .get_bugs_migrated_at(repo_id)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        if let Err(e) = crate::sync::bugs::reconcile_bugs_for_repo(db, repo_id) {
+            errors.push(format!("reconcile: {}", e));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn import_tasks(
+    db: &AppDb,
+    git: &GitBinary,
+    root: &Path,
+    repo_id: i64,
+    imp: &ss::SharedImport,
+    head_blob: &BTreeMap<&str, Option<String>>,
+    authors: &Authors,
+) -> Result<(), String> {
+    let (st_todo, st_done) = (stored_pair(imp, TODO_REL), stored_pair(imp, DONE_REL));
+    if st_todo.is_none() && st_done.is_none() {
+        // Baseline: the ordinary disk run mirrors the files.
+        return Ok(());
+    }
+    if db
+        .get_tasks_migrated_at(repo_id)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        // The mirror was never built; the first disk run suppresses `created`.
+        return Ok(());
+    }
+    let prev_text = |st: &Option<(String, Option<String>)>| -> Result<String, String> {
+        match st {
+            Some((b, _)) => blob_text(git, root, b).or_else(|_| Ok(String::new())),
+            None => Ok(String::new()),
+        }
+    };
+    let head_text = |p: &str| -> Result<Option<String>, String> {
+        match &head_blob[p] {
+            Some(b) => Ok(Some(blob_text(git, root, b)?)),
+            None => Ok(None),
+        }
+    };
+    let (prev_todo, prev_done) = (prev_text(&st_todo)?, prev_text(&st_done)?);
+    let (head_todo, head_done) = (head_text(TODO_REL)?, head_text(DONE_REL)?);
+
+    let mut logins: Option<Vec<String>> = Some(Vec::new());
+    for (p, st) in [(TODO_REL, &st_todo), (DONE_REL, &st_done)] {
+        if head_blob[p].as_deref() == st.as_ref().map(|s| s.0.as_str()) {
+            continue;
+        }
+        let from = st.as_ref().and_then(|s| s.1.as_deref());
+        match (Authors::trailer_logins(git, root, from, p), logins.as_mut()) {
+            (Some(l), Some(all)) => all.extend(l),
+            _ => logins = None,
+        }
+    }
+    let rule = authors.rule(logins);
+    let author_of = |id: &str| authors.resolve(&rule, id_number(id));
+    crate::sync::tasks::sync_tasks_incoming(
+        db,
+        repo_id,
+        (&prev_todo, &prev_done),
+        (head_todo.as_deref(), head_done.as_deref()),
+        &author_of,
+    )?;
     Ok(())
+}
+
+fn import_bugs(
+    db: &AppDb,
+    git: &GitBinary,
+    root: &Path,
+    repo_id: i64,
+    imp: &ss::SharedImport,
+    head_blob: &BTreeMap<&str, Option<String>>,
+    authors: &Authors,
+) -> Result<(), String> {
+    use crate::sync::bugs as bugs_sync;
+    if db
+        .get_bugs_migrated_at(repo_id)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        // Never migrated: the one-time import reads the work tree, which equals
+        // HEAD after a clean fast-forward.
+        bugs_sync::migrate_bugs_for_repo(db, repo_id)?;
+        return Ok(());
+    }
+    let Some(head_sha) = &head_blob[BUGS_REL] else {
+        return Ok(());
+    };
+    let head_text = blob_text(git, root, head_sha)?;
+    let stored = stored_pair(imp, BUGS_REL);
+    let prev_text = match &stored {
+        Some((b, _)) => blob_text(git, root, b).ok(),
+        None => None,
+    };
+    let prev_text = match prev_text {
+        Some(t) => t,
+        // Baseline: what the database renders now, so only real differences apply.
+        None => {
+            let notes: Vec<crate::models::FileBugNote> = db
+                .list_bugs_for_md(repo_id)
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(bugs_sync::bug_to_file_note)
+                .collect();
+            crate::export::generate_bug_reports(&notes)
+        }
+    };
+    let from = stored.as_ref().and_then(|s| s.1.as_deref());
+    let rule = authors.rule(Authors::trailer_logins(git, root, from, BUGS_REL));
+    let author_of = |n: i64| authors.resolve(&rule, Some(n));
+    bugs_sync::import_bug_delta(db, repo_id, &prev_text, &head_text, &author_of)?;
+    Ok(())
+}
+
+/// After this install's own commit on the current branch: the new HEAD's copies
+/// of the shared task files are what it committed itself and need no import.
+/// A file whose stored blob is neither absent nor the blob it had before the
+/// commit (`pre_head`) has a pending import and keeps its old record.
+fn record_own_commit(
+    db: &AppDb,
+    git: &GitBinary,
+    root: &Path,
+    repo_id: i64,
+    pre_head: Option<&str>,
+) {
+    let Ok(Some(head)) = git_sync::rev_parse(git, root, "HEAD") else {
+        return;
+    };
+    let mut imp = ss::read_shared_import(db, repo_id);
+    let mut touched = false;
+    for p in IMPORT_FILES {
+        let Ok(Some(now)) = git_sync::blob_sha_at(git, root, "HEAD", p) else {
+            continue;
+        };
+        let before = pre_head
+            .and_then(|h| git_sync::blob_sha_at(git, root, h, p).ok())
+            .flatten();
+        let ok = match stored_pair(&imp, p) {
+            None => true,
+            Some((s, _)) => s == now || Some(&s) == before.as_ref(),
+        };
+        if ok {
+            store_pair(&mut imp, p, &now, &head);
+            touched = true;
+        }
+    }
+    if touched {
+        let _ = ss::write_shared_import(db, repo_id, &imp);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -864,13 +1198,22 @@ fn path_in_specs(file: &str, specs: &[String]) -> bool {
 /// exact sync subject and an `SDH-Participant:` trailer, and touch shared files
 /// only. `true` when there are none.
 fn local_only_commits_are_ours(git: &GitBinary, root: &Path, branch: &str) -> Result<bool, String> {
-    let local = local_ref(branch);
+    Ok(local_tip_if_ours(git, root, branch)?.is_some())
+}
+
+/// `local_only_commits_are_ours`, answering with the tip it judged: `Some(sha)`
+/// when every local-only commit up to that sha is ours. The judgement is of the
+/// sha, not of the ref, so a caller that moves the branch can use the sha as the
+/// compare-and-swap old value.
+fn local_tip_if_ours(git: &GitBinary, root: &Path, branch: &str) -> Result<Option<String>, String> {
+    let tip = git_sync::rev_parse(git, root, &local_ref(branch))?
+        .ok_or_else(|| format!("branch '{}' does not exist", branch))?;
     let remote = remote_ref(branch);
     let mut args: Vec<String> = vec!["rev-list".into(), "--reverse".into()];
     if git_sync::rev_parse(git, root, &remote)?.is_some() {
-        args.push(format!("{}..{}", remote, local));
+        args.push(format!("{}..{}", remote, tip));
     } else {
-        args.push(local);
+        args.push(tip.clone());
         args.push("--not".into());
         args.push(format!("--remotes={}", REMOTE));
     }
@@ -917,7 +1260,7 @@ fn local_only_commits_are_ours(git: &GitBinary, root: &Path, branch: &str) -> Re
             || subject != "chore(sdh-sync): sync shared files"
             || !has_trailer
         {
-            return Ok(false);
+            return Ok(None);
         }
         let files = git_bytes(
             git,
@@ -933,10 +1276,10 @@ fn local_only_commits_are_ours(git: &GitBinary, root: &Path, branch: &str) -> Re
             &[],
         )?;
         if split_nul(&files).iter().any(|f| !path_in_specs(f, &specs)) {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    Ok(true)
+    Ok(Some(tip))
 }
 
 fn diverged_detail(branch: &str, current: bool) -> String {
@@ -1226,6 +1569,11 @@ fn retry_disabling(
     if !net_slot(NetKind::Push, repo.id, root, min_net_interval()) {
         return None;
     }
+    // The comparison below and the push both need an up-to-date view of origin.
+    if let Err(e) = git_sync::fetch(git, root, REMOTE) {
+        pass.note(SharedStatus::FetchFailed, e.to_string());
+        return Some(pass);
+    }
     let local = git_sync::rev_parse(git, root, &local_ref(&dev))
         .ok()
         .flatten();
@@ -1311,21 +1659,27 @@ fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass) {
     }
 }
 
-/// Move the local branch back onto origin's when everything it holds over origin
-/// is ours, keeping the old tip in `refs/sdh-backup/<branch>`. The branch is not
-/// checked out in any worktree (`fast_forward_ref` already refused those).
-/// `Ok(false)` when the ref moved meanwhile.
-fn reset_to_origin(git: &GitBinary, root: &Path, branch: &str) -> Result<bool, String> {
-    let observed = git_sync::rev_parse(git, root, &local_ref(branch))?
-        .ok_or_else(|| format!("branch '{}' does not exist", branch))?;
+/// Move the local branch back onto origin's, keeping the old tip in
+/// `refs/sdh-backup/<branch>`. `observed` is the tip `local_tip_if_ours` judged
+/// to hold nothing but our own sync commits: it is the compare-and-swap old
+/// value of both ref updates, so a branch that moved since the judgement is
+/// left alone. The branch must not be checked out in any worktree (re-checked
+/// here). `Ok(false)` when the ref moved meanwhile.
+fn reset_to_origin(
+    git: &GitBinary,
+    root: &Path,
+    branch: &str,
+    observed: &str,
+) -> Result<bool, String> {
+    git_sync::refuse_checked_out(git, root, branch, "it cannot be reset")?;
     let target = git_sync::rev_parse(git, root, &remote_ref(branch))?
         .ok_or_else(|| format!("origin/{} does not exist", branch))?;
     let backup = format!("refs/sdh-backup/{}", branch);
     let old_backup = git_sync::rev_parse(git, root, &backup)?;
-    if !git_sync::update_ref_cas(git, root, &backup, &observed, old_backup.as_deref())? {
+    if !git_sync::update_ref_cas(git, root, &backup, observed, old_backup.as_deref())? {
         return Ok(false);
     }
-    git_sync::update_ref_cas(git, root, &local_ref(branch), &target, Some(&observed))
+    git_sync::update_ref_cas(git, root, &local_ref(branch), &target, Some(observed))
 }
 
 /// Fast-forward the recipients, guard the non-current ones, then the import hook.
@@ -1362,9 +1716,13 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
             match git_sync::fast_forward_ref(git, &pass.root, b, &remote) {
                 Ok(FfOutcome::Diverged) => {
                     check = false;
-                    let ours = pass.fetched
-                        && local_only_commits_are_ours(git, &pass.root, b).unwrap_or(false);
-                    let reset = ours && reset_to_origin(git, &pass.root, b).unwrap_or(false);
+                    let tip = if pass.fetched {
+                        local_tip_if_ours(git, &pass.root, b).unwrap_or(None)
+                    } else {
+                        None
+                    };
+                    let reset = tip
+                        .is_some_and(|t| reset_to_origin(git, &pass.root, b, &t).unwrap_or(false));
                     if !reset {
                         pass.blocked.insert(b.to_ascii_lowercase());
                         pass.note(SharedStatus::NeedsManualMerge, diverged_detail(b, false));
@@ -1561,6 +1919,7 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
             let mut paths: Vec<PathBuf> = active.iter().map(PathBuf::from).collect();
             paths.extend(exclude_specs(&active).into_iter().map(PathBuf::from));
             let (subject, body) = commit_message(&login);
+            let pre_head = git_sync::rev_parse(git, &root, "HEAD").ok().flatten();
             match commit_paths(
                 git,
                 &root,
@@ -1571,7 +1930,11 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
                 SDH_COMMIT_NAME,
                 SDH_COMMIT_EMAIL,
             ) {
-                Ok(CommitOutcome::Committed { .. }) => pass.committed = true,
+                Ok(CommitOutcome::Committed { .. }) => {
+                    pass.committed = true;
+                    // Our own content: it needs no import (spec R11 step 3).
+                    record_own_commit(db, git, &root, pass.repo.id, pre_head.as_deref());
+                }
                 Ok(_) => {}
                 Err(e) => {
                     let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
@@ -1867,6 +2230,12 @@ pub fn enable_shared_mode(
         .map_err(|e| e.to_string())?;
     ss::write_structure_if_changed(&root, &built)?;
     register_merge_driver(git, &root)?;
+    // A deletion of `.sdh/` that never reached the remote is obsolete now: the
+    // owner wants sharing on again, so it must not be pushed later.
+    let mut imp = ss::read_shared_import(db, repo_id);
+    if imp.disabling.take().is_some() {
+        ss::write_shared_import(db, repo_id, &imp)?;
+    }
     Ok(())
 }
 
@@ -3544,6 +3913,589 @@ mod tests {
         fx.sync_main();
         assert_eq!(fx.remote_file("dev", ".sdh/project.json"), None);
         assert_eq!(fx.main_status(), None);
+        assert_eq!(
+            ss::read_shared_import(&fx.main_db, fx.main_repo).disabling,
+            None
+        );
+    }
+
+    // ----- T-000221: import of what arrived by commit ------------------------------
+
+    use crate::models::{ActivityEvent, FileBugNote, TimelineFilter};
+
+    fn note(id: &str, desc: &str, status: &str, attempts: i32) -> FileBugNote {
+        FileBugNote {
+            id: id.to_string(),
+            date: "2026-10-01".to_string(),
+            description: desc.to_string(),
+            severity: "major".to_string(),
+            category: "logic".to_string(),
+            status: status.to_string(),
+            fix_attempts: attempts,
+            comment: None,
+        }
+    }
+
+    fn bugs_md(notes: &[FileBugNote]) -> String {
+        crate::export::generate_bug_reports(notes)
+    }
+
+    fn events(db: &AppDb, author: Option<&str>) -> Vec<ActivityEvent> {
+        db.read_timeline_filtered(
+            &TimelineFilter {
+                start_date: "1970-01-01".into(),
+                end_date: "2100-01-01".into(),
+                event_kinds: None,
+                project_ids: None,
+                repo_ids: None,
+                search: None,
+                author: author.map(String::from),
+            },
+            0,
+            1000,
+        )
+        .unwrap()
+    }
+
+    fn bug_events_of(db: &AppDb, display_id: &str) -> Vec<ActivityEvent> {
+        events(db, None)
+            .into_iter()
+            .filter(|e| e.kind == "bug_event" && e.bug_display_id.as_deref() == Some(display_id))
+            .collect()
+    }
+
+    fn task_events_of(db: &AppDb, task_id: &str) -> Vec<ActivityEvent> {
+        events(db, None)
+            .into_iter()
+            .filter(|e| e.kind == "task_event" && e.task_display_id.as_deref() == Some(task_id))
+            .collect()
+    }
+
+    /// An owner DB bug, with its `created` event, and the MD regenerated.
+    fn owner_bug(fx: &TwoInstalls, nid: i64, desc: &str, status: &str, attempts: i32) {
+        let bug = fx
+            .main_db
+            .insert_bug(
+                fx.main_repo,
+                nid,
+                "2026-10-01T00:00:00Z",
+                desc,
+                "major",
+                "logic",
+                status,
+                attempts,
+                None,
+                (status == "confirmed").then_some("2026-10-02T00:00:00Z"),
+            )
+            .unwrap();
+        fx.main_db
+            .insert_bug_event(bug.id, "created", None, Some("created"), &bug.created_at)
+            .unwrap();
+        for _ in 0..attempts {
+            fx.main_db
+                .insert_bug_event(
+                    bug.id,
+                    "entered_testing",
+                    Some("in-progress"),
+                    Some("testing"),
+                    "2026-10-01T10:00:00Z",
+                )
+                .unwrap();
+        }
+    }
+
+    fn entered_testing(db: &AppDb, display_id: &str) -> usize {
+        bug_events_of(db, display_id)
+            .iter()
+            .filter(|e| e.event_type == "entered_testing")
+            .count()
+    }
+
+    #[test]
+    fn a_bug_the_helper_committed_arrives_with_its_author_and_events() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        let mut b = note("B-500000", "found by helper", "testing", 2);
+        b.comment = Some("see logs".into());
+        write(&fx.helper_dir, "docs/bug-reports.md", &bugs_md(&[b]));
+        fx.sync_helper();
+
+        fx.sync_main();
+        let got = fx
+            .main_db
+            .get_bug_by_display_id(fx.main_repo, "B-500000")
+            .unwrap()
+            .expect("the helper's bug is in the owner's database");
+        assert_eq!(got.numeric_id, 500000);
+        assert_eq!(got.description, "found by helper");
+        assert_eq!(got.status, "testing");
+        assert_eq!(got.fix_attempts, 2);
+        assert_eq!(got.comment.as_deref(), Some("see logs"));
+        assert!(got.created_at.starts_with("2026-10-01"));
+
+        let evs = bug_events_of(&fx.main_db, "B-500000");
+        assert!(evs.iter().any(|e| e.event_type == "created"));
+        assert_eq!(
+            entered_testing(&fx.main_db, "B-500000"),
+            got.fix_attempts as usize,
+            "COUNT(entered_testing) == fix_attempts"
+        );
+        // No trailer range on the first import: the band owner is the author.
+        assert!(evs.iter().all(|e| e.author.as_deref() == Some("helper")));
+        // The work tree still holds the row (the reconcile did not drop it).
+        assert!(fs::read_to_string(fx.main_dir.join("docs/bug-reports.md"))
+            .unwrap()
+            .contains("B-500000"));
+    }
+
+    #[test]
+    fn a_committed_protected_change_is_accepted_and_attributed_by_trailer() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        owner_bug(&fx, 1, "original text", "created", 0);
+        crate::sync::bugs::regenerate_bugs_md(&fx.main_db, fx.main_repo).unwrap();
+        fx.sync_main(); // committed + pushed: its own content, nothing to import
+        let imp = ss::read_shared_import(&fx.main_db, fx.main_repo);
+        assert!(
+            imp.blobs.contains_key("docs/bug-reports.md"),
+            "the own commit is recorded: {:?}",
+            imp
+        );
+        fx.sync_helper(); // the helper receives the file
+
+        let text = fs::read_to_string(fx.helper_dir.join("docs/bug-reports.md")).unwrap();
+        assert!(text.contains("original text"));
+        // The helper's UI changes a protected field and the status; the sync
+        // commits the rendering.
+        let hb = fx
+            .helper_db
+            .get_bug_by_display_id(fx.helper_repo, "B-000001")
+            .unwrap()
+            .expect("migrated from the file that arrived");
+        fx.helper_db
+            .update_bug_fields(hb.id, Some("helper rewrote it"), None, None, None)
+            .unwrap();
+        fx.helper_db
+            .update_bug_status(hb.id, "in-progress", None, None)
+            .unwrap();
+        crate::sync::bugs::regenerate_bugs_md(&fx.helper_db, fx.helper_repo).unwrap();
+        fx.sync_helper();
+
+        fx.sync_main();
+        let got = fx
+            .main_db
+            .get_bug_by_display_id(fx.main_repo, "B-000001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.description, "helper rewrote it");
+        assert_eq!(got.status, "in-progress");
+        let evs = bug_events_of(&fx.main_db, "B-000001");
+        let taken = evs.iter().find(|e| e.event_type == "taken").unwrap();
+        // B-000001 lies in main's band, so only the trailer can name the helper.
+        assert_eq!(taken.author.as_deref(), Some("helper"));
+        let created = evs.iter().find(|e| e.event_type == "created").unwrap();
+        assert_eq!(created.author, None);
+        // The rendering sticks.
+        assert!(fs::read_to_string(fx.main_dir.join("docs/bug-reports.md"))
+            .unwrap()
+            .contains("helper rewrote it"));
+    }
+
+    #[test]
+    fn an_uncommitted_local_edit_of_a_protected_field_is_restored() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        owner_bug(&fx, 1, "original text", "created", 0);
+        crate::sync::bugs::regenerate_bugs_md(&fx.main_db, fx.main_repo).unwrap();
+        fx.sync_main();
+
+        let path = fx.main_dir.join("docs/bug-reports.md");
+        let edited = fs::read_to_string(&path)
+            .unwrap()
+            .replace("original text", "local AI changed it");
+        fs::write(&path, edited).unwrap();
+        fx.sync_main();
+
+        let got = fx
+            .main_db
+            .get_bug_by_display_id(fx.main_repo, "B-000001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.description, "original text");
+        assert!(fs::read_to_string(&path).unwrap().contains("original text"));
+        assert!(!fs::read_to_string(&path)
+            .unwrap()
+            .contains("local AI changed it"));
+    }
+
+    #[test]
+    fn a_row_only_the_work_tree_has_is_not_a_bug() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        owner_bug(&fx, 1, "real one", "created", 0);
+        crate::sync::bugs::regenerate_bugs_md(&fx.main_db, fx.main_repo).unwrap();
+        fx.sync_main();
+        let path = fx.main_dir.join("docs/bug-reports.md");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("- B-000009 | 2026-10-05 | invented by AI | major | logic | created | 0 |\n");
+        fs::write(&path, text).unwrap();
+        fx.sync_main();
+        assert!(fx
+            .main_db
+            .get_bug_by_display_id(fx.main_repo, "B-000009")
+            .unwrap()
+            .is_none());
+        assert!(!fs::read_to_string(&path).unwrap().contains("B-000009"));
+    }
+
+    #[test]
+    fn a_confirmed_bug_removed_by_commit_is_archived_a_live_one_is_kept() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        owner_bug(&fx, 1, "verdict given", "confirmed", 1);
+        owner_bug(&fx, 2, "still open", "testing", 1);
+        crate::sync::bugs::regenerate_bugs_md(&fx.main_db, fx.main_repo).unwrap();
+        fx.sync_main();
+
+        // Another install commits a version of the file without both rows onto
+        // origin's dev (a hand-made commit with the participant trailer: the
+        // merge by id cannot carry a deletion between two plumbed branches).
+        g(&fx.helper_dir, &["fetch", "-q", "origin"]);
+        let wt = fx._tmp.path().join("wt");
+        g(
+            &fx.helper_dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "tmpdev",
+                wt.to_str().unwrap(),
+                "origin/dev",
+            ],
+        );
+        write(&wt, "docs/bug-reports.md", &bugs_md(&[]));
+        g(&wt, &["add", "docs/bug-reports.md"]);
+        g(
+            &wt,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "chore(sdh-sync): sync shared files\n\nSDH-Participant: helper",
+            ],
+        );
+        g(&wt, &["push", "-q", "origin", "tmpdev:dev"]);
+
+        fx.sync_main();
+        let confirmed = fx
+            .main_db
+            .get_bug_by_display_id(fx.main_repo, "B-000001")
+            .unwrap()
+            .unwrap();
+        assert!(confirmed.archived_from_md_at.is_some(), "acknowledged");
+        let live = fx
+            .main_db
+            .get_bug_by_display_id(fx.main_repo, "B-000002")
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.status, "testing");
+        assert_eq!(live.archived_from_md_at, None);
+        let rendered = fs::read_to_string(fx.main_dir.join("docs/bug-reports.md")).unwrap();
+        assert!(rendered.contains("B-000002"), "re-rendered:\n{}", rendered);
+        assert!(!rendered.contains("B-000001"));
+    }
+
+    #[test]
+    fn task_events_carry_the_author_of_the_commit_and_local_edits_carry_none() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/todo.md", &todo(&["T-000001"]));
+        crate::sync::tasks::sync_tasks_for_repo(&fx.main_db, fx.main_repo).unwrap();
+        fx.sync_main(); // committed
+        fx.sync_helper();
+
+        let started = fs::read_to_string(fx.helper_dir.join("docs/todo.md"))
+            .unwrap()
+            .replace("| open |", "| in-progress |");
+        write(&fx.helper_dir, "docs/todo.md", &started);
+        fx.sync_helper();
+
+        fx.sync_main(); // arrives
+        let evs = task_events_of(&fx.main_db, "T-000001");
+        let taken = evs.iter().find(|e| e.event_type == "taken").unwrap();
+        assert_eq!(taken.author.as_deref(), Some("helper"));
+        let before = evs.len();
+
+        // The ordinary disk run after the import sees nothing new.
+        crate::sync::tasks::sync_tasks_for_repo(&fx.main_db, fx.main_repo).unwrap();
+        assert_eq!(task_events_of(&fx.main_db, "T-000001").len(), before);
+
+        // A local edit made afterwards is this install's own.
+        let reviewed = fs::read_to_string(fx.main_dir.join("docs/todo.md"))
+            .unwrap()
+            .replace("| in-progress |", "| review |");
+        write(&fx.main_dir, "docs/todo.md", &reviewed);
+        crate::sync::tasks::sync_tasks_for_repo(&fx.main_db, fx.main_repo).unwrap();
+        let evs = task_events_of(&fx.main_db, "T-000001");
+        let review = evs.iter().find(|e| e.event_type == "review").unwrap();
+        assert_eq!(review.author, None);
+        // And the author filter finds exactly the helper's events.
+        let mine = events(&fx.main_db, Some("helper"));
+        assert!(!mine.is_empty());
+        assert!(mine.iter().all(|e| e.author.as_deref() == Some("helper")));
+    }
+
+    #[test]
+    fn the_first_sync_is_a_baseline_and_applies_nothing_spurious() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The owner commits a bug and a task.
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        owner_bug(&fx, 1, "shared bug", "testing", 1);
+        crate::sync::bugs::regenerate_bugs_md(&fx.main_db, fx.main_repo).unwrap();
+        write(&fx.main_dir, "docs/todo.md", &todo(&["T-000001"]));
+        fx.sync_main();
+
+        // The helper already has the same bug and the same (older) task in its
+        // own database, and has never imported anything.
+        let hb = fx
+            .helper_db
+            .insert_bug(
+                fx.helper_repo,
+                1,
+                "2026-10-01T00:00:00Z",
+                "shared bug",
+                "major",
+                "logic",
+                "testing",
+                1,
+                None,
+                None,
+            )
+            .unwrap();
+        fx.helper_db
+            .insert_bug_event(hb.id, "created", None, Some("created"), &hb.created_at)
+            .unwrap();
+        fx.helper_db
+            .insert_bug_event(
+                hb.id,
+                "entered_testing",
+                Some("in-progress"),
+                Some("testing"),
+                "2026-10-01T10:00:00Z",
+            )
+            .unwrap();
+        fx.helper_db
+            .set_bugs_migrated_at(fx.helper_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        fx.helper_db
+            .insert_task(
+                fx.helper_repo,
+                "T-000001",
+                "T",
+                "task T-000001",
+                Some(1.0),
+                Some("low"),
+                Some("in-progress"),
+                Some("v1.0.0"),
+                "todo",
+                "2026-10-01",
+            )
+            .unwrap();
+        fx.helper_db
+            .mark_tasks_migrated(fx.helper_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        let bugs_before = bug_events_of(&fx.helper_db, "B-000001").len();
+        let tasks_before = task_events_of(&fx.helper_db, "T-000001").len();
+
+        fx.sync_helper();
+        assert_eq!(bug_events_of(&fx.helper_db, "B-000001").len(), bugs_before);
+        assert_eq!(
+            fx.helper_db
+                .get_bug_by_display_id(fx.helper_repo, "B-000001")
+                .unwrap()
+                .unwrap()
+                .fix_attempts,
+            1
+        );
+        // Tasks: the baseline leaves the mirror to the disk run.
+        assert_eq!(
+            task_events_of(&fx.helper_db, "T-000001").len(),
+            tasks_before
+        );
+        let imp = ss::read_shared_import(&fx.helper_db, fx.helper_repo);
+        assert!(imp.blobs.contains_key("docs/todo.md"), "{:?}", imp);
+        assert!(imp.blobs["docs/bug-reports.md"].contains('@'));
+    }
+
+    #[test]
+    fn a_file_that_does_not_change_is_not_imported_twice() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        write(
+            &fx.helper_dir,
+            "docs/bug-reports.md",
+            &bugs_md(&[note("B-500000", "once", "testing", 1)]),
+        );
+        fx.sync_helper();
+        fx.sync_main();
+        let n = bug_events_of(&fx.main_db, "B-500000").len();
+        assert!(n >= 2);
+        fx.sync_main();
+        fx.sync_helper();
+        fx.sync_main();
+        assert_eq!(bug_events_of(&fx.main_db, "B-500000").len(), n);
+    }
+
+    #[test]
+    fn authors_follow_the_trailer_or_the_band() {
+        let s = ProjectStructure {
+            format: 1,
+            project: ss::StructProject {
+                name: "Acme".into(),
+                project_type: "standard".into(),
+            },
+            main: ss::StructMain {
+                login: "Owner".into(),
+                dev_branch: "dev".into(),
+            },
+            repos: vec![],
+            microservices: vec![],
+            participants: vec![
+                ss::Participant {
+                    login: "helper".into(),
+                    branch: "h".into(),
+                    band_start: 500000,
+                },
+                ss::Participant {
+                    login: "other".into(),
+                    branch: "o".into(),
+                    band_start: 600000,
+                },
+            ],
+        };
+        let a = Authors {
+            me: "Owner".into(),
+            structure: Some(s),
+        };
+        // one foreign login
+        let r = a.rule(Some(vec!["helper".into(), "Helper".into()]));
+        assert_eq!(a.resolve(&r, Some(1)).as_deref(), Some("helper"));
+        // only this install / nobody
+        let r = a.rule(Some(vec!["owner".into()]));
+        assert_eq!(a.resolve(&r, Some(500001)), None);
+        let r = a.rule(Some(vec![]));
+        assert_eq!(a.resolve(&r, Some(500001)), None);
+        // several logins: per id band; main's own band is this install
+        let r = a.rule(Some(vec!["helper".into(), "other".into()]));
+        assert_eq!(a.resolve(&r, Some(500010)).as_deref(), Some("helper"));
+        assert_eq!(a.resolve(&r, Some(600010)).as_deref(), Some("other"));
+        assert_eq!(a.resolve(&r, Some(42)), None);
+        // unusable range: same as several
+        let r = a.rule(None);
+        assert_eq!(a.resolve(&r, Some(600010)).as_deref(), Some("other"));
+        assert_eq!(id_number("T-500001"), Some(500001));
+        assert_eq!(id_number("B-000042"), Some(42));
+        assert_eq!(id_number("nonsense"), None);
+    }
+
+    // ----- T-000220 review minors -----------------------------------------------
+
+    fn commit_on(dir: &Path, branch: &str, msg: &str) -> String {
+        let tree = g(dir, &["rev-parse", &format!("{}^{{tree}}", branch)]);
+        let new = g(dir, &["commit-tree", &tree, "-p", branch, "-m", msg]);
+        g(
+            dir,
+            &["update-ref", &format!("refs/heads/{}", branch), &new],
+        );
+        new
+    }
+
+    #[test]
+    fn reset_to_origin_uses_the_judged_tip_and_refuses_a_checked_out_branch() {
+        let fx = two_installs();
+        let dir = &fx.main_dir;
+        g(dir, &["branch", "side"]);
+        g(dir, &["push", "-q", "origin", "side"]);
+        let judged = g(dir, &["rev-parse", "side"]);
+        let origin_side = judged.clone();
+        // the branch moves after it was judged
+        let moved = commit_on(dir, "side", "moved after the judgement");
+        assert!(!reset_to_origin(&gb(), dir, "side", &judged).unwrap());
+        assert_eq!(g(dir, &["rev-parse", "side"]), moved, "left alone");
+        // the judged tip is the current one: reset, with a backup
+        assert!(reset_to_origin(&gb(), dir, "side", &moved).unwrap());
+        assert_eq!(g(dir, &["rev-parse", "side"]), origin_side);
+        assert_eq!(g(dir, &["rev-parse", "refs/sdh-backup/side"]), moved);
+        // a checked-out branch is refused outright
+        let tip = g(dir, &["rev-parse", "dev"]);
+        assert!(reset_to_origin(&gb(), dir, "dev", &tip).is_err());
+        assert_eq!(g(dir, &["rev-parse", "dev"]), tip);
+        // the judgement itself reports the sha it judged
+        assert_eq!(
+            local_tip_if_ours(&gb(), dir, "side").unwrap(),
+            Some(origin_side)
+        );
+    }
+
+    #[test]
+    fn a_pending_removal_is_fetched_before_it_is_pushed() {
+        let fx = two_installs();
+        fx.enable_main();
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+        disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert_eq!(fx.main_status().as_deref(), Some("push_failed"));
+        fs::remove_file(&hook).unwrap();
+        // The remote is unreachable now: the retry fails at the fetch.
+        g(
+            &fx.main_dir,
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        );
+        fx.sync_main();
+        assert_eq!(fx.main_status().as_deref(), Some("fetch_failed"));
+        assert_eq!(
+            ss::read_shared_import(&fx.main_db, fx.main_repo)
+                .disabling
+                .as_deref(),
+            Some("dev"),
+            "still pending"
+        );
+    }
+
+    #[test]
+    fn enabling_sharing_again_drops_a_leftover_removal_marker() {
+        let fx = two_installs();
+        fx.enable_main();
+        block_pushes_to(&fx, "refs/heads/dev");
+        disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert_eq!(
+            ss::read_shared_import(&fx.main_db, fx.main_repo)
+                .disabling
+                .as_deref(),
+            Some("dev")
+        );
+        enable_shared_mode(&fx.main_db, &gb(), fx.main_repo, false).unwrap();
         assert_eq!(
             ss::read_shared_import(&fx.main_db, fx.main_repo).disabling,
             None

@@ -752,7 +752,7 @@ fn checked_out_branches(git: &GitBinary, repo: &Path) -> Result<Vec<String>, Str
 
 /// Err when `branch` is checked out anywhere (case-insensitively): moving a
 /// checked-out branch behind the work tree's back would corrupt that checkout.
-fn refuse_checked_out(
+pub(crate) fn refuse_checked_out(
     git: &GitBinary,
     repo: &Path,
     branch: &str,
