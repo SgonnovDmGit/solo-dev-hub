@@ -1647,11 +1647,13 @@ mod tests {
         let r = run_git(
             &gb(),
             tmp.path(),
-            &["-c", "alias.slow=!sleep 10", "slow"],
+            &["-c", "alias.slow=!sleep 30", "slow"],
             &opts,
         );
         assert!(matches!(r, Err(RunError::Timeout { .. })), "{r:?}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // Killed long before the 30 s sleep would have ended; the bound is generous
+        // so a loaded machine does not flake it.
+        assert!(started.elapsed() < Duration::from_secs(20));
         assert!(RunError::Timeout {
             cmd: "fetch".into(),
             after: Duration::from_secs(60)

@@ -379,6 +379,15 @@ const CATEGORIES: [&str; 9] = [
 ];
 const STATUSES: [&str; 5] = ["created", "in-progress", "testing", "rejected", "confirmed"];
 
+/// What `import_bug_delta` did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BugImportReport {
+    /// Rows inserted or changed.
+    pub applied: u32,
+    /// Ids of rows skipped because of a value the schema refuses.
+    pub refused: Vec<String>,
+}
+
 fn same_note(a: &FileBugNote, b: &FileBugNote) -> bool {
     a.id == b.id
         && a.date == b.date
@@ -442,14 +451,14 @@ fn events_for_change(
 /// `confirmed` (the other side acknowledged the verdict); any other bug never
 /// legitimately disappears, so it stays and the next regen puts it back. Rows
 /// with an unparseable id or a value the schema refuses are skipped.
-/// Returns the number of rows inserted or changed.
+/// Returns how many rows were inserted or changed and which ids were refused.
 pub fn import_bug_delta(
     db: &AppDb,
     repo_id: i64,
     prev: &str,
     head: &str,
     author_of: &dyn Fn(i64) -> Option<String>,
-) -> Result<u32, String> {
+) -> Result<BugImportReport, String> {
     let (prev_notes, _) = export::parse_bug_reports(prev);
     let (head_notes, warnings) = export::parse_bug_reports(head);
     for w in &warnings {
@@ -467,6 +476,7 @@ pub fn import_bug_delta(
     let now = db::utc_now_rfc3339();
     let mut head_ids = std::collections::HashSet::new();
     let mut applied = 0u32;
+    let mut refused: Vec<String> = Vec::new();
 
     // Reversed, so that with a repeated id the LAST row of the file wins.
     for note in head_notes.iter().rev() {
@@ -491,6 +501,7 @@ pub fn import_bug_delta(
                 "[import_bugs repo={}] {} has a value the schema refuses - skipped",
                 repo_id, note.id
             );
+            refused.push(note.id.clone());
             continue;
         }
         let author = author_of(nid);
@@ -545,6 +556,11 @@ pub fn import_bug_delta(
                 }
                 let confirmed_at = (note.status == "confirmed" && old.status != "confirmed")
                     .then_some(now.as_str());
+                let evs = events_for_change(&old.status, &note.status, attempts - old.fix_attempts);
+                let evs: Vec<(&str, &str, &str)> = evs
+                    .iter()
+                    .map(|(e, f, t)| (*e, f.as_str(), t.as_str()))
+                    .collect();
                 db.overwrite_bug_from_commit(
                     old.id,
                     new_created,
@@ -555,14 +571,11 @@ pub fn import_bug_delta(
                     attempts,
                     comment,
                     confirmed_at,
+                    &evs,
+                    &now,
+                    author,
                 )
                 .map_err(|e| e.to_string())?;
-                for (ev, from, to) in
-                    events_for_change(&old.status, &note.status, attempts - old.fix_attempts)
-                {
-                    db.insert_bug_event_by(old.id, ev, Some(&from), Some(&to), &now, author)
-                        .map_err(|e| e.to_string())?;
-                }
                 applied += 1;
             }
         }
@@ -580,7 +593,7 @@ pub fn import_bug_delta(
             }
         }
     }
-    Ok(applied)
+    Ok(BugImportReport { applied, refused })
 }
 
 #[cfg(test)]
@@ -1321,7 +1334,9 @@ mod tests {
         // a new row: number, date, status, attempts and comment from the row
         let head = md_of(&[("B-500000", "from helper", "testing", 2)]);
         assert_eq!(
-            import_bug_delta(&db, rid, &prev, &head, &author).unwrap(),
+            import_bug_delta(&db, rid, &prev, &head, &author)
+                .unwrap()
+                .applied,
             1
         );
         let b = db.get_bug_by_display_id(rid, "B-500000").unwrap().unwrap();
@@ -1332,7 +1347,9 @@ mod tests {
 
         // the same content again: nothing happens
         assert_eq!(
-            import_bug_delta(&db, rid, &head, &head, &author).unwrap(),
+            import_bug_delta(&db, rid, &head, &head, &author)
+                .unwrap()
+                .applied,
             0
         );
         assert_eq!(count_events(&db, rid, "B-500000", "entered_testing"), 2);
@@ -1340,7 +1357,9 @@ mod tests {
         // a changed row: protected fields and a verdict
         let head2 = md_of(&[("B-500000", "reworded by helper", "confirmed", 2)]);
         assert_eq!(
-            import_bug_delta(&db, rid, &head, &head2, &author).unwrap(),
+            import_bug_delta(&db, rid, &head, &head2, &author)
+                .unwrap()
+                .applied,
             1
         );
         let b = db.get_bug_by_display_id(rid, "B-500000").unwrap().unwrap();
@@ -1351,7 +1370,9 @@ mod tests {
 
         // the row leaves the file: a confirmed verdict is archived
         assert_eq!(
-            import_bug_delta(&db, rid, &head2, &md_of(&[]), &author).unwrap(),
+            import_bug_delta(&db, rid, &head2, &md_of(&[]), &author)
+                .unwrap()
+                .applied,
             0
         );
         let b = db.get_bug_by_display_id(rid, "B-500000").unwrap().unwrap();
@@ -1383,7 +1404,9 @@ mod tests {
 
         // a value the schema refuses, an unparseable id: skipped, no error
         let bad = "## Open bugs\n- B-000008 | 2026-10-01 | x | huge | logic | created | 0 |\n- B-xyz | 2026-10-01 | y | major | logic | created | 0 |\n";
-        assert_eq!(import_bug_delta(&db, rid, "", bad, &nobody).unwrap(), 0);
+        let rep = import_bug_delta(&db, rid, "", bad, &nobody).unwrap();
+        assert_eq!(rep.applied, 0);
+        assert_eq!(rep.refused, vec!["B-000008".to_string()]);
         assert!(db.get_bug_by_display_id(rid, "B-000008").unwrap().is_none());
 
         // an uncommitted local bug (DB only) is not touched by an unrelated delta
@@ -1407,5 +1430,29 @@ mod tests {
         import_bug_delta(&db, rid, &prev, &head, &nobody).unwrap();
         assert!(db.get_bug_by_display_id(rid, "B-000009").unwrap().is_some());
         assert!(db.get_bug_by_display_id(rid, "B-000010").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_committed_drop_of_fix_attempts_removes_the_newest_testing_events() {
+        let (db, _tmp, rid) = setup_repo_with_dir();
+        let author = |_n: i64| Some("helper".to_string());
+        let head = md_of(&[("B-500000", "x", "testing", 3)]);
+        import_bug_delta(&db, rid, "", &head, &author).unwrap();
+        assert_eq!(count_events(&db, rid, "B-500000", "entered_testing"), 3);
+        // The other side's file says one attempt, back in progress.
+        let head2 = md_of(&[("B-500000", "x", "in-progress", 1)]);
+        let rep = import_bug_delta(&db, rid, &head, &head2, &author).unwrap();
+        assert_eq!(rep.applied, 1);
+        let b = db.get_bug_by_display_id(rid, "B-500000").unwrap().unwrap();
+        assert_eq!(b.fix_attempts, 1);
+        assert_eq!(
+            count_events(&db, rid, "B-500000", "entered_testing"),
+            1,
+            "COUNT(entered_testing) == fix_attempts"
+        );
+        // and up again by two: the invariant still holds
+        let head3 = md_of(&[("B-500000", "x", "testing", 3)]);
+        import_bug_delta(&db, rid, &head2, &head3, &author).unwrap();
+        assert_eq!(count_events(&db, rid, "B-500000", "entered_testing"), 3);
     }
 }

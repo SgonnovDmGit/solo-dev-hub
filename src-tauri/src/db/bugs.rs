@@ -512,10 +512,14 @@ impl AppDb {
     }
 
     /// F-000044 / T-000221: overwrite every mutable column of a bug with what a
-    /// commit brought (the committed file is truth, protected fields included).
-    /// `created_at` is touched only when it is `Some`. A status other than
-    /// `confirmed` clears `confirmed_at` and `archived_from_md_at`; for
-    /// `confirmed`, `confirmed_at` is set when it is `Some`.
+    /// commit brought (the committed file is truth, protected fields included),
+    /// and log `events` (`(event_type, from, to)`, stamped `ts`, by `author`) -
+    /// all in one transaction. `created_at` is touched only when it is `Some`.
+    /// A status other than `confirmed` clears `confirmed_at` and
+    /// `archived_from_md_at`; for `confirmed`, `confirmed_at` is set when it is
+    /// `Some`. When `fix_attempts` goes DOWN, the newest `old - new`
+    /// `entered_testing` events are deleted, so `COUNT(entered_testing) ==
+    /// fix_attempts` keeps holding.
     #[allow(clippy::too_many_arguments)]
     pub fn overwrite_bug_from_commit(
         &self,
@@ -528,9 +532,18 @@ impl AppDb {
         fix_attempts: i32,
         comment: Option<&str>,
         confirmed_at: Option<&str>,
+        events: &[(&str, &str, &str)],
+        ts: &str,
+        author: Option<&str>,
     ) -> SqlResult<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let old_attempts: i32 = tx.query_row(
+            "SELECT fix_attempts FROM bugs WHERE id = ?1",
+            rusqlite::params![bug_id],
+            |r| r.get(0),
+        )?;
+        tx.execute(
             "UPDATE bugs SET description = ?1, severity = ?2, category = ?3, status = ?4,
                     fix_attempts = ?5, comment = ?6 WHERE id = ?7",
             rusqlite::params![
@@ -544,23 +557,39 @@ impl AppDb {
             ],
         )?;
         if let Some(c) = created_at {
-            conn.execute(
+            tx.execute(
                 "UPDATE bugs SET created_at = ?1 WHERE id = ?2",
                 rusqlite::params![c, bug_id],
             )?;
         }
         if status != "confirmed" {
-            conn.execute(
+            tx.execute(
                 "UPDATE bugs SET confirmed_at = NULL, archived_from_md_at = NULL WHERE id = ?1",
                 rusqlite::params![bug_id],
             )?;
         } else if let Some(c) = confirmed_at {
-            conn.execute(
+            tx.execute(
                 "UPDATE bugs SET confirmed_at = ?1 WHERE id = ?2",
                 rusqlite::params![c, bug_id],
             )?;
         }
-        Ok(())
+        if fix_attempts < old_attempts {
+            tx.execute(
+                "DELETE FROM bug_events WHERE id IN (
+                     SELECT id FROM bug_events
+                     WHERE bug_id = ?1 AND event_type = 'entered_testing'
+                     ORDER BY ts DESC, id DESC LIMIT ?2)",
+                rusqlite::params![bug_id, old_attempts - fix_attempts],
+            )?;
+        }
+        for (event_type, from, to) in events {
+            tx.execute(
+                "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status, author)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![bug_id, event_type, ts, from, to, author],
+            )?;
+        }
+        tx.commit()
     }
 
     /// Back-fill bug_events for bugs inserted BEFORE migration v19.

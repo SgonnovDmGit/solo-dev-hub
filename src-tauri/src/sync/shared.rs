@@ -805,22 +805,22 @@ impl Authors {
         )
     }
 
-    /// Exactly one distinct login that is not this install's -> that login; no
-    /// login or only this install's -> `None`; several (or an unusable range)
-    /// -> decided per entity by band.
+    /// This install's own login does not count. Exactly one other distinct
+    /// login -> that login; none -> `None`; several (or an unusable range) ->
+    /// decided per entity by band.
     fn rule(&self, logins: Option<Vec<String>>) -> AuthorRule {
         let Some(logins) = logins else {
             return AuthorRule::ByBand;
         };
         let mut distinct: Vec<String> = Vec::new();
         for l in logins {
-            if !distinct.iter().any(|d| ss::logins_equal(d, &l)) {
+            if !ss::logins_equal(&l, &self.me) && !distinct.iter().any(|d| ss::logins_equal(d, &l))
+            {
                 distinct.push(l);
             }
         }
         match distinct.len() {
             0 => AuthorRule::Fixed(None),
-            1 if ss::logins_equal(&distinct[0], &self.me) => AuthorRule::Fixed(None),
             1 => AuthorRule::Fixed(distinct.pop()),
             _ => AuthorRule::ByBand,
         }
@@ -890,6 +890,7 @@ pub fn import_incoming(
     };
     let mut errors: Vec<String> = Vec::new();
     let mut done: Vec<&str> = Vec::new();
+    let mut skip_reconcile = false;
 
     // Tasks.
     if pending(&imp, TODO_REL) || pending(&imp, DONE_REL) {
@@ -901,8 +902,23 @@ pub fn import_incoming(
     // Bugs.
     if pending(&imp, BUGS_REL) {
         match import_bugs(db, git, root, repo_id, &imp, &head_blob, &authors) {
-            Ok(()) => done.push(BUGS_REL),
-            Err(e) => errors.push(format!("bugs: {}", e)),
+            Ok(refused) => {
+                done.push(BUGS_REL);
+                if !refused.is_empty() {
+                    skip_reconcile = true;
+                    errors.push(format!(
+                        "bugs: {} row(s) with a value the schema refuses were not imported: {}",
+                        refused.len(),
+                        refused.join(", ")
+                    ));
+                }
+            }
+            Err(e) => {
+                // Reconciling now would revert the incoming change in the
+                // work tree and commit that.
+                skip_reconcile = true;
+                errors.push(format!("bugs: {}", e));
+            }
         }
     }
     if !done.is_empty() {
@@ -916,10 +932,11 @@ pub fn import_incoming(
     }
 
     // The work-tree diff against what is in the database now: local AI edits.
-    if db
-        .get_bugs_migrated_at(repo_id)
-        .map_err(|e| e.to_string())?
-        .is_some()
+    if !skip_reconcile
+        && db
+            .get_bugs_migrated_at(repo_id)
+            .map_err(|e| e.to_string())?
+            .is_some()
     {
         if let Err(e) = crate::sync::bugs::reconcile_bugs_for_repo(db, repo_id) {
             errors.push(format!("reconcile: {}", e));
@@ -992,6 +1009,13 @@ fn import_tasks(
     Ok(())
 }
 
+/// Import the bugs file; returns the ids of rows that were refused.
+///
+/// The first sync (nothing stored) of an already migrated repo applies the
+/// database-render baseline only when the work-tree file equals HEAD's copy (a
+/// clean tree: the database is merely stale). A file that differs holds local
+/// work that is not committed yet, so HEAD is recorded as the baseline without
+/// applying anything.
 fn import_bugs(
     db: &AppDb,
     git: &GitBinary,
@@ -1000,7 +1024,7 @@ fn import_bugs(
     imp: &ss::SharedImport,
     head_blob: &BTreeMap<&str, Option<String>>,
     authors: &Authors,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     use crate::sync::bugs as bugs_sync;
     if db
         .get_bugs_migrated_at(repo_id)
@@ -1010,12 +1034,11 @@ fn import_bugs(
         // Never migrated: the one-time import reads the work tree, which equals
         // HEAD after a clean fast-forward.
         bugs_sync::migrate_bugs_for_repo(db, repo_id)?;
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(head_sha) = &head_blob[BUGS_REL] else {
-        return Ok(());
+        return Ok(Vec::new());
     };
-    let head_text = blob_text(git, root, head_sha)?;
     let stored = stored_pair(imp, BUGS_REL);
     let prev_text = match &stored {
         Some((b, _)) => blob_text(git, root, b).ok(),
@@ -1023,8 +1046,16 @@ fn import_bugs(
     };
     let prev_text = match prev_text {
         Some(t) => t,
-        // Baseline: what the database renders now, so only real differences apply.
         None => {
+            let on_disk = if root.join(BUGS_REL).is_file() {
+                hash_files(git, root, &[BUGS_REL.to_string()])?.remove(BUGS_REL)
+            } else {
+                None
+            };
+            if on_disk.as_ref() != Some(head_sha) {
+                return Ok(Vec::new());
+            }
+            // Baseline: what the database renders now, so only real differences apply.
             let notes: Vec<crate::models::FileBugNote> = db
                 .list_bugs_for_md(repo_id)
                 .map_err(|e| e.to_string())?
@@ -1034,11 +1065,11 @@ fn import_bugs(
             crate::export::generate_bug_reports(&notes)
         }
     };
+    let head_text = blob_text(git, root, head_sha)?;
     let from = stored.as_ref().and_then(|s| s.1.as_deref());
     let rule = authors.rule(Authors::trailer_logins(git, root, from, BUGS_REL));
     let author_of = |n: i64| authors.resolve(&rule, Some(n));
-    bugs_sync::import_bug_delta(db, repo_id, &prev_text, &head_text, &author_of)?;
-    Ok(())
+    Ok(bugs_sync::import_bug_delta(db, repo_id, &prev_text, &head_text, &author_of)?.refused)
 }
 
 /// After this install's own commit on the current branch: the new HEAD's copies
@@ -1816,7 +1847,10 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
         }
     }
     if let Err(e) = import_incoming(db, git, pass.repo.id, &pass.root) {
-        let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+        // Recurring: `fresh_issues` reports it once until the text changes.
+        let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+            .target("docs/bug-reports.md")
+            .detail(format!("import of the shared task files: {}", e));
         pass.issue(issue)
     }
 }
@@ -4008,7 +4042,8 @@ mod tests {
                 project_ids: None,
                 repo_ids: None,
                 search: None,
-                author: author.map(String::from),
+                author: author.filter(|a| *a != "me").map(String::from),
+                author_is_me: author == Some("me"),
             },
             0,
             1000,
@@ -4459,6 +4494,9 @@ mod tests {
         // one foreign login
         let r = a.rule(Some(vec!["helper".into(), "Helper".into()]));
         assert_eq!(a.resolve(&r, Some(1)).as_deref(), Some("helper"));
+        // this install's own login does not count towards "several"
+        let r = a.rule(Some(vec!["Owner".into(), "helper".into(), "owner".into()]));
+        assert_eq!(a.resolve(&r, Some(42)).as_deref(), Some("helper"));
         // only this install / nobody
         let r = a.rule(Some(vec!["owner".into()]));
         assert_eq!(a.resolve(&r, Some(500001)), None);
@@ -4730,5 +4768,146 @@ mod tests {
         }
         let mine = fs::read_to_string(fx.main_dir.join("docs/todo.md")).unwrap();
         assert!(!mine.contains("T-000001") && mine.contains("T-500001"));
+    }
+
+    #[test]
+    fn a_first_sync_with_a_dirty_bugs_file_keeps_the_local_work() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        owner_bug(&fx, 1, "original", "created", 0);
+        crate::sync::bugs::regenerate_bugs_md(&fx.main_db, fx.main_repo).unwrap();
+        fx.sync_main();
+        // The helper gets HEAD by hand, so its first shared sync meets a
+        // migrated repo whose HEAD has the file.
+        g(&fx.helper_dir, &["fetch", "-q", "origin"]);
+        g(
+            &fx.helper_dir,
+            &["merge", "-q", "--ff-only", "origin/helper-dev"],
+        );
+        fx.helper_db
+            .set_bugs_migrated_at(fx.helper_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        // Uncommitted UI work: an edit of the owner's bug and a new bug.
+        let hb = fx
+            .helper_db
+            .insert_bug(
+                fx.helper_repo,
+                1,
+                "2026-10-01T00:00:00Z",
+                "ui edited",
+                "major",
+                "logic",
+                "created",
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        fx.helper_db
+            .insert_bug_event(hb.id, "created", None, Some("created"), &hb.created_at)
+            .unwrap();
+        let new = fx
+            .helper_db
+            .insert_bug(
+                fx.helper_repo,
+                500000,
+                "2026-10-02T00:00:00Z",
+                "ui created",
+                "minor",
+                "other",
+                "created",
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        fx.helper_db
+            .insert_bug_event(new.id, "created", None, Some("created"), &new.created_at)
+            .unwrap();
+        crate::sync::bugs::regenerate_bugs_md(&fx.helper_db, fx.helper_repo).unwrap();
+
+        fx.sync_helper();
+        let got = |id: &str| {
+            fx.helper_db
+                .get_bug_by_display_id(fx.helper_repo, id)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(got("B-000001").description, "ui edited");
+        assert_eq!(got("B-500000").description, "ui created");
+        let imp = ss::read_shared_import(&fx.helper_db, fx.helper_repo);
+        assert!(
+            imp.blobs.contains_key("docs/bug-reports.md"),
+            "HEAD is recorded as the baseline"
+        );
+    }
+
+    #[test]
+    fn refused_rows_are_reported_and_hold_the_reconcile_back_for_one_pass() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        owner_bug(&fx, 1, "fine", "created", 0);
+        crate::sync::bugs::regenerate_bugs_md(&fx.main_db, fx.main_repo).unwrap();
+        fx.sync_main();
+
+        g(&fx.helper_dir, &["fetch", "-q", "origin"]);
+        let wt = fx._tmp.path().join("wt2");
+        g(
+            &fx.helper_dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "tmpdev2",
+                wt.to_str().unwrap(),
+                "origin/dev",
+            ],
+        );
+        let text = fs::read_to_string(wt.join("docs/bug-reports.md")).unwrap()
+            + "- B-500001 | 2026-10-03 | good | major | logic | created | 0 |\n"
+            + "- B-500002 | 2026-10-03 | bad | huge | logic | created | 0 |\n";
+        write(&wt, "docs/bug-reports.md", &text);
+        g(&wt, &["add", "docs/bug-reports.md"]);
+        g(
+            &wt,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "chore(sdh-sync): sync shared files\n\nSDH-Participant: helper",
+            ],
+        );
+        g(&wt, &["push", "-q", "origin", "tmpdev2:dev"]);
+
+        let out = fx.sync_main();
+        assert!(
+            codes(&out).contains(&Code::ManagedFileFailed),
+            "reported: {:?}",
+            out.issues
+        );
+        let detail = out
+            .issues
+            .iter()
+            .find_map(|i| i.detail.clone())
+            .unwrap_or_default();
+        assert!(detail.contains("B-500002"), "{}", detail);
+        let main = |id: &str| fx.main_db.get_bug_by_display_id(fx.main_repo, id).unwrap();
+        assert!(main("B-500001").is_some(), "the good row is imported");
+        assert!(main("B-500002").is_none());
+        // The reconcile was held back: the incoming file is not rewritten yet.
+        let file = fs::read_to_string(fx.main_dir.join("docs/bug-reports.md")).unwrap();
+        assert!(file.contains("B-500002"));
+        // The same problem is not reported again, and the next pass reconciles.
+        let again = fx.sync_main();
+        assert!(!codes(&again).contains(&Code::ManagedFileFailed));
+        let file = fs::read_to_string(fx.main_dir.join("docs/bug-reports.md")).unwrap();
+        assert!(!file.contains("B-500002"));
     }
 }

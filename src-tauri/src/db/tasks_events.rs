@@ -18,6 +18,7 @@ impl AppDb {
             repo_ids: None,
             search: None,
             author: None,
+            author_is_me: false,
         };
         self.read_timeline_filtered(&filter, 0, limit)
     }

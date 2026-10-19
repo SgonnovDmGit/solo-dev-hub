@@ -6,6 +6,8 @@ export interface TimelineFilter {
   project_ids?: number[];
   repo_ids?: number[];
   search?: string;
-  /** F-000044: `"me"` = events of this install, otherwise a GitHub login. */
+  /** F-000044: only the events of this install (no author). */
+  author_is_me?: boolean;
+  /** F-000044: only the events of this GitHub login; ignored when `author_is_me`. */
   author?: string;
 }

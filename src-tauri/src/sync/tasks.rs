@@ -1237,6 +1237,7 @@ mod tests {
             repo_ids: Some(vec![repo_id]),
             search: None,
             author: None,
+            author_is_me: false,
         };
         let mut evs: Vec<_> = db
             .read_timeline_filtered(&filter, 0, 1000)
@@ -1297,10 +1298,7 @@ mod tests {
         assert_eq!(status("T-000002"), Some(Some("in-progress".to_string())));
         assert!(status("T-000003").is_some(), "no orphan cleanup");
         let evs = task_event_authors(&db, rid, "T-000001");
-        assert_eq!(
-            evs,
-            vec![("taken".to_string(), Some("helper".to_string()))]
-        );
+        assert_eq!(evs, vec![("taken".to_string(), Some("helper".to_string()))]);
         // nothing changed -> nothing done
         let again =
             sync_tasks_incoming(&db, rid, (&head, ""), (Some(&head), None), &by_helper).unwrap();

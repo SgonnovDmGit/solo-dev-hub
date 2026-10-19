@@ -8,8 +8,11 @@ pub struct TimelineFilter {
     pub project_ids: Option<Vec<i64>>,
     pub repo_ids: Option<Vec<i64>>,
     pub search: Option<String>,
-    /// F-000044: `"me"` = events of this install (no author), otherwise a
-    /// GitHub login. `None` = everybody.
+    /// F-000044: only the events of this install (no author).
+    #[serde(default)]
+    pub author_is_me: bool,
+    /// F-000044: only the events of this GitHub login (ignored when
+    /// `author_is_me`). Both unset = everybody.
     #[serde(default)]
     pub author: Option<String>,
 }

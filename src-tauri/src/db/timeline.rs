@@ -64,20 +64,23 @@ impl AppDb {
             }
         }
 
-        // F-000044 / T-000221: author of the event. `"me"` = events of this
-        // install (author IS NULL); anything else is a GitHub login. A value that
-        // is not a valid login matches nothing; valid logins are inlined (the
-        // charset is [A-Za-z0-9-], nothing to escape).
-        if let Some(ref a) = filter.author {
-            let a = a.trim();
-            if a.eq_ignore_ascii_case("me") {
-                where_extra.push_str(" AND author IS NULL");
-            } else if crate::sync::shared_structure::is_valid_login(a) {
-                where_extra.push_str(&format!(" AND author = '{}' COLLATE NOCASE", a));
-            } else if !a.is_empty() {
-                where_extra.push_str(" AND 0");
-            }
-        }
+        // F-000044 / T-000221: author of the event. `author_is_me` = events of
+        // this install (author IS NULL); otherwise `author` is a GitHub login,
+        // bound as a parameter (?5). Both unset = everybody.
+        let author_param: Option<String> = if filter.author_is_me {
+            where_extra.push_str(" AND author IS NULL");
+            None
+        } else if let Some(a) = filter
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            where_extra.push_str(" AND author = ?5 COLLATE NOCASE");
+            Some(a.to_string())
+        } else {
+            None
+        };
 
         // T-000103 Task 6: every UNION leg now projects a 14th `details` column
         // so sync_event rows can carry their `details` JSON to the frontend
@@ -186,29 +189,35 @@ impl AppDb {
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params![&filter.start_date, &filter.end_date, limit, offset],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,          // kind
-                    row.get::<_, String>(1)?,          // event_type
-                    row.get::<_, String>(2)?,          // ts
-                    row.get::<_, Option<i64>>(3)?,     // repo_id
-                    row.get::<_, Option<String>>(4)?,  // repo_display_name
-                    row.get::<_, Option<String>>(5)?,  // bug_display_id
-                    row.get::<_, Option<String>>(6)?,  // task_display_id
-                    row.get::<_, Option<String>>(7)?,  // old_canonical
-                    row.get::<_, Option<String>>(8)?,  // new_canonical
-                    row.get::<_, Option<String>>(9)?,  // sync_type
-                    row.get::<_, Option<String>>(10)?, // deploy_action
-                    row.get::<_, Option<String>>(11)?, // deploy_env_name
-                    row.get::<_, Option<i64>>(12)?,    // change_count
-                    row.get::<_, Option<String>>(13)?, // details (T-000103 Task 6)
-                    row.get::<_, Option<i64>>(14)?,    // project_id
-                    row.get::<_, Option<String>>(15)?, // author (F-000044)
-                ))
-            },
-        )?;
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            filter.start_date.clone().into(),
+            filter.end_date.clone().into(),
+            (limit as i64).into(),
+            (offset as i64).into(),
+        ];
+        if let Some(a) = author_param {
+            values.push(a.into());
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,          // kind
+                row.get::<_, String>(1)?,          // event_type
+                row.get::<_, String>(2)?,          // ts
+                row.get::<_, Option<i64>>(3)?,     // repo_id
+                row.get::<_, Option<String>>(4)?,  // repo_display_name
+                row.get::<_, Option<String>>(5)?,  // bug_display_id
+                row.get::<_, Option<String>>(6)?,  // task_display_id
+                row.get::<_, Option<String>>(7)?,  // old_canonical
+                row.get::<_, Option<String>>(8)?,  // new_canonical
+                row.get::<_, Option<String>>(9)?,  // sync_type
+                row.get::<_, Option<String>>(10)?, // deploy_action
+                row.get::<_, Option<String>>(11)?, // deploy_env_name
+                row.get::<_, Option<i64>>(12)?,    // change_count
+                row.get::<_, Option<String>>(13)?, // details (T-000103 Task 6)
+                row.get::<_, Option<i64>>(14)?,    // project_id
+                row.get::<_, Option<String>>(15)?, // author (F-000044)
+            ))
+        })?;
 
         let mut out: Vec<crate::models::ActivityEvent> = Vec::new();
         for row in rows {
@@ -492,6 +501,7 @@ mod tests {
             repo_ids: None,
             search: None,
             author: None,
+            author_is_me: false,
         };
         let events = db.read_timeline_filtered(&filter, 0, 50).unwrap();
         assert_eq!(
@@ -539,6 +549,7 @@ mod tests {
             repo_ids: None,
             search: None,
             author: None,
+            author_is_me: false,
         };
         let page1 = db.read_timeline_filtered(&filter, 0, 10).unwrap();
         let page2 = db.read_timeline_filtered(&filter, 10, 10).unwrap();
@@ -678,7 +689,18 @@ mod tests {
         db.insert_sync_event(Some(repo.id), "tasks", "2026-04-28T00:00:00Z", 1, None)
             .unwrap();
 
-        let mk = |author: Option<&str>| crate::models::TimelineFilter {
+        // A real user whose login is "me" must not be mistaken for "this install".
+        db.insert_task_event_by(
+            task.id,
+            "review",
+            "2026-04-29T00:00:00Z",
+            Some("in-progress"),
+            Some("review"),
+            Some("me"),
+        )
+        .unwrap();
+
+        let mk = |author: Option<&str>, is_me: bool| crate::models::TimelineFilter {
             start_date: "2026-04-01".into(),
             end_date: "2026-04-30".into(),
             event_kinds: None,
@@ -686,9 +708,10 @@ mod tests {
             repo_ids: None,
             search: None,
             author: author.map(String::from),
+            author_is_me: is_me,
         };
-        let all = db.read_timeline_filtered(&mk(None), 0, 50).unwrap();
-        assert_eq!(all.len(), 4);
+        let all = db.read_timeline_filtered(&mk(None, false), 0, 50).unwrap();
+        assert_eq!(all.len(), 5);
         let taken = all.iter().find(|e| e.event_type == "taken").unwrap();
         assert_eq!(taken.author.as_deref(), Some("helper"));
         let created = all
@@ -698,7 +721,7 @@ mod tests {
         assert_eq!(created.author, None);
 
         let helper = db
-            .read_timeline_filtered(&mk(Some("HELPER")), 0, 50)
+            .read_timeline_filtered(&mk(Some("HELPER"), false), 0, 50)
             .unwrap();
         let types: Vec<&str> = helper.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(
@@ -707,11 +730,16 @@ mod tests {
             "task + bug event of the helper: {:?}",
             types
         );
-        let me = db.read_timeline_filtered(&mk(Some("me")), 0, 50).unwrap();
+        let me = db.read_timeline_filtered(&mk(None, true), 0, 50).unwrap();
         assert_eq!(me.len(), 2, "own task event + the sync event");
         assert!(me.iter().all(|e| e.author.is_none()));
+        let named_me = db
+            .read_timeline_filtered(&mk(Some("me"), false), 0, 50)
+            .unwrap();
+        assert_eq!(named_me.len(), 1, "the user named me, not this install");
+        assert_eq!(named_me[0].author.as_deref(), Some("me"));
         let bad = db
-            .read_timeline_filtered(&mk(Some("x' OR 1=1 --")), 0, 50)
+            .read_timeline_filtered(&mk(Some("x' OR 1=1 --"), false), 0, 50)
             .unwrap();
         assert!(bad.is_empty(), "an invalid login matches nothing");
     }
