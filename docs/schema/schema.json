@@ -1989,6 +1989,12 @@
           "type": "TEXT",
           "nullable": false,
           "comment": "RFC 3339 UTC, when the conflict was first seen."
+        },
+        {
+          "name": "repo_ids",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "JSON array of repositories.id, sorted: the sides of the conflict. Only grows while the conflict is open (a repo joining is added). The conflict closes only once every side still in the portfolio with a local path has been read again; ids, unlike labels, survive a rename."
         }
       ],
       "indexes": [
@@ -2021,7 +2027,7 @@
           ]
         }
       ],
-      "def": "CREATE TABLE rule_conflicts (\n             rule TEXT PRIMARY KEY,\n             opened_at TEXT NOT NULL\n         )"
+      "def": "CREATE TABLE rule_conflicts (\n             rule TEXT PRIMARY KEY,\n             opened_at TEXT NOT NULL,\n             repo_ids TEXT NOT NULL\n         )"
     }
   ],
   "relations": [

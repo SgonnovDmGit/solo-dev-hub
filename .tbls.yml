@@ -124,6 +124,11 @@ comments:
     columnComments:
       rule: Skill name; the primary key, so a rule has at most one open conflict.
       opened_at: RFC 3339 UTC, when the conflict was first seen.
+      repo_ids: >-
+        JSON array of repositories.id, sorted: the sides of the conflict. Only
+        grows while the conflict is open (a repo joining is added). The conflict
+        closes only once every side still in the portfolio with a local path has
+        been read again; ids, unlike labels, survive a rename.
 
   - table: project_renames
     tableComment: >-

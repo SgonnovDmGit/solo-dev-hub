@@ -10,7 +10,8 @@ v33 (T-000206) — one row per rule whose hand-backs currently conflict (two rep
 ```sql
 CREATE TABLE rule_conflicts (
              rule TEXT PRIMARY KEY,
-             opened_at TEXT NOT NULL
+             opened_at TEXT NOT NULL,
+             repo_ids TEXT NOT NULL
          )
 ```
 
@@ -18,10 +19,11 @@ CREATE TABLE rule_conflicts (
 
 ## Columns
 
-| Name      | Type | Default | Nullable | Children | Parents | Comment                                                               |
-| --------- | ---- | ------- | -------- | -------- | ------- | --------------------------------------------------------------------- |
-| rule      | TEXT |         | true     |          |         | Skill name; the primary key, so a rule has at most one open conflict. |
-| opened_at | TEXT |         | false    |          |         | RFC 3339 UTC, when the conflict was first seen.                       |
+| Name      | Type | Default | Nullable | Children | Parents | Comment                                                                                                                                                                                                                                                                         |
+| --------- | ---- | ------- | -------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| rule      | TEXT |         | true     |          |         | Skill name; the primary key, so a rule has at most one open conflict.                                                                                                                                                                                                           |
+| opened_at | TEXT |         | false    |          |         | RFC 3339 UTC, when the conflict was first seen.                                                                                                                                                                                                                                 |
+| repo_ids  | TEXT |         | false    |          |         | JSON array of repositories.id, sorted: the sides of the conflict. Only grows while the conflict is open (a repo joining is added). The conflict closes only once every side still in the portfolio with a local path has been read again; ids, unlike labels, survive a rename. |
 
 ## Constraints
 

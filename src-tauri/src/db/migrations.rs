@@ -1048,7 +1048,10 @@ fn mig_v33_rule_events_and_conflicts(conn: &Connection) -> SqlResult<()> {
     //
     // `rule_conflicts` holds one row per rule whose hand-backs currently
     // conflict, so a repeated pass can tell a conflict it already reported from
-    // a new one instead of raising the same error on every sync.
+    // a new one instead of raising the same error on every sync. `repo_ids` (a
+    // JSON array of repository ids) names its sides: a conflict closes only once
+    // every side still in the portfolio has been read again, and ids - unlike
+    // labels - survive a rename (T-000206).
     conn.execute_batch(
         "CREATE TABLE rule_events (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1061,7 +1064,8 @@ fn mig_v33_rule_events_and_conflicts(conn: &Connection) -> SqlResult<()> {
          CREATE INDEX idx_rule_events_rule ON rule_events(rule, created_at);
          CREATE TABLE rule_conflicts (
              rule TEXT PRIMARY KEY,
-             opened_at TEXT NOT NULL
+             opened_at TEXT NOT NULL,
+             repo_ids TEXT NOT NULL
          );
          PRAGMA user_version = 33;",
     )
@@ -1248,13 +1252,13 @@ mod tests {
         assert!(refused.is_err(), "an unknown kind must be rejected");
 
         conn.execute(
-            "INSERT INTO rule_conflicts (rule, opened_at) VALUES ('sdh-retro', 'x')",
+            "INSERT INTO rule_conflicts (rule, opened_at, repo_ids) VALUES ('sdh-retro', 'x', '[1,2]')",
             [],
         )
         .unwrap();
         assert!(
             conn.execute(
-                "INSERT INTO rule_conflicts (rule, opened_at) VALUES ('sdh-retro', 'y')",
+                "INSERT INTO rule_conflicts (rule, opened_at, repo_ids) VALUES ('sdh-retro', 'y', '[3]')",
                 [],
             )
             .is_err(),

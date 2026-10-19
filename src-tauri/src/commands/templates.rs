@@ -77,6 +77,11 @@ fn save_template_file_in(
     // is no event of the rule's history. Compared before the write, which is
     // what replaces the old text. An unreadable old row counts as a change:
     // recording one save too many beats losing one.
+    //
+    // An unchanged save still renders through `after_rule_write` and so still
+    // supersedes pending hand-backs of this skill. Intended: pressing Save is
+    // the owner's explicit edit, and the explicit edit wins — the history
+    // just has nothing new to say about the text.
     let unchanged = matches!(
         db.get_template_file(language_key, file_name),
         Ok(Some(old)) if old.content == content
@@ -589,6 +594,52 @@ mod tests {
         );
         assert_eq!(outcome.superseded.len(), 2, "{:?}", outcome.superseded);
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    }
+
+    /// T-000206: a reset is an explicit edit like a save — it sets both
+    /// markers of a conflict aside and closes the conflict, saying why.
+    #[test]
+    fn test_resetting_a_skill_in_conflict_closes_the_conflict() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let dirs = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        for (i, dir) in dirs.iter().enumerate() {
+            db.insert_local_repository(
+                &dir.path().to_string_lossy(),
+                &format!("r{}", i),
+                None,
+                None,
+            )
+            .unwrap();
+            sync::render_skills_to_repo(&db, dir.path()).unwrap();
+            hand_back_edit(dir.path(), "sdh-debugging");
+        }
+        sync::refresh_rules(&db, None, sync::RenderScope::UptakeOnly, None);
+        assert!(db.open_rule_conflicts().unwrap().contains("sdh-debugging"));
+
+        reset_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "skill.sdh-debugging.md.tmpl",
+        )
+        .unwrap();
+
+        assert!(db.open_rule_conflicts().unwrap().is_empty());
+        let resolved: Vec<_> = rule_history(&db, "sdh-debugging")
+            .into_iter()
+            .filter(|e| e.kind == rule_event::CONFLICT_RESOLVED)
+            .collect();
+        assert_eq!(resolved.len(), 1, "{:?}", resolved);
+        assert_eq!(
+            resolved[0].note.as_deref(),
+            Some(conflict_note::SUPERSEDED_BY_OWNER)
+        );
+        for dir in &dirs {
+            let skills = dir.path().join("docs/sdh_skills");
+            assert!(!skills.join("sdh-debugging.md.approved").exists());
+            assert!(!skills.join("sdh-debugging.md.conflict").exists());
+        }
     }
 
     /// Saving the text that is already stored changes nothing, so it is not an

@@ -788,20 +788,24 @@
 <!-- rule_conflicts -->
 <g id="node21" class="node">
 <title>rule_conflicts</title>
-<polygon fill="#efefef" stroke="none" points="12314.66,-1888.2 12314.66,-1934.2 14151.94,-1934.2 14151.94,-1888.2 12314.66,-1888.2"/>
-<polygon fill="none" stroke="black" points="12314.66,-1888.2 12314.66,-1934.2 14151.94,-1934.2 14151.94,-1888.2 12314.66,-1888.2"/>
-<text text-anchor="start" x="13149.19" y="-1912" font-family="Arial Bold" font-size="18.00">rule_conflicts</text>
-<text text-anchor="start" x="13248.16" y="-1912" font-family="Arial" font-size="14.00">    </text>
-<text text-anchor="start" x="13279.27" y="-1912" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
-<text text-anchor="start" x="12321.66" y="-1897.6" font-family="Arial" font-size="14.00" fill="#333333">v33 (T&#45;000206) — one row per rule whose hand&#45;backs currently conflict (two repos handed back different texts). Lets a repeated pass tell a conflict it already reported from a new one instead of raising the same error on every sync. The conflicting texts are not stored: they stay in the repo copies.</text>
-<polygon fill="none" stroke="black" points="12314.66,-1857.4 12314.66,-1888.2 14151.94,-1888.2 14151.94,-1857.4 12314.66,-1857.4"/>
-<text text-anchor="start" x="12321.66" y="-1869.6" font-family="Arial" font-size="14.00">rule </text>
-<text text-anchor="start" x="12348.9" y="-1869.6" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="12392.46" y="-1869.6" font-family="Arial" font-size="14.00"> Skill name; the primary key, so a rule has at most one open conflict.</text>
-<polygon fill="none" stroke="black" points="12314.66,-1826.6 12314.66,-1857.4 14151.94,-1857.4 14151.94,-1826.6 12314.66,-1826.6"/>
-<text text-anchor="start" x="12321.66" y="-1838.8" font-family="Arial" font-size="14.00">opened_at </text>
-<text text-anchor="start" x="12391.73" y="-1838.8" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
-<text text-anchor="start" x="12435.29" y="-1838.8" font-family="Arial" font-size="14.00"> RFC 3339 UTC, when the conflict was first seen.</text>
+<polygon fill="#efefef" stroke="none" points="12314.66,-1903.6 12314.66,-1949.6 14151.94,-1949.6 14151.94,-1903.6 12314.66,-1903.6"/>
+<polygon fill="none" stroke="black" points="12314.66,-1903.6 12314.66,-1949.6 14151.94,-1949.6 14151.94,-1903.6 12314.66,-1903.6"/>
+<text text-anchor="start" x="13149.19" y="-1927.4" font-family="Arial Bold" font-size="18.00">rule_conflicts</text>
+<text text-anchor="start" x="13248.16" y="-1927.4" font-family="Arial" font-size="14.00">    </text>
+<text text-anchor="start" x="13279.27" y="-1927.4" font-family="Arial" font-size="14.00" fill="#666666">[table]</text>
+<text text-anchor="start" x="12321.66" y="-1913" font-family="Arial" font-size="14.00" fill="#333333">v33 (T&#45;000206) — one row per rule whose hand&#45;backs currently conflict (two repos handed back different texts). Lets a repeated pass tell a conflict it already reported from a new one instead of raising the same error on every sync. The conflicting texts are not stored: they stay in the repo copies.</text>
+<polygon fill="none" stroke="black" points="12314.66,-1872.8 12314.66,-1903.6 14151.94,-1903.6 14151.94,-1872.8 12314.66,-1872.8"/>
+<text text-anchor="start" x="12321.66" y="-1885" font-family="Arial" font-size="14.00">rule </text>
+<text text-anchor="start" x="12348.9" y="-1885" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="12392.46" y="-1885" font-family="Arial" font-size="14.00"> Skill name; the primary key, so a rule has at most one open conflict.</text>
+<polygon fill="none" stroke="black" points="12314.66,-1842 12314.66,-1872.8 14151.94,-1872.8 14151.94,-1842 12314.66,-1842"/>
+<text text-anchor="start" x="12321.66" y="-1854.2" font-family="Arial" font-size="14.00">opened_at </text>
+<text text-anchor="start" x="12391.73" y="-1854.2" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="12435.29" y="-1854.2" font-family="Arial" font-size="14.00"> RFC 3339 UTC, when the conflict was first seen.</text>
+<polygon fill="none" stroke="black" points="12314.66,-1811.2 12314.66,-1842 14151.94,-1842 14151.94,-1811.2 12314.66,-1811.2"/>
+<text text-anchor="start" x="12321.66" y="-1823.4" font-family="Arial" font-size="14.00">repo_ids </text>
+<text text-anchor="start" x="12379.26" y="-1823.4" font-family="Arial" font-size="14.00" fill="#666666">[TEXT]</text>
+<text text-anchor="start" x="12422.82" y="-1823.4" font-family="Arial" font-size="14.00"> JSON array of repositories.id, sorted: the sides of the conflict. Only grows while the conflict is open (a repo joining is added). The conflict closes only once every side still in the portfolio with a local path has been read again; ids, unlike labels, survive a rename.</text>
 </g>
 </g>
 </svg>

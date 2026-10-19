@@ -5,7 +5,7 @@
 
 use crate::db::{conflict_note, rule_event, AppDb};
 use crate::models::{lookup, Repository, RulesRefresh, SyncIssue, SyncIssueCode};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -160,9 +160,15 @@ fn has_marker(dir: &Path, name: &str) -> bool {
     dir.join(format!("{}.md{}", name, APPROVED_SUFFIX)).exists()
 }
 
-/// Remove an approval marker. Already gone counts as removed: a concurrent pass
-/// (or the owner) may have cleared it, and the outcome is the same.
-fn clear_marker(path: &Path) -> io::Result<()> {
+/// T-000206: `<dir>/<name>.md.conflict`, the reason file of `name`.
+fn conflict_file(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.md{}", name, CONFLICT_SUFFIX))
+}
+
+/// Remove a file this app placed or consumes — an approval marker, a reason
+/// file. Already gone counts as removed: a concurrent pass (or the owner) may
+/// have cleared it, and the outcome is the same.
+fn remove_if_present(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
@@ -175,7 +181,10 @@ fn clear_marker(path: &Path) -> io::Result<()> {
 /// sees a copy equal to the new rule and reports the edit "lost".
 static RULES_LOCK: Mutex<()> = Mutex::new(());
 
-fn rules_guard() -> std::sync::MutexGuard<'static, ()> {
+/// Take the rules lock. `pub(crate)` for a caller that must run its own steps
+/// and a `refresh_rules_locked` under ONE hold of it (T-000206: resolving a
+/// conflict); the lock is not re-entrant, so taking it twice deadlocks.
+pub(crate) fn rules_guard() -> std::sync::MutexGuard<'static, ()> {
     // A panic in another pass leaves no state behind this lock worth refusing over.
     RULES_LOCK
         .lock()
@@ -195,6 +204,77 @@ const APPROVED_SUFFIX: &str = ".approved";
 /// ever mistakes it for a copy or a marker.
 const CONFLICT_SUFFIX: &str = ".conflict";
 
+/// T-000206: separator of the repo labels of a conflict — in its `conflict`
+/// event and in the `VersionConflict` target. For display only: the sides a
+/// conflict is decided on are its stored repo ids, never these labels.
+const CONFLICT_REPOS_SEPARATOR: &str = ", ";
+
+/// One approval marker found in a repo's `docs/sdh_skills/`.
+#[derive(Debug, Clone)]
+pub(crate) struct FoundMarker {
+    /// The skill it flags: `<name>` of `<name>.md.approved`.
+    pub name: String,
+    /// The copy it sits beside: `<name>.md`.
+    pub stem: String,
+    /// The marker file itself.
+    pub path: PathBuf,
+}
+
+impl FoundMarker {
+    /// The marker's file name, `<name>.md.approved`.
+    fn file_name(&self) -> String {
+        format!("{}{}", self.stem, APPROVED_SUFFIX)
+    }
+}
+
+/// One repo's `docs/sdh_skills/` as read in one pass.
+#[derive(Debug)]
+pub(crate) struct RepoScan {
+    pub repo_id: i64,
+    /// `rule_copy_label` of the repo.
+    pub label: String,
+    pub dir: PathBuf,
+    pub markers: Vec<FoundMarker>,
+}
+
+/// T-000206: the approval markers of one repo — pure I/O, nothing written,
+/// cleared or recorded, so it can also serve a read-only look at a conflict.
+/// `None` when the repo has no local path or its `docs/sdh_skills/` cannot be
+/// read (no copies yet, or a checkout missing on this machine): nothing in it
+/// was seen this pass.
+pub(crate) fn scan_repo_markers(repo: &Repository) -> Option<RepoScan> {
+    let path = repo.local_path.as_deref()?;
+    let dir = Path::new(path).join("docs").join("sdh_skills");
+    let entries = fs::read_dir(&dir).ok()?;
+    let mut markers = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(stem) = file_name.strip_suffix(APPROVED_SUFFIX) else {
+            continue;
+        };
+        let Some(name) = stem.strip_suffix(".md") else {
+            continue;
+        };
+        markers.push(FoundMarker {
+            name: name.to_string(),
+            stem: stem.to_string(),
+            path: entry.path(),
+        });
+    }
+    markers.sort_by(|a, b| a.path.cmp(&b.path));
+    Some(RepoScan {
+        repo_id: repo.id,
+        // T-000198: one unambiguous label for every finding of this pass —
+        // issues and the `<skill> (<repo>)` lines alike.
+        label: rule_copy_label(repo),
+        dir,
+        markers,
+    })
+}
+
 /// What one collection pass found beside the repo copies.
 #[derive(Debug, Default)]
 struct Collected {
@@ -204,6 +284,41 @@ struct Collected {
     errors: Vec<SyncIssue>,
     /// T-000206: see `RulesRefresh::quiet_conflicts`.
     quiet_conflicts: Vec<String>,
+}
+
+/// One repo's handed-back copy of a skill, as found beside its marker.
+#[derive(Debug)]
+struct HandedCopy {
+    repo_id: i64,
+    /// `rule_copy_label` of the repo.
+    label: String,
+    content: String,
+    marker: PathBuf,
+    /// The marker's approval line, trimmed; `None` when the marker is empty.
+    note: Option<String>,
+}
+
+/// What the markers of one pass amount to, before anything is decided.
+#[derive(Debug, Default)]
+struct Found {
+    /// Skill -> its handed-back copies; sorted by skill, copies by label, so
+    /// reports and reason files read the same on every pass.
+    handed: Vec<(String, Vec<HandedCopy>)>,
+    /// Repos whose `docs/sdh_skills/` was read this pass.
+    read: HashSet<i64>,
+    /// `(skill, repo id)`: a flagged copy that could not be read.
+    unread: HashSet<(String, i64)>,
+}
+
+/// A conflict open before this pass. `sides` is `Err` when its stored repo
+/// ids do not parse.
+struct OpenConflict {
+    sides: Result<BTreeSet<i64>, String>,
+}
+
+/// Whether the handed-back copies of one skill disagree.
+fn in_conflict(copies: &[HandedCopy]) -> bool {
+    copies.iter().any(|c| c.content != copies[0].content)
 }
 
 impl Collected {
@@ -222,16 +337,12 @@ impl Collected {
                 Some(repo) => format!("{}: rule_events", repo),
                 None => "rule_events".to_string(),
             };
-            self.errors.push(
-                SyncIssue::new(SyncIssueCode::RuleFailed, rule)
-                    .target(target)
-                    .detail(e),
-            );
+            self.rule_failed(rule, target, e);
         }
     }
 
-    /// A file step of the conflict bookkeeping failed: reported, never fatal.
-    fn file_failed(&mut self, rule: &str, target: String, e: impl std::fmt::Display) {
+    /// One step about `rule` failed: reported, never fatal.
+    fn rule_failed(&mut self, rule: &str, target: impl Into<String>, e: impl std::fmt::Display) {
         self.errors.push(
             SyncIssue::new(SyncIssueCode::RuleFailed, rule)
                 .target(target)
@@ -239,102 +350,334 @@ impl Collected {
         );
     }
 
-    /// T-000206: the hand-backs of `name` disagree. Reported in full only by
-    /// the pass that opens the conflict (`already_open` false); a repeat goes to
-    /// `quiet_conflicts` instead, so it no longer fires a toast on every sync.
-    /// Either way each repo of the conflict gets the reason file, rewritten only
-    /// when its content changed, and a repo that has left the conflict loses it.
-    fn conflict(
-        &mut self,
-        db: &AppDb,
-        repos: &[Repository],
-        name: &str,
-        copies: &[HandedCopy],
-        other: &HandedCopy,
-        already_open: bool,
-    ) {
-        if already_open {
-            self.quiet_conflicts.push(name.to_string());
-        } else {
-            if let Err(e) = db.open_rule_conflict(name) {
-                self.file_failed(name, "rule_conflicts".to_string(), e);
-            }
-            let labels: Vec<&str> = copies.iter().map(|c| c.label.as_str()).collect();
-            self.record(
-                db,
-                name,
-                rule_event::CONFLICT,
-                Some(&labels.join(CONFLICT_REPOS_SEPARATOR)),
-                None,
-            );
-            self.errors.push(
-                SyncIssue::new(SyncIssueCode::VersionConflict, name)
-                    .target(format!("{}, {}", copies[0].label, other.label)),
-            );
-        }
+    /// Sort the per-pass lists, so a report reads the same however the
+    /// filesystem happened to order the files.
+    fn sorted(mut self) -> Self {
+        self.taken.sort();
+        self.lost.sort();
+        self.superseded.sort();
+        self.quiet_conflicts.sort();
+        self
+    }
+}
 
-        let reason = conflict_reason(name, copies);
-        let mut involved = HashSet::new();
-        for copy in copies {
-            let Some(dir) = copy.marker.parent() else {
+/// T-000206: the conflicts open before this pass, read BEFORE scanning, so the
+/// pass that opens a conflict still reports it in full and only the passes
+/// after it keep quiet. A failed read is reported and leaves the map empty:
+/// every live conflict then reads as new (loud, never silent) and none closes.
+fn read_open_conflicts(db: &AppDb, out: &mut Collected) -> HashMap<String, OpenConflict> {
+    match db.list_rule_conflicts() {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(rule, raw)| {
+                let sides = crate::db::parse_conflict_repo_ids(&raw);
+                (rule, OpenConflict { sides })
+            })
+            .collect(),
+        Err(e) => {
+            out.rule_failed("", "rule_conflicts", e);
+            HashMap::new()
+        }
+    }
+}
+
+/// Sort the markers of a pass into its outcomes. Unknown, superseded and lost
+/// markers are settled (and recorded) right here; everything else is returned
+/// as a hand-back for the decisions that follow.
+///
+/// - **unknown** — the marker names a skill the bundle does not have. A repo
+///   copy cannot invent a rule.
+/// - **superseded** (T-000207) — `settings_edit` names the skill the owner has
+///   just saved or reset. That explicit edit wins over a pending hand-back of
+///   the same skill: not taken, marker cleared, reported.
+/// - **lost** (T-000207) — the copy beside the marker is byte-equal to the
+///   current rule. The edit the marker stood for was overwritten before anyone
+///   collected it; taking it up would report a success and flag an untouched
+///   rule as a fork. Marker cleared, loss reported, rule left alone.
+/// - **unread** (T-000206) — the copy beside the marker cannot be read. Kept in
+///   `Found::unread`: that side was not seen, which matters for a conflict.
+fn classify(
+    db: &AppDb,
+    scans: &[RepoScan],
+    known: &HashMap<String, String>,
+    settings_edit: Option<&str>,
+    out: &mut Collected,
+) -> Found {
+    let mut found = Found::default();
+    let mut handed: HashMap<String, Vec<HandedCopy>> = HashMap::new();
+    for scan in scans {
+        found.read.insert(scan.repo_id);
+        let label = scan.label.as_str();
+        for marker in &scan.markers {
+            let name = marker.name.as_str();
+            let Some(current) = known.get(name) else {
+                out.errors.push(
+                    SyncIssue::new(SyncIssueCode::RuleUnknownSkill, label)
+                        .target(marker.file_name()),
+                );
                 continue;
             };
-            involved.insert(dir.to_path_buf());
-            let path = dir.join(format!("{}.md{}", name, CONFLICT_SUFFIX));
-            if let Err(e) = write_if_changed(&path, &reason) {
-                self.file_failed(
-                    name,
-                    format!("{}: {}.md{}", copy.label, name, CONFLICT_SUFFIX),
-                    e,
-                );
+            if settings_edit == Some(name) {
+                match remove_if_present(&marker.path) {
+                    Ok(()) => {
+                        out.superseded.push(format!("{} ({})", name, label));
+                        out.record(db, name, rule_event::SUPERSEDED, Some(label), None);
+                    }
+                    Err(e) => {
+                        out.rule_failed(name, format!("{}: {}", label, marker.file_name()), e)
+                    }
+                }
+                continue;
+            }
+            match fs::read_to_string(scan.dir.join(&marker.stem)) {
+                Ok(content) if content == *current => match remove_if_present(&marker.path) {
+                    Ok(()) => {
+                        out.lost.push(format!("{} ({})", name, label));
+                        out.record(db, name, rule_event::LOST, Some(label), None);
+                    }
+                    Err(e) => {
+                        out.rule_failed(name, format!("{}: {}", label, marker.file_name()), e)
+                    }
+                },
+                Ok(content) => {
+                    // The marker may carry the approval line. Empty is allowed;
+                    // when present it is worth having in the log and, since
+                    // T-000174, in the rule's history.
+                    let note = fs::read_to_string(&marker.path)
+                        .ok()
+                        .map(|note| note.trim().to_string())
+                        .filter(|note| !note.is_empty());
+                    if let Some(note) = &note {
+                        eprintln!("[skills] {} hands back {}: {}", label, name, note);
+                    }
+                    handed
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(HandedCopy {
+                            repo_id: scan.repo_id,
+                            label: label.to_string(),
+                            content,
+                            marker: marker.path.clone(),
+                            note,
+                        });
+                }
+                Err(e) => {
+                    found.unread.insert((name.to_string(), scan.repo_id));
+                    out.rule_failed(name, format!("{}: {}", label, marker.stem), e);
+                }
             }
         }
-        self.remove_reason_files(repos, name, &involved);
     }
+    let mut handed: Vec<(String, Vec<HandedCopy>)> = handed.into_iter().collect();
+    handed.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, copies) in &mut handed {
+        copies.sort_by(|a, b| a.label.cmp(&b.label));
+    }
+    found.handed = handed;
+    found
+}
 
-    /// T-000206: a conflict that was open before this pass and is not one any
-    /// more — a marker went away, or the texts became equal. Closed, recorded
-    /// with how it went away, and its reason files removed everywhere. The
-    /// collection then goes on as usual: what is still handed back is taken.
-    fn close_conflict(
-        &mut self,
-        db: &AppDb,
-        repos: &[Repository],
-        name: &str,
-        settings_edit: Option<&str>,
-    ) {
-        if let Err(e) = db.close_rule_conflict(name) {
-            self.file_failed(name, "rule_conflicts".to_string(), e);
-        }
-        let note = if settings_edit == Some(name) {
-            // The owner's own save or reset set both markers aside this pass.
+/// T-000206: decide every conflict that was open before this pass and is not
+/// live in it. Returns the rules left **undecided**: still open, quiet, and
+/// none of their hand-backs may be taken this pass (their markers stay).
+///
+/// "Not live" may only mean a side was not seen — a checkout missing on this
+/// machine, an unreadable folder or copy, a repo left out of the pass. Closing
+/// then would record a false "resolved outside the app", take the other side
+/// as a lone hand-back, and let the unseen side overwrite it once it is back.
+/// So a conflict closes only when every side still in the portfolio with a
+/// local path was read (`all_sides_read`); the note says whether the owner's
+/// own edit superseded it or it went away outside the app.
+fn settle_open_conflicts(
+    db: &AppDb,
+    repos: &[Repository],
+    open: &HashMap<String, OpenConflict>,
+    found: &Found,
+    settings_edit: Option<&str>,
+    out: &mut Collected,
+) -> HashSet<String> {
+    let live: HashSet<&str> = found
+        .handed
+        .iter()
+        .filter(|(_, copies)| in_conflict(copies))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let mut gone: Vec<&String> = open
+        .keys()
+        .filter(|rule| !live.contains(rule.as_str()))
+        .collect();
+    gone.sort();
+    let mut undecided = HashSet::new();
+    for rule in gone {
+        let decidable = match &open[rule].sides {
+            Ok(sides) => match all_sides_read(db, rule, sides, found) {
+                Ok(all) => all,
+                Err(e) => {
+                    out.rule_failed(rule, "repositories", e);
+                    false
+                }
+            },
+            Err(e) => {
+                out.rule_failed(rule, "rule_conflicts.repo_ids", e);
+                false
+            }
+        };
+        let note = if settings_edit == Some(rule.as_str()) {
+            // The owner's own save or reset set the markers aside this pass.
             conflict_note::SUPERSEDED_BY_OWNER
         } else {
             conflict_note::RESOLVED_OUTSIDE
         };
-        self.record(db, name, rule_event::CONFLICT_RESOLVED, None, Some(note));
-        self.remove_reason_files(repos, name, &HashSet::new());
+        if !(decidable && close_conflict(db, repos, rule, None, note, out)) {
+            out.quiet_conflicts.push(rule.clone());
+            undecided.insert(rule.clone());
+        }
+    }
+    undecided
+}
+
+/// T-000206: whether every side of a conflict that can still hand something
+/// back was read this pass. Sides are repo ids, stable across a rename. A side
+/// gone from the portfolio, or whose local path was cleared, can hand nothing
+/// back any more and does not block; a side with a local path that was not
+/// read — or whose copy of `rule` was unreadable — does.
+fn all_sides_read(
+    db: &AppDb,
+    rule: &str,
+    sides: &BTreeSet<i64>,
+    found: &Found,
+) -> rusqlite::Result<bool> {
+    for &id in sides {
+        let repo = match db.get_repository(id) {
+            Ok(repo) => repo,
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(e) => return Err(e),
+        };
+        if repo.local_path.is_none() {
+            continue;
+        }
+        if !found.read.contains(&id) || found.unread.contains(&(rule.to_string(), id)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// T-000206: close the conflict on `name` — row removed, `conflict_resolved`
+/// recorded with `repo` (the accepted side, `None` if no side was accepted)
+/// and `note`, reason files removed across the portfolio. The caller picks the
+/// note. Returns `false`, having recorded and removed nothing, when the row
+/// could not be removed: the conflict is still open, and a history saying
+/// otherwise would be false.
+fn close_conflict(
+    db: &AppDb,
+    repos: &[Repository],
+    name: &str,
+    repo: Option<&str>,
+    note: &str,
+    out: &mut Collected,
+) -> bool {
+    if let Err(e) = db.close_rule_conflict(name) {
+        out.rule_failed(name, "rule_conflicts", e);
+        return false;
+    }
+    out.record(db, name, rule_event::CONFLICT_RESOLVED, repo, Some(note));
+    remove_reason_files(repos, name, &HashSet::new(), out);
+    true
+}
+
+/// T-000206: the hand-backs of `name` disagree.
+///
+/// - **open** — no conflict was open before this pass: the row is opened with
+///   the repo ids of the sides, a `conflict` event names them, and one
+///   `VersionConflict` reports it. This is the only pass that reports it.
+/// - **quiet** — it was open already: listed in `quiet_conflicts`, no report.
+///   A repo that joined since is added to the stored sides (sides only grow
+///   while the conflict lives) and a new `conflict` event shows it joined.
+///
+/// Either way each side gets the reason file, rewritten only when its content
+/// changed, and a repo that has left the conflict loses it.
+fn record_conflict(
+    db: &AppDb,
+    repos: &[Repository],
+    name: &str,
+    copies: &[HandedCopy],
+    open: Option<&OpenConflict>,
+    out: &mut Collected,
+) {
+    let live: BTreeSet<i64> = copies.iter().map(|c| c.repo_id).collect();
+    let labels = copies
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect::<Vec<_>>()
+        .join(CONFLICT_REPOS_SEPARATOR);
+    match open {
+        None => {
+            if let Err(e) = db.open_rule_conflict(name, &live) {
+                out.rule_failed(name, "rule_conflicts", e);
+            }
+            out.record(db, name, rule_event::CONFLICT, Some(&labels), None);
+            out.errors
+                .push(SyncIssue::new(SyncIssueCode::VersionConflict, name).target(labels));
+        }
+        Some(OpenConflict { sides: Ok(sides) }) => {
+            out.quiet_conflicts.push(name.to_string());
+            if !live.is_subset(sides) {
+                let all: BTreeSet<i64> = sides.union(&live).copied().collect();
+                if let Err(e) = db.set_rule_conflict_repos(name, &all) {
+                    out.rule_failed(name, "rule_conflicts", e);
+                }
+                out.record(db, name, rule_event::CONFLICT, Some(&labels), None);
+            }
+        }
+        Some(OpenConflict { sides: Err(e) }) => {
+            // Left as stored: rewriting it from this pass alone could drop a
+            // side that is not seen right now. The owner decides it in the app.
+            out.quiet_conflicts.push(name.to_string());
+            out.rule_failed(name, "rule_conflicts.repo_ids", e);
+        }
     }
 
-    /// Remove `<name>.md.conflict` from every repo of the portfolio except the
-    /// `keep` skill dirs. Missing is the normal case, not an error.
-    fn remove_reason_files(&mut self, repos: &[Repository], name: &str, keep: &HashSet<PathBuf>) {
-        for repo in repos {
-            let Some(path) = repo.local_path.as_deref() else {
-                continue;
-            };
-            let dir = Path::new(path).join("docs").join("sdh_skills");
-            if keep.contains(&dir) {
-                continue;
-            }
-            let file = dir.join(format!("{}.md{}", name, CONFLICT_SUFFIX));
-            if let Err(e) = clear_marker(&file) {
-                self.file_failed(
-                    name,
-                    format!("{}: {}.md{}", rule_copy_label(repo), name, CONFLICT_SUFFIX),
-                    e,
-                );
-            }
+    let reason = conflict_reason(name, copies);
+    let mut involved = HashSet::new();
+    for copy in copies {
+        let Some(dir) = copy.marker.parent() else {
+            continue;
+        };
+        involved.insert(dir.to_path_buf());
+        if let Err(e) = write_if_changed(&conflict_file(dir, name), &reason) {
+            out.rule_failed(
+                name,
+                format!("{}: {}.md{}", copy.label, name, CONFLICT_SUFFIX),
+                e,
+            );
+        }
+    }
+    remove_reason_files(repos, name, &involved, out);
+}
+
+/// Remove the reason file of `name` from every repo of the portfolio except
+/// the `keep` skill dirs. Missing is the normal case, not an error.
+fn remove_reason_files(
+    repos: &[Repository],
+    name: &str,
+    keep: &HashSet<PathBuf>,
+    out: &mut Collected,
+) {
+    for repo in repos {
+        let Some(path) = repo.local_path.as_deref() else {
+            continue;
+        };
+        let dir = Path::new(path).join("docs").join("sdh_skills");
+        if keep.contains(&dir) {
+            continue;
+        }
+        if let Err(e) = remove_if_present(&conflict_file(&dir, name)) {
+            out.rule_failed(
+                name,
+                format!("{}: {}.md{}", rule_copy_label(repo), name, CONFLICT_SUFFIX),
+                e,
+            );
         }
     }
 }
@@ -365,44 +708,6 @@ fn conflict_reason(name: &str, copies: &[HandedCopy]) -> String {
     )
 }
 
-/// Separator of the repo labels in a `conflict` event's `repo`.
-const CONFLICT_REPOS_SEPARATOR: &str = ", ";
-
-/// T-000206 review: whether every repo named in `joined` — the labels of a
-/// conflict's sides, as its `conflict` event stores them — is among `read`,
-/// the repos whose copy of the skill this pass actually looked at.
-///
-/// Not a plain split: a local-only repo is labelled by its path, which may
-/// itself contain the separator. `joined` matches when it can be cut into a
-/// sequence of labels from `read` separated by `, ` (a word-break over the
-/// string). An empty `joined` names nobody and so proves nothing: `false`.
-fn all_participants_read(joined: &str, read: &[String]) -> bool {
-    if joined.is_empty() {
-        return false;
-    }
-    // reachable[i]: joined[..i] is a complete run of read labels.
-    let mut reachable = vec![false; joined.len() + 1];
-    reachable[0] = true;
-    for start in 0..joined.len() {
-        if !reachable[start] {
-            continue;
-        }
-        for label in read {
-            if label.is_empty() || !joined[start..].starts_with(label.as_str()) {
-                continue;
-            }
-            let end = start + label.len();
-            if end == joined.len() {
-                return true;
-            }
-            if joined[end..].starts_with(CONFLICT_REPOS_SEPARATOR) {
-                reachable[end + CONFLICT_REPOS_SEPARATOR.len()] = true;
-            }
-        }
-    }
-    false
-}
-
 /// A marker's mtime as `YYYY-MM-DD HH:MM`, local time.
 fn marker_time(marker: &Path) -> String {
     match fs::metadata(marker).and_then(|m| m.modified()) {
@@ -413,15 +718,33 @@ fn marker_time(marker: &Path) -> String {
     }
 }
 
-/// One repo's handed-back copy of a skill, as found beside its marker.
-#[derive(Debug)]
-struct HandedCopy {
-    /// `rule_copy_label` of the repo.
-    label: String,
-    content: String,
-    marker: PathBuf,
-    /// The marker's approval line, trimmed; `None` when the marker is empty.
-    note: Option<String>,
+/// Store the agreed text of `name` — every copy handed back the same — and
+/// clear the markers it came from.
+fn take_up(db: &AppDb, name: String, copies: &[HandedCopy], out: &mut Collected) {
+    let text = &copies[0].content;
+    let file_name = format!("{}{}{}", SKILL_PREFIX, name, SKILL_SUFFIX);
+    if let Err(e) = db.upsert_template_file("_global", &file_name, text, true) {
+        out.rule_failed(&name, file_name, e);
+        return;
+    }
+    for copy in copies {
+        // Recorded before the marker is cleared, and whether or not that
+        // succeeds: the text is already the rule at this point.
+        out.record(
+            db,
+            &name,
+            rule_event::TAKEN,
+            Some(&copy.label),
+            copy.note.as_deref(),
+        );
+        if let Err(e) = remove_if_present(&copy.marker) {
+            // The text is already stored; a surviving marker now sits beside
+            // a copy equal to the rule, so the next pass reports it as lost
+            // instead of taking it up again.
+            out.rule_failed(&name, copy.marker.display().to_string(), e);
+        }
+    }
+    out.taken.push(name);
 }
 
 /// T-000205: take an approved rule edit back out of a repo's own copy.
@@ -438,45 +761,38 @@ struct HandedCopy {
 /// first destroys the edit at the exact moment it was about to be collected.
 /// That is why it is private and reached only through `refresh_rules`.
 ///
-/// Two repos handing back the same skill with *different* text in one pass is a
-/// conflict: both are refused and their markers left in place. Taking the last
-/// one silently would lose somebody's rule without a trace.
-///
-/// T-000207 adds two outcomes that are not an uptake:
-/// - **lost** — the copy beside the marker is byte-equal to the current rule.
-///   The edit the marker stood for was overwritten before anyone collected it;
-///   taking the copy up would report a success and flag an untouched rule as a
-///   fork. The marker is cleared and the loss reported, the rule left alone.
-/// - **superseded** — `settings_edit` names the skill the owner has just saved
-///   in Settings. That explicit edit wins over a pending hand-back of the same
-///   skill: the hand-back is not taken, its marker is cleared, and it is
-///   reported so the owner knows an agent's text was set aside.
+/// The pass, in order:
+/// 1. read the conflicts open before it (`read_open_conflicts`);
+/// 2. scan every repo's markers (`scan_repo_markers`, read-only);
+/// 3. classify them — unknown, superseded, lost, unread, handed back
+///    (`classify`, T-000207);
+/// 4. settle the conflicts open before this pass that are not live in it —
+///    **close** one once every side was read, otherwise leave it
+///    **undecided**: open, quiet, its hand-backs not taken
+///    (`settle_open_conflicts`, T-000206);
+/// 5. per handed-back skill: a disagreement is a conflict — **opened** and
+///    reported once, **quiet** on every later pass, markers left in place,
+///    because taking the last one silently would lose somebody's rule
+///    (`record_conflict`, T-000206); an undecided skill is skipped; anything
+///    else is taken up (`take_up`).
 ///
 /// Lost and superseded entries read `<skill> (<repo>)`, the repo labelled by
 /// `rule_copy_label` (full `owner/name`, or the path of a local-only repo).
 ///
 /// T-000174: every outcome that is not an error is also written to the rule's
 /// history (`rule_events`) — `taken` once per repo whose copy was taken, with
-/// the marker's approval line, plus `lost` and `superseded` with their repo.
-/// The report above is a toast that is gone in seconds; the history is what
-/// answers "where did this rule's text come from" afterwards. A failed history
-/// write is reported as `RuleFailed` like any other step here and never undoes
-/// or blocks the outcome it describes.
+/// the marker's approval line, `lost` and `superseded` with their repo, and the
+/// conflict events. The report is a toast that is gone in seconds; the history
+/// is what answers "where did this rule's text come from" afterwards. A failed
+/// history write is reported as `RuleFailed` like any other step here and never
+/// undoes or blocks the outcome it describes.
 fn collect_approved_skill_edits(
     db: &AppDb,
     repos: &[Repository],
     settings_edit: Option<&str>,
 ) -> Collected {
     let mut out = Collected::default();
-    // T-000206: read BEFORE scanning, so the pass that opens a conflict still
-    // reports it in full and only the passes after it keep quiet.
-    let open = match db.open_rule_conflicts() {
-        Ok(open) => open,
-        Err(e) => {
-            out.file_failed("", "rule_conflicts".to_string(), e);
-            HashSet::new()
-        }
-    };
+    let open = read_open_conflicts(db, &mut out);
     let known: HashMap<String, String> = match list_skill_templates(db) {
         Ok(v) => v.into_iter().collect(),
         Err(e) => {
@@ -485,202 +801,19 @@ fn collect_approved_skill_edits(
             return out;
         }
     };
-
-    // skill name -> handed-back copies, one per repo that flagged it.
-    let mut handed: HashMap<String, Vec<HandedCopy>> = HashMap::new();
-    // T-000206 review: what this pass actually looked at — repos whose
-    // `docs/sdh_skills/` was read, and (skill, repo) pairs whose flagged copy
-    // could not be. An open conflict is only closed on what was seen.
-    let mut read: HashSet<String> = HashSet::new();
-    let mut unread_copies: HashSet<(String, String)> = HashSet::new();
-
-    for repo in repos {
-        let Some(path) = repo.local_path.as_deref() else {
-            continue;
-        };
-        let dir = Path::new(path).join("docs").join("sdh_skills");
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue; // no copies here yet — nothing can have been handed back
-        };
-        // T-000198: one unambiguous label for every finding of this pass —
-        // issues and the `<skill> (<repo>)` lines alike.
-        let label = rule_copy_label(repo);
-        read.insert(label.clone());
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(marker) = file_name.to_str() else {
-                continue;
-            };
-            let Some(stem) = marker.strip_suffix(APPROVED_SUFFIX) else {
-                continue;
-            };
-            let Some(name) = stem.strip_suffix(".md") else {
-                continue;
-            };
-            let Some(current) = known.get(name) else {
-                out.errors.push(
-                    SyncIssue::new(SyncIssueCode::RuleUnknownSkill, label.clone()).target(marker),
-                );
-                continue;
-            };
-            if settings_edit == Some(name) {
-                match clear_marker(&entry.path()) {
-                    Ok(()) => {
-                        out.superseded.push(format!("{} ({})", name, label));
-                        out.record(db, name, rule_event::SUPERSEDED, Some(&label), None);
-                    }
-                    Err(e) => out.errors.push(
-                        SyncIssue::new(SyncIssueCode::RuleFailed, name)
-                            .target(format!("{}: {}", label, marker))
-                            .detail(e),
-                    ),
-                }
-                continue;
-            }
-            let copy = dir.join(stem);
-            match fs::read_to_string(&copy) {
-                Ok(content) if content == *current => match clear_marker(&entry.path()) {
-                    Ok(()) => {
-                        out.lost.push(format!("{} ({})", name, label));
-                        out.record(db, name, rule_event::LOST, Some(&label), None);
-                    }
-                    Err(e) => out.errors.push(
-                        SyncIssue::new(SyncIssueCode::RuleFailed, name)
-                            .target(format!("{}: {}", label, marker))
-                            .detail(e),
-                    ),
-                },
-                Ok(content) => {
-                    // The marker may carry the approval line. Empty is allowed;
-                    // when present it is worth having in the log and, since
-                    // T-000174, in the rule's history.
-                    let note = fs::read_to_string(entry.path())
-                        .ok()
-                        .map(|note| note.trim().to_string())
-                        .filter(|note| !note.is_empty());
-                    if let Some(note) = &note {
-                        eprintln!("[skills] {} hands back {}: {}", label, name, note);
-                    }
-                    handed
-                        .entry(name.to_string())
-                        .or_default()
-                        .push(HandedCopy {
-                            label: label.clone(),
-                            content,
-                            marker: entry.path(),
-                            note,
-                        });
-                }
-                Err(e) => {
-                    unread_copies.insert((name.to_string(), label.clone()));
-                    out.errors.push(
-                        SyncIssue::new(SyncIssueCode::RuleFailed, name)
-                            .target(format!("{}: {}", label, stem))
-                            .detail(e),
-                    )
-                }
-            }
+    let scans: Vec<RepoScan> = repos.iter().filter_map(scan_repo_markers).collect();
+    let found = classify(db, &scans, &known, settings_edit, &mut out);
+    // Closed first, so a `conflict_resolved` reads before whatever this pass
+    // then takes up.
+    let undecided = settle_open_conflicts(db, repos, &open, &found, settings_edit, &mut out);
+    for (name, copies) in found.handed {
+        if in_conflict(&copies) {
+            record_conflict(db, repos, &name, &copies, open.get(&name), &mut out);
+        } else if !undecided.contains(&name) {
+            take_up(db, name, &copies, &mut out);
         }
     }
-
-    // Sorted, so the reason file and the reports read the same on every pass.
-    let mut handed: Vec<(String, Vec<HandedCopy>)> = handed.into_iter().collect();
-    handed.sort_by(|a, b| a.0.cmp(&b.0));
-    for (_, copies) in &mut handed {
-        copies.sort_by(|a, b| a.label.cmp(&b.label));
-    }
-    let in_conflict = |copies: &[HandedCopy]| copies.iter().any(|c| c.content != copies[0].content);
-
-    // A conflict open before this pass and gone now is closed first, so its
-    // `conflict_resolved` reads before whatever this pass then takes up.
-    let mut gone: Vec<&String> = open
-        .iter()
-        .filter(|rule| {
-            !handed
-                .iter()
-                .any(|(name, copies)| name == *rule && in_conflict(copies))
-        })
-        .collect();
-    gone.sort();
-    // T-000206 review: "gone" may only mean that a side was not seen — a
-    // checkout missing on this machine, an unreadable folder or copy, a failed
-    // repo listing. Closing then would record a false "resolved outside the
-    // app", take the other side as a lone hand-back, and let the unseen side
-    // overwrite it once it is back. So a conflict closes only when every repo
-    // of its newest `conflict` event was read in this pass; otherwise it stays
-    // open and quiet, and no hand-back of that skill is taken until it is.
-    let mut undecided: HashSet<String> = HashSet::new();
-    for rule in gone {
-        let seen: Vec<String> = read
-            .iter()
-            .filter(|label| !unread_copies.contains(&(rule.clone(), (*label).clone())))
-            .cloned()
-            .collect();
-        let decidable = match db.latest_conflict_repos(rule) {
-            Ok(Some(sides)) => all_participants_read(&sides, &seen),
-            // No record of the sides (its `conflict` event failed to write):
-            // nothing proves they were all seen, so it waits for the owner.
-            Ok(None) => false,
-            Err(e) => {
-                out.file_failed(rule, "rule_events".to_string(), e);
-                false
-            }
-        };
-        if decidable {
-            out.close_conflict(db, repos, rule, settings_edit);
-        } else {
-            out.quiet_conflicts.push(rule.clone());
-            undecided.insert(rule.clone());
-        }
-    }
-
-    for (name, copies) in handed {
-        let first = &copies[0].content;
-        if let Some(other) = copies.iter().find(|copy| copy.content != *first) {
-            out.conflict(db, repos, &name, &copies, other, open.contains(&name));
-            continue; // markers stay put: nobody's edit is thrown away
-        }
-        if undecided.contains(&name) {
-            continue; // a side of its open conflict was not seen: markers stay
-        }
-        let file_name = format!("{}{}{}", SKILL_PREFIX, name, SKILL_SUFFIX);
-        if let Err(e) = db.upsert_template_file("_global", &file_name, first, true) {
-            out.errors.push(
-                SyncIssue::new(SyncIssueCode::RuleFailed, name.clone())
-                    .target(file_name.clone())
-                    .detail(e),
-            );
-            continue;
-        }
-        for copy in &copies {
-            // Recorded before the marker is cleared, and whether or not that
-            // succeeds: the text is already the rule at this point.
-            out.record(
-                db,
-                &name,
-                rule_event::TAKEN,
-                Some(&copy.label),
-                copy.note.as_deref(),
-            );
-            let marker = &copy.marker;
-            if let Err(e) = clear_marker(marker) {
-                // The text is already stored; a surviving marker now sits beside
-                // a copy equal to the rule, so the next pass reports it as lost
-                // instead of taking it up again.
-                out.errors.push(
-                    SyncIssue::new(SyncIssueCode::RuleFailed, name.clone())
-                        .target(marker.display().to_string())
-                        .detail(e),
-                );
-            }
-        }
-        out.taken.push(name);
-    }
-    out.taken.sort();
-    out.lost.sort();
-    out.superseded.sort();
-    out.quiet_conflicts.sort();
-    out
+    out.sorted()
 }
 
 /// What a `refresh_rules` pass renders when nothing was taken up. An uptake
@@ -718,8 +851,32 @@ pub fn refresh_rules(
     settings_edit: Option<&str>,
 ) -> RulesRefresh {
     let _guard = rules_guard();
+    refresh_rules_locked(db, claude_dir, scope, settings_edit)
+}
+
+/// The body of `refresh_rules` for a caller that already holds `rules_guard()`
+/// (T-000206: resolving a conflict runs its own steps and this refresh under
+/// one hold of the lock).
+pub(crate) fn refresh_rules_locked(
+    db: &AppDb,
+    claude_dir: Option<&Path>,
+    scope: RenderScope,
+    settings_edit: Option<&str>,
+) -> RulesRefresh {
     let mut report = RulesRefresh::default();
-    let repos = match db.list_repos_with_local_path(None) {
+    let repos = portfolio_repos(db, &mut report);
+
+    let collected = collect_approved_skill_edits(db, &repos, settings_edit);
+    report.absorb(collected);
+    let everywhere = !report.taken.is_empty();
+    render_scope(db, claude_dir, scope, everywhere, &repos, &mut report);
+    report
+}
+
+/// Every repo with a local path — what a collection covers. A failed listing
+/// is reported and yields none: nothing is read, so nothing is decided.
+fn portfolio_repos(db: &AppDb, report: &mut RulesRefresh) -> Vec<Repository> {
+    match db.list_repos_with_local_path(None) {
         Ok(v) => v,
         Err(e) => {
             report
@@ -727,13 +884,7 @@ pub fn refresh_rules(
                 .push(SyncIssue::lookup(lookup::REPOS, "").detail(e));
             Vec::new()
         }
-    };
-
-    let collected = collect_approved_skill_edits(db, &repos, settings_edit);
-    report.absorb(collected);
-    let everywhere = !report.taken.is_empty();
-    render_scope(db, claude_dir, scope, everywhere, &repos, &mut report);
-    report
+    }
 }
 
 /// The render half of a refresh: `scope`, widened to everywhere when
@@ -871,15 +1022,7 @@ fn render_skills_everywhere(
 pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option<RulesRefresh> {
     let _guard = rules_guard();
     let mut report = RulesRefresh::default();
-    let repos = match db.list_repos_with_local_path(None) {
-        Ok(v) => v,
-        Err(e) => {
-            report
-                .errors
-                .push(SyncIssue::lookup(lookup::REPOS, "").detail(e));
-            Vec::new()
-        }
-    };
+    let repos = portfolio_repos(db, &mut report);
     report.absorb(collect_approved_skill_edits(db, &repos, None));
 
     let seeded = match crate::template_seeder::seed_bundled_templates(db) {
@@ -1041,7 +1184,7 @@ mod tests {
     #[test]
     fn test_clearing_a_marker_that_is_already_gone_is_not_an_error() {
         let tmp = TempDir::new().unwrap();
-        assert!(clear_marker(&tmp.path().join("sdh-alpha.md.approved")).is_ok());
+        assert!(remove_if_present(&tmp.path().join("sdh-alpha.md.approved")).is_ok());
     }
 
     #[test]
@@ -1617,73 +1760,127 @@ mod tests {
         );
     }
 
-    /// The closing decision of an open conflict, as the review found it: a side
-    /// that could not be read this pass silently dropped out, the other side
-    /// looked like a lone hand-back, and the conflict was closed "outside the
-    /// app" and that text taken. Asserts nothing about `sdh-alpha` changed.
-    fn assert_conflict_still_open(db: &AppDb, collected: &Collected, two: &TempDir) {
-        assert!(collected.taken.is_empty(), "{:?}", collected.taken);
-        assert_eq!(collected.quiet_conflicts, vec!["sdh-alpha".to_string()]);
+    /// `n` stored GitHub repos `acme/r<i>`, each handing back its own text of
+    /// `sdh-alpha` (`VERSION <i>`). GitHub labels, so a test can rename one.
+    fn conflict_of(db: &AppDb, n: usize) -> Vec<TempDir> {
+        (0..n)
+            .map(|i| {
+                let dir = TempDir::new().unwrap();
+                insert_repo(db, &format!("acme/r{}", i), &dir.path().to_string_lossy());
+                render_skills_to_repo(db, dir.path()).unwrap();
+                hand_back(
+                    &dir.path().join("docs/sdh_skills"),
+                    "sdh-alpha",
+                    &format!("VERSION {}", i),
+                    "",
+                );
+                dir
+            })
+            .collect()
+    }
+
+    fn portfolio(db: &AppDb) -> Vec<Repository> {
+        db.list_repos_with_local_path(None).unwrap()
+    }
+
+    /// The side leaves the conflict: its marker is removed by hand.
+    fn drop_out(dir: &TempDir) {
+        fs::remove_file(dir.path().join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap();
+    }
+
+    fn resolved(db: &AppDb) -> Vec<crate::models::RuleEvent> {
+        rule_history(db, "sdh-alpha")
+            .into_iter()
+            .filter(|e| e.kind == rule_event::CONFLICT_RESOLVED)
+            .collect()
+    }
+
+    fn rule_text(db: &AppDb) -> String {
+        db.get_template_file("_global", "skill.sdh-alpha.md.tmpl")
+            .unwrap()
+            .unwrap()
+            .content
+    }
+
+    /// T-000206: nothing about `sdh-alpha` was decided this pass — the
+    /// conflict is still open and quiet, nothing was taken, and `keeper`
+    /// (a side that was read) still has its marker, its copy and its note.
+    fn assert_conflict_still_open(
+        db: &AppDb,
+        taken: &[String],
+        quiet: &[String],
+        keeper: &TempDir,
+        keeper_text: &str,
+    ) {
+        assert!(taken.is_empty(), "{:?}", taken);
+        assert_eq!(quiet, ["sdh-alpha".to_string()]);
         assert!(db.open_rule_conflicts().unwrap().contains("sdh-alpha"));
-        assert!(
-            rule_history(db, "sdh-alpha")
-                .iter()
-                .all(|e| e.kind != rule_event::CONFLICT_RESOLVED),
-            "{:?}",
-            rule_history(db, "sdh-alpha")
-        );
-        assert_eq!(
-            db.get_template_file("_global", "skill.sdh-alpha.md.tmpl")
-                .unwrap()
-                .unwrap()
-                .content,
-            "ALPHA BODY"
-        );
-        let skills = two.path().join("docs/sdh_skills");
+        assert!(resolved(db).is_empty(), "{:?}", resolved(db));
+        assert_eq!(rule_text(db), "ALPHA BODY");
+        let skills = keeper.path().join("docs/sdh_skills");
         assert!(skills.join("sdh-alpha.md.approved").exists());
         assert_eq!(
             fs::read_to_string(skills.join("sdh-alpha.md")).unwrap(),
-            "VERSION TWO"
+            keeper_text
         );
-        assert!(reason_file(two, "sdh-alpha").exists());
+        assert!(reason_file(keeper, "sdh-alpha").exists());
     }
 
-    /// T-000206 review: a checkout missing on this machine is not a side that
-    /// gave up. Until every repo of the conflict has been read again, the
-    /// conflict stays open and quiet and nothing of that skill is taken.
+    /// T-000206: a side missing from this pass is not a side that gave up.
+    /// Closing then would record a false "resolved outside the app" and take
+    /// the other side, which the missing one overwrites once it is back.
     #[test]
-    fn test_an_open_conflict_with_an_unreadable_side_is_not_closed() {
+    fn test_an_open_conflict_with_a_side_left_out_of_the_pass_is_not_closed() {
         let db = db_with_skill();
-        let (one, two, _, _) = conflicting_repos(&db);
-        let repos = db.list_repos_with_local_path(None).unwrap();
-        collect_approved_skill_edits(&db, &repos, None);
-        let away = one.path().with_extension("away");
-        fs::rename(one.path(), &away).unwrap();
+        let dirs = conflict_of(&db, 2);
+        collect_approved_skill_edits(&db, &portfolio(&db), None);
+        let without_r0: Vec<Repository> = portfolio(&db)
+            .into_iter()
+            .filter(|r| r.github_name.as_deref() != Some("acme/r0"))
+            .collect();
 
-        let collected = collect_approved_skill_edits(&db, &repos, None);
-        fs::rename(&away, one.path()).unwrap();
+        let c = collect_approved_skill_edits(&db, &without_r0, None);
 
-        assert_conflict_still_open(&db, &collected, &two);
-        // Back on this machine: both sides read again, still different.
-        let collected = collect_approved_skill_edits(&db, &repos, None);
-        assert_conflict_still_open(&db, &collected, &two);
-        assert!(collected.errors.is_empty(), "{:?}", collected.errors);
+        assert_conflict_still_open(&db, &c.taken, &c.quiet_conflicts, &dirs[1], "VERSION 1");
     }
 
-    /// Same, for a side whose dir is readable but whose copy is not.
+    /// Same, for a side whose checkout is not on this machine.
+    #[test]
+    fn test_an_open_conflict_with_a_missing_checkout_is_not_closed() {
+        let db = db_with_skill();
+        let dirs = conflict_of(&db, 2);
+        collect_approved_skill_edits(&db, &portfolio(&db), None);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE repositories SET local_path = 'F:/definitely/not/cloned/here'
+                 WHERE github_name = 'acme/r0'",
+                [],
+            )
+            .unwrap();
+
+        let c = collect_approved_skill_edits(&db, &portfolio(&db), None);
+
+        assert_conflict_still_open(&db, &c.taken, &c.quiet_conflicts, &dirs[1], "VERSION 1");
+    }
+
+    /// Same, for a side whose folder is readable but whose copy is not.
     #[test]
     fn test_an_open_conflict_with_an_unreadable_copy_is_not_closed() {
         let db = db_with_skill();
-        let (one, two, _, _) = conflicting_repos(&db);
-        let repos = db.list_repos_with_local_path(None).unwrap();
-        collect_approved_skill_edits(&db, &repos, None);
-        let copy = one.path().join("docs/sdh_skills/sdh-alpha.md");
-        fs::remove_file(&copy).unwrap();
-        fs::create_dir(&copy).unwrap();
+        let dirs = conflict_of(&db, 2);
+        collect_approved_skill_edits(&db, &portfolio(&db), None);
+        fs::write(
+            dirs[0].path().join("docs/sdh_skills/sdh-alpha.md"),
+            [0xff, 0xfe, 0x00, 0xc3],
+        )
+        .unwrap();
 
-        let collected = collect_approved_skill_edits(&db, &repos, None);
+        let c = collect_approved_skill_edits(&db, &portfolio(&db), None);
 
-        assert_conflict_still_open(&db, &collected, &two);
+        assert_conflict_still_open(&db, &c.taken, &c.quiet_conflicts, &dirs[1], "VERSION 1");
+        assert!(c.errors.iter().any(|e| e.code == SyncIssueCode::RuleFailed));
     }
 
     /// A failed repo listing reads no side at all, so it closes nothing.
@@ -1691,7 +1888,7 @@ mod tests {
     fn test_a_failed_repo_listing_closes_no_conflict() {
         let db = db_with_skill();
         let home = TempDir::new().unwrap();
-        let (_one, two, _, _) = conflicting_repos(&db);
+        let dirs = conflict_of(&db, 2);
         refresh_rules(&db, Some(home.path()), RenderScope::UptakeOnly, None);
         db.conn
             .lock()
@@ -1702,32 +1899,208 @@ mod tests {
         let report = refresh_rules(&db, Some(home.path()), RenderScope::UptakeOnly, None);
 
         assert!(!report.errors.is_empty(), "the listing failure is reported");
-        let collected = Collected {
-            quiet_conflicts: report.quiet_conflicts,
-            ..Collected::default()
-        };
-        assert_conflict_still_open(&db, &collected, &two);
+        assert_conflict_still_open(
+            &db,
+            &report.taken,
+            &report.quiet_conflicts,
+            &dirs[1],
+            "VERSION 1",
+        );
     }
 
-    /// The participants are stored as labels joined by ", ", and a label of a
-    /// local-only repo is a path that may itself contain ", ". The check must
-    /// still read such a list right, in both directions.
+    /// Sides leave one by one. While two still differ the conflict stays open
+    /// and quiet, and only the leaver loses its reason file; once one side is
+    /// left it closes as resolved outside the app and that side is taken.
     #[test]
-    fn test_conflict_participants_are_matched_even_when_a_label_has_a_comma() {
-        let scanned =
-            |labels: &[&str]| -> Vec<String> { labels.iter().map(|l| l.to_string()).collect() };
-        let joined = "C:/work/a, b, acme/two";
+    fn test_a_three_repo_conflict_closes_when_one_side_is_left() {
+        let db = db_with_skill();
+        let dirs = conflict_of(&db, 3);
 
-        assert!(all_participants_read(
-            joined,
-            &scanned(&["acme/two", "C:/work/a, b"])
-        ));
-        assert!(!all_participants_read(joined, &scanned(&["acme/two"])));
-        assert!(!all_participants_read(
-            joined,
-            &scanned(&["C:/work/a", "acme/two"])
-        ));
-        assert!(!all_participants_read("", &scanned(&["acme/two"])));
+        let first = collect_approved_skill_edits(&db, &portfolio(&db), None);
+        let conflict: Vec<_> = first
+            .errors
+            .iter()
+            .filter(|e| e.code == SyncIssueCode::VersionConflict)
+            .collect();
+        assert_eq!(conflict.len(), 1, "{:?}", first.errors);
+        assert_eq!(
+            conflict[0].target.as_deref(),
+            Some("acme/r0, acme/r1, acme/r2"),
+            "every side is named"
+        );
+
+        drop_out(&dirs[1]);
+        let second = collect_approved_skill_edits(&db, &portfolio(&db), None);
+        assert!(second.taken.is_empty());
+        assert_eq!(second.quiet_conflicts, vec!["sdh-alpha".to_string()]);
+        assert!(resolved(&db).is_empty());
+        assert!(!reason_file(&dirs[1], "sdh-alpha").exists(), "the leaver's");
+        assert!(reason_file(&dirs[0], "sdh-alpha").exists());
+        assert!(reason_file(&dirs[2], "sdh-alpha").exists());
+
+        drop_out(&dirs[2]);
+        let third = collect_approved_skill_edits(&db, &portfolio(&db), None);
+        assert!(third.errors.is_empty(), "{:?}", third.errors);
+        assert_eq!(third.taken, vec!["sdh-alpha".to_string()]);
+        assert_eq!(rule_text(&db), "VERSION 0");
+        assert!(db.open_rule_conflicts().unwrap().is_empty());
+        let closed = resolved(&db);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(
+            closed[0].note.as_deref(),
+            Some(conflict_note::RESOLVED_OUTSIDE)
+        );
+        for dir in &dirs {
+            assert!(!reason_file(dir, "sdh-alpha").exists());
+        }
+    }
+
+    /// A side is known by its repo id, not by its label: renaming the repo
+    /// on GitHub does not make it a stranger that blocks the conflict forever.
+    #[test]
+    fn test_a_renamed_side_does_not_block_closing() {
+        let db = db_with_skill();
+        let dirs = conflict_of(&db, 2);
+        collect_approved_skill_edits(&db, &portfolio(&db), None);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE repositories SET github_name = 'acme/renamed' WHERE github_name = 'acme/r0'",
+                [],
+            )
+            .unwrap();
+        drop_out(&dirs[1]);
+
+        let c = collect_approved_skill_edits(&db, &portfolio(&db), None);
+
+        assert_eq!(c.taken, vec!["sdh-alpha".to_string()]);
+        assert_eq!(rule_text(&db), "VERSION 0");
+        assert!(db.open_rule_conflicts().unwrap().is_empty());
+        assert_eq!(resolved(&db).len(), 1);
+    }
+
+    /// A side removed from the portfolio can hand nothing back any more: it
+    /// does not block the conflict either.
+    #[test]
+    fn test_a_deleted_side_does_not_block_closing() {
+        let db = db_with_skill();
+        let _dirs = conflict_of(&db, 2);
+        collect_approved_skill_edits(&db, &portfolio(&db), None);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM repositories WHERE github_name = 'acme/r1'", [])
+            .unwrap();
+
+        let c = collect_approved_skill_edits(&db, &portfolio(&db), None);
+
+        assert_eq!(c.taken, vec!["sdh-alpha".to_string()]);
+        assert_eq!(rule_text(&db), "VERSION 0");
+        assert!(db.open_rule_conflicts().unwrap().is_empty());
+        assert_eq!(resolved(&db).len(), 1);
+    }
+
+    /// A repo joining an open conflict is not a new conflict (no toast), but
+    /// the history shows it joined, and it becomes a side that must be read.
+    #[test]
+    fn test_a_repo_joining_an_open_conflict_is_recorded_quietly() {
+        let db = db_with_skill();
+        let _dirs = conflict_of(&db, 2);
+        collect_approved_skill_edits(&db, &portfolio(&db), None);
+        let third = TempDir::new().unwrap();
+        insert_repo(&db, "acme/r2", &third.path().to_string_lossy());
+        render_skills_to_repo(&db, third.path()).unwrap();
+        hand_back(
+            &third.path().join("docs/sdh_skills"),
+            "sdh-alpha",
+            "VERSION 2",
+            "",
+        );
+
+        let c = collect_approved_skill_edits(&db, &portfolio(&db), None);
+
+        assert!(
+            c.errors
+                .iter()
+                .all(|e| e.code != SyncIssueCode::VersionConflict),
+            "{:?}",
+            c.errors
+        );
+        assert_eq!(c.quiet_conflicts, vec!["sdh-alpha".to_string()]);
+        let conflicts: Vec<_> = rule_history(&db, "sdh-alpha")
+            .into_iter()
+            .filter(|e| e.kind == rule_event::CONFLICT)
+            .collect();
+        assert_eq!(conflicts.len(), 2, "{:?}", conflicts);
+        assert_eq!(
+            conflicts[1].repo.as_deref(),
+            Some("acme/r0, acme/r1, acme/r2")
+        );
+        assert!(reason_file(&third, "sdh-alpha").exists());
+
+        // The newcomer is a side now: left out of a pass, it blocks closing.
+        fs::remove_file(third.path().join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap();
+        let without: Vec<Repository> = portfolio(&db)
+            .into_iter()
+            .filter(|r| r.github_name.as_deref() != Some("acme/r2"))
+            .collect();
+        let dirs_left = collect_approved_skill_edits(&db, &without, None);
+        assert_eq!(dirs_left.quiet_conflicts, vec!["sdh-alpha".to_string()]);
+    }
+
+    /// Once closed, a conflict that comes back is a new one: reported in full.
+    #[test]
+    fn test_a_conflict_that_comes_back_after_closing_is_reported_again() {
+        let db = db_with_skill();
+        let dirs = conflict_of(&db, 2);
+        collect_approved_skill_edits(&db, &portfolio(&db), None);
+        drop_out(&dirs[1]);
+        let closed = collect_approved_skill_edits(&db, &portfolio(&db), None);
+        assert_eq!(closed.taken, vec!["sdh-alpha".to_string()]);
+        for (i, dir) in dirs.iter().enumerate() {
+            hand_back(
+                &dir.path().join("docs/sdh_skills"),
+                "sdh-alpha",
+                &format!("AGAIN {}", i),
+                "",
+            );
+        }
+
+        let again = collect_approved_skill_edits(&db, &portfolio(&db), None);
+
+        assert_eq!(
+            again
+                .errors
+                .iter()
+                .filter(|e| e.code == SyncIssueCode::VersionConflict)
+                .count(),
+            1,
+            "{:?}",
+            again.errors
+        );
+        assert!(again.quiet_conflicts.is_empty());
+        assert!(db.open_rule_conflicts().unwrap().contains("sdh-alpha"));
+    }
+
+    /// Stored sides that cannot be parsed prove nothing: the conflict stays
+    /// open and quiet, and the damage is reported.
+    #[test]
+    fn test_unparseable_sides_keep_the_conflict_open() {
+        let db = db_with_skill();
+        let dirs = conflict_of(&db, 2);
+        collect_approved_skill_edits(&db, &portfolio(&db), None);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE rule_conflicts SET repo_ids = 'not json'", [])
+            .unwrap();
+        drop_out(&dirs[0]);
+
+        let c = collect_approved_skill_edits(&db, &portfolio(&db), None);
+
+        assert_conflict_still_open(&db, &c.taken, &c.quiet_conflicts, &dirs[1], "VERSION 1");
+        assert!(c.errors.iter().any(|e| e.code == SyncIssueCode::RuleFailed));
     }
 
     /// The reason file sits in `docs/sdh_skills/` beside the copies, so both
