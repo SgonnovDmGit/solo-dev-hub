@@ -37,7 +37,10 @@ fn git_merge_uses_the_registered_driver() {
     git(&repo, &["config", "user.email", "t@example.com"]);
     git(&repo, &["config", "user.name", "T"]);
     git(&repo, &["config", "core.autocrlf", "false"]);
-    git(&repo, &["config", "merge.sdh.name", "Solo Dev Hub merge by id"]);
+    git(
+        &repo,
+        &["config", "merge.sdh.name", "Solo Dev Hub merge by id"],
+    );
     git(
         &repo,
         &[
@@ -54,7 +57,10 @@ fn git_merge_uses_the_registered_driver() {
     git(&repo, &["checkout", "-q", "-b", "other"]);
     fs::write(
         repo.join("docs/todo.md"),
-        BASE.replace("третья задача | 3 | medium | open", "третья задача | 3 | medium | review"),
+        BASE.replace(
+            "третья задача | 3 | medium | open",
+            "третья задача | 3 | medium | review",
+        ),
     )
     .unwrap();
     git(&repo, &["commit", "-q", "-am", "theirs"]);
@@ -71,6 +77,10 @@ fn git_merge_uses_the_registered_driver() {
     git(&repo, &["merge", "-q", "--no-edit", "other"]);
     let merged = fs::read_to_string(repo.join("docs/todo.md")).unwrap();
     assert!(merged.contains("вторая задача, правка | 1"), "{}", merged);
-    assert!(merged.contains("третья задача | 3 | medium | review"), "{}", merged);
+    assert!(
+        merged.contains("третья задача | 3 | medium | review"),
+        "{}",
+        merged
+    );
     assert!(!merged.contains("<<<<<<<"));
 }

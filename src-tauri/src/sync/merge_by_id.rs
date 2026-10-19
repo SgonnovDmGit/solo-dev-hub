@@ -95,7 +95,10 @@ struct Ent {
 }
 
 enum Line {
-    Header { key: String, text: String },
+    Header {
+        key: String,
+        text: String,
+    },
     Ent(usize),
     /// A line that looks like an entity but repeats an id seen earlier in the
     /// same file; kept verbatim where it is, never merged.
@@ -732,7 +735,11 @@ pub fn merge_shared_file(
 
     // Render with ours' conventions.
     let eol = if o.crlf { "\r\n" } else { "\n" };
-    let trailing = if o.empty { t.trailing_nl } else { o.trailing_nl };
+    let trailing = if o.empty {
+        t.trailing_nl
+    } else {
+        o.trailing_nl
+    };
     let mut s = String::new();
     if o.bom {
         s.push('\u{feff}');
@@ -788,7 +795,10 @@ mod tests {
     #[test]
     fn different_tasks_edited_on_both_sides() {
         let ours = TODO_BASE.replace("first task", "first task EDITED");
-        let theirs = TODO_BASE.replace("third task | 3 | medium | open", "third task | 5 | medium | open");
+        let theirs = TODO_BASE.replace(
+            "third task | 3 | medium | open",
+            "third task | 5 | medium | open",
+        );
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         assert!(r.contains("T-000001 | first task EDITED | 2"));
         assert!(r.contains("T-000003 | third task | 5 | medium"));
@@ -797,8 +807,14 @@ mod tests {
 
     #[test]
     fn same_task_status_both_sides_further_wins() {
-        let ours = TODO_BASE.replace("T-000002 | second task | 1 | low | open", "T-000002 | second task | 1 | low | in-progress");
-        let theirs = TODO_BASE.replace("T-000002 | second task | 1 | low | open", "T-000002 | second task | 1 | low | review");
+        let ours = TODO_BASE.replace(
+            "T-000002 | second task | 1 | low | open",
+            "T-000002 | second task | 1 | low | in-progress",
+        );
+        let theirs = TODO_BASE.replace(
+            "T-000002 | second task | 1 | low | open",
+            "T-000002 | second task | 1 | low | review",
+        );
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         assert!(r.contains("second task | 1 | low | review | 2026-10-02"));
         // and the other way round
@@ -808,12 +824,21 @@ mod tests {
 
     #[test]
     fn unknown_status_ranks_lowest() {
-        let ours = TODO_BASE.replace("T-000002 | second task | 1 | low | open", "T-000002 | second task | 1 | low | weird");
-        let theirs = TODO_BASE.replace("T-000002 | second task | 1 | low | open", "T-000002 | second task | 1 | low | open!");
+        let ours = TODO_BASE.replace(
+            "T-000002 | second task | 1 | low | open",
+            "T-000002 | second task | 1 | low | weird",
+        );
+        let theirs = TODO_BASE.replace(
+            "T-000002 | second task | 1 | low | open",
+            "T-000002 | second task | 1 | low | open!",
+        );
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         // both unknown -> tie -> ours
         assert!(r.contains("| low | weird |"));
-        let theirs2 = TODO_BASE.replace("T-000002 | second task | 1 | low | open", "T-000002 | second task | 1 | low | in-progress");
+        let theirs2 = TODO_BASE.replace(
+            "T-000002 | second task | 1 | low | open",
+            "T-000002 | second task | 1 | low | in-progress",
+        );
         let r2 = m(Todo, TODO_BASE, &ours, &theirs2);
         assert!(r2.contains("| low | in-progress |"));
     }
@@ -821,15 +846,25 @@ mod tests {
     #[test]
     fn description_both_sides_ours_wins_other_fields_merge() {
         let ours = TODO_BASE.replace("second task | 1 | low", "наша правка | 1 | low");
-        let theirs = TODO_BASE.replace("second task | 1 | low | open", "чужая правка | 4 | low | open");
+        let theirs = TODO_BASE.replace(
+            "second task | 1 | low | open",
+            "чужая правка | 4 | low | open",
+        );
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         // description: ours; effort changed only by theirs: theirs
-        assert!(r.contains("T-000002 | наша правка | 4 | low | open | 2026-10-02"), "{}", r);
+        assert!(
+            r.contains("T-000002 | наша правка | 4 | low | open | 2026-10-02"),
+            "{}",
+            r
+        );
     }
 
     #[test]
     fn delete_vs_unchanged_is_deleted() {
-        let ours = TODO_BASE.replace("- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n", "");
+        let ours = TODO_BASE.replace(
+            "- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n",
+            "",
+        );
         let theirs = TODO_BASE.replace("first task", "first task v2");
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         assert!(!r.contains("T-000002"));
@@ -842,7 +877,10 @@ mod tests {
 
     #[test]
     fn delete_vs_description_edit_is_kept() {
-        let ours = TODO_BASE.replace("- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n", "");
+        let ours = TODO_BASE.replace(
+            "- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n",
+            "",
+        );
         let theirs = TODO_BASE.replace("second task", "second task reworded");
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         assert!(r.contains("T-000002 | second task reworded"));
@@ -852,8 +890,14 @@ mod tests {
 
     #[test]
     fn todo_delete_vs_status_only_edit_is_deleted() {
-        let ours = TODO_BASE.replace("- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n", "");
-        let theirs = TODO_BASE.replace("second task | 1 | low | open", "second task | 1 | low | in-progress");
+        let ours = TODO_BASE.replace(
+            "- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n",
+            "",
+        );
+        let theirs = TODO_BASE.replace(
+            "second task | 1 | low | open",
+            "second task | 1 | low | in-progress",
+        );
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         assert!(!r.contains("T-000002"));
         let r2 = m(Todo, TODO_BASE, &theirs, &ours);
@@ -862,12 +906,24 @@ mod tests {
 
     #[test]
     fn todo_delete_vs_section_move_only_is_deleted() {
-        let base = format!("{}\n## v1.21.0\n\n- [ ] T-000009 | later | 1 | low | open | 2026-10-09\n", TODO_BASE);
-        let ours = base.replace("- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n", "");
+        let base = format!(
+            "{}\n## v1.21.0\n\n- [ ] T-000009 | later | 1 | low | open | 2026-10-09\n",
+            TODO_BASE
+        );
+        let ours = base.replace(
+            "- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n",
+            "",
+        );
         // theirs moves T-000002 into v1.21.0
         let theirs = base
-            .replace("- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n", "")
-            .replace("- [ ] T-000009", "- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n- [ ] T-000009");
+            .replace(
+                "- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n",
+                "",
+            )
+            .replace(
+                "- [ ] T-000009",
+                "- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n- [ ] T-000009",
+            );
         let r = m(Todo, &base, &ours, &theirs);
         assert!(!r.contains("T-000002"), "{}", r);
     }
@@ -884,21 +940,38 @@ mod tests {
 
     #[test]
     fn added_on_both_sides_different_sections() {
-        let base = format!("{}\n## v1.21.0\n\n- [ ] T-000009 | later | 1 | low | open | 2026-10-09\n", TODO_BASE);
-        let ours = base.replace("- [ ] T-000003", "- [ ] T-000010 | ours new | 1 | low | open | 2026-10-10\n- [ ] T-000003");
-        let theirs = base.replace("- [ ] T-000009", "- [ ] T-000011 | theirs new | 1 | low | open | 2026-10-11\n- [ ] T-000009");
+        let base = format!(
+            "{}\n## v1.21.0\n\n- [ ] T-000009 | later | 1 | low | open | 2026-10-09\n",
+            TODO_BASE
+        );
+        let ours = base.replace(
+            "- [ ] T-000003",
+            "- [ ] T-000010 | ours new | 1 | low | open | 2026-10-10\n- [ ] T-000003",
+        );
+        let theirs = base.replace(
+            "- [ ] T-000009",
+            "- [ ] T-000011 | theirs new | 1 | low | open | 2026-10-11\n- [ ] T-000009",
+        );
         let r = m(Todo, &base, &ours, &theirs);
         let l = lines(&r);
         let pos = |needle: &str| l.iter().position(|x| x.contains(needle)).unwrap();
         let h2 = pos("## v1.21.0");
         assert!(pos("T-000010") < h2, "ours new stays in v1.20.0");
         assert!(pos("T-000011") > h2, "theirs new lands in v1.21.0");
-        assert_eq!(pos("T-000011"), pos("T-000009") - 1, "inserted after predecessor... or before? {}", r);
+        assert_eq!(
+            pos("T-000011"),
+            pos("T-000009") - 1,
+            "inserted after predecessor... or before? {}",
+            r
+        );
     }
 
     #[test]
     fn added_after_predecessor_in_same_section() {
-        let theirs = TODO_BASE.replace("- [ ] T-000003", "- [ ] T-000010 | between | 1 | low | open | 2026-10-10\n- [ ] T-000003");
+        let theirs = TODO_BASE.replace(
+            "- [ ] T-000003",
+            "- [ ] T-000010 | between | 1 | low | open | 2026-10-10\n- [ ] T-000003",
+        );
         let ours = TODO_BASE.replace("third task", "third task v2");
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         let l = lines(&r);
@@ -909,7 +982,10 @@ mod tests {
 
     #[test]
     fn new_section_only_in_theirs_is_created() {
-        let theirs = format!("{}\n## v1.21.0 — next\n\n- [ ] T-000020 | next thing | 1 | low | open | 2026-10-20\n", TODO_BASE);
+        let theirs = format!(
+            "{}\n## v1.21.0 — next\n\n- [ ] T-000020 | next thing | 1 | low | open | 2026-10-20\n",
+            TODO_BASE
+        );
         let ours = TODO_BASE.replace("first task", "first task v2");
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         assert!(r.contains("first task v2"));
@@ -921,12 +997,21 @@ mod tests {
 
     #[test]
     fn task_moved_between_versions_follows_the_move() {
-        let base = format!("{}\n## v1.21.0\n\n- [ ] T-000009 | later | 1 | low | open | 2026-10-09\n", TODO_BASE);
+        let base = format!(
+            "{}\n## v1.21.0\n\n- [ ] T-000009 | later | 1 | low | open | 2026-10-09\n",
+            TODO_BASE
+        );
         let ours = base.replace("first task", "first task edited");
         // theirs moves T-000001 to v1.21.0
         let theirs = base
-            .replace("- [ ] T-000001 | first task | 2 | high | open | 2026-10-01\n", "")
-            .replace("- [ ] T-000009", "- [ ] T-000001 | first task | 2 | high | open | 2026-10-01\n- [ ] T-000009");
+            .replace(
+                "- [ ] T-000001 | first task | 2 | high | open | 2026-10-01\n",
+                "",
+            )
+            .replace(
+                "- [ ] T-000009",
+                "- [ ] T-000001 | first task | 2 | high | open | 2026-10-01\n- [ ] T-000009",
+            );
         let r = m(Todo, &base, &ours, &theirs);
         let l = lines(&r);
         let h2 = l.iter().position(|x| x.starts_with("## v1.21.0")).unwrap();
@@ -939,30 +1024,58 @@ mod tests {
     #[test]
     fn checkbox_both_changed_ours_wins() {
         let ours = TODO_BASE.replace("- [ ] T-000001", "- [x] T-000001");
-        let theirs = TODO_BASE.replace("- [ ] T-000001 | first task | 2 | high | open", "- [X] T-000001 | first task | 2 | high | review");
+        let theirs = TODO_BASE.replace(
+            "- [ ] T-000001 | first task | 2 | high | open",
+            "- [X] T-000001 | first task | 2 | high | review",
+        );
         let r = m(Todo, TODO_BASE, &ours, &theirs);
-        assert!(r.contains("- [x] T-000001 | first task | 2 | high | review | 2026-10-01"), "{}", r);
+        assert!(
+            r.contains("- [x] T-000001 | first task | 2 | high | review | 2026-10-01"),
+            "{}",
+            r
+        );
     }
 
     #[test]
     fn escaped_pipe_survives() {
         let base = "## v1\n\n- [ ] T-000001 | regex a\\|b here | 1 | low | open | 2026-10-01\n- [ ] T-000002 | other | 1 | low | open | 2026-10-02\n";
-        let ours = base.replace("| 1 | low | open | 2026-10-01", "| 1 | low | review | 2026-10-01");
+        let ours = base.replace(
+            "| 1 | low | open | 2026-10-01",
+            "| 1 | low | review | 2026-10-01",
+        );
         let theirs = base.replace("other", "other v2");
         let r = m(Todo, base, &ours, &theirs);
-        assert!(r.contains("T-000001 | regex a\\|b here | 1 | low | review | 2026-10-01"), "{}", r);
+        assert!(
+            r.contains("T-000001 | regex a\\|b here | 1 | low | review | 2026-10-01"),
+            "{}",
+            r
+        );
         assert!(r.contains("other v2"));
         // an escaped pipe in a field that has to be re-joined
-        let theirs2 = base.replace("| 1 | low | open | 2026-10-01", "| 3 | low | open | 2026-10-01");
+        let theirs2 = base.replace(
+            "| 1 | low | open | 2026-10-01",
+            "| 3 | low | open | 2026-10-01",
+        );
         let r2 = m(Todo, base, &ours, &theirs2);
-        assert!(r2.contains("T-000001 | regex a\\|b here | 3 | low | review | 2026-10-01"), "{}", r2);
+        assert!(
+            r2.contains("T-000001 | regex a\\|b here | 3 | low | review | 2026-10-01"),
+            "{}",
+            r2
+        );
     }
 
     #[test]
     fn legacy_five_field_todo_line() {
-        let base = "## v1\n\n- T-001 | old style | M | open\n- [ ] T-002 | five | L | high | open\n";
-        let ours = base.replace("T-002 | five | L | high | open", "T-002 | five | L | high | in-progress");
-        let theirs = base.replace("T-002 | five | L | high | open", "T-002 | five | L | high | review");
+        let base =
+            "## v1\n\n- T-001 | old style | M | open\n- [ ] T-002 | five | L | high | open\n";
+        let ours = base.replace(
+            "T-002 | five | L | high | open",
+            "T-002 | five | L | high | in-progress",
+        );
+        let theirs = base.replace(
+            "T-002 | five | L | high | open",
+            "T-002 | five | L | high | review",
+        );
         let r = m(Todo, base, &ours, &theirs);
         assert!(r.contains("T-002 | five | L | high | review"), "{}", r);
         assert!(r.contains("- T-001 | old style | M | open"));
@@ -975,7 +1088,10 @@ mod tests {
 
     #[test]
     fn prose_and_blank_lines_come_from_ours() {
-        let ours = format!("{}\nsome note of ours\n", TODO_BASE.replace("# Todo", "# Todo (ours)"));
+        let ours = format!(
+            "{}\nsome note of ours\n",
+            TODO_BASE.replace("# Todo", "# Todo (ours)")
+        );
         let theirs = TODO_BASE.replace("third task", "third task v2");
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         assert!(r.starts_with("# Todo (ours)\n"));
@@ -1040,7 +1156,8 @@ mod tests {
     fn done_same_task_added_on_both_sides_not_duplicated() {
         let base = "## 2026-10-01\n- T-000001 | a | v1\n";
         let ours = "## 2026-10-01\n- T-000001 | a | v1\n- T-000002 | same | v2\n";
-        let theirs = "## 2026-10-01\n- T-000001 | a | v1\n- T-000002 | same | v2\n- T-000003 | extra | v2\n";
+        let theirs =
+            "## 2026-10-01\n- T-000001 | a | v1\n- T-000002 | same | v2\n- T-000003 | extra | v2\n";
         let r = m(Done, base, ours, theirs);
         assert_eq!(r.matches("T-000002").count(), 1);
         assert!(r.contains("T-000003"));
@@ -1066,26 +1183,53 @@ mod tests {
         );
         let r = m(Bugs, BUGS_BASE, &ours, &theirs);
         // status: rejected > testing; attempts: max(2,3)=3; comment both changed -> ours
-        assert!(r.contains("B-000002 | 2026-10-02 | second bug | minor | ui_ux | rejected | 3 | fixed it"), "{}", r);
+        assert!(
+            r.contains(
+                "B-000002 | 2026-10-02 | second bug | minor | ui_ux | rejected | 3 | fixed it"
+            ),
+            "{}",
+            r
+        );
         // confirmed beats rejected
         let theirs2 = BUGS_BASE.replace("in-progress | 1 | looking", "confirmed | 1 | looking");
         let r2 = m(Bugs, BUGS_BASE, &theirs, &theirs2);
         assert!(r2.contains("| confirmed |"), "{}", r2);
         // created < in-progress
-        let o3 = BUGS_BASE.replace("first bug | major | logic | created", "first bug | major | logic | in-progress");
-        let t3 = BUGS_BASE.replace("first bug | major | logic | created | 0 | ", "first bug | major | logic | created | 0 | note");
+        let o3 = BUGS_BASE.replace(
+            "first bug | major | logic | created",
+            "first bug | major | logic | in-progress",
+        );
+        let t3 = BUGS_BASE.replace(
+            "first bug | major | logic | created | 0 | ",
+            "first bug | major | logic | created | 0 | note",
+        );
         let r3 = m(Bugs, BUGS_BASE, &o3, &t3);
-        assert!(r3.contains("B-000001 | 2026-10-01 | first bug | major | logic | in-progress | 0 | note"), "{}", r3);
+        assert!(
+            r3.contains(
+                "B-000001 | 2026-10-01 | first bug | major | logic | in-progress | 0 | note"
+            ),
+            "{}",
+            r3
+        );
     }
 
     #[test]
     fn bugs_added_on_both_sides() {
-        let ours = format!("{}- B-000003 | 2026-10-03 | ours bug | minor | other | created | 0 | \n", BUGS_BASE);
-        let theirs = format!("{}- B-000004 | 2026-10-04 | theirs bug | minor | other | created | 0 | \n", BUGS_BASE);
+        let ours = format!(
+            "{}- B-000003 | 2026-10-03 | ours bug | minor | other | created | 0 | \n",
+            BUGS_BASE
+        );
+        let theirs = format!(
+            "{}- B-000004 | 2026-10-04 | theirs bug | minor | other | created | 0 | \n",
+            BUGS_BASE
+        );
         let r = m(Bugs, BUGS_BASE, &ours, &theirs);
         assert!(r.contains("B-000003") && r.contains("B-000004"));
         let l = lines(&r);
-        assert!(l.iter().position(|x| x.contains("B-000004")).unwrap() > l.iter().position(|x| x.contains("B-000002")).unwrap());
+        assert!(
+            l.iter().position(|x| x.contains("B-000004")).unwrap()
+                > l.iter().position(|x| x.contains("B-000002")).unwrap()
+        );
     }
 
     // ---- line endings ----
@@ -1095,34 +1239,55 @@ mod tests {
         let crlf = |s: &str| s.replace('\n', "\r\n");
         let base = crlf(TODO_BASE);
         let ours = base.replace("first task", "first task v2");
-        let theirs = crlf(&TODO_BASE.replace("- [ ] T-000003", "- [ ] T-000010 | new | 1 | low | open | 2026-10-10\n- [ ] T-000003"));
+        let theirs = crlf(&TODO_BASE.replace(
+            "- [ ] T-000003",
+            "- [ ] T-000010 | new | 1 | low | open | 2026-10-10\n- [ ] T-000003",
+        ));
         let r = m(Todo, &base, &ours, &theirs);
         assert!(r.contains("\r\n"));
         assert!(!r.replace("\r\n", "").contains('\n'), "bare LF in output");
         assert!(r.contains("T-000010"));
         assert!(r.ends_with("\r\n"));
         // ours LF, theirs CRLF -> LF output
-        let r2 = m(Todo, TODO_BASE, &TODO_BASE.replace("first task", "first task v2"), &crlf(&TODO_BASE.replace("third task", "third task v2")));
+        let r2 = m(
+            Todo,
+            TODO_BASE,
+            &TODO_BASE.replace("first task", "first task v2"),
+            &crlf(&TODO_BASE.replace("third task", "third task v2")),
+        );
         assert!(!r2.contains('\r'));
         assert!(r2.contains("first task v2") && r2.contains("third task v2"));
     }
 
     #[test]
     fn trailing_newline_state_follows_ours() {
-        let ours = TODO_BASE.trim_end_matches('\n').replace("first task", "first task v2");
+        let ours = TODO_BASE
+            .trim_end_matches('\n')
+            .replace("first task", "first task v2");
         let theirs = TODO_BASE.replace("third task", "third task v2");
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         assert!(!r.ends_with('\n'));
         assert!(r.contains("third task v2"));
-        let r2 = m(Todo, TODO_BASE, &(ours.clone() + "\n"), &theirs.trim_end_matches('\n'));
+        let r2 = m(
+            Todo,
+            TODO_BASE,
+            &(ours.clone() + "\n"),
+            &theirs.trim_end_matches('\n'),
+        );
         assert!(r2.ends_with('\n'));
     }
 
     #[test]
     fn bom_kept_and_not_duplicated() {
-        let ours = format!("\u{feff}{}", TODO_BASE.replace("first task", "first task v2"));
+        let ours = format!(
+            "\u{feff}{}",
+            TODO_BASE.replace("first task", "first task v2")
+        );
         let base = format!("\u{feff}{}", TODO_BASE);
-        let theirs = format!("\u{feff}{}", TODO_BASE.replace("third task", "third task v2"));
+        let theirs = format!(
+            "\u{feff}{}",
+            TODO_BASE.replace("third task", "third task v2")
+        );
         let r = m(Todo, &base, &ours, &theirs);
         assert!(r.starts_with('\u{feff}'));
         assert_eq!(r.matches("# Todo").count(), 1);
@@ -1133,7 +1298,10 @@ mod tests {
     #[test]
     fn idempotence_properties() {
         let ours = TODO_BASE.replace("first task", "first task v2");
-        let theirs = TODO_BASE.replace("third task", "third task v2").replace("- [ ] T-000003", "- [ ] T-000010 | n | 1 | low | open | 2026-10-10\n- [ ] T-000003");
+        let theirs = TODO_BASE.replace("third task", "third task v2").replace(
+            "- [ ] T-000003",
+            "- [ ] T-000010 | n | 1 | low | open | 2026-10-10\n- [ ] T-000003",
+        );
         for kind_case in [(Todo, TODO_BASE), (Done, DONE_BASE), (Bugs, BUGS_BASE)] {
             let (k, f) = kind_case;
             assert_eq!(m(k, f, f, f), f);
@@ -1158,7 +1326,10 @@ mod tests {
     fn duplicate_ids_in_one_file_do_not_multiply() {
         let base = "## v1\n\n- [ ] T-000001 | a | 1 | low | open | 2026-10-01\n- [ ] T-000001 | a dup | 1 | low | open | 2026-10-01\n";
         let ours = base.replace("| a |", "| a2 |");
-        let theirs = base.replace("| 1 | low | open | 2026-10-01\n- [ ] T-000001", "| 1 | low | review | 2026-10-01\n- [ ] T-000001");
+        let theirs = base.replace(
+            "| 1 | low | open | 2026-10-01\n- [ ] T-000001",
+            "| 1 | low | review | 2026-10-01\n- [ ] T-000001",
+        );
         let r = m(Todo, base, &ours, &theirs);
         assert_eq!(r.matches("T-000001").count(), 2, "{}", r);
         assert!(r.contains("a2") && r.contains("review"));
@@ -1176,7 +1347,10 @@ mod tests {
     #[test]
     fn header_renamed_by_theirs_only_is_applied() {
         let ours = TODO_BASE.replace("first task", "first task v2");
-        let theirs = TODO_BASE.replace("## v1.20.0 — contributor mode", "## v1.20.0 — contributor mode (renamed)");
+        let theirs = TODO_BASE.replace(
+            "## v1.20.0 — contributor mode",
+            "## v1.20.0 — contributor mode (renamed)",
+        );
         let r = m(Todo, TODO_BASE, &ours, &theirs);
         assert!(r.contains("## v1.20.0 — contributor mode (renamed)"));
         assert_eq!(r.matches("## v1.20.0").count(), 1);

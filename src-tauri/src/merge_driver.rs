@@ -80,7 +80,10 @@ pub fn register_merge_driver(git: &GitBinary, repo: &Path) -> Result<bool, Strin
 
 fn register_with(git: &GitBinary, repo: &Path, command: &str) -> Result<bool, String> {
     let mut wrote = false;
-    for (key, value) in [("merge.sdh.name", DRIVER_NAME), ("merge.sdh.driver", command)] {
+    for (key, value) in [
+        ("merge.sdh.name", DRIVER_NAME),
+        ("merge.sdh.driver", command),
+    ] {
         if config_get(git, repo, key)?.as_deref() != Some(value) {
             config_set(git, repo, key, value)?;
             wrote = true;
@@ -120,7 +123,10 @@ mod tests {
 
     #[test]
     fn flag_without_paths_is_failure() {
-        assert_eq!(run_from_args(&args(&["app.exe", "--merge-driver", "a", "b"])), Some(1));
+        assert_eq!(
+            run_from_args(&args(&["app.exe", "--merge-driver", "a", "b"])),
+            Some(1)
+        );
     }
 
     #[test]
@@ -129,7 +135,14 @@ mod tests {
         let ours = BASE.replace("one", "one ours");
         let theirs = BASE.replace("two", "два theirs");
         let (o, a, b) = setup(&dir, BASE.as_bytes(), ours.as_bytes(), theirs.as_bytes());
-        let code = run_from_args(&args(&["app.exe", "--merge-driver", &o, &a, &b, "docs/todo.md"]));
+        let code = run_from_args(&args(&[
+            "app.exe",
+            "--merge-driver",
+            &o,
+            &a,
+            &b,
+            "docs/todo.md",
+        ]));
         assert_eq!(code, Some(0));
         let res = fs::read_to_string(&a).unwrap();
         assert!(res.contains("one ours") && res.contains("два theirs"));
@@ -142,7 +155,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ours = BASE.replace("one", "one ours");
         let (o, a, b) = setup(&dir, BASE.as_bytes(), ours.as_bytes(), BASE.as_bytes());
-        let code = run_from_args(&args(&["app.exe", "--merge-driver", &o, &a, &b, "README.md"]));
+        let code = run_from_args(&args(&[
+            "app.exe",
+            "--merge-driver",
+            &o,
+            &a,
+            &b,
+            "README.md",
+        ]));
         assert_eq!(code, Some(1));
         assert_eq!(fs::read_to_string(&a).unwrap(), ours);
     }
@@ -151,8 +171,20 @@ mod tests {
     fn non_utf8_fails_and_leaves_a_untouched() {
         let dir = TempDir::new().unwrap();
         let bad: &[u8] = &[b'-', b' ', 0xff, 0xfe, b'\n'];
-        let (o, a, b) = setup(&dir, BASE.as_bytes(), bad, BASE.replace("two", "2").as_bytes());
-        let code = run_from_args(&args(&["app.exe", "--merge-driver", &o, &a, &b, "docs/todo.md"]));
+        let (o, a, b) = setup(
+            &dir,
+            BASE.as_bytes(),
+            bad,
+            BASE.replace("two", "2").as_bytes(),
+        );
+        let code = run_from_args(&args(&[
+            "app.exe",
+            "--merge-driver",
+            &o,
+            &a,
+            &b,
+            "docs/todo.md",
+        ]));
         assert_eq!(code, Some(1));
         assert_eq!(fs::read(&a).unwrap(), bad);
     }
@@ -162,7 +194,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (o, a, b) = setup(&dir, b"", b"x", b"y");
         fs::remove_file(&o).unwrap();
-        let code = run_from_args(&args(&["app.exe", "--merge-driver", &o, &a, &b, "docs/todo.md"]));
+        let code = run_from_args(&args(&[
+            "app.exe",
+            "--merge-driver",
+            &o,
+            &a,
+            &b,
+            "docs/todo.md",
+        ]));
         assert_eq!(code, Some(1));
         assert_eq!(fs::read_to_string(&a).unwrap(), "x");
     }
@@ -179,9 +218,18 @@ mod tests {
             "/home/u/SoloDevHub.AppImage"
         );
         // empty / blank APPIMAGE is ignored
-        assert_eq!(resolve_exe(Some(""), cur), "C:/Program Files/Solo Dev Hub/app.exe");
-        assert_eq!(resolve_exe(Some("  "), cur), "C:/Program Files/Solo Dev Hub/app.exe");
-        assert_eq!(resolve_exe(Some("C:\\x\\y.AppImage"), cur), "C:/x/y.AppImage");
+        assert_eq!(
+            resolve_exe(Some(""), cur),
+            "C:/Program Files/Solo Dev Hub/app.exe"
+        );
+        assert_eq!(
+            resolve_exe(Some("  "), cur),
+            "C:/Program Files/Solo Dev Hub/app.exe"
+        );
+        assert_eq!(
+            resolve_exe(Some("C:\\x\\y.AppImage"), cur),
+            "C:/x/y.AppImage"
+        );
     }
 
     #[test]
@@ -193,8 +241,17 @@ mod tests {
     }
 
     fn git(dir: &Path, a: &[&str]) {
-        let out = Command::new("git").args(a).current_dir(dir).output().unwrap();
-        assert!(out.status.success(), "git {:?}: {}", a, String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .args(a)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            a,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
@@ -206,11 +263,15 @@ mod tests {
         assert_eq!(register_with(&gb, dir.path(), &cmd), Ok(true));
         assert_eq!(register_with(&gb, dir.path(), &cmd), Ok(false));
         assert_eq!(
-            config_get(&gb, dir.path(), "merge.sdh.driver").unwrap().as_deref(),
+            config_get(&gb, dir.path(), "merge.sdh.driver")
+                .unwrap()
+                .as_deref(),
             Some(cmd.as_str())
         );
         assert_eq!(
-            config_get(&gb, dir.path(), "merge.sdh.name").unwrap().as_deref(),
+            config_get(&gb, dir.path(), "merge.sdh.name")
+                .unwrap()
+                .as_deref(),
             Some(DRIVER_NAME)
         );
         // a changed exe path rewrites only the driver

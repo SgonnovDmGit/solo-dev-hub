@@ -1313,7 +1313,11 @@ mod tests {
         )
         .unwrap();
         let repo_id: i64 = conn
-            .query_row("SELECT id FROM repositories WHERE github_name='o/r'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM repositories WHERE github_name='o/r'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO tasks (repository_id, task_id, prefix, description, source, created_at, updated_at)              VALUES (?1, 'T-000001', 'T', 'd', 'todo', 'x', 'x')",
