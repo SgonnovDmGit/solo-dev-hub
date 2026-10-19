@@ -80,7 +80,7 @@ export const en: Record<keyof typeof ru, string> = {
   'rules.chipChanged': 'changed',
   'rules.chipConflict': 'conflict',
   'rules.chipFollowsMain': "owner's canon",
-  'rules.followsMain': 'This rule is edited by the owner ({0}). To change it, ask him or hand it back from your own repo.',
+  'rules.followsMain': 'This rule is edited by the owner ({0}). To change it, ask the owner or hand it back from your own repo.',
   'rules.canonOf': 'canon: app version {0}',
   'rules.tabText': 'Text',
   'rules.tabDiff': 'Diff from canon',
