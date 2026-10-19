@@ -108,23 +108,22 @@ pub fn detect_repo_state(local_path: &Path) -> RepoState {
     RepoState::Clean
 }
 
-/// Current checked-out branch name, or None if detached HEAD (or unborn).
+/// Current checked-out branch name, or None if detached HEAD. An unborn branch
+/// (no commits yet) still has a name. Read from the symbolic ref itself:
+/// `rev-parse --abbrev-ref HEAD` prints `heads/<name>` when a tag of the same
+/// name exists.
 pub fn current_branch(git: &GitBinary, local_path: &Path) -> Result<Option<String>, String> {
     let out = spawn_cmd(&git.0)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .args(["symbolic-ref", "-q", "HEAD"])
         .current_dir(local_path)
         .output()
-        .map_err(|e| format!("git rev-parse failed to start: {}", e))?;
+        .map_err(|e| format!("git symbolic-ref failed to start: {}", e))?;
     if !out.status.success() {
-        // Unborn branch (no commits yet) — treat as no resolvable branch.
+        // Exit 1 with -q: HEAD is detached.
         return Ok(None);
     }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if name.is_empty() || name == "HEAD" {
-        Ok(None) // detached HEAD
-    } else {
-        Ok(Some(name))
-    }
+    let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(full.strip_prefix("refs/heads/").map(|s| s.to_string()))
 }
 
 /// Outcome of a scoped (pathspec) commit attempt.
@@ -644,6 +643,25 @@ mod tests {
             current_branch(&git, tmp.path()).unwrap(),
             Some("master".to_string())
         );
+    }
+
+    #[test]
+    fn test_current_branch_ignores_same_named_tag_and_detects_detached() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        fs::write(tmp.path().join("README.md"), "# r\n").unwrap();
+        run_git(tmp.path(), &["add", "README.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "init"]);
+        // With a tag named like the branch, `rev-parse --abbrev-ref HEAD`
+        // prints `heads/master`.
+        run_git(tmp.path(), &["tag", "master"]);
+        let git = check_git_available().expect("git available");
+        assert_eq!(
+            current_branch(&git, tmp.path()).unwrap(),
+            Some("master".to_string())
+        );
+        run_git(tmp.path(), &["checkout", "-q", "--detach"]);
+        assert_eq!(current_branch(&git, tmp.path()).unwrap(), None);
     }
 
     #[test]

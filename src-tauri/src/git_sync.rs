@@ -21,7 +21,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -65,7 +65,6 @@ pub enum FfOutcome {
     FastForwarded,
     LocalAhead,
     Diverged,
-    Missing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,17 +106,34 @@ pub enum PushOutcome {
 // Safety helpers
 // ---------------------------------------------------------------------------
 
-/// True for `master` and `main`, bare or as `refs/heads/<name>`. Exact match.
+/// `refs/heads/` prefix stripped, ASCII case-insensitively (NTFS and macOS
+/// resolve `refs/heads/Master` to the `master` ref file).
+fn short_branch(name: &str) -> &str {
+    const PREFIX: &str = "refs/heads/";
+    match name.get(..PREFIX.len()) {
+        Some(p) if p.eq_ignore_ascii_case(PREFIX) => &name[PREFIX.len()..],
+        _ => name,
+    }
+}
+
+/// Branch names are compared ASCII case-insensitively everywhere in this
+/// module: on case-insensitive filesystems `Dev` and `dev` are the same ref.
+fn same_branch(a: &str, b: &str) -> bool {
+    short_branch(a).eq_ignore_ascii_case(short_branch(b))
+}
+
+/// True for `master` and `main`, bare or as `refs/heads/<name>`, in any ASCII
+/// letter case (`Master`, `MAIN`, ...).
 pub fn is_protected_branch(name: &str) -> bool {
-    let short = name.strip_prefix("refs/heads/").unwrap_or(name);
-    short == "master" || short == "main"
+    let short = short_branch(name);
+    short.eq_ignore_ascii_case("master") || short.eq_ignore_ascii_case("main")
 }
 
 fn refuse_protected(name: &str) -> Result<(), String> {
     if is_protected_branch(name) {
         Err(format!(
             "refusing to touch protected branch '{}'",
-            name.strip_prefix("refs/heads/").unwrap_or(name)
+            short_branch(name)
         ))
     } else {
         Ok(())
@@ -139,6 +155,7 @@ fn validate_branch(name: &str) -> Result<(), String> {
         || name.contains("//")
         || name.contains("@{")
         || name == "@"
+        || name.eq_ignore_ascii_case("HEAD")
         || name
             .chars()
             .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c));
@@ -259,25 +276,82 @@ fn drain<R: Read + Send + 'static>(reader: Option<R>) -> mpsc::Receiver<Vec<u8>>
     rx
 }
 
+/// The git subcommand of `args`, skipping leading `-c <k=v>` pairs and options
+/// (used only for messages).
+fn subcommand<S: AsRef<OsStr>>(args: &[S]) -> String {
+    let mut it = args
+        .iter()
+        .map(|a| a.as_ref().to_string_lossy().into_owned());
+    while let Some(a) = it.next() {
+        if a == "-c" {
+            it.next();
+        } else if !a.starts_with('-') {
+            return a;
+        }
+    }
+    String::new()
+}
+
+/// Kill `child` and everything it spawned. `git.exe` on Windows is a launcher:
+/// killing only that process leaves the real git and `git-remote-https` alive
+/// and holding our pipes. `taskkill /T` walks the tree (no extra crate needed);
+/// elsewhere the child leads its own process group, which `kill` takes down.
+fn kill_process_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    #[cfg(windows)]
+    {
+        let _ = git_ops::spawn_cmd("taskkill")
+            .args(["/T", "/F", "/PID", pid.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let group = format!("-{}", pid);
+        let _ = git_ops::spawn_cmd("kill")
+            .args(["-KILL", "--", group.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Run git with a timeout. Output is drained on helper threads so a large
-/// stdout/stderr cannot deadlock the pipe; on timeout the child is killed and
-/// the drain threads are left to finish on their own (a grandchild such as
-/// `git-remote-https` may still hold the pipe open for a moment).
+/// stdout/stderr cannot deadlock the pipe; on timeout the whole process tree
+/// is killed (see `kill_process_tree`), which also releases the pipes.
 fn run_git<S: AsRef<OsStr>>(
     git: &GitBinary,
     repo: &Path,
     args: &[S],
     opts: &RunOpts,
 ) -> Result<Output, RunError> {
-    let label = args
-        .first()
-        .map(|a| a.as_ref().to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let label = subcommand(args);
+    // Relative paths would be ambiguous for `GIT_INDEX_FILE` and `current_dir`.
+    if !repo.is_absolute() {
+        return Err(RunError::Spawn(format!(
+            "git {}: repository path must be absolute: {}",
+            label,
+            repo.display()
+        )));
+    }
     let mut cmd = git_ops::spawn_cmd(&git.0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     cmd.args(args)
         .current_dir(repo)
-        // English messages: stderr is parsed to classify failures.
-        .env("LC_ALL", "C")
+        // English messages: stderr is parsed to classify failures. LC_ALL would
+        // override LC_MESSAGES, so it is removed for the child.
+        .env_remove("LC_ALL")
+        .env("LC_MESSAGES", "C")
+        .env("LANGUAGE", "C")
         .stdin(if opts.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -308,13 +382,12 @@ fn run_git<S: AsRef<OsStr>>(
             Ok(Some(s)) => break s,
             Ok(None) => {}
             Err(e) => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 return Err(RunError::Spawn(format!("git {} wait failed: {}", label, e)));
             }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_process_tree(&mut child);
             return Err(RunError::Timeout {
                 cmd: label,
                 after: opts.timeout,
@@ -361,10 +434,7 @@ fn run_ok_with<S: AsRef<OsStr>>(
     args: &[S],
     opts: &RunOpts,
 ) -> Result<Output, String> {
-    let sub = args
-        .first()
-        .map(|a| a.as_ref().to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let sub = subcommand(args);
     let out = run_git(git, repo, args, opts).map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(out)
@@ -456,6 +526,15 @@ fn net_env() -> [(&'static str, &'static OsStr); 2] {
     ]
 }
 
+/// A transfer slower than 1000 B/s for 30 s ends by itself, so a stalled HTTP
+/// connection does not have to wait for the overall timeout.
+const LOW_SPEED_ARGS: [&str; 4] = [
+    "-c",
+    "http.lowSpeedLimit=1000",
+    "-c",
+    "http.lowSpeedTime=30",
+];
+
 /// `git fetch <remote>` — non-interactive, 60 s timeout.
 pub fn fetch(git: &GitBinary, repo: &Path, remote: &str) -> Result<(), NetError> {
     fetch_with_timeout(git, repo, remote, NET_TIMEOUT)
@@ -472,8 +551,9 @@ pub fn fetch_with_timeout(
         message: m,
     })?;
     let env = net_env();
-    let out = run_git(git, repo, &["fetch", remote], &net_opts(&env, timeout))
-        .map_err(net_error_from_run)?;
+    let mut args: Vec<&str> = LOW_SPEED_ARGS.to_vec();
+    args.extend(["fetch", remote]);
+    let out = run_git(git, repo, &args, &net_opts(&env, timeout)).map_err(net_error_from_run)?;
     if out.status.success() {
         Ok(())
     } else {
@@ -609,7 +689,7 @@ pub fn update_ref_cas(
     let out = run_git(
         git,
         repo,
-        &["update-ref", refname, new, old],
+        &["update-ref", "--no-deref", refname, new, old],
         &RunOpts::LOCAL,
     )
     .map_err(|e| e.to_string())?;
@@ -626,6 +706,74 @@ pub fn update_ref_cas(
     Err(failure("update-ref", &out))
 }
 
+/// Branches checked out in ANY worktree of this repository (the main one, the
+/// current one and every `git worktree add` one), as short names.
+fn checked_out_branches(git: &GitBinary, repo: &Path) -> Result<Vec<String>, String> {
+    let out = run_ok(git, repo, &["worktree", "list", "--porcelain"])?;
+    let mut branches: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("branch "))
+        .map(|b| short_branch(b.trim()).to_string())
+        .collect();
+    // `worktree list` already includes the current worktree; this is a cheap
+    // second source in case the list is unavailable for it (e.g. bare layouts).
+    if let Some(cur) = git_ops::current_branch(git, repo)? {
+        branches.push(cur);
+    }
+    Ok(branches)
+}
+
+/// Err when `branch` is checked out anywhere (case-insensitively): moving a
+/// checked-out branch behind the work tree's back would corrupt that checkout.
+fn refuse_checked_out(
+    git: &GitBinary,
+    repo: &Path,
+    branch: &str,
+    hint: &str,
+) -> Result<(), String> {
+    if checked_out_branches(git, repo)?
+        .iter()
+        .any(|b| same_branch(b, branch))
+    {
+        return Err(format!("'{}' is a checked-out branch; {}", branch, hint));
+    }
+    Ok(())
+}
+
+/// Repo state from the real git dir (`rev-parse --git-path`), so it also works
+/// when `.git` is a file (linked worktree, submodule).
+fn repo_state(git: &GitBinary, repo: &Path) -> Result<RepoState, String> {
+    let out = run_ok(
+        git,
+        repo,
+        &[
+            "rev-parse",
+            "--git-path",
+            "MERGE_HEAD",
+            "--git-path",
+            "rebase-merge",
+            "--git-path",
+            "rebase-apply",
+        ],
+    )?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let exists = |line: Option<&str>| {
+        line.map(|l| {
+            let p = PathBuf::from(l.trim());
+            (if p.is_absolute() { p } else { repo.join(p) }).exists()
+        })
+        .unwrap_or(false)
+    };
+    let mut lines = text.lines();
+    if exists(lines.next()) {
+        return Ok(RepoState::MidMerge);
+    }
+    if exists(lines.next()) || exists(lines.next()) {
+        return Ok(RepoState::MidRebase);
+    }
+    Ok(RepoState::Clean)
+}
+
 /// Move local `branch` (NOT the checked-out one) forward to `target_rev`
 /// without touching the working tree. A missing local branch is created.
 pub fn fast_forward_ref(
@@ -637,12 +785,7 @@ pub fn fast_forward_ref(
     refuse_protected(branch)?;
     validate_branch(branch)?;
     validate_rev(target_rev)?;
-    if git_ops::current_branch(git, repo)?.as_deref() == Some(branch) {
-        return Err(format!(
-            "'{}' is the checked-out branch; use merge_ff_only",
-            branch
-        ));
-    }
+    refuse_checked_out(git, repo, branch, "use merge_ff_only")?;
     let target = rev_parse(git, repo, target_rev)?
         .ok_or_else(|| format!("target '{}' does not exist", target_rev))?;
     let refname = format!("refs/heads/{}", branch);
@@ -675,7 +818,7 @@ fn checked_out_branch_for_merge(git: &GitBinary, repo: &Path) -> Result<String, 
     let branch = git_ops::current_branch(git, repo)?
         .ok_or_else(|| "HEAD is detached or unborn; refusing to merge".to_string())?;
     refuse_protected(&branch)?;
-    match git_ops::detect_repo_state(repo) {
+    match repo_state(git, repo)? {
         RepoState::Clean => Ok(branch),
         RepoState::MidMerge => Err("repository is in the middle of a merge".to_string()),
         RepoState::MidRebase => Err("repository is in the middle of a rebase".to_string()),
@@ -739,25 +882,48 @@ pub fn merge_or_abort(
     if out.status.success() {
         return Ok(MergeOutcome::Merged);
     }
-    if git_ops::detect_repo_state(repo) != RepoState::MidMerge {
+    if repo_state(git, repo)? != RepoState::MidMerge {
         // Refused before touching anything (dirty tree overlap, no identity, ...).
         return Err(failure("merge", &out));
     }
-    let diff = run_ok(git, repo, &["diff", "--name-only", "--diff-filter=U", "-z"])?;
-    let files: Vec<String> = diff
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect();
-    run_ok(git, repo, &["merge", "--abort"])?;
-    let head_after = rev_parse(git, repo, "HEAD")?;
-    if head_after.as_deref() != Some(head_before.as_str())
-        || git_ops::detect_repo_state(repo) != RepoState::Clean
-    {
-        return Err("merge --abort did not restore the pre-merge state".to_string());
+    // The abort is attempted whatever happens while listing the conflicts, so a
+    // failed listing can never leave the repo stuck mid-merge.
+    let listing = run_ok(git, repo, &["diff", "--name-only", "--diff-filter=U", "-z"]);
+    let abort = run_ok(git, repo, &["merge", "--abort"]);
+    let restored = match (rev_parse(git, repo, "HEAD"), repo_state(git, repo)) {
+        (Ok(head), Ok(state)) => {
+            if head.as_deref() == Some(head_before.as_str()) && state == RepoState::Clean {
+                Ok(())
+            } else {
+                Err("merge --abort did not restore the pre-merge state".to_string())
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => Err(format!("could not verify the repo after abort: {}", e)),
+    };
+    let mut errors: Vec<String> = Vec::new();
+    let files = match listing {
+        Ok(diff) => diff
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect(),
+        Err(e) => {
+            errors.push(format!("listing conflicted files: {}", e));
+            Vec::new()
+        }
+    };
+    if let Err(e) = abort {
+        errors.push(format!("aborting the merge: {}", e));
     }
-    Ok(MergeOutcome::Conflict { files })
+    if let Err(e) = restored {
+        errors.push(e);
+    }
+    if errors.is_empty() {
+        Ok(MergeOutcome::Conflict { files })
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -854,12 +1020,7 @@ fn commit_files_to_branch_inner(
 ) -> Result<BranchCommit, String> {
     refuse_protected(branch)?;
     validate_branch(branch)?;
-    if git_ops::current_branch(git, repo)?.as_deref() == Some(branch) {
-        return Err(format!(
-            "'{}' is the checked-out branch; commit it with commit_paths",
-            branch
-        ));
-    }
+    refuse_checked_out(git, repo, branch, "commit it with commit_paths")?;
     let refname = format!("refs/heads/{}", branch);
     let old = rev_parse(git, repo, &refname)?
         .ok_or_else(|| format!("branch '{}' does not exist", branch))?;
@@ -880,6 +1041,9 @@ fn commit_files_to_branch_inner(
         timeout: LOCAL_TIMEOUT,
     };
 
+    // A stale file at this path (crashed run, recycled pid) must never act as a
+    // starting index or block the lock; start clean.
+    let _ = std::fs::remove_file(&index.0);
     run_ok_with(git, repo, &["read-tree", old.as_str()], &idx_opts)?;
     for (change, path) in changes.iter().zip(&paths) {
         match &change.content {
@@ -986,7 +1150,8 @@ pub fn push_branches_with_timeout(
     if branches.is_empty() {
         return Ok(Vec::new());
     }
-    let mut args: Vec<String> = vec!["push".into(), "--porcelain".into(), remote.into()];
+    let mut args: Vec<String> = LOW_SPEED_ARGS.iter().map(|a| a.to_string()).collect();
+    args.extend(["push".into(), "--porcelain".into(), remote.into()]);
     for b in branches {
         args.push(format!("refs/heads/{0}:refs/heads/{0}", b));
     }
@@ -1253,6 +1418,11 @@ mod tests {
         assert!(is_protected_branch("main"));
         assert!(is_protected_branch("refs/heads/master"));
         assert!(is_protected_branch("refs/heads/main"));
+        assert!(is_protected_branch("Master"));
+        assert!(is_protected_branch("MAIN"));
+        assert!(is_protected_branch("refs/heads/Master"));
+        assert!(is_protected_branch("REFS/HEADS/main"));
+        assert!(!is_protected_branch("Mainline"));
         assert!(!is_protected_branch("dev"));
         assert!(!is_protected_branch("main2"));
         assert!(!is_protected_branch("feature/main"));
@@ -1337,6 +1507,8 @@ mod tests {
             "x/",
             "a~1",
             "a@{1}",
+            "HEAD",
+            "head",
         ] {
             assert!(validate_branch(bad).is_err(), "{bad:?} should be invalid");
         }
@@ -1657,8 +1829,17 @@ mod tests {
         let fx = fixture();
         let e = fast_forward_ref(&gb(), &fx.a, "dev", "shared").unwrap_err();
         assert!(e.contains("checked-out"), "{e}");
+        let e = fast_forward_ref(&gb(), &fx.a, "Dev", "shared").unwrap_err();
+        assert!(e.contains("checked-out"), "{e}");
         let nogit = GitBinary(PathBuf::from("/definitely/not/git"));
-        for p in ["master", "main", "refs/heads/main"] {
+        for p in [
+            "master",
+            "main",
+            "refs/heads/main",
+            "Master",
+            "MAIN",
+            "refs/heads/Main",
+        ] {
             let e = fast_forward_ref(&nogit, &fx.a, p, "shared").unwrap_err();
             assert!(e.contains("protected"), "{e}");
         }
@@ -1936,12 +2117,21 @@ mod tests {
         let fx = fixture();
         let nogit = GitBinary(PathBuf::from("/definitely/not/git"));
         let ch = [change("a.txt", Some("a"))];
-        for p in ["main", "master", "refs/heads/main"] {
+        for p in [
+            "main",
+            "master",
+            "refs/heads/main",
+            "Master",
+            "MAIN",
+            "refs/heads/Main",
+        ] {
             let e = commit_files_to_branch(&nogit, &fx.a, p, &ch, "m", "H", "h@e.com").unwrap_err();
             assert!(e.contains("protected"), "{e}");
         }
         // current branch
         let e = commit_files_to_branch(&gb(), &fx.a, "dev", &ch, "m", "H", "h@e.com").unwrap_err();
+        assert!(e.contains("checked-out"), "{e}");
+        let e = commit_files_to_branch(&gb(), &fx.a, "Dev", &ch, "m", "H", "h@e.com").unwrap_err();
         assert!(e.contains("checked-out"), "{e}");
         // missing branch
         let e =
@@ -2043,7 +2233,14 @@ mod tests {
     fn push_branches_refuses_protected_before_spawning() {
         let fx = fixture();
         let nogit = GitBinary(PathBuf::from("/definitely/not/git"));
-        for p in ["main", "master", "refs/heads/master"] {
+        for p in [
+            "main",
+            "master",
+            "refs/heads/master",
+            "Master",
+            "MAIN",
+            "refs/heads/Main",
+        ] {
             let e = push_branches(&nogit, &fx.a, "origin", &["dev", p]).unwrap_err();
             assert_eq!(e.kind, NetErrorKind::Other);
             assert!(e.message.contains("protected"), "{}", e.message);
@@ -2155,5 +2352,172 @@ mod tests {
         assert!(e.contains("middle of a merge"), "{e}");
         let e = merge_ff_only(&gb(), &fx.a, "shared").unwrap_err();
         assert!(e.contains("middle of a merge"), "{e}");
+    }
+
+    // ----- review follow-ups (T-000217) -----------------------------------
+
+    #[test]
+    fn subcommand_skips_config_pairs_and_options() {
+        assert_eq!(subcommand(&["fetch", "origin"]), "fetch");
+        assert_eq!(
+            subcommand(&[
+                "-c",
+                "http.lowSpeedLimit=1000",
+                "-c",
+                "a=b",
+                "push",
+                "--porcelain"
+            ]),
+            "push"
+        );
+        assert_eq!(subcommand::<&str>(&[]), "");
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_tree() {
+        let tmp = TempDir::new().unwrap();
+        g(tmp.path(), &["init", "-q"]);
+        let hb = tmp.path().join("heartbeat");
+        let hb_arg = hb.to_str().unwrap().replace(std::path::MAIN_SEPARATOR, "/");
+        // A shell loop (a grandchild of git.exe) that bumps a counter file. It
+        // stops by itself after ~15 s so a failing test cannot leak it.
+        let alias = format!(
+            "alias.loop=!i=0; while [ $i -lt 150 ]; do i=$((i+1)); echo $i > '{hb_arg}'; sleep 0.1; done"
+        );
+        let opts = RunOpts {
+            env: &[],
+            stdin: None,
+            timeout: Duration::from_millis(2500),
+        };
+        let r = run_git(&gb(), tmp.path(), &["-c", alias.as_str(), "loop"], &opts);
+        assert!(matches!(r, Err(RunError::Timeout { .. })), "{r:?}");
+        assert!(hb.exists(), "the loop never started; test proves nothing");
+        std::thread::sleep(Duration::from_millis(600));
+        let first = fs::read_to_string(&hb).unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+        let second = fs::read_to_string(&hb).unwrap();
+        assert_eq!(first, second, "a process of the tree is still running");
+    }
+
+    #[test]
+    fn relative_repo_path_is_refused() {
+        let e = rev_parse(&gb(), Path::new("some/relative/dir"), "HEAD").unwrap_err();
+        assert!(e.contains("absolute"), "{e}");
+    }
+
+    #[test]
+    fn update_ref_cas_does_not_follow_symbolic_refs() {
+        let fx = fixture();
+        let first = g(&fx.a, &["rev-parse", "shared"]);
+        let second = commit_file(&fx.a, "n.txt", "1", "two");
+        g(
+            &fx.a,
+            &["symbolic-ref", "refs/heads/sym", "refs/heads/shared"],
+        );
+        let moved = update_ref_cas(&gb(), &fx.a, "refs/heads/sym", &second, Some(&first)).unwrap();
+        assert!(moved);
+        // The target branch must not have been moved through the symref.
+        assert_eq!(g(&fx.a, &["rev-parse", "refs/heads/shared"]), first);
+    }
+
+    #[test]
+    fn branch_checked_out_in_another_worktree_is_refused() {
+        let fx = fixture();
+        let wt = fx._tmp.path().join("wt");
+        g(
+            &fx.a,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "shared"],
+        );
+        let ch = [change("a.txt", Some("a"))];
+        for name in ["shared", "Shared", "SHARED"] {
+            let e =
+                commit_files_to_branch(&gb(), &fx.a, name, &ch, "m", "H", "h@e.com").unwrap_err();
+            assert!(e.contains("checked-out"), "{name}: {e}");
+            let e = fast_forward_ref(&gb(), &fx.a, name, "dev").unwrap_err();
+            assert!(e.contains("checked-out"), "{name}: {e}");
+        }
+        // from inside the linked worktree, the main checkout's branch is refused too
+        let e = commit_files_to_branch(&gb(), &wt, "dev", &ch, "m", "H", "h@e.com").unwrap_err();
+        assert!(e.contains("checked-out"), "{e}");
+        // an unrelated branch still works
+        g(&fx.a, &["branch", "free"]);
+        let r = commit_files_to_branch(&gb(), &fx.a, "free", &ch, "m", "H", "h@e.com").unwrap();
+        assert!(matches!(r, BranchCommit::Committed { .. }));
+    }
+
+    #[test]
+    fn mid_merge_guard_works_in_a_linked_worktree() {
+        let fx = fixture();
+        let wt = fx._tmp.path().join("wt");
+        g(
+            &fx.a,
+            &["worktree", "add", "-q", "-b", "other", wt.to_str().unwrap()],
+        );
+        assert!(wt.join(".git").is_file(), "linked worktree has a .git file");
+        assert_eq!(repo_state(&gb(), &wt).unwrap(), RepoState::Clean);
+        let merge_head = g(&wt, &["rev-parse", "--git-path", "MERGE_HEAD"]);
+        let merge_head = if Path::new(&merge_head).is_absolute() {
+            PathBuf::from(merge_head)
+        } else {
+            wt.join(merge_head)
+        };
+        fs::write(&merge_head, "deadbeef\n").unwrap();
+        assert_eq!(repo_state(&gb(), &wt).unwrap(), RepoState::MidMerge);
+        let e = merge_or_abort(&gb(), &wt, "shared").unwrap_err();
+        assert!(e.contains("middle of a merge"), "{e}");
+        let e = merge_ff_only(&gb(), &wt, "shared").unwrap_err();
+        assert!(e.contains("middle of a merge"), "{e}");
+    }
+
+    #[test]
+    fn merge_or_abort_aborts_even_when_listing_conflicts_fails() {
+        let fx = fixture();
+        let b = clone_b(&fx);
+        commit_file(&fx.a, "clash.txt", "from a\n", "a clash");
+        g(&fx.a, &["push", "-q", "origin", "dev"]);
+        commit_file(&b, "clash.txt", "from b\n", "b clash");
+        fetch(&gb(), &b, "origin").unwrap();
+        let head = g(&b, &["rev-parse", "HEAD"]);
+        // `git diff` (the listing step) now fails; the merge itself does not use it.
+        g(
+            &b,
+            &["config", "diff.orderFile", "/definitely/not/an/order/file"],
+        );
+
+        let e = merge_or_abort(&gb(), &b, "origin/dev").unwrap_err();
+        assert!(e.contains("listing conflicted files"), "{e}");
+        assert_eq!(g(&b, &["rev-parse", "HEAD"]), head);
+        assert_eq!(repo_state(&gb(), &b).unwrap(), RepoState::Clean);
+        assert!(!b.join(".git/MERGE_HEAD").exists());
+    }
+
+    #[test]
+    fn commit_to_branch_normalises_crlf_like_git_add() {
+        let fx = fixture();
+        g(&fx.a, &["config", "core.autocrlf", "true"]);
+        let r = commit_files_to_branch(
+            &gb(),
+            &fx.a,
+            "shared",
+            &[change("docs/todo.md", Some("a\r\nb\r\n"))],
+            "m",
+            "H",
+            "h@e.com",
+        )
+        .unwrap();
+        assert!(matches!(r, BranchCommit::Committed { .. }));
+        let stored = show_file(&gb(), &fx.a, "shared", "docs/todo.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, b"a\nb\n");
+        // ... exactly what `git add` would have stored for the same bytes.
+        fs::create_dir_all(fx.a.join("docs")).unwrap();
+        fs::write(fx.a.join("docs/other.md"), b"a\r\nb\r\n").unwrap();
+        g(&fx.a, &["add", "docs/other.md"]);
+        let added = g(&fx.a, &["rev-parse", ":docs/other.md"]);
+        let ours = blob_sha_at(&gb(), &fx.a, "shared", "docs/todo.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(added, ours);
     }
 }
