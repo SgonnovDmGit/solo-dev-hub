@@ -25,6 +25,12 @@ The rules get a screen of their own: which rule was changed, where an edit came 
   - on the Rules screen the owner accepts one side's text or rejects all, and the decision goes into the rule's history;
   - a conflict closes only after every side has been read again, so a repo that is offline for a while cannot be resolved by mistake.
 - **Rule toasts stay until closed (T-000211).** "Rules taken up" and "edit deferred" faded after five seconds like any info toast, although a taken-up rule rewrites copies across the portfolio. They now stay until closed. Every toast also got copy and close buttons.
+- **Three approved hand-backs joined the canon.** Agents in other repositories handed back one line each, approved by the owner:
+  - `sdh-debugging`: an intermittent, order-dependent failure is diagnosed by measuring the shared state at the failure point, not by exclusion bisection;
+  - `sdh-release-closure`: closure also closes any open REQ pair with a final receipt that no task depends on any more;
+  - `sdh-visual-mockups`: a donor the owner points to is copied in every visible property, and any property not taken is named.
+
+  The bundle now carries these texts, so the forked rows heal.
 - **A project without a server is not a sync problem.** A project with no repository in the server role, or none in the client role, is a valid shape. Sync no longer warns about it.
 
 ### Fixed
