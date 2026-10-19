@@ -131,7 +131,7 @@
 {#if showResetConfirm}
   <ConfirmDialog
     title={$tStore('rules.resetCanon')}
-    message={$tStore('rules.resetConfirm')}
+    message={dirty ? $tStore('rules.resetConfirmDirty') : $tStore('rules.resetConfirm')}
     onConfirm={confirmReset}
     onCancel={() => (showResetConfirm = false)}
   />

@@ -19,11 +19,14 @@
     selectedFileName ? files.find((f) => f.file_name === selectedFileName) ?? null : null
   );
 
-  async function loadFiles(key: string) {
+  async function loadFiles(key: string, refreshSelected = false) {
     try {
       const all = await listTemplateFiles(key);
       files = exclude ? all.filter((f) => !exclude(f.file_name)) : all;
-      if (files.length > 0 && !selectedFileName) {
+      if (refreshSelected && selectedFileName && files.some((f) => f.file_name === selectedFileName)) {
+        // After a save or reset the stored text changed: re-select so the textarea follows it.
+        selectFile(selectedFileName);
+      } else if (files.length > 0 && !selectedFileName) {
         selectFile(files[0].file_name);
       }
     } catch (err) {
@@ -61,7 +64,7 @@
       // "saved" alone left the owner unable to tell an applied rule from one
       // still sitting in the database.
       reportRuleOutcome(outcome, 'toast.templateSaved');
-      await loadFiles(languageKey);
+      await loadFiles(languageKey, true);
     } catch (err) {
       addToast(String(err), 'error');
     }
@@ -73,7 +76,7 @@
       // T-000212: resetting a skill re-renders it everywhere, like a save.
       const outcome = await resetTemplateFile(languageKey, selectedFileName);
       reportRuleOutcome(outcome, 'toast.templateReset');
-      await loadFiles(languageKey);
+      await loadFiles(languageKey, true);
       showResetConfirm = false;
     } catch (err) {
       addToast(String(err), 'error');

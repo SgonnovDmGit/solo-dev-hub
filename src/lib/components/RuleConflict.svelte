@@ -24,8 +24,11 @@
 
   let sides = $state<RuleConflictSide[]>([]);
   let loaded = $state(false);
+  // A failed read is not "no live markers" — keep it apart and offer a retry.
+  let loadError = $state<string | null>(null);
 
   async function load(name: string) {
+    loadError = null;
     try {
       const result = await getRuleConflict(name);
       if (name === rule.rule) {
@@ -33,8 +36,7 @@
         loaded = true;
       }
     } catch (err) {
-      addToast(String(err), 'error');
-      loaded = true;
+      if (name === rule.rule) loadError = String(err);
     }
   }
 
@@ -53,7 +55,12 @@
 <div class="conflict">
   <div class="banner">{$tStore('rules.conflictBanner')}</div>
 
-  {#if !loaded}
+  {#if loadError}
+    <div class="load-error">
+      <span>{loadError}</span>
+      <button type="button" onclick={() => load(rule.rule)}>{$tStore('rules.retry')}</button>
+    </div>
+  {:else if !loaded}
     <div class="muted">{$tStore('common.loading')}</div>
   {:else if cards.length === 0}
     <div class="muted">{$tStore('rules.noSides')}</div>
@@ -92,6 +99,7 @@
   .conflict { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
   /* Red tint of --danger (#ef4444). */
   .banner { font-size: 12px; line-height: 1.5; padding: 8px 12px; border: 1px solid var(--danger); border-radius: var(--radius); background: rgba(239, 68, 68, 0.1); }
+  .load-error { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--danger); overflow-wrap: anywhere; }
   .muted { font-size: 11px; color: var(--text-muted); line-height: 1.4; }
   .sides { display: grid; gap: 12px; align-items: start; }
   .side { display: flex; flex-direction: column; gap: 6px; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }

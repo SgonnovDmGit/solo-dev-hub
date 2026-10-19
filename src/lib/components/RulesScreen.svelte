@@ -29,6 +29,8 @@
   let edited = $state('');
   let events = $state<RuleEvent[]>([]);
   let version = $state('');
+  // The first read of the overview failed — show it with a retry, not "Loading…" forever.
+  let loadError = $state<string | null>(null);
   let busy = $state(false);
   let syncing = $state(false);
   let conflictGeneration = $state(0);
@@ -138,7 +140,9 @@
       reportRuleOutcome(outcome);
     } catch (err) {
       const text = String(err);
-      if (text.includes('rule_conflict_gone') || text.includes('rule_conflict_side_gone')) {
+      if (text.includes('rule_conflict_side_gone')) {
+        addToast($tStore('rules.sideGone'), 'info');
+      } else if (text.includes('rule_conflict_gone')) {
         addToast($tStore('rules.conflictGone'), 'info');
       } else {
         addToast(text, 'error');
@@ -167,17 +171,23 @@
     } catch (err) {
       console.warn('getVersion failed', err);
     }
-    // One-shot snapshot of the requested rule — not reactive state.
-    const wanted = untrack(() => get(currentScreen).params?.rule);
+    await loadInitial();
+  });
+
+  // One-shot snapshot of the requested rule — not reactive state.
+  const wantedRule = untrack(() => get(currentScreen).params?.rule);
+
+  async function loadInitial() {
+    loadError = null;
     try {
       const ov = await listRules();
       overview = ov;
-      const initial = ov.rules.find((r) => r.rule === wanted) ?? ov.rules[0] ?? null;
+      const initial = ov.rules.find((r) => r.rule === wantedRule) ?? ov.rules[0] ?? null;
       if (initial) select(initial.rule);
     } catch (err) {
-      addToast(String(err), 'error');
+      loadError = String(err);
     }
-  });
+  }
 </script>
 
 <div class="rules-screen">
@@ -203,7 +213,12 @@
     </div>
   </div>
 
-  {#if !overview}
+  {#if loadError}
+    <div class="loading error">
+      <div>{loadError}</div>
+      <button type="button" onclick={loadInitial}>{$tStore('rules.retry')}</button>
+    </div>
+  {:else if !overview}
     <div class="loading">{$tStore('common.loading')}</div>
   {:else}
     <div class="body">
@@ -257,4 +272,5 @@
   .right { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
   .right > :global(.detail) { flex: 1; }
   .loading { padding: 40px; color: var(--text-muted); text-align: center; }
+  .loading.error { color: var(--danger); display: flex; flex-direction: column; align-items: center; gap: 12px; overflow-wrap: anywhere; }
 </style>
