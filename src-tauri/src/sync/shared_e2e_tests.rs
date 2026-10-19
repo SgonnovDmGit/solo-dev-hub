@@ -735,12 +735,10 @@ fn v3_helpers_task_and_bug_reach_the_owner_with_their_author_and_the_bands_hold(
     let w = World::new();
     let fx = &w.fx;
     w.participants();
-    // (A fresh repo's bug file already carries the template's example row, which the
-    // migration reads as bug 1 -- not shared-mode business, see the report -- so the
-    // first number is read, not assumed.)
     let own = World::add_bug(&fx.main_db, fx.main_repo, "owner bug");
+    // The template's example row sits in an HTML comment and is not a bug.
+    assert_eq!(own, "B-000001");
     let own_n: i64 = own[2..].parse().unwrap();
-    assert!(own_n < 500_000, "{}", own);
     w.sync_owner();
     w.sync_helper();
 
@@ -1354,9 +1352,10 @@ fn the_owners_rule_canon_reaches_a_contributor_and_is_released_on_switch_off() {
         crate::sync::shared_canon::follows_main(db, "sdh-debugging").as_deref(),
         Some("Owner")
     );
+    // An unchanged rule is the owner's as well, only nothing was taken for it.
     assert_eq!(
-        crate::sync::shared_canon::follows_main(db, "sdh-retro"),
-        None
+        crate::sync::shared_canon::follows_main(db, "sdh-retro").as_deref(),
+        Some("Owner")
     );
     // Delivered to the helper's other targets as well.
     let global = w
@@ -1428,10 +1427,12 @@ fn bug2_a_reworded_task_description_reaches_the_tasks_table() {
 /// `.sdh/` is nowhere on the helper's side any more: not in the work tree, not
 /// in the local or the remote copy of its branch, not on origin's dev.
 fn assert_no_sdh_anywhere(w: &World) {
+    // The helper's local branch from its clone; the remote's branches straight
+    // from the bare origin, not from the clone's remote-tracking refs.
     for (what, rev, dir) in [
         ("local helper-dev", "helper-dev", &w.fx.helper_dir),
-        ("origin/helper-dev", "origin/helper-dev", &w.fx.helper_dir),
-        ("origin/dev", "origin/dev", &w.fx.helper_dir),
+        ("origin helper-dev", "helper-dev", &w.fx.origin),
+        ("origin dev", "dev", &w.fx.origin),
     ] {
         let files = tracked(dir, rev);
         assert!(

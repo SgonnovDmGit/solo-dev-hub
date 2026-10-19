@@ -1490,6 +1490,7 @@ pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>, project_id: Option<i64>)
         // finish (the contributor's own branch still tracks `.sdh/`): that is read
         // from facts and retried on every sync, not on the probe's schedule.
         if !known
+            && in_project
             && ss::read_shared_import(db, repo.id)
                 .pinned_dev_branch
                 .is_some()
@@ -1682,7 +1683,9 @@ fn phase_a_foreign(
             // Р16: this install does not render rule copies here; copies an
             // earlier version (or the time before the join) left untracked
             // would stop the owner's from being fast-forwarded in.
-            drop_untracked_rule_copies(git, root);
+            if role != Role::Main {
+                drop_untracked_rule_copies(git, root);
+            }
             pass.structure = Some(s);
             after_fetch(db, git, &mut pass);
             Some(pass)
@@ -2141,14 +2144,18 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     }
     // T-000224 (В4): the owner's committed rule copies are this install's canon.
     if role == Role::Contributor {
-        let main_login = pass.structure.as_ref().map(|s| s.main.login.clone());
-        if let Some(main_login) = main_login {
+        let owner = pass
+            .structure
+            .as_ref()
+            .map(|s| (s.main.login.clone(), s.main.dev_branch.clone()));
+        if let Some((main_login, dev_branch)) = owner {
             match crate::sync::shared_canon::adopt_main_canon(
                 db,
                 git,
                 &pass.repo,
                 &pass.root,
                 &main_login,
+                &dev_branch,
             ) {
                 Ok(done) => {
                     pass.canon_changed.extend(done.changed);

@@ -106,10 +106,10 @@ pub fn refuse_if_followed(db: &AppDb, rule: &str) -> Result<(), String> {
     }
 }
 
-/// Unix seconds of the newest commit of HEAD that touched `path`.
-fn last_commit_time(git: &GitBinary, root: &Path, path: &str) -> i64 {
+/// Unix seconds of the newest commit of `rev` that touched `path`.
+fn last_commit_time(git: &GitBinary, root: &Path, rev: &str, path: &str) -> i64 {
     spawn_cmd(&git.0)
-        .args(["log", "-1", "--format=%ct", "HEAD", "--", path])
+        .args(["log", "-1", "--format=%ct", rev, "--", path])
         .current_dir(root)
         .output()
         .ok()
@@ -118,30 +118,38 @@ fn last_commit_time(git: &GitBinary, root: &Path, path: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// Take the owner's committed rule copies of `repo` (a contributor repo whose
-/// owner is `main_login`) as this install's canon.
+/// Take the owner's published rule copies of `repo` (a contributor repo whose
+/// owner is `main_login`, dev branch `dev_branch`) as this install's canon.
 ///
-/// For each `docs/sdh_skills/<name>.md` tracked at HEAD whose name is a skill
-/// this install knows and whose text differs from this install's canon: store
-/// it as the canon (custom), record a `taken` event naming the repo and
-/// `canon of main <login>`, and remember that the rule follows the owner. When
+/// The copies are read from `origin/<dev_branch>` -- the owner's published
+/// branch, the same trust boundary as the structure file -- never from the
+/// checked-out branch, which the contributor writes himself. A missing ref
+/// (nothing fetched yet) skips the pass.
+///
+/// For each `docs/sdh_skills/<name>.md` tracked there whose name is a skill this
+/// install knows, the rule is *followed*: remembered in `rules_from_main` and so
+/// locked in the app, whether or not the text differs. When it differs from this
+/// install's canon, the text is also stored as the canon (custom) and a `taken`
+/// event with the repo and the note `canon of main <login>` is recorded. When
 /// another repo already feeds the same rule, the copy whose last commit is
 /// newest wins; a tie keeps the one already followed.
 ///
-/// Called by Phase A after the import, so HEAD is as fresh as this sync could
-/// make it. The caller renders everywhere when `changed` is not empty.
+/// Called by Phase A after the import and the fast-forward. The caller renders
+/// everywhere when `changed` is not empty.
 pub fn adopt_main_canon(
     db: &AppDb,
     git: &GitBinary,
     repo: &Repository,
     root: &Path,
     main_login: &str,
+    dev_branch: &str,
 ) -> Result<Adopted, String> {
     let mut out = Adopted::default();
-    if git_sync::rev_parse(git, root, "HEAD")?.is_none() {
+    let rev = format!("refs/remotes/origin/{}", dev_branch);
+    if git_sync::rev_parse(git, root, &rev)?.is_none() {
         return Ok(out);
     }
-    let tree = ls_tree(git, root, "HEAD", &[SKILLS_DIR.to_string()])?;
+    let tree = ls_tree(git, root, &rev, &[SKILLS_DIR.to_string()])?;
     if tree.is_empty() {
         return Ok(out);
     }
@@ -164,6 +172,12 @@ pub fn adopt_main_canon(
         let Some(current) = known.get(name) else {
             continue;
         };
+        let at = last_commit_time(git, root, &rev, path);
+        if let Some(f) = followed.get(name) {
+            if f.repo_id != repo.id && f.committed_at >= at {
+                continue;
+            }
+        }
         let text = match blob_text(git, root, sha) {
             Ok(t) => t,
             Err(e) => {
@@ -171,35 +185,29 @@ pub fn adopt_main_canon(
                 continue;
             }
         };
-        if text == *current {
-            continue;
-        }
-        let at = last_commit_time(git, root, path);
-        if let Some(f) = followed.get(name) {
-            if f.repo_id != repo.id && f.committed_at >= at {
+        let differs = text != *current;
+        if differs {
+            let file_name = format!("skill.{}.md.tmpl", name);
+            if let Err(e) = db.upsert_template_file("_global", &file_name, &text, true) {
+                out.errors.push(format!("{}: {}", file_name, e));
                 continue;
             }
+            out.changed.push(name.to_string());
+            let note = format!("canon of main {}", main_login);
+            if let Err(e) =
+                db.insert_rule_event(name, rule_event::TAKEN, Some(&label), Some(note.as_str()))
+            {
+                out.errors.push(format!("rule_events: {}", e));
+            }
         }
-        let file_name = format!("skill.{}.md.tmpl", name);
-        if let Err(e) = db.upsert_template_file("_global", &file_name, &text, true) {
-            out.errors.push(format!("{}: {}", file_name, e));
-            continue;
-        }
-        followed.insert(
-            name.to_string(),
-            Followed {
-                login: main_login.to_string(),
-                repo_id: repo.id,
-                committed_at: at,
-            },
-        );
-        dirty = true;
-        out.changed.push(name.to_string());
-        let note = format!("canon of main {}", main_login);
-        if let Err(e) =
-            db.insert_rule_event(name, rule_event::TAKEN, Some(&label), Some(note.as_str()))
-        {
-            out.errors.push(format!("rule_events: {}", e));
+        let entry = Followed {
+            login: main_login.to_string(),
+            repo_id: repo.id,
+            committed_at: at,
+        };
+        if followed.get(name) != Some(&entry) {
+            followed.insert(name.to_string(), entry);
+            dirty = true;
         }
     }
     if dirty {
@@ -214,6 +222,7 @@ pub fn adopt_main_canon(
 mod tests {
     use super::*;
     use crate::sync::shared::test_support::{configure, g, gb, write};
+    use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -229,10 +238,12 @@ mod tests {
         db
     }
 
-    /// A git clone holding `files` under `docs/sdh_skills/`, committed on `date`.
+    /// A clone on branch `dev` holding `files` under `docs/sdh_skills/`,
+    /// committed on `date` and published: `origin/dev` points at the commit.
     fn owner_clone(files: &[(&str, &str)], date: &str) -> TempDir {
         let tmp = TempDir::new().unwrap();
         g(tmp.path(), &["init", "-q"]);
+        g(tmp.path(), &["symbolic-ref", "HEAD", "refs/heads/dev"]);
         configure(tmp.path());
         for (name, text) in files {
             write(tmp.path(), &format!("docs/sdh_skills/{}", name), text);
@@ -246,7 +257,13 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "{:?}", out);
+        publish(tmp.path());
         tmp
+    }
+
+    /// What a fetch of the owner's pushed branch does to the clone.
+    fn publish(dir: &Path) {
+        g(dir, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
     }
 
     fn contributor_repo(db: &AppDb, dir: &TempDir, name: &str) -> Repository {
@@ -266,11 +283,11 @@ mod tests {
     }
 
     fn adopt(db: &AppDb, repo: &Repository, dir: &TempDir) -> Adopted {
-        adopt_main_canon(db, &gb(), repo, dir.path(), "owner").unwrap()
+        adopt_main_canon(db, &gb(), repo, dir.path(), "owner", "dev").unwrap()
     }
 
     #[test]
-    fn a_differing_copy_becomes_the_canon_an_equal_or_unknown_one_does_not() {
+    fn a_differing_copy_becomes_the_canon_an_equal_one_only_locks_an_unknown_one_nothing() {
         let db = db();
         let dir = owner_clone(
             &[
@@ -303,7 +320,9 @@ mod tests {
         assert_eq!(origin.note.as_deref(), Some("canon of main owner"));
         assert!(db.latest_origin_event("sdh-beta").unwrap().is_none());
         assert_eq!(follows_main(&db, "sdh-alpha").as_deref(), Some("owner"));
-        assert_eq!(follows_main(&db, "sdh-beta"), None);
+        // An equal text is not stored again, but the rule is the owner's all the same.
+        assert_eq!(follows_main(&db, "sdh-beta").as_deref(), Some("owner"));
+        assert_eq!(follows_main(&db, "sdh-gamma"), None);
 
         // Nothing changed since: nothing is taken, nothing recorded twice.
         assert!(adopt(&db, &repo, &dir).changed.is_empty());
@@ -318,6 +337,7 @@ mod tests {
         adopt(&db, &repo, &dir);
         write(dir.path(), "docs/sdh_skills/sdh-alpha.md", "V2");
         g(dir.path(), &["commit", "-qam", "again"]);
+        publish(dir.path());
 
         assert_eq!(adopt(&db, &repo, &dir).changed, vec!["sdh-alpha"]);
         assert_eq!(canon(&db, "sdh-alpha").0, "V2");
@@ -395,5 +415,58 @@ mod tests {
         g(dir.path(), &["init", "-q"]);
         let repo = contributor_repo(&db, &dir, "owner/app");
         assert!(adopt(&db, &repo, &dir).changed.is_empty());
+        assert!(followed_rules(&db).is_empty());
+    }
+
+    #[test]
+    fn only_the_owners_published_branch_counts_not_the_checked_out_one() {
+        let db = db();
+        let dir = owner_clone(&[("sdh-alpha.md", "PUBLISHED")], "2026-01-01T00:00:00");
+        let repo = contributor_repo(&db, &dir, "owner/app");
+        // The contributor's own branch carries another text and another rule.
+        write(dir.path(), "docs/sdh_skills/sdh-alpha.md", "SNEAKY LOCAL");
+        write(dir.path(), "docs/sdh_skills/sdh-beta.md", "SNEAKY BETA");
+        g(dir.path(), &["add", "."]);
+        g(dir.path(), &["commit", "-qm", "local"]);
+
+        let done = adopt(&db, &repo, &dir);
+
+        assert_eq!(done.changed, vec!["sdh-alpha"]);
+        assert_eq!(canon(&db, "sdh-alpha").0, "PUBLISHED");
+        assert_eq!(canon(&db, "sdh-beta"), ("BETA BODY".into(), false));
+        assert_eq!(follows_main(&db, "sdh-beta"), None);
+    }
+
+    #[test]
+    fn without_the_owners_ref_nothing_is_adopted() {
+        let db = db();
+        let dir = owner_clone(&[("sdh-alpha.md", "LOCAL ONLY")], "2026-01-01T00:00:00");
+        g(dir.path(), &["update-ref", "-d", "refs/remotes/origin/dev"]);
+        let repo = contributor_repo(&db, &dir, "owner/app");
+
+        assert!(adopt(&db, &repo, &dir).changed.is_empty());
+        assert_eq!(canon(&db, "sdh-alpha").0, "ALPHA BODY");
+        assert!(followed_rules(&db).is_empty());
+    }
+
+    #[test]
+    fn a_rule_the_owner_shares_unchanged_is_locked_and_relocked_after_a_role_flap() {
+        let db = db();
+        let dir = owner_clone(&[("sdh-alpha.md", "ALPHA BODY")], "2026-01-01T00:00:00");
+        let repo = contributor_repo(&db, &dir, "owner/app");
+        let done = adopt(&db, &repo, &dir);
+        assert!(done.changed.is_empty());
+        assert_eq!(follows_main(&db, "sdh-alpha").as_deref(), Some("owner"));
+        assert!(db.list_rule_events("sdh-alpha").unwrap().is_empty());
+
+        // Sharing flaps off and on: the lock goes with the role ...
+        db.set_shared_role(repo.id, None).unwrap();
+        assert_eq!(follows_main(&db, "sdh-alpha"), None);
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        assert_eq!(follows_main(&db, "sdh-alpha"), None);
+        // ... and the next pass puts it back, with nothing else to record.
+        assert!(adopt(&db, &repo, &dir).changed.is_empty());
+        assert_eq!(follows_main(&db, "sdh-alpha").as_deref(), Some("owner"));
+        assert!(db.list_rule_events("sdh-alpha").unwrap().is_empty());
     }
 }
