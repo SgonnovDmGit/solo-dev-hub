@@ -905,6 +905,10 @@ pub struct SharedImport {
     /// the dev branch whose deletion of `.sdh/` still has to be pushed.
     #[serde(default)]
     pub disabling: Option<String>,
+    /// Participant branches whose deletion of `.sdh/` is committed locally and
+    /// still has to be pushed along with the dev branch.
+    #[serde(default)]
+    pub disabling_branches: Vec<String>,
 }
 
 /// Tolerant parse: empty or invalid JSON (or a different shape) -> default.
@@ -958,6 +962,23 @@ pub fn discover_structure(
 ) -> Result<DiscoverOutcome, String> {
     let pinned = pinned.map(str::trim).filter(|p| !p.is_empty());
     let mut untrusted: Option<String> = None;
+
+    // BUG-3: once a structure was accepted, the owner's switch-off is read from
+    // origin's pinned dev branch: the ref is there and no longer carries the
+    // file -> the repo is not shared, whatever the work tree or the contributor's
+    // own branch still hold (they keep the file until somebody deletes it).
+    if let Some(pin) = pinned {
+        let full = format!("refs/remotes/origin/{}", pin);
+        let have_ref = matches!(git_sync::rev_parse(git, repo_root, &full), Ok(Some(_)));
+        if have_ref
+            && matches!(
+                git_sync::blob_sha_at(git, repo_root, &full, STRUCTURE_REL_PATH),
+                Ok(None)
+            )
+        {
+            return Ok(DiscoverOutcome::NotFound);
+        }
+    }
 
     match read_structure_raw(repo_root) {
         Ok(Some(s)) => match validate_structure(&s, github_name) {

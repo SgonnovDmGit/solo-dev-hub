@@ -1591,10 +1591,19 @@ fn phase_a_foreign(
     match found {
         DiscoverOutcome::NotFound => {
             let st = db.get_shared_state(repo.id).ok();
+            let was_participant = st.as_ref().is_some_and(|s| {
+                matches!(
+                    s.shared_role.as_deref(),
+                    Some("contributor") | Some("pending")
+                )
+            });
             if st.is_some_and(|s| s.shared_role.is_some() || s.shared_status.is_some()) {
                 // Repo is ordinary again (spec R15).
                 let _ = db.set_shared_role(repo.id, None);
                 let _ = db.set_shared_status(repo.id, None);
+            }
+            if was_participant {
+                drop_stale_structure(db, git, repo, root, pass.net_ok);
             }
             None
         }
@@ -1645,6 +1654,70 @@ fn phase_a_foreign(
     }
 }
 
+/// BUG-3: the owner switched sharing off, so the `.sdh/` this contributor's own
+/// branch still tracks is stale -- and a later pull request from that branch
+/// would switch sharing back on in the dev branch. Delete it from the branch
+/// (commit on the current branch, plumbing otherwise) and push it, best effort.
+/// If origin's copy of the branch already lost it (the owner removed it there),
+/// the branch is only brought forward to it. Every failure is silent: the repo is
+/// ordinary now, and the next sync looks again.
+fn drop_stale_structure(db: &AppDb, git: &GitBinary, repo: &Repository, root: &Path, net_ok: bool) {
+    let Some(own) = own_branch_of(db, repo.id) else {
+        return;
+    };
+    if !repo_ready(git, root) {
+        return;
+    }
+    let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
+    let login = db.github_login().unwrap_or_default();
+    let (_, body) = commit_message(&login);
+    let subject = "chore(sdh-sync): remove shared project structure";
+    let remote = remote_ref(&own);
+    let has_remote = matches!(git_sync::rev_parse(git, root, &remote), Ok(Some(_)));
+    let cur = current_branch(git, root).ok().flatten();
+    if cur.as_deref().is_some_and(|c| same_branch(c, &own)) {
+        // The owner may have removed it from origin's copy already.
+        if has_remote
+            && ls_tree(git, root, &remote, &sdh).is_ok_and(|t| t.is_empty())
+            && git_sync::is_ancestor(git, root, "HEAD", &remote).unwrap_or(false)
+            && !shared_paths_dirty(git, root, &sdh).unwrap_or(true)
+        {
+            let _ = git_sync::merge_ff_only(git, root, &remote);
+        }
+        let Ok(tracked) = ls_files_tracked(git, root, &sdh) else {
+            return;
+        };
+        if tracked.is_empty() {
+            return;
+        }
+        remove_sdh_files(root);
+        let paths: Vec<PathBuf> = tracked.iter().map(PathBuf::from).collect();
+        let committed = commit_paths(
+            git,
+            root,
+            &own,
+            &paths,
+            subject,
+            Some(&body),
+            SDH_COMMIT_NAME,
+            SDH_COMMIT_EMAIL,
+        );
+        if !matches!(committed, Ok(CommitOutcome::Committed { .. })) {
+            // Put the files back: nothing was removed.
+            let _ = git_bytes(git, root, &["checkout", "HEAD"], &tracked);
+            return;
+        }
+    } else {
+        match remove_sdh_from_branch(git, root, &own, &sdh, &login) {
+            Ok(true) => {}
+            _ => return,
+        }
+    }
+    if net_ok && has_remote {
+        let _ = git_sync::push_branches(git, root, REMOTE, &[own.as_str()]);
+    }
+}
+
 /// The owner's deletion of `.sdh/` was committed but not pushed: push it now.
 /// The repo is not shared any more; this is the only thing left to do for it.
 fn retry_disabling(
@@ -1664,22 +1737,28 @@ fn retry_disabling(
         pass.note(SharedStatus::FetchFailed, e.to_string());
         return Some(pass);
     }
-    let local = git_sync::rev_parse(git, root, &local_ref(&dev))
-        .ok()
-        .flatten();
-    let Some(local) = local else {
-        // The branch is gone: nothing to push.
-        let _ = clear_disabling(db, repo.id);
-        return None;
-    };
-    let remote = git_sync::rev_parse(git, root, &remote_ref(&dev))
-        .ok()
-        .flatten();
-    if remote.as_deref() == Some(local.as_str()) {
+    // The dev branch and the participant branches whose deletion is pending.
+    let mut branches: Vec<String> = vec![dev.clone()];
+    branches.extend(imp.disabling_branches.iter().cloned());
+    let branches = clean_recipients(branches);
+    let mut to_push: Vec<String> = Vec::new();
+    for b in &branches {
+        let Ok(Some(local)) = git_sync::rev_parse(git, root, &local_ref(b)) else {
+            continue; // the branch is gone: nothing to push
+        };
+        let remote = git_sync::rev_parse(git, root, &remote_ref(b))
+            .ok()
+            .flatten();
+        if remote.as_deref() != Some(local.as_str()) {
+            to_push.push(b.clone());
+        }
+    }
+    if to_push.is_empty() {
         let _ = clear_disabling(db, repo.id);
         return None;
     }
-    match git_sync::push_branches(git, root, REMOTE, &[dev.as_str()]) {
+    let refs: Vec<&str> = to_push.iter().map(String::as_str).collect();
+    match git_sync::push_branches(git, root, REMOTE, &refs) {
         Ok(results)
             if results
                 .iter()
@@ -1702,6 +1781,7 @@ fn retry_disabling(
 fn clear_disabling(db: &AppDb, repo_id: i64) -> Result<(), String> {
     let mut imp = ss::read_shared_import(db, repo_id);
     imp.disabling = None;
+    imp.disabling_branches.clear();
     ss::write_shared_import(db, repo_id, &imp)?;
     db.set_shared_status(repo_id, None)
         .map_err(|e| e.to_string())
@@ -2376,6 +2456,14 @@ pub fn disable_shared_mode(
     }
     let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
     let tracked = ls_files_tracked(git, &root, &sdh)?;
+    // The participants' branches carry `.sdh/` too (the sync plumbed it there):
+    // read them before the file is gone.
+    let participant_branches: Vec<String> = repo
+        .github_name
+        .as_deref()
+        .and_then(|gh| ss::read_structure_file(&root, gh).ok().flatten())
+        .map(|s| s.participants.iter().map(|p| p.branch.clone()).collect())
+        .unwrap_or_default();
     let dev = own_branch_of(db, repo_id);
     let fetch_ok = git_sync::fetch(git, &root, REMOTE).is_ok();
     let login = db.github_login().unwrap_or_default();
@@ -2461,33 +2549,67 @@ pub fn disable_shared_mode(
     db.set_shared_status(repo_id, None)
         .map_err(|e| e.to_string())?;
 
-    let Some(dev) = dev.filter(|_| committed) else {
+    // The same deletion on every participant branch (BUG-3): a contributor
+    // whose own branch kept `.sdh/project.json` would otherwise carry it for
+    // good. Best effort per branch -- a branch that cannot be brought forward is
+    // reported and left to the contributor's own clean-up.
+    let mut extra: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    if !tracked.is_empty() {
+        for b in clean_recipients(participant_branches) {
+            if dev.as_deref().is_some_and(|d| same_branch(d, &b)) {
+                continue;
+            }
+            match remove_sdh_from_branch(git, &root, &b, &sdh, &login) {
+                Ok(true) => extra.push(b),
+                Ok(false) => {}
+                Err(e) => skipped.push(format!("{}: {}", b, e)),
+            }
+        }
+    }
+    let skipped_note = (!skipped.is_empty()).then(|| {
+        format!(
+            "`.sdh/` was not removed from participant branch(es): {}",
+            skipped.join("; ")
+        )
+    });
+
+    let dev = dev.filter(|_| committed);
+    let mut to_push: Vec<String> = dev.iter().cloned().collect();
+    to_push.extend(extra.iter().cloned());
+    let Some(marker) = to_push.first().cloned() else {
         return Ok(SharedDisableResult {
             pushed: false,
-            note: Some("nothing to commit".into()),
+            note: Some(match skipped_note {
+                Some(s) => format!("nothing to commit; {}", s),
+                None => "nothing to commit".into(),
+            }),
         });
     };
-    let failure = match git_sync::push_branches(git, &root, REMOTE, &[dev.as_str()]) {
+    let refs: Vec<&str> = to_push.iter().map(String::as_str).collect();
+    let failure = match git_sync::push_branches(git, &root, REMOTE, &refs) {
         Ok(results)
             if results
                 .iter()
                 .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)) =>
         {
+            let mut notes: Vec<String> = Vec::new();
+            if !fetch_ok {
+                notes.push("fetch failed before committing".into());
+            }
+            notes.extend(skipped_note);
             return Ok(SharedDisableResult {
                 pushed: true,
-                note: if fetch_ok {
-                    None
-                } else {
-                    Some("fetch failed before committing".into())
-                },
-            })
+                note: (!notes.is_empty()).then(|| notes.join("; ")),
+            });
         }
-        Ok(results) => format!("push of {} was refused: {:?}", dev, results),
+        Ok(results) => format!("push of {} was refused: {:?}", to_push.join(", "), results),
         Err(e) => format!("push failed: {}", e),
     };
     // Keep the repo in the shared pass until the deletion reaches origin.
     let mut imp = ss::read_shared_import(db, repo_id);
-    imp.disabling = Some(dev);
+    imp.disabling = Some(marker);
+    imp.disabling_branches = extra;
     ss::write_shared_import(db, repo_id, &imp)?;
     db.set_shared_status(repo_id, Some(SharedStatus::PushFailed.as_str()))
         .map_err(|e| e.to_string())?;
@@ -2495,6 +2617,63 @@ pub fn disable_shared_mode(
         pushed: false,
         note: Some(format!("{} - it is retried on the next sync", failure)),
     })
+}
+
+/// Delete `.sdh/` from the local copy of `branch` (a branch that is not checked
+/// out) with plumbing, first bringing it up to origin's copy. `Ok(false)` when
+/// there is nothing to delete. Refused when the branch holds commits that are
+/// not sync commits or has diverged from origin.
+fn remove_sdh_from_branch(
+    git: &GitBinary,
+    root: &Path,
+    branch: &str,
+    sdh: &[String],
+    login: &str,
+) -> Result<bool, String> {
+    let remote = remote_ref(branch);
+    let has_remote = matches!(git_sync::rev_parse(git, root, &remote), Ok(Some(_)));
+    if has_remote && git_sync::fast_forward_ref(git, root, branch, &remote)? == FfOutcome::Diverged
+    {
+        return Err(format!("it has diverged from origin/{}", branch));
+    }
+    if !matches!(
+        git_sync::rev_parse(git, root, &local_ref(branch)),
+        Ok(Some(_))
+    ) {
+        return Ok(false);
+    }
+    let in_branch = ls_tree(git, root, &local_ref(branch), sdh)?;
+    if in_branch.is_empty() {
+        return Ok(false);
+    }
+    if !local_only_commits_are_ours(git, root, branch)? {
+        return Err("it holds commits that are not sync commits".into());
+    }
+    let changes: Vec<FileChange> = in_branch
+        .keys()
+        .map(|p| FileChange {
+            rel_path: PathBuf::from(p),
+            content: None,
+        })
+        .collect();
+    let (_, body) = commit_message(login);
+    let res = git_sync::commit_files_to_branch(
+        git,
+        root,
+        branch,
+        &changes,
+        &format!(
+            "chore(sdh-sync): remove shared project structure\n\n{}",
+            body
+        ),
+        SDH_COMMIT_NAME,
+        SDH_COMMIT_EMAIL,
+    )?;
+    match res {
+        BranchCommit::Committed { .. } => Ok(true),
+        BranchCommit::NothingToCommit => Ok(false),
+        BranchCommit::RefMoved => Err("it moved meanwhile".into()),
+    }
 }
 
 /// Join requests in the work tree plus, when the owner's current branch is not

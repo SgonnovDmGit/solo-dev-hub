@@ -1140,7 +1140,8 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
 /// Verification 11: the owner switches the mode off. `.sdh/` is gone from
 /// origin/dev and from the owner's tree, the owner's repo is ordinary, and the
 /// helper's next syncs raise no status and leave every row of the helper's
-/// database intact. (The helper's role being cleared is BUG-3, below.)
+/// database intact; the repo is ordinary for the helper (no role) and its branch
+/// no longer carries `.sdh/` (BUG-3, below).
 #[test]
 fn v11_switching_off_removes_sdh_and_the_helpers_repo_is_ordinary_again() {
     let w = World::new();
@@ -1192,8 +1193,9 @@ fn v11_switching_off_removes_sdh_and_the_helpers_repo_is_ordinary_again() {
     w.sync_owner();
     assert_eq!(fx.main_status(), None);
 
-    // The helper's next sync. (That it also drops the role is BUG-3 below.)
+    // The helper's next sync.
     w.sync_helper();
+    assert_eq!(shared_role(&fx.helper_db, fx.helper_repo), None);
     assert_eq!(fx.helper_status(), None);
     assert_eq!(
         rows(&fx.helper_db, fx.helper_repo),
@@ -1202,8 +1204,10 @@ fn v11_switching_off_removes_sdh_and_the_helpers_repo_is_ordinary_again() {
     );
     w.sync_helper();
     w.sync_helper();
+    assert_eq!(shared_role(&fx.helper_db, fx.helper_repo), None);
     assert_eq!(fx.helper_status(), None);
     assert_eq!(rows(&fx.helper_db, fx.helper_repo), before);
+    assert_no_sdh_anywhere(&w);
     w.check_origin();
 }
 
@@ -1322,7 +1326,7 @@ fn bug1_a_contributors_rendered_skills_do_not_block_the_fast_forward() {
 }
 
 // ---------------------------------------------------------------------------
-// BUG-2 (fixed) and BUG-3 (found by these scenarios)
+// BUG-2 and BUG-3 (found by these scenarios, fixed)
 // ---------------------------------------------------------------------------
 
 /// BUG-2, minimal repro (fixed). Not a shared-mode defect: the tasks table mirrored status, source and version of a
@@ -1352,15 +1356,32 @@ fn bug2_a_reworded_task_description_reaches_the_tasks_table() {
     );
 }
 
-/// BUG-3, minimal repro (ignored: it fails until the product is fixed; run with
-/// `--ignored`). The owner switches the mode off: `.sdh/` is deleted on `dev`
-/// only. The helper's own branch still tracks `.sdh/project.json` (the owner
-/// plumbed it there), `discover_structure` reads the work-tree file first and
-/// finds it valid, so the helper stays a contributor -- with the band, the
-/// read-only chips and the shared commit rules -- for good, whatever origin/dev
-/// says. Item 11 of the spec ("the helper's repo is ordinary") does not hold.
+/// `.sdh/` is nowhere on the helper's side any more: not in the work tree, not
+/// in the local or the remote copy of its branch, not on origin's dev.
+fn assert_no_sdh_anywhere(w: &World) {
+    for (what, rev, dir) in [
+        ("local helper-dev", "helper-dev", &w.fx.helper_dir),
+        ("origin/helper-dev", "origin/helper-dev", &w.fx.helper_dir),
+        ("origin/dev", "origin/dev", &w.fx.helper_dir),
+    ] {
+        let files = tracked(dir, rev);
+        assert!(
+            !files.iter().any(|f| f.starts_with(".sdh/")),
+            "{} still tracks .sdh: {:?}",
+            what,
+            files
+        );
+    }
+    assert!(!w.fx.helper_dir.join(".sdh").join("project.json").exists());
+}
+
+/// BUG-3 (fixed). The owner switches the mode off. `.sdh/` used to be deleted on
+/// `dev` only; the helper's own branch kept `.sdh/project.json`, discovery read
+/// the work-tree file first and found it valid, so the helper stayed a
+/// contributor for good. Now the owner removes it from every participant branch
+/// too, the contributor reads the switch-off from origin's dev, and the branch
+/// no longer carries the file after a round.
 #[test]
-#[ignore = "BUG-3: a contributor whose branch tracks .sdh/project.json never learns the owner switched sharing off"]
 fn bug3_switching_off_makes_the_helpers_repo_ordinary_again() {
     let w = World::new();
     w.participants();
@@ -1370,8 +1391,49 @@ fn bug3_switching_off_makes_the_helpers_repo_ordinary_again() {
     );
     let res = disable_shared_mode(&w.fx.main_db, &gb(), w.fx.main_repo).unwrap();
     assert!(res.pushed, "{:?}", res);
+    // The owner's deletion reached the participant branch on the remote.
+    assert!(!tracked(&w.fx.origin, "helper-dev")
+        .iter()
+        .any(|f| f.starts_with(".sdh/")));
     w.sync_owner();
     w.sync_helper();
     w.sync_helper();
     assert_eq!(shared_role(&w.fx.helper_db, w.fx.helper_repo), None);
+    assert_eq!(w.fx.helper_status(), None);
+    assert_no_sdh_anywhere(&w);
+    w.check_origin();
+}
+
+/// BUG-3, contributor side alone: the owner's switch-off could not reach the
+/// helper's branch (here: the owner's structure no longer listed the
+/// participant when sharing was switched off). The helper's sync reads the
+/// switch-off from origin's dev, clears the role and deletes the stale file from
+/// its own branch -- committed on the current branch and pushed -- so a later
+/// pull request from it cannot switch sharing back on in dev.
+#[test]
+fn bug3_the_contributor_drops_a_stale_structure_the_owner_could_not_remove() {
+    let w = World::new();
+    w.participants();
+    // The owner's switch-off does not know the participant's branch.
+    let path = w.fx.main_dir.join(".sdh").join("project.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    v["participants"] = serde_json::json!([]);
+    fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    let res = disable_shared_mode(&w.fx.main_db, &gb(), w.fx.main_repo).unwrap();
+    assert!(res.pushed, "{:?}", res);
+    assert!(
+        tracked(&w.fx.origin, "helper-dev")
+            .iter()
+            .any(|f| f == ".sdh/project.json"),
+        "the owner left the participant branch alone"
+    );
+
+    w.sync_helper();
+    assert_eq!(shared_role(&w.fx.helper_db, w.fx.helper_repo), None);
+    assert_eq!(w.fx.helper_status(), None);
+    assert_no_sdh_anywhere(&w);
+    w.sync_helper();
+    assert_eq!(shared_role(&w.fx.helper_db, w.fx.helper_repo), None);
+    w.check_origin();
 }
