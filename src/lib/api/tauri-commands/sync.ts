@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult } from '$lib/types';
+import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult, SharedPreflight, SharedMergeResult, SharedDisableResult, JoinRequest, ProjectStructure } from '$lib/types';
 
 
 // ── Requirements sync commands ──────────────────────────────────────────────
@@ -63,4 +63,43 @@ export async function setAutocommitBranch(repoId: number, branch: string | null)
 // T-000193: peer channels (InOutBox) touching a project.
 export async function listPeerChannels(projectId: number): Promise<PeerChannelInfo[]> {
   return invoke<PeerChannelInfo[]>('list_peer_channels', { projectId });
+}
+
+// ── F-000044 / T-000220: shared (contributor-mode) repos ─────────────────────
+
+export async function sharedModePreflight(repoId: number): Promise<SharedPreflight> {
+  return invoke<SharedPreflight>('shared_mode_preflight', { repoId });
+}
+
+/** Owner: switch shared mode on. Rejects when blocking .gitignore lines remain
+ *  and `removeLines` is false; with it, exactly those lines are removed. */
+export async function enableSharedMode(repoId: number, removeLines: boolean): Promise<void> {
+  return invoke<void>('enable_shared_mode', { repoId, removeLines });
+}
+
+export async function disableSharedMode(repoId: number): Promise<SharedDisableResult> {
+  return invoke<SharedDisableResult>('disable_shared_mode', { repoId });
+}
+
+/** Owner: approve a helper's join request. The next sync commits it. */
+export async function approveJoinRequest(repoId: number, login: string): Promise<ProjectStructure> {
+  return invoke<ProjectStructure>('approve_join_request', { repoId, login });
+}
+
+/** Contributor: trust the owner's changed dev branch again. */
+export async function acceptNewMainBranch(repoId: number): Promise<void> {
+  return invoke<void>('accept_new_main_branch', { repoId });
+}
+
+/** The "merge" button of a diverged shared branch. */
+export async function mergeSharedUpstream(repoId: number): Promise<SharedMergeResult> {
+  return invoke<SharedMergeResult>('merge_shared_upstream', { repoId });
+}
+
+export async function listJoinRequests(repoId: number): Promise<JoinRequest[]> {
+  return invoke<JoinRequest[]>('list_join_requests', { repoId });
+}
+
+export async function getRepoStructure(repoId: number): Promise<ProjectStructure | null> {
+  return invoke<ProjectStructure | null>('get_repo_structure', { repoId });
 }

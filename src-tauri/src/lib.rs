@@ -232,6 +232,15 @@ pub fn run() {
             commands::sync::get_autocommit_branch,
             commands::sync::set_autocommit_branch,
             commands::sync::get_repo_current_branch,
+            // F-000044: shared (contributor-mode) repos
+            commands::shared::shared_mode_preflight,
+            commands::shared::enable_shared_mode,
+            commands::shared::disable_shared_mode,
+            commands::shared::approve_join_request,
+            commands::shared::accept_new_main_branch,
+            commands::shared::merge_shared_upstream,
+            commands::shared::list_join_requests,
+            commands::shared::get_repo_structure,
             // Templates (0.6.0)
             commands::templates::list_template_languages,
             commands::templates::list_template_files,
