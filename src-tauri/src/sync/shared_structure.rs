@@ -16,6 +16,7 @@ use crate::db::AppDb;
 use crate::git_ops::{spawn_cmd, GitBinary};
 use crate::git_sync;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -153,6 +154,8 @@ pub const MAX_STRUCTURE_BYTES: u64 = 256 * 1024;
 const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 /// At most this many request files are looked at.
 pub const MAX_REQUEST_FILES: usize = 50;
+/// At most this many request-named files are opened to find those 50.
+const MAX_REQUEST_INSPECTED: usize = 500;
 
 /// The repositories.role CHECK set (db/migrations.rs).
 const REPO_ROLES: &[&str] = &[
@@ -383,6 +386,36 @@ pub fn serialize_structure(s: &ProjectStructure) -> String {
     out
 }
 
+/// Remove temp files left by a crashed write: `.<name>.json.<pid>.tmp`, the
+/// exact pattern `write_if_changed` uses. Regular files only, nothing else.
+fn remove_stale_temps(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(core) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else {
+            continue;
+        };
+        let Some((stem, pid)) = core.rsplit_once('.') else {
+            continue;
+        };
+        if !stem.ends_with(".json") || pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if matches!(e.file_type(), Ok(t) if t.is_file()) {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Clear crashed-write leftovers in `.sdh` and `.sdh/requests` (neither may be a
+/// symlink; callers have checked).
+fn clean_sdh_temps(repo_root: &Path) {
+    remove_stale_temps(&repo_root.join(".sdh"));
+    remove_stale_temps(&requests_dir(repo_root));
+}
+
 /// Write `content` unless the file already holds it (line endings compared
 /// after CRLF -> LF, so an autocrlf checkout does not churn). The write goes
 /// through a temp file and a rename, so a reader never sees a partial file.
@@ -396,6 +429,7 @@ fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
     }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+        remove_stale_temps(dir);
     }
     let name = path
         .file_name()
@@ -413,6 +447,8 @@ fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
 /// `Ok(true)` when the file was written, `Ok(false)` when it was already identical.
 pub fn write_structure_if_changed(repo_root: &Path, s: &ProjectStructure) -> Result<bool, String> {
     ensure_sdh_dir_safe(repo_root)?;
+    ensure_not_symlink(&requests_dir(repo_root))?;
+    clean_sdh_temps(repo_root);
     write_if_changed(&structure_path(repo_root), &serialize_structure(s))
 }
 
@@ -569,22 +605,25 @@ pub fn list_requests(repo_root: &Path, github_name: &str) -> Vec<JoinRequest> {
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
+    // Names that cannot be a request are dropped first, so junk files cannot
+    // push real requests out of the window; the number of files actually
+    // opened is bounded too.
     let mut names: Vec<String> = entries
         .flatten()
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.ends_with(".json"))
+        .filter(|n| n.strip_suffix(".json").is_some_and(is_valid_request_login))
         .collect();
     names.sort();
-    names.truncate(MAX_REQUEST_FILES);
+    names.truncate(MAX_REQUEST_INSPECTED);
 
     let mut out: Vec<JoinRequest> = Vec::new();
     for name in names {
+        if out.len() >= MAX_REQUEST_FILES {
+            break;
+        }
         let Some(stem) = name.strip_suffix(".json") else {
             continue;
         };
-        if !is_valid_request_login(stem) {
-            continue;
-        }
         let path = dir.join(&name);
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
@@ -628,6 +667,7 @@ pub fn write_request_if_changed(repo_root: &Path, req: &JoinRequest) -> Result<b
     let path = request_path(repo_root, &req.login)?;
     ensure_sdh_dir_safe(repo_root)?;
     ensure_not_symlink(&requests_dir(repo_root))?;
+    clean_sdh_temps(repo_root);
     let clean = JoinRequest {
         login: req.login.clone(),
         branch: branch.to_string(),
@@ -710,6 +750,42 @@ pub enum DiscoverOutcome {
     Untrusted(String),
 }
 
+/// What this install remembers about the shared files of a repo, stored as JSON
+/// in `repositories.shared_import`. `pinned_dev_branch` is the trust-on-first-use
+/// pin of the owner's dev branch; `blobs` is reserved for the last-imported blob
+/// shas (T-000221) and stays empty for now. Parsing is tolerant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedImport {
+    #[serde(default)]
+    pub pinned_dev_branch: Option<String>,
+    #[serde(default)]
+    pub blobs: BTreeMap<String, String>,
+}
+
+/// Tolerant parse: empty or invalid JSON (or a different shape) -> default.
+pub fn parse_shared_import(json: Option<&str>) -> SharedImport {
+    json.and_then(|j| serde_json::from_str::<SharedImport>(j).ok())
+        .unwrap_or_default()
+}
+
+pub fn read_shared_import(db: &AppDb, repo_id: i64) -> SharedImport {
+    parse_shared_import(db.get_shared_import(repo_id).ok().flatten().as_deref())
+}
+
+pub fn write_shared_import(db: &AppDb, repo_id: i64, v: &SharedImport) -> Result<(), String> {
+    let json = serde_json::to_string(v).map_err(|e| e.to_string())?;
+    db.set_shared_import(repo_id, Some(&json))
+        .map_err(|e| e.to_string())
+}
+
+/// Pin the owner's dev branch once a structure has been accepted (trust on
+/// first use): later discovery looks only at `origin/<pin>`.
+pub fn pin_after_accept(db: &AppDb, repo_id: i64, s: &ProjectStructure) -> Result<(), String> {
+    let mut v = read_shared_import(db, repo_id);
+    v.pinned_dev_branch = Some(s.main.dev_branch.clone());
+    write_shared_import(db, repo_id, &v)
+}
+
 /// Find the trusted structure of the repo `github_name` (`owner/name`).
 ///
 /// Meant for a contributor's repos only (the caller checks the owner is not
@@ -718,50 +794,102 @@ pub enum DiscoverOutcome {
 /// the remote-tracking refs.
 ///
 /// Trust anchor: a structure is accepted only if `validate_structure` passes,
-/// i.e. its `main.login` is the repo's owner. On remote refs a candidate must
-/// also sit on the ref named exactly `origin/<main.dev_branch>` (there is at
-/// most one such ref), so a helper's own branch carrying a copy is ignored.
+/// i.e. its `main.login` is the repo's owner.
+///
+/// * `pinned` is `Some(dev_branch)` once a structure was accepted before (see
+///   `pin_after_accept`). Then ONLY `origin/<pinned>` is consulted (and the
+///   worktree file, if it names the same dev branch). A structure there whose
+///   `dev_branch` differs from the pin is `Untrusted("dev branch changed ...")`.
+/// * Unpinned, every remote ref that sits on `origin/<its own main.dev_branch>`
+///   and validates is a candidate. One candidate is the answer; two or more
+///   are `Untrusted("ambiguous structure: ...")` - none is ever picked.
+///
 /// A worktree file that fails validation does not stop the search of the refs.
 pub fn discover_structure(
     git: &GitBinary,
     repo_root: &Path,
     github_name: &str,
+    pinned: Option<&str>,
 ) -> Result<DiscoverOutcome, String> {
+    let pinned = pinned.map(str::trim).filter(|p| !p.is_empty());
     let mut untrusted: Option<String> = None;
+
     match read_structure_raw(repo_root) {
         Ok(Some(s)) => match validate_structure(&s, github_name) {
-            Ok(()) => return Ok(DiscoverOutcome::Found(s, SOURCE_WORKTREE.to_string())),
+            Ok(()) => match pinned {
+                Some(pin) if s.main.dev_branch != pin => {
+                    untrusted = Some(format!(
+                        "{}: dev branch changed from {} to {}",
+                        STRUCTURE_REL_PATH, pin, s.main.dev_branch
+                    ));
+                }
+                _ => return Ok(DiscoverOutcome::Found(s, SOURCE_WORKTREE.to_string())),
+            },
             Err(reason) => untrusted = Some(format!("{}: {}", STRUCTURE_REL_PATH, reason)),
         },
         Ok(None) => {}
         Err(reason) => untrusted = Some(reason),
     }
+
+    let read_ref = |full: &str| -> Option<ProjectStructure> {
+        match git_sync::show_file_capped(
+            git,
+            repo_root,
+            full,
+            STRUCTURE_REL_PATH,
+            MAX_STRUCTURE_BYTES,
+        ) {
+            Ok(Some(b)) => parse_structure(&b).ok(),
+            _ => None,
+        }
+    };
+
+    if let Some(pin) = pinned {
+        let full = format!("refs/remotes/origin/{}", pin);
+        if let Some(s) = read_ref(&full) {
+            if s.main.dev_branch != pin {
+                untrusted = Some(format!(
+                    "origin/{}: dev branch changed from {} to {}",
+                    pin, pin, s.main.dev_branch
+                ));
+            } else {
+                match validate_structure(&s, github_name) {
+                    Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", pin))),
+                    Err(reason) => untrusted = Some(format!("origin/{}: {}", pin, reason)),
+                }
+            }
+        }
+        return Ok(match untrusted {
+            Some(reason) => DiscoverOutcome::Untrusted(reason),
+            None => DiscoverOutcome::NotFound,
+        });
+    }
+
+    let mut candidates: Vec<(ProjectStructure, String)> = Vec::new();
     for full in list_origin_refs(git, repo_root)? {
         let Some(branch) = full.strip_prefix("refs/remotes/origin/") else {
             continue;
         };
-        let bytes = match git_sync::show_file_capped(
-            git,
-            repo_root,
-            &full,
-            STRUCTURE_REL_PATH,
-            MAX_STRUCTURE_BYTES,
-        ) {
-            Ok(Some(b)) => b,
-            _ => continue,
-        };
-        let Ok(s) = parse_structure(&bytes) else {
-            continue;
-        };
+        let Some(s) = read_ref(&full) else { continue };
         if s.main.dev_branch != branch {
             continue;
         }
         match validate_structure(&s, github_name) {
-            Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", branch))),
+            Ok(()) => candidates.push((s, format!("origin/{}", branch))),
             Err(reason) => {
                 untrusted.get_or_insert(format!("origin/{}: {}", branch, reason));
             }
         }
+    }
+    if candidates.len() > 1 {
+        let names: Vec<&str> = candidates.iter().map(|(_, r)| r.as_str()).collect();
+        return Ok(DiscoverOutcome::Untrusted(format!(
+            "ambiguous structure: {}",
+            names.join(" vs ")
+        )));
+    }
+    if let Some((s, r)) = candidates.pop() {
+        return Ok(DiscoverOutcome::Found(s, r));
     }
     Ok(match untrusted {
         Some(reason) => DiscoverOutcome::Untrusted(reason),
@@ -793,12 +921,12 @@ pub fn apply_structure_locally(
         .clone()
         .ok_or_else(|| "the repository has no GitHub name".to_string())?;
     validate_structure(s, &called_name)?;
-    let my_login = db.github_login();
-    let mine = |github: &str| {
-        my_login
-            .as_deref()
-            .is_some_and(|l| repo_owner_is(github, l))
-    };
+    // Fail closed: without a known login this install cannot tell its own
+    // repos from the owner's, so it must not move anything.
+    let my_login = db
+        .github_login()
+        .ok_or_else(|| "the GitHub login of this install is unknown".to_string())?;
+    let mine = |github: &str| repo_owner_is(github, &my_login);
     if mine(&called_name) {
         return Err("this install owns the repository: nothing to apply as a contributor".into());
     }
@@ -870,6 +998,12 @@ mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
+
+    fn make_helper_db() -> AppDb {
+        let db = make_db();
+        db.set_setting("github_login", "helper").unwrap();
+        db
+    }
 
     fn make_db() -> AppDb {
         AppDb::new(PathBuf::from(":memory:")).unwrap()
@@ -1304,7 +1438,7 @@ mod tests {
     fn discover_prefers_working_tree() {
         let fx = fx();
         write_structure_if_changed(&fx.a, &sample()).unwrap();
-        let (s, src) = found(discover_structure(&gb(), &fx.a, REPO).unwrap());
+        let (s, src) = found(discover_structure(&gb(), &fx.a, REPO, None).unwrap());
         assert_eq!(src, SOURCE_WORKTREE);
         assert_eq!(s.project.name, "Acme");
     }
@@ -1315,7 +1449,7 @@ mod tests {
         g(&fx.a, &["push", "-q", "origin", "dev"]);
         let c = contributor(&fx);
         assert_eq!(
-            discover_structure(&gb(), &c, REPO).unwrap(),
+            discover_structure(&gb(), &c, REPO, None).unwrap(),
             DiscoverOutcome::NotFound
         );
     }
@@ -1325,7 +1459,7 @@ mod tests {
         let fx = fx();
         publish(&fx, "dev", "dev", "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
-        let (s, src) = found(discover_structure(&gb(), &c, REPO).unwrap());
+        let (s, src) = found(discover_structure(&gb(), &c, REPO, None).unwrap());
         assert_eq!(src, "origin/dev");
         assert_eq!(s.main.dev_branch, "dev");
     }
@@ -1337,7 +1471,7 @@ mod tests {
         publish(&fx, "helper-branch", "dev", "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
         assert_eq!(
-            discover_structure(&gb(), &c, REPO).unwrap(),
+            discover_structure(&gb(), &c, REPO, None).unwrap(),
             DiscoverOutcome::NotFound
         );
     }
@@ -1348,7 +1482,7 @@ mod tests {
         publish(&fx, "dev", "DEV", "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
         assert_eq!(
-            discover_structure(&gb(), &c, REPO).unwrap(),
+            discover_structure(&gb(), &c, REPO, None).unwrap(),
             DiscoverOutcome::NotFound
         );
     }
@@ -1364,7 +1498,7 @@ mod tests {
         };
         publish_struct(&fx, "helper", &forged, "2026-06-01T00:00:00Z");
         let c = contributor(&fx);
-        match discover_structure(&gb(), &c, REPO).unwrap() {
+        match discover_structure(&gb(), &c, REPO, None).unwrap() {
             DiscoverOutcome::Untrusted(reason) => {
                 assert!(reason.contains("main is not the repo owner"), "{}", reason)
             }
@@ -1374,7 +1508,7 @@ mod tests {
         // the legitimate copy is still found, however old
         publish(&fx, "dev", "dev", "2020-01-01T00:00:00Z");
         g(&c, &["fetch", "-q", "origin"]);
-        let (s, src) = found(discover_structure(&gb(), &c, REPO).unwrap());
+        let (s, src) = found(discover_structure(&gb(), &c, REPO, None).unwrap());
         assert_eq!(src, "origin/dev");
         assert_eq!(s.main.login, "Owner");
     }
@@ -1387,12 +1521,12 @@ mod tests {
         forged.main.login = "helper".into();
         write_structure_if_changed(&c, &forged).unwrap();
         assert!(matches!(
-            discover_structure(&gb(), &c, REPO).unwrap(),
+            discover_structure(&gb(), &c, REPO, None).unwrap(),
             DiscoverOutcome::Untrusted(_)
         ));
         publish(&fx, "dev", "dev", "2026-01-01T00:00:00Z");
         g(&c, &["fetch", "-q", "origin"]);
-        let (_, src) = found(discover_structure(&gb(), &c, REPO).unwrap());
+        let (_, src) = found(discover_structure(&gb(), &c, REPO, None).unwrap());
         assert_eq!(src, "origin/dev");
     }
 
@@ -1413,7 +1547,7 @@ mod tests {
         publish_struct(&fx, "dev", &big, "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
         assert_eq!(
-            discover_structure(&gb(), &c, REPO).unwrap(),
+            discover_structure(&gb(), &c, REPO, None).unwrap(),
             DiscoverOutcome::NotFound
         );
     }
@@ -1422,7 +1556,7 @@ mod tests {
 
     #[test]
     fn apply_creates_project_assigns_roles_and_is_idempotent() {
-        let db = make_db();
+        let db = make_helper_db();
         let web = local_repo(&db, "owner/web"); // case differs from the file
         let api = local_repo(&db, "Owner/api");
         let other = local_repo(&db, "Owner/unrelated");
@@ -1467,7 +1601,7 @@ mod tests {
 
     #[test]
     fn apply_reuses_existing_project_by_name_case_insensitively() {
-        let db = make_db();
+        let db = make_helper_db();
         let web = local_repo(&db, "Owner/web");
         let existing = db.create_project("ACME", None, "standard").unwrap();
         apply_structure_locally(&db, web, &sample()).unwrap();
@@ -1751,7 +1885,7 @@ mod tests {
 
     #[test]
     fn apply_rejects_an_invalid_structure_before_writing_anything() {
-        let db = make_db();
+        let db = make_helper_db();
         let web = local_repo(&db, "Owner/web");
         let mut bad = sample();
         bad.repos[0].role = "boss".into();
@@ -1765,7 +1899,7 @@ mod tests {
 
     #[test]
     fn apply_touches_only_repos_of_the_main_owner() {
-        let db = make_db();
+        let db = make_helper_db();
         let web = local_repo(&db, "Owner/web");
         let foreign = local_repo(&db, "Stranger/api");
         let mut s = sample();
@@ -1780,7 +1914,7 @@ mod tests {
 
     #[test]
     fn apply_never_moves_repos_of_this_installs_own_login() {
-        let db = make_db();
+        let db = make_helper_db();
         db.set_setting("github_login", "Owner").unwrap();
         let web = local_repo(&db, "Owner/web");
         assert!(apply_structure_locally(&db, web, &sample())
@@ -1792,7 +1926,7 @@ mod tests {
 
     #[test]
     fn apply_skips_a_microservice_that_cannot_be_connected() {
-        let db = make_db();
+        let db = make_helper_db();
         let web = local_repo(&db, "Owner/web");
         // Acme is itself a microservice that Mailer depends on; connecting
         // Mailer to Acme would close a cycle and must be skipped quietly.
@@ -1808,5 +1942,182 @@ mod tests {
             db.list_project_microservices(acme.id).unwrap(),
             vec![other.id]
         );
+    }
+
+    // ----- second review follow-up (N1-N4) -------------------------------------
+
+    fn publish_dev_and_aaa(fx: &Fx) {
+        publish(fx, "dev", "dev", "2026-01-01T00:00:00Z");
+        // a helper's branch carrying the real owner's login, naming itself
+        publish(fx, "aaa", "aaa", "2026-06-01T00:00:00Z");
+    }
+
+    #[test]
+    fn discover_unpinned_with_two_valid_refs_is_ambiguous() {
+        let fx = fx();
+        publish_dev_and_aaa(&fx);
+        let c = contributor(&fx);
+        match discover_structure(&gb(), &c, REPO, None).unwrap() {
+            DiscoverOutcome::Untrusted(reason) => {
+                assert!(reason.starts_with("ambiguous structure: "), "{}", reason);
+                assert!(reason.contains("origin/aaa") && reason.contains("origin/dev"));
+            }
+            other => panic!("expected Untrusted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn discover_pinned_ignores_other_refs() {
+        let fx = fx();
+        publish_dev_and_aaa(&fx);
+        let c = contributor(&fx);
+        let (s, src) = found(discover_structure(&gb(), &c, REPO, Some("dev")).unwrap());
+        assert_eq!(src, "origin/dev");
+        assert_eq!(s.main.dev_branch, "dev");
+        // an absent pinned ref is simply not found
+        assert_eq!(
+            discover_structure(&gb(), &c, REPO, Some("gone")).unwrap(),
+            DiscoverOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn discover_pinned_detects_a_changed_dev_branch() {
+        let fx = fx();
+        // origin/dev now claims another dev branch
+        publish(&fx, "dev", "other", "2026-01-01T00:00:00Z");
+        let c = contributor(&fx);
+        match discover_structure(&gb(), &c, REPO, Some("dev")).unwrap() {
+            DiscoverOutcome::Untrusted(reason) => {
+                assert!(
+                    reason.contains("dev branch changed from dev to other"),
+                    "{}",
+                    reason
+                )
+            }
+            other => panic!("expected Untrusted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn discover_pinned_worktree_file_must_name_the_pinned_branch() {
+        let fx = fx();
+        let mut st = sample();
+        st.main.dev_branch = "other".into();
+        write_structure_if_changed(&fx.a, &st).unwrap();
+        assert!(matches!(
+            discover_structure(&gb(), &fx.a, REPO, Some("dev")).unwrap(),
+            DiscoverOutcome::Untrusted(_)
+        ));
+        assert!(matches!(
+            discover_structure(&gb(), &fx.a, REPO, Some("other")).unwrap(),
+            DiscoverOutcome::Found(_, _)
+        ));
+    }
+
+    #[test]
+    fn shared_import_parses_tolerantly_and_round_trips() {
+        assert_eq!(parse_shared_import(None), SharedImport::default());
+        assert_eq!(parse_shared_import(Some("")), SharedImport::default());
+        assert_eq!(
+            parse_shared_import(Some("not json")),
+            SharedImport::default()
+        );
+        assert_eq!(parse_shared_import(Some("[1,2]")), SharedImport::default());
+        assert_eq!(parse_shared_import(Some("{}")), SharedImport::default());
+        let v = parse_shared_import(Some(
+            r#"{"pinned_dev_branch":"dev","blobs":{"docs/todo.md":"abc"},"extra":1}"#,
+        ));
+        assert_eq!(v.pinned_dev_branch.as_deref(), Some("dev"));
+        assert_eq!(v.blobs.get("docs/todo.md").map(String::as_str), Some("abc"));
+        assert_eq!(
+            parse_shared_import(Some(r#"{"blobs":{}}"#)).pinned_dev_branch,
+            None
+        );
+
+        let db = make_helper_db();
+        let id = local_repo(&db, "Owner/web");
+        assert_eq!(read_shared_import(&db, id), SharedImport::default());
+        pin_after_accept(&db, id, &sample()).unwrap();
+        assert_eq!(
+            read_shared_import(&db, id).pinned_dev_branch.as_deref(),
+            Some("dev")
+        );
+        // pinning keeps what else is stored
+        let mut v = read_shared_import(&db, id);
+        v.blobs.insert("a".into(), "b".into());
+        write_shared_import(&db, id, &v).unwrap();
+        let mut moved = sample();
+        moved.main.dev_branch = "next".into();
+        pin_after_accept(&db, id, &moved).unwrap();
+        let back = read_shared_import(&db, id);
+        assert_eq!(back.pinned_dev_branch.as_deref(), Some("next"));
+        assert_eq!(back.blobs.len(), 1);
+    }
+
+    #[test]
+    fn apply_fails_closed_without_a_known_login() {
+        let db = make_db();
+        let web = local_repo(&db, "Owner/web");
+        assert!(apply_structure_locally(&db, web, &sample())
+            .unwrap_err()
+            .contains("login"));
+        assert!(db.list_projects().unwrap().is_empty());
+        assert_eq!(db.get_repository(web).unwrap().project_id, None);
+    }
+
+    #[test]
+    fn junk_files_do_not_push_real_requests_out_of_the_window() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let dir = root.join(".sdh/requests");
+        fs::create_dir_all(&dir).unwrap();
+        // 60 junk files sorting before the real one, with valid names
+        for i in 10..70 {
+            fs::write(dir.join(format!("aaa{}.json", i)), "garbage").unwrap();
+        }
+        // and 60 files whose NAMES are unusable
+        for i in 0..60 {
+            fs::write(dir.join(format!("bad name {}.json", i)), "x").unwrap();
+        }
+        write_request_if_changed(root, &req("zed")).unwrap();
+        let logins: Vec<_> = list_requests(root, REPO)
+            .into_iter()
+            .map(|r| r.login)
+            .collect();
+        assert_eq!(logins, vec!["zed"]);
+    }
+
+    #[test]
+    fn stale_temp_files_are_removed_on_write_but_nothing_else() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let sdh = root.join(".sdh");
+        let reqs = sdh.join("requests");
+        fs::create_dir_all(&reqs).unwrap();
+        fs::write(sdh.join(".project.json.4242.tmp"), "x").unwrap();
+        fs::write(reqs.join(".amy.json.7.tmp"), "x").unwrap();
+        // not our pattern: kept
+        fs::write(sdh.join(".keep.tmp"), "x").unwrap();
+        fs::write(sdh.join(".project.json.abc.tmp"), "x").unwrap();
+        fs::write(sdh.join("notes.tmp"), "x").unwrap();
+        fs::write(reqs.join(".gitkeep"), "x").unwrap();
+
+        write_structure_if_changed(root, &sample()).unwrap();
+        assert!(!sdh.join(".project.json.4242.tmp").exists());
+        assert!(!reqs.join(".amy.json.7.tmp").exists());
+
+        fs::write(reqs.join(".bob.json.9.tmp"), "x").unwrap();
+        write_request_if_changed(root, &req("amy")).unwrap();
+        assert!(!reqs.join(".bob.json.9.tmp").exists());
+
+        for kept in [
+            sdh.join(".keep.tmp"),
+            sdh.join(".project.json.abc.tmp"),
+            sdh.join("notes.tmp"),
+            reqs.join(".gitkeep"),
+        ] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
     }
 }
