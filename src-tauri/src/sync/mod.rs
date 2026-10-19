@@ -16,6 +16,7 @@ pub mod peer_channels;
 pub mod project_md;
 pub mod project_sync;
 pub mod requirements;
+pub mod shared;
 pub mod shared_structure;
 pub mod skills;
 pub mod tasks;

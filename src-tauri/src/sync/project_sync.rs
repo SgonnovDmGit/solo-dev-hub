@@ -209,10 +209,15 @@ fn write_repo_skeletons(
         Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
         Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
     }
-    if let Err(e) = sync::sync_gitignore_section(&tpl.gitignore, base) {
+    // F-000044: a shared repo (any role) renders the blocks without the shared
+    // paths; the same text for the owner and for contributors, so it never churns.
+    let shared = sync::shared::is_shared_repo(db, repo.id);
+    let gitignore = sync::shared::gitignore_template_for(&tpl.gitignore, shared);
+    let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
+    if let Err(e) = sync::sync_gitignore_section(&gitignore, base) {
         c.push(file_issue(".gitignore", e));
     }
-    if let Err(e) = sync::sync_gitattributes_section(&tpl.gitattributes, base) {
+    if let Err(e) = sync::sync_gitattributes_section(&gitattributes, base) {
         c.push(file_issue(".gitattributes", e));
     }
     if let Err(e) = sync::copy_doc_skeleton_if_missing(&tpl.todo, base, "todo.md") {
@@ -976,6 +981,23 @@ fn run_codex_req_channels(db: &AppDb, project_id: i64, project_type: &str, c: &m
     }
 }
 
+/// Phase B of the shared repos: commit, push, settle statuses; its issues and
+/// committed repos join the pass result.
+fn finish_shared(
+    db: &AppDb,
+    git: Option<&crate::git_ops::GitBinary>,
+    shared: sync::shared::SharedSync,
+    c: &mut SyncCounters,
+) {
+    let out = shared.finish(db, git);
+    c.extend(out.issues);
+    for name in out.committed {
+        if !c.committed.contains(&name) {
+            c.committed.push(name);
+        }
+    }
+}
+
 /// Orchestrator for a full project sync — the body of the former
 /// `sync_project` Tauri command. Writes Phase-0 skeletons to every repo, then
 /// runs the directional REQ / api / handlers copies based on project topology.
@@ -994,6 +1016,13 @@ pub(crate) fn run_project_sync_in(
     project_id: i64,
     home: Option<PathBuf>,
 ) -> Result<SyncResult, String> {
+    // F-000044 / T-000220: phase A of the shared repos (portfolio-wide) runs
+    // first: it settles each shared repo's role -- and so which project it
+    // belongs to and how its managed blocks render -- before anything below
+    // reads or writes. Phase B (commit + push) follows the other steps.
+    let git = crate::git_ops::check_git_available();
+    let shared = sync::shared::run_phase_a(db, git.as_ref());
+
     let all_repos = db
         .list_repos_by_project(Some(project_id))
         .map_err(|e| e.to_string())?;
@@ -1094,6 +1123,7 @@ pub(crate) fn run_project_sync_in(
             // B-001: guard — do not silently recreate a moved/deleted server folder.
             if sync::ensure_root_exists(srv_base).is_err() {
                 c.push(root_missing(srv));
+                finish_shared(db, git.as_ref(), shared, &mut c);
                 return Ok(c.into_result());
             }
 
@@ -1126,10 +1156,17 @@ pub(crate) fn run_project_sync_in(
 
     // T-000137: auto-commit synced cross-repo files in opted-in repos (portfolio-wide;
     // pathspec-scoped, so untouched repos and the dev's own WIP are no-ops).
-    if let Some(git) = crate::git_ops::check_git_available() {
+    // F-000044: shared repos (phase A took them over) are committed and pushed
+    // by `shared`, not by this block.
+    let handled = shared.handled.clone();
+    finish_shared(db, git.as_ref(), shared, &mut c);
+    if let Some(git) = git {
         match db.list_autocommit_repos() {
             Ok(repos) => {
                 for (repo, branch) in repos {
+                    if handled.contains(&repo.id) {
+                        continue;
+                    }
                     let Some(ref lp) = repo.local_path else {
                         continue;
                     };

@@ -71,6 +71,24 @@ pub enum SyncIssueCode {
     RuleHeld,
     /// A hand-back step (read / store / clear marker) failed. subject = skill or repo.
     RuleFailed,
+    /// F-000044: the shared project structure of a repo failed validation and
+    /// was ignored. subject = repo, detail = why.
+    SharedUntrusted,
+    /// F-000044: `git fetch` of a shared repo failed. subject = repo, detail = git text.
+    SharedFetchFailed,
+    /// F-000044: `git push` of a shared repo failed. subject = repo, detail = git text.
+    SharedPushFailed,
+    /// F-000044: the remote refused the push (protected branch). subject = repo,
+    /// detail = the remote's message.
+    SharedPushRejected,
+    /// F-000044: a shared branch diverged from its remote; merge by hand. subject = repo.
+    SharedNeedsManualMerge,
+    /// F-000044: this install has no usable branch of its own in a shared repo. subject = repo.
+    SharedNoOwnBranch,
+    /// F-000044: the join request waits for the owner's approval. subject = repo.
+    SharedPendingApproval,
+    /// F-000044: the GitHub login of this install is unknown. subject = repo.
+    SharedNoLogin,
 }
 
 /// T-000198: one non-fatal issue found by a sync-like pass. Replaces free
@@ -170,6 +188,44 @@ pub struct SyncResult {
     /// the marker is cleared and the rule left as it was.
     #[serde(default)]
     pub rules_lost: Vec<String>,
+}
+
+/// F-000044 / T-000220: one `.gitignore` line (outside the managed block) that
+/// still ignores a shared path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IgnoreLine {
+    /// 1-based line number in the repo's own `.gitignore`.
+    pub line_no: u32,
+    pub text: String,
+}
+
+/// F-000044 / T-000220: what the owner must settle before shared mode can be
+/// switched on for a repo.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedPreflight {
+    pub blocking_lines: Vec<IgnoreLine>,
+    /// The repo belongs to no project.
+    pub missing_project: bool,
+    /// The repo has no auto-commit (dev) branch set.
+    pub missing_dev_branch: bool,
+}
+
+/// F-000044 / T-000220: result of the "merge" button. `outcome` is
+/// `"up_to_date"`, `"merged"` or `"conflict"`; `files` lists the conflicted
+/// files of a `"conflict"`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedMergeResult {
+    pub outcome: String,
+    pub files: Vec<String>,
+}
+
+/// F-000044 / T-000220: result of switching shared mode off.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedDisableResult {
+    /// The deletion of `.sdh/` reached the remote dev branch.
+    pub pushed: bool,
+    /// Why the deletion is only local (nothing to commit, push failed, ...).
+    pub note: Option<String>,
 }
 
 /// T-000207: result of `init_docs_for_repo` — the files written plus what the
@@ -423,14 +479,44 @@ mod tests {
             RuleUnknownSkill,
             RuleHeld,
             RuleFailed,
+            SharedUntrusted,
+            SharedFetchFailed,
+            SharedPushFailed,
+            SharedPushRejected,
+            SharedNeedsManualMerge,
+            SharedNoOwnBranch,
+            SharedPendingApproval,
+            SharedNoLogin,
         ];
         for code in &all {
             match code {
-                CopyFailed | NoLocalPath | RootMissing | RenameCollision | RenameReplayFailed
-                | LookupFailed | MissingCounterpart | ManagedFileFailed | PeerChannelFailed
-                | VersionConflict | RuleConflict | ReqAutoCloseFailed | MigrationFailed
-                | MigrationLeftInPlace | MigrationDiverged | AutocommitFailed
-                | RuleUnknownSkill | RuleHeld | RuleFailed => {}
+                CopyFailed
+                | NoLocalPath
+                | RootMissing
+                | RenameCollision
+                | RenameReplayFailed
+                | LookupFailed
+                | MissingCounterpart
+                | ManagedFileFailed
+                | PeerChannelFailed
+                | VersionConflict
+                | RuleConflict
+                | ReqAutoCloseFailed
+                | MigrationFailed
+                | MigrationLeftInPlace
+                | MigrationDiverged
+                | AutocommitFailed
+                | RuleUnknownSkill
+                | RuleHeld
+                | RuleFailed
+                | SharedUntrusted
+                | SharedFetchFailed
+                | SharedPushFailed
+                | SharedPushRejected
+                | SharedNeedsManualMerge
+                | SharedNoOwnBranch
+                | SharedPendingApproval
+                | SharedNoLogin => {}
             }
         }
         all

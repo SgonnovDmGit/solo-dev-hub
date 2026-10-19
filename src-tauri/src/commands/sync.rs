@@ -100,6 +100,11 @@ fn init_docs_for_repo_in(
     if sync::copy_doc_skeleton_if_missing(&bug_reports_template, base, "bug-reports.md")? {
         updated.push("docs/bug-reports.md".to_string());
     }
+    // F-000044: a shared repo renders both blocks for sharing (same as the sync).
+    let shared = sync::shared::is_shared_repo(db, repo_id);
+    let gitignore_template = sync::shared::gitignore_template_for(&gitignore_template, shared);
+    let gitattributes_template =
+        sync::shared::gitattributes_template_for(&gitattributes_template, shared);
     if sync::sync_gitignore_section(&gitignore_template, base)? {
         updated.push(".gitignore (section)".to_string());
     }

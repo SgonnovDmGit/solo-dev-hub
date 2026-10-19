@@ -25,6 +25,14 @@ export const SYNC_ISSUE_CODES = [
   'rule_unknown_skill',
   'rule_held',
   'rule_failed',
+  'shared_untrusted',
+  'shared_fetch_failed',
+  'shared_push_failed',
+  'shared_push_rejected',
+  'shared_needs_manual_merge',
+  'shared_no_own_branch',
+  'shared_pending_approval',
+  'shared_no_login',
 ] as const;
 export type SyncIssueCode = (typeof SYNC_ISSUE_CODES)[number];
 
@@ -162,4 +170,64 @@ export interface PeerChannelInfo {
   pact_count: number;
   status: 'synced' | 'pending' | 'unresolved';
   registry_present: boolean;
+}
+
+// ── F-000044 / T-000220: shared (contributor-mode) repos ─────────────────────
+
+/** Stored `shared_status` codes of a shared repo (`SharedStatus::as_str` in Rust). */
+export type SharedStatusCode =
+  | 'shared_untrusted'
+  | 'fetch_failed'
+  | 'push_failed'
+  | 'push_rejected'
+  | 'needs_manual_merge'
+  | 'no_own_branch'
+  | 'pending_approval'
+  | 'shared_no_login';
+
+/** One `.gitignore` line (outside the managed block) that still ignores a shared path. */
+export interface IgnoreLine {
+  line_no: number;
+  text: string;
+}
+
+/** What must be settled before shared mode can be switched on (`SharedPreflight`). */
+export interface SharedPreflight {
+  blocking_lines: IgnoreLine[];
+  missing_project: boolean;
+  missing_dev_branch: boolean;
+}
+
+/** Result of the "merge" button (`SharedMergeResult`). */
+export interface SharedMergeResult {
+  outcome: 'up_to_date' | 'merged' | 'conflict';
+  files: string[];
+}
+
+/** Result of switching shared mode off (`SharedDisableResult`). */
+export interface SharedDisableResult {
+  pushed: boolean;
+  note: string | null;
+}
+
+/** A helper's request to join a shared project (`.sdh/requests/<login>.json`). */
+export interface JoinRequest {
+  login: string;
+  branch: string;
+}
+
+export interface StructureParticipant {
+  login: string;
+  branch: string;
+  band_start: number;
+}
+
+/** The shared project structure (`.sdh/project.json`, format 1). */
+export interface ProjectStructure {
+  format: number;
+  project: { name: string; type: string };
+  main: { login: string; dev_branch: string };
+  repos: { github: string; role: string }[];
+  microservices: string[];
+  participants: StructureParticipant[];
 }
