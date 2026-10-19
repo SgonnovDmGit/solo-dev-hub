@@ -115,6 +115,21 @@ impl AppDb {
         rows.next().transpose()
     }
 
+    /// T-000206: the `repo` of the newest `conflict` event of `rule` — the
+    /// labels of the repos that took part, joined by ", ". `None` when no such
+    /// event exists (or it names no repo).
+    pub fn latest_conflict_repos(&self, rule: &str) -> SqlResult<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT repo FROM rule_events WHERE rule = ?1 AND kind = ?2
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![rule, rule_event::CONFLICT], |r| {
+            r.get::<_, Option<String>>(0)
+        })?;
+        Ok(rows.next().transpose()?.flatten())
+    }
+
     /// Names of the rules whose hand-backs are currently in conflict.
     pub fn open_rule_conflicts(&self) -> SqlResult<HashSet<String>> {
         let conn = self.conn.lock().unwrap();
@@ -234,6 +249,25 @@ mod tests {
         assert_eq!(
             db.latest_origin_event("sdh-retro").unwrap().unwrap().kind,
             "reset"
+        );
+    }
+
+    #[test]
+    fn test_latest_conflict_repos_is_the_newest_conflict_of_the_rule() {
+        let db = make_db();
+        assert_eq!(db.latest_conflict_repos("sdh-retro").unwrap(), None);
+        db.insert_rule_event("sdh-retro", rule_event::CONFLICT, Some("a, b"), None)
+            .unwrap();
+        db.insert_rule_event("sdh-retro", rule_event::CONFLICT, Some("a, c"), None)
+            .unwrap();
+        db.insert_rule_event("sdh-retro", rule_event::TAKEN, Some("x"), None)
+            .unwrap();
+        db.insert_rule_event("sdh-debugging", rule_event::CONFLICT, Some("y"), None)
+            .unwrap();
+
+        assert_eq!(
+            db.latest_conflict_repos("sdh-retro").unwrap().as_deref(),
+            Some("a, c")
         );
     }
 
