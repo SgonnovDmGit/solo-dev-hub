@@ -68,7 +68,7 @@ Solo Dev Hub — десктопное приложение в одном окн�
 
 **Windows**
 
-1. Скачать `solo-dev-hub_<версия>_x64-setup.exe` со страницы [Releases](https://github.com/SgonnovDmGit/solo-dev-hub/releases)
+1. Скачать `Solo.Dev.Hub_<версия>_x64-setup.exe` со страницы [Releases](https://github.com/SgonnovDmGit/solo-dev-hub/releases)
 2. Запустить installer.
 3. **При первом запуске Windows SmartScreen может показать предупреждение** ("Издатель не определён"). Authenticode code-signing — в roadmap'е v2.0.0. Пока что: "Подробнее" → "Выполнить в любом случае".
 

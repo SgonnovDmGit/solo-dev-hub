@@ -68,7 +68,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 
 **Windows**
 
-1. Download `solo-dev-hub_<version>_x64-setup.exe` from the [Releases page](https://github.com/SgonnovDmGit/solo-dev-hub/releases)
+1. Download `Solo.Dev.Hub_<version>_x64-setup.exe` from the [Releases page](https://github.com/SgonnovDmGit/solo-dev-hub/releases)
 2. Run the installer.
 3. **First launch may show a Windows SmartScreen warning** ("Unrecognized publisher"). Authenticode code-signing is on the v2.0.0 roadmap. Until then: click "More info" → "Run anyway".
 
