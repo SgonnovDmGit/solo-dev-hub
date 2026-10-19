@@ -123,9 +123,10 @@ export async function savePat(token: string): Promise<boolean> {
 export async function removePat(): Promise<void> {
   try {
     await tauriDeletePat();
-    await setSetting('github_login', '');
     pat.set(null);
     addToast(t('toast.tokenRemoved'), 'info');
+    // The token is already gone; a failed login reset must not report it as kept.
+    await setSetting('github_login', '').catch(() => {});
   } catch (err) {
     addToast(tf('toast.failedToRemoveToken', String(err)), 'error');
   }
