@@ -43,6 +43,10 @@ use crate::sync::shared_structure::{
 
 const REMOTE: &str = "origin";
 
+/// Subject of the commit that deletes `.sdh/` from a branch (switch-off). It counts
+/// as one of our own commits wherever the sync judges a branch.
+const REMOVAL_SUBJECT: &str = "chore(sdh-sync): remove shared project structure";
+
 /// How often a repo that is not (yet) known to be shared is probed with a
 /// `git fetch` to see whether its owner switched sharing on.
 const PROBE_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -1347,7 +1351,7 @@ fn local_tip_if_ours(git: &GitBinary, root: &Path, branch: &str) -> Result<Optio
         if name != SDH_COMMIT_NAME
             || email != SDH_COMMIT_EMAIL
             || parents.split_whitespace().count() != 1
-            || subject != "chore(sdh-sync): sync shared files"
+            || (subject != "chore(sdh-sync): sync shared files" && subject != REMOVAL_SUBJECT)
             || !has_trailer
         {
             return Ok(None);
@@ -1465,6 +1469,18 @@ pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>, project_id: Option<i64>)
         let known = state.shared_role.is_some();
         if known && !in_project {
             continue;
+        }
+        // A repo that was shared and is not any more may still have a clean-up to
+        // finish (the contributor's own branch still tracks `.sdh/`): that is read
+        // from facts and retried on every sync, not on the probe's schedule.
+        if !known
+            && ss::read_shared_import(db, repo.id)
+                .pinned_dev_branch
+                .is_some()
+        {
+            let mut pass = new_pass(&repo, &root, login);
+            fetch_into(git, &mut pass, FetchMode::Probe);
+            drop_stale_structure(db, git, &repo, &root, pass.net_ok);
         }
         // A role-less repo is probed at most every 10 minutes (persisted); one
         // that was refused as untrusted is looked at again on every sync.
@@ -1591,20 +1607,14 @@ fn phase_a_foreign(
     match found {
         DiscoverOutcome::NotFound => {
             let st = db.get_shared_state(repo.id).ok();
-            let was_participant = st.as_ref().is_some_and(|s| {
-                matches!(
-                    s.shared_role.as_deref(),
-                    Some("contributor") | Some("pending")
-                )
-            });
             if st.is_some_and(|s| s.shared_role.is_some() || s.shared_status.is_some()) {
                 // Repo is ordinary again (spec R15).
                 let _ = db.set_shared_role(repo.id, None);
                 let _ = db.set_shared_status(repo.id, None);
             }
-            if was_participant {
-                drop_stale_structure(db, git, repo, root, pass.net_ok);
-            }
+            // Facts decide whether anything is left to clean up (nothing, for a repo
+            // that never carried a structure).
+            drop_stale_structure(db, git, repo, root, pass.net_ok);
             None
         }
         DiscoverOutcome::Untrusted(reason) => {
@@ -1654,67 +1664,140 @@ fn phase_a_foreign(
     }
 }
 
-/// BUG-3: the owner switched sharing off, so the `.sdh/` this contributor's own
-/// branch still tracks is stale -- and a later pull request from that branch
-/// would switch sharing back on in the dev branch. Delete it from the branch
-/// (commit on the current branch, plumbing otherwise) and push it, best effort.
-/// If origin's copy of the branch already lost it (the owner removed it there),
-/// the branch is only brought forward to it. Every failure is silent: the repo is
-/// ordinary now, and the next sync looks again.
+/// Does `rev` exist and carry `.sdh/project.json`? `None` when `rev` is unknown.
+fn tracks_structure(git: &GitBinary, root: &Path, rev: &str) -> Option<bool> {
+    if !matches!(git_sync::rev_parse(git, root, rev), Ok(Some(_))) {
+        return None;
+    }
+    Some(matches!(
+        git_sync::blob_sha_at(git, root, rev, STRUCTURE_REL_PATH),
+        Ok(Some(_))
+    ))
+}
+
+/// Delete the tracked `.sdh/` files from the checked-out `branch` with a commit.
+/// `Ok(false)` when nothing is tracked. The files are put back on a failure.
+fn remove_sdh_from_checked_out(
+    git: &GitBinary,
+    root: &Path,
+    branch: &str,
+    sdh: &[String],
+    login: &str,
+) -> Result<bool, String> {
+    let tracked = ls_files_tracked(git, root, sdh)?;
+    if tracked.is_empty() {
+        return Ok(false);
+    }
+    let (_, body) = commit_message(login);
+    remove_sdh_files(root);
+    let paths: Vec<PathBuf> = tracked.iter().map(PathBuf::from).collect();
+    match commit_paths(
+        git,
+        root,
+        branch,
+        &paths,
+        REMOVAL_SUBJECT,
+        Some(&body),
+        SDH_COMMIT_NAME,
+        SDH_COMMIT_EMAIL,
+    ) {
+        Ok(CommitOutcome::Committed { .. }) => Ok(true),
+        other => {
+            let _ = git_bytes(git, root, &["checkout", "HEAD"], &tracked);
+            match other {
+                Err(e) => Err(e),
+                _ => Ok(false),
+            }
+        }
+    }
+}
+
+/// BUG-3, contributor side. The condition is read from facts, not from the cached
+/// role (which the switch-off clears at once): the pinned dev branch exists on
+/// origin and no longer carries `.sdh/project.json`, while this contributor's own
+/// branch -- or origin's copy of it -- still does. A pull request from such a
+/// branch would switch sharing back on in the dev branch, so the file is deleted
+/// from it (commit on the current branch, plumbing otherwise) and the branch is
+/// pushed, best effort. Every step that fails leaves the facts as they are, so the
+/// next sync does it again; the pin is dropped only once neither the branch, its
+/// origin copy nor the work tree carries the file (until then it also keeps the
+/// work-tree file from being taken for a live structure).
 fn drop_stale_structure(db: &AppDb, git: &GitBinary, repo: &Repository, root: &Path, net_ok: bool) {
-    let Some(own) = own_branch_of(db, repo.id) else {
+    let mut imp = ss::read_shared_import(db, repo.id);
+    let Some(pin) = imp.pinned_dev_branch.clone() else {
         return;
     };
     if !repo_ready(git, root) {
         return;
     }
+    // The switch-off must be established by origin's pinned dev branch itself.
+    if tracks_structure(git, root, &remote_ref(&pin)) != Some(false) {
+        return;
+    }
+    let finish = |db: &AppDb, imp: &mut ss::SharedImport| {
+        if !root.join(STRUCTURE_REL_PATH).exists() {
+            imp.pinned_dev_branch = None;
+            let _ = ss::write_shared_import(db, repo.id, imp);
+        }
+    };
+    let Some(own) = own_branch_of(db, repo.id) else {
+        finish(db, &mut imp);
+        return;
+    };
     let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
     let login = db.github_login().unwrap_or_default();
-    let (_, body) = commit_message(&login);
-    let subject = "chore(sdh-sync): remove shared project structure";
     let remote = remote_ref(&own);
-    let has_remote = matches!(git_sync::rev_parse(git, root, &remote), Ok(Some(_)));
     let cur = current_branch(git, root).ok().flatten();
-    if cur.as_deref().is_some_and(|c| same_branch(c, &own)) {
-        // The owner may have removed it from origin's copy already.
-        if has_remote
-            && ls_tree(git, root, &remote, &sdh).is_ok_and(|t| t.is_empty())
-            && git_sync::is_ancestor(git, root, "HEAD", &remote).unwrap_or(false)
-            && !shared_paths_dirty(git, root, &sdh).unwrap_or(true)
-        {
-            let _ = git_sync::merge_ff_only(git, root, &remote);
-        }
-        let Ok(tracked) = ls_files_tracked(git, root, &sdh) else {
-            return;
-        };
-        if tracked.is_empty() {
-            return;
-        }
-        remove_sdh_files(root);
-        let paths: Vec<PathBuf> = tracked.iter().map(PathBuf::from).collect();
-        let committed = commit_paths(
-            git,
-            root,
-            &own,
-            &paths,
-            subject,
-            Some(&body),
-            SDH_COMMIT_NAME,
-            SDH_COMMIT_EMAIL,
-        );
-        if !matches!(committed, Ok(CommitOutcome::Committed { .. })) {
-            // Put the files back: nothing was removed.
-            let _ = git_bytes(git, root, &["checkout", "HEAD"], &tracked);
-            return;
-        }
-    } else {
-        match remove_sdh_from_branch(git, root, &own, &sdh, &login) {
-            Ok(true) => {}
-            _ => return,
+    let is_current = cur.as_deref().is_some_and(|c| same_branch(c, &own));
+    if tracks_structure(git, root, &local_ref(&own)) != Some(true)
+        && tracks_structure(git, root, &remote) != Some(true)
+    {
+        finish(db, &mut imp);
+        return;
+    }
+
+    // Bring a local copy that only lags up to origin's first (the owner may have
+    // removed the file there already; a contributor may have pushed more).
+    let local = git_sync::rev_parse(git, root, &local_ref(&own))
+        .ok()
+        .flatten();
+    let remote_sha = git_sync::rev_parse(git, root, &remote).ok().flatten();
+    if let Some(remote_sha) = &remote_sha {
+        match &local {
+            None => {
+                let _ = git_sync::fast_forward_ref(git, root, &own, &remote);
+            }
+            Some(l) if l != remote_sha => {
+                if git_sync::is_ancestor(git, root, l, remote_sha).unwrap_or(false) {
+                    if is_current {
+                        if !shared_paths_dirty(git, root, &sdh).unwrap_or(true) {
+                            let _ = git_sync::merge_ff_only(git, root, &remote);
+                        }
+                    } else {
+                        let _ = git_sync::fast_forward_ref(git, root, &own, &remote);
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    if net_ok && has_remote {
+    if tracks_structure(git, root, &local_ref(&own)) == Some(true) {
+        let removed = if is_current {
+            remove_sdh_from_checked_out(git, root, &own, &sdh, &login)
+        } else {
+            remove_sdh_from_branch(git, root, &own, &sdh, &login)
+        };
+        if !matches!(removed, Ok(true)) {
+            return;
+        }
+    }
+    if net_ok && remote_sha.is_some() {
         let _ = git_sync::push_branches(git, root, REMOTE, &[own.as_str()]);
+    }
+    if tracks_structure(git, root, &local_ref(&own)) != Some(true)
+        && tracks_structure(git, root, &remote) != Some(true)
+    {
+        finish(db, &mut imp);
     }
 }
 
@@ -1741,8 +1824,18 @@ fn retry_disabling(
     let mut branches: Vec<String> = vec![dev.clone()];
     branches.extend(imp.disabling_branches.iter().cloned());
     let branches = clean_recipients(branches);
+    let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
+    let login = db.github_login().unwrap_or_default();
     let mut to_push: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
     for b in &branches {
+        // A branch origin moved past meanwhile (a contributor pushed first) is
+        // brought up to origin's copy and the deletion is made again on top, so
+        // the push is a fast-forward and not a permanent rejection.
+        if let Err(e) = refresh_pending_removal(git, root, b, &sdh, &login) {
+            failures.push(format!("{}: {}", b, e));
+            continue;
+        }
         let Ok(Some(local)) = git_sync::rev_parse(git, root, &local_ref(b)) else {
             continue; // the branch is gone: nothing to push
         };
@@ -1754,28 +1847,87 @@ fn retry_disabling(
         }
     }
     if to_push.is_empty() {
-        let _ = clear_disabling(db, repo.id);
-        return None;
+        if failures.is_empty() {
+            let _ = clear_disabling(db, repo.id);
+            return None;
+        }
+        pass.note(SharedStatus::PushFailed, failures.join("; "));
+        return Some(pass);
     }
     let refs: Vec<&str> = to_push.iter().map(String::as_str).collect();
     match git_sync::push_branches(git, root, REMOTE, &refs) {
         Ok(results)
-            if results
-                .iter()
-                .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)) =>
+            if failures.is_empty()
+                && results
+                    .iter()
+                    .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)) =>
         {
             let _ = clear_disabling(db, repo.id);
             None
         }
         Ok(results) => {
-            pass.note(SharedStatus::PushFailed, format!("{:?}", results));
+            failures.push(format!("{:?}", results));
+            pass.note(SharedStatus::PushFailed, failures.join("; "));
             Some(pass)
         }
         Err(e) => {
-            pass.note(SharedStatus::PushFailed, e.to_string());
+            failures.push(e.to_string());
+            pass.note(SharedStatus::PushFailed, failures.join("; "));
             Some(pass)
         }
     }
+}
+
+/// Before a pending deletion is pushed again: if origin moved past the local copy
+/// of `branch`, bring the local copy up to origin's (fast-forward when it only
+/// lags; when it has diverged, reset it -- keeping a backup -- provided every
+/// local-only commit is ours) and make the deletion again on top. A branch that
+/// is equal to or ahead of origin is pushable as it is.
+fn refresh_pending_removal(
+    git: &GitBinary,
+    root: &Path,
+    branch: &str,
+    sdh: &[String],
+    login: &str,
+) -> Result<(), String> {
+    let remote = remote_ref(branch);
+    let (Some(remote_sha), Some(local_sha)) = (
+        git_sync::rev_parse(git, root, &remote)?,
+        git_sync::rev_parse(git, root, &local_ref(branch))?,
+    ) else {
+        return Ok(());
+    };
+    if local_sha == remote_sha || git_sync::is_ancestor(git, root, &remote_sha, &local_sha)? {
+        return Ok(());
+    }
+    let is_current = current_branch(git, root)?
+        .as_deref()
+        .is_some_and(|c| same_branch(c, branch));
+    if git_sync::is_ancestor(git, root, &local_sha, &remote_sha)? {
+        if is_current {
+            git_sync::merge_ff_only(git, root, &remote)?;
+        } else {
+            git_sync::fast_forward_ref(git, root, branch, &remote)?;
+        }
+    } else {
+        if is_current {
+            return Err(format!(
+                "it has diverged from origin/{}: merge it first",
+                branch
+            ));
+        }
+        let tip = local_tip_if_ours(git, root, branch)?
+            .ok_or_else(|| "it holds commits that are not sync commits".to_string())?;
+        if !reset_to_origin(git, root, branch, &tip)? {
+            return Err("it moved meanwhile".into());
+        }
+    }
+    if is_current {
+        remove_sdh_from_checked_out(git, root, branch, sdh, login)?;
+    } else {
+        remove_sdh_from_branch(git, root, branch, sdh, login)?;
+    }
+    Ok(())
 }
 
 fn clear_disabling(db: &AppDb, repo_id: i64) -> Result<(), String> {
@@ -2468,7 +2620,7 @@ pub fn disable_shared_mode(
     let fetch_ok = git_sync::fetch(git, &root, REMOTE).is_ok();
     let login = db.github_login().unwrap_or_default();
     let (_, body) = commit_message(&login);
-    let subject = "chore(sdh-sync): remove shared project structure";
+    let subject = REMOVAL_SUBJECT;
     let mut committed = false;
 
     if tracked.is_empty() {
@@ -4189,6 +4341,178 @@ mod tests {
             ss::read_shared_import(&fx.main_db, fx.main_repo).disabling,
             None
         );
+    }
+
+    // ----- BUG-3: switching sharing off, branch clean-up and its failure paths ----------
+
+    /// The helper is a contributor whose own branch `helper-dev` is on the remote
+    /// and tracks `.sdh/project.json` (the owner plumbed it there), checked out in
+    /// the helper's tree.
+    fn helper_branch_with_sdh(fx: &TwoInstalls) {
+        fx.make_participant();
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        fx.sync_helper(); // helper-dev and dev get the task
+        fx.sync_main(); // the owner plumbs the structure into helper-dev
+        fx.sync_helper(); // and the helper fast-forwards onto it
+        assert!(fx.remote_file("helper-dev", ".sdh/project.json").is_some());
+        assert!(fx.helper_dir.join(".sdh/project.json").exists());
+    }
+
+    /// The owner's switch-off as the remote sees it: `.sdh/` gone from dev only.
+    fn owner_unshares_dev_only(fx: &TwoInstalls) {
+        g(&fx.main_dir, &["rm", "-q", "-r", ".sdh"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "unshare"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+    }
+
+    fn tracks(dir: &Path, rev: &str) -> bool {
+        !g(dir, &["ls-tree", "-r", "--name-only", rev, "--", ".sdh"]).is_empty()
+    }
+
+    #[test]
+    fn a_failed_cleanup_push_is_retried_until_the_branch_on_origin_is_clean() {
+        let fx = two_installs();
+        helper_branch_with_sdh(&fx);
+        owner_unshares_dev_only(&fx);
+        let hook = block_pushes_to(&fx, "refs/heads/helper-dev");
+
+        fx.sync_helper();
+        // The role went at once; the clean-up is committed but did not reach origin.
+        assert_eq!(shared_role_of(&fx), None);
+        assert!(!tracks(&fx.helper_dir, "helper-dev"));
+        assert!(!fx.helper_dir.join(".sdh/project.json").exists());
+        assert!(fx.remote_file("helper-dev", ".sdh/project.json").is_some());
+        assert!(
+            ss::read_shared_import(&fx.helper_db, fx.helper_repo)
+                .pinned_dev_branch
+                .is_some(),
+            "the pin stays until the clean-up has reached origin"
+        );
+        // Still pending on the next sync while the push keeps failing.
+        fx.sync_helper();
+        assert!(fx.remote_file("helper-dev", ".sdh/project.json").is_some());
+
+        fs::remove_file(&hook).unwrap();
+        fx.sync_helper();
+        assert_eq!(fx.remote_file("helper-dev", ".sdh/project.json"), None);
+        assert_eq!(shared_role_of(&fx), None);
+        assert_eq!(
+            ss::read_shared_import(&fx.helper_db, fx.helper_repo).pinned_dev_branch,
+            None,
+            "done: the pin is dropped"
+        );
+        // And it stays done.
+        fx.sync_helper();
+        assert_eq!(shared_role_of(&fx), None);
+        assert!(!tracks(&fx.helper_dir, "helper-dev"));
+    }
+
+    fn shared_role_of(fx: &TwoInstalls) -> Option<String> {
+        fx.helper_db
+            .get_shared_state(fx.helper_repo)
+            .unwrap()
+            .shared_role
+    }
+
+    #[test]
+    fn without_the_pinned_dev_ref_nothing_is_deleted() {
+        let fx = two_installs();
+        helper_branch_with_sdh(&fx);
+        owner_unshares_dev_only(&fx);
+        // The helper cannot reach the remote and has no copy of origin/dev: the
+        // switch-off is not established, so nothing is taken for stale.
+        g(
+            &fx.helper_dir,
+            &["update-ref", "-d", "refs/remotes/origin/dev"],
+        );
+        g(
+            &fx.helper_dir,
+            &["remote", "set-url", "origin", "/nonexistent/sdh-remote.git"],
+        );
+        fx.sync_helper();
+        assert_eq!(shared_role_of(&fx).as_deref(), Some("contributor"));
+        assert!(tracks(&fx.helper_dir, "helper-dev"));
+        assert!(fx.helper_dir.join(".sdh/project.json").exists());
+        assert!(ss::read_shared_import(&fx.helper_db, fx.helper_repo)
+            .pinned_dev_branch
+            .is_some());
+    }
+
+    /// A commit on top of `parent` with the same tree, made without touching any
+    /// checkout.
+    fn foreign_commit_on(dir: &Path, branch_ref: &str, parent: &str) {
+        let tree = g(dir, &["rev-parse", &format!("{}^{{tree}}", parent)]);
+        let c = g(dir, &["commit-tree", &tree, "-p", parent, "-m", "foreign"]);
+        g(dir, &["update-ref", branch_ref, &c]);
+    }
+
+    #[test]
+    fn a_diverged_participant_branch_is_skipped_with_a_note() {
+        let fx = two_installs();
+        helper_branch_with_sdh(&fx);
+        // The owner's local copy of helper-dev holds a commit origin does not have,
+        // while the helper pushes another one after the owner's last fetch.
+        foreign_commit_on(&fx.main_dir, "refs/heads/helper-dev", "origin/helper-dev");
+        write(
+            &fx.helper_dir,
+            "docs/todo.md",
+            &todo(&["T-500000", "T-500001"]),
+        );
+        fx.sync_helper();
+        fx.sync_main(); // dev is up to date; helper-dev is diverged and left alone
+
+        let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(res.pushed, "dev itself went through: {:?}", res);
+        let note = res.note.unwrap_or_default();
+        assert!(
+            note.contains("helper-dev") && note.contains("diverged"),
+            "{}",
+            note
+        );
+        assert_eq!(fx.remote_file("dev", ".sdh/project.json"), None);
+        assert!(
+            fx.remote_file("helper-dev", ".sdh/project.json").is_some(),
+            "the diverged branch is left alone"
+        );
+        // The foreign commit was not pushed.
+        assert!(!g(&fx.origin, &["log", "--format=%s", "helper-dev"])
+            .lines()
+            .any(|s| s == "foreign"));
+    }
+
+    #[test]
+    fn a_retried_removal_is_made_again_on_top_of_a_branch_origin_moved_past() {
+        let fx = two_installs();
+        helper_branch_with_sdh(&fx);
+        let hook = block_pushes_to(&fx, "refs/heads/helper-dev");
+        let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!res.pushed, "{:?}", res);
+        assert_eq!(fx.main_status().as_deref(), Some("push_failed"));
+        let imp = ss::read_shared_import(&fx.main_db, fx.main_repo);
+        assert_eq!(imp.disabling_branches, vec!["helper-dev".to_string()]);
+        // dev already went through; helper-dev still tracks .sdh on origin.
+        assert_eq!(fx.remote_file("dev", ".sdh/project.json"), None);
+        assert!(fx.remote_file("helper-dev", ".sdh/project.json").is_some());
+
+        // The contributor pushes first: origin's helper-dev moves past the
+        // owner's local copy (which holds the removal commit).
+        fs::remove_file(&hook).unwrap();
+        write(&fx.helper_dir, "extra.txt", "x\n");
+        g(&fx.helper_dir, &["add", "extra.txt"]);
+        g(&fx.helper_dir, &["commit", "-q", "-m", "extra"]);
+        g(&fx.helper_dir, &["push", "-q", "origin", "helper-dev"]);
+
+        fx.sync_main();
+        assert_eq!(fx.remote_file("helper-dev", ".sdh/project.json"), None);
+        assert_eq!(
+            fx.remote_file("helper-dev", "extra.txt").as_deref(),
+            Some("x\n"),
+            "the contributor's commit is kept"
+        );
+        assert_eq!(fx.main_status(), None);
+        let imp = ss::read_shared_import(&fx.main_db, fx.main_repo);
+        assert_eq!(imp.disabling, None);
+        assert!(imp.disabling_branches.is_empty());
     }
 
     // ----- T-000221: import of what arrived by commit ------------------------------
