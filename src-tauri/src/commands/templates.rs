@@ -161,7 +161,7 @@ fn after_rule_write(
     // targets now rather than waiting for the separate global-rules button and
     // for a project sync that auto-runs only where auto-sync is opted into.
     //
-    // T-000207: through `refresh_rules`, so hand-backs pending anywhere in the
+    // T-000207: through `refresh_rules_locked`, so hand-backs pending anywhere in the
     // portfolio are collected before this render overwrites them. A pending
     // hand-back of THIS skill is superseded: the owner's explicit edit wins.
     let claude_dir = home.map(|h| h.join(".claude"));
@@ -764,8 +764,12 @@ mod tests {
         let bundle = stored();
         let events = || db.list_rule_events("sdh-retro").unwrap().len();
 
+        // Verdicts are taken while the lock is held and asserted only after it
+        // is released and the thread joined: an assert panicking inside the
+        // scope would leave the worker blocked on the lock and the scope
+        // joining it forever — a hang instead of a failure.
         let guard = sync::rules_guard();
-        std::thread::scope(|s| {
+        let (during_stored, during_events) = std::thread::scope(|s| {
             let save = s.spawn(|| {
                 save_template_file_in(
                     &db,
@@ -777,16 +781,21 @@ mod tests {
                 .unwrap()
             });
             std::thread::sleep(Duration::from_millis(300));
-            assert!(stored() == bundle, "the save wrote before it had the lock");
-            assert_eq!(events(), 0);
+            let seen = (stored(), events());
             drop(guard);
             save.join().unwrap();
+            seen
         });
+        assert!(
+            during_stored == bundle,
+            "the save wrote before it had the lock"
+        );
+        assert_eq!(during_events, 0);
         assert_eq!(stored(), "OWNER TEXT");
         assert_eq!(events(), 1);
 
         let guard = sync::rules_guard();
-        std::thread::scope(|s| {
+        let (during_stored, during_events) = std::thread::scope(|s| {
             let reset = s.spawn(|| {
                 reset_template_file_in(
                     &db,
@@ -797,31 +806,46 @@ mod tests {
                 .unwrap()
             });
             std::thread::sleep(Duration::from_millis(300));
-            assert_eq!(stored(), "OWNER TEXT", "the reset wrote before the lock");
-            assert_eq!(events(), 1);
+            let seen = (stored(), events());
             drop(guard);
             reset.join().unwrap();
+            seen
         });
+        assert_eq!(
+            during_stored, "OWNER TEXT",
+            "the reset wrote before the lock"
+        );
+        assert_eq!(during_events, 1);
         assert!(stored() == bundle);
         assert_eq!(events(), 2);
     }
 
     /// An ordinary template is no rule: it never waits for the rules lock.
+    /// The worker signals when the save returns; the verdict is read with a
+    /// timeout and asserted only after the lock is released, so a regression
+    /// fails instead of hanging.
     #[test]
     fn test_saving_an_ordinary_template_does_not_wait_for_the_rules_lock() {
+        use std::time::Duration;
         let (db, _db_dir) = seeded();
-        let _guard = sync::rules_guard();
-        std::thread::scope(|s| {
-            let save = s.spawn(|| {
-                save_template_file_in(&db, None, "_global", ".gitignore.tmpl", "custom").unwrap()
+        let (done, saved) = std::sync::mpsc::channel();
+        let guard = sync::rules_guard();
+        let returned_in_time = std::thread::scope(|s| {
+            let worker = s.spawn(|| {
+                let outcome =
+                    save_template_file_in(&db, None, "_global", ".gitignore.tmpl", "custom");
+                let _ = done.send(());
+                outcome.unwrap()
             });
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            assert!(
-                save.is_finished(),
-                "an ordinary save blocked on the rules lock"
-            );
-            save.join().unwrap();
+            let returned = saved.recv_timeout(Duration::from_secs(2)).is_ok();
+            drop(guard);
+            worker.join().unwrap();
+            returned
         });
+        assert!(
+            returned_in_time,
+            "an ordinary save blocked on the rules lock"
+        );
     }
 
     /// Saving the text that is already stored changes nothing, so it is not an
@@ -1071,6 +1095,42 @@ mod tests {
         assert!(resolutions(&db).is_empty());
     }
 
+    /// A failed repo listing refuses the decision before anything is touched:
+    /// nothing was read, so neither side can be found and no marker cleared.
+    #[test]
+    fn test_deciding_a_conflict_with_an_unreadable_repo_list_touches_nothing() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let (dirs, labels, texts) = open_conflict(&db);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE repositories")
+            .unwrap();
+
+        for accept in [None, Some(labels[0].as_str())] {
+            let err = resolve_rule_conflict_in(&db, Some(home.path().to_path_buf()), SKILL, accept)
+                .unwrap_err();
+            assert!(
+                err != "rule_conflict_gone" && err != "rule_conflict_side_gone",
+                "the listing failure is reported as itself: {}",
+                err
+            );
+        }
+
+        assert!(db.open_rule_conflicts().unwrap().contains(SKILL));
+        assert!(resolutions(&db).is_empty());
+        assert!(!rule_row(&db).is_custom);
+        for (dir, text) in dirs.iter().zip(&texts) {
+            assert!(skills_dir(dir).join("sdh-debugging.md.approved").exists());
+            assert!(skills_dir(dir).join("sdh-debugging.md.conflict").exists());
+            assert_eq!(
+                &fs::read_to_string(skills_dir(dir).join("sdh-debugging.md")).unwrap(),
+                text
+            );
+        }
+    }
+
     /// An open row with no marker left anywhere (removed by hand, checkouts
     /// gone) must still be closable, or the screen is stuck on it for good.
     #[test]
@@ -1126,7 +1186,8 @@ mod tests {
             .collect();
         assert_eq!(got, expected, "sorted by label");
         for side in &sides {
-            chrono::DateTime::parse_from_rfc3339(&side.marked_at).expect("an RFC 3339 time");
+            let at = side.marked_at.as_deref().expect("a marker time");
+            chrono::DateTime::parse_from_rfc3339(at).expect("an RFC 3339 time");
         }
         assert!(
             sync::conflict_sides(&db, "sdh-retro").unwrap().is_empty(),

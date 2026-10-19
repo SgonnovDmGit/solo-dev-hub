@@ -130,9 +130,9 @@ pub struct RuleConflictSide {
     /// `rule_copy_label` of the repo. Also the key `resolve_rule_conflict`
     /// accepts a side by.
     pub repo: String,
-    /// The approval marker's modification time, RFC 3339. Empty when the
+    /// The approval marker's modification time, RFC 3339. `None` when the
     /// filesystem would not say.
-    pub marked_at: String,
+    pub marked_at: Option<String>,
     /// The approval line the agent put in the marker, trimmed.
     pub note: Option<String>,
     /// The handed-back text.

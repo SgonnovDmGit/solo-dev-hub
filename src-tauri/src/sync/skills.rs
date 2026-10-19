@@ -860,7 +860,7 @@ fn live_conflict(repos: &[Repository], rule: &str) -> LiveConflict {
                 marked_at: fs::metadata(&marker.path)
                     .and_then(|m| m.modified())
                     .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
-                    .unwrap_or_default(),
+                    .ok(),
                 note: fs::read_to_string(&marker.path)
                     .ok()
                     .map(|note| note.trim().to_string())
@@ -897,8 +897,8 @@ pub fn conflict_sides(db: &AppDb, rule: &str) -> Result<Vec<RuleConflictSide>, S
 /// 4. the rule is delivered everywhere, with `rule` as the settings edit: a
 ///    marker that could not be cleared in step 2 is superseded, not taken.
 ///
-/// Errors are the two `ERR_*` codes (checked before anything is touched) or a
-/// failed store of the accepted text. Past that point the decision is made: a
+/// Errors are the two `ERR_*` codes, a failed read of the repo list (all
+/// checked before anything is touched) or a failed store of the accepted text. Past that point the decision is made: a
 /// step that fails is reported in the returned report's errors and the
 /// remaining steps still run, as in every other pass.
 ///
@@ -916,8 +916,12 @@ pub fn resolve_conflict(
     if !open.contains(rule) {
         return Err(ERR_CONFLICT_GONE.to_string());
     }
-    let mut early = RulesRefresh::default();
-    let repos = portfolio_repos(db, &mut early);
+    // A failed listing is refused outright: with no repos nothing is read, so
+    // an accept would claim its side is gone and a reject would close the
+    // conflict without clearing a single marker.
+    let repos = db
+        .list_repos_with_local_path(None)
+        .map_err(|e| e.to_string())?;
     let live = live_conflict(&repos, rule);
     let accepted = match accept {
         Some(label) => Some(
@@ -944,11 +948,13 @@ pub fn resolve_conflict(
         Some(side) => (Some(side.repo.as_str()), conflict_note::ACCEPTED),
         None => (None, conflict_note::REJECTED_BY_OWNER),
     };
+    // If this close fails the pass goes on: the next pass's settle retries it as
+    // SUPERSEDED_BY_OWNER, so an accepted side then has no origin event
+    // (accepted trade-off, the failure is reported in the outcome's errors).
     close_conflict(db, &repos, rule, repo, note, &mut out);
 
     let mut report = refresh_rules_locked(db, claude_dir, RenderScope::Everywhere, Some(rule));
-    let mut errors = early.errors;
-    errors.extend(out.errors);
+    let mut errors = out.errors;
     errors.append(&mut report.errors);
     report.errors = errors;
     Ok(report)

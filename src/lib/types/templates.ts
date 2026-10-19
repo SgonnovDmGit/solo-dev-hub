@@ -75,8 +75,8 @@ export interface RulesOverview {
 export interface RuleConflictSide {
   /** Repo label — also the key to accept this side by. */
   repo: string;
-  /** Marker mtime, RFC 3339; empty when unknown. */
-  marked_at: string;
+  /** Marker mtime, RFC 3339; null when the filesystem would not say. */
+  marked_at: string | null;
   note: string | null;
   content: string;
 }
