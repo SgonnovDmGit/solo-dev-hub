@@ -20,8 +20,10 @@ export async function saveTemplateFile(languageKey: string, fileName: string, co
   return invoke<TemplateSaveOutcome>('save_template_file', { languageKey, fileName, content });
 }
 
-export async function resetTemplateFile(languageKey: string, fileName: string): Promise<void> {
-  return invoke<void>('reset_template_file', { languageKey, fileName });
+/** T-000212: resetting a skill re-renders it everywhere, so the reset reports
+ *  what reached the portfolio exactly as a save does. */
+export async function resetTemplateFile(languageKey: string, fileName: string): Promise<TemplateSaveOutcome> {
+  return invoke<TemplateSaveOutcome>('reset_template_file', { languageKey, fileName });
 }
 
 /** T-000207: what the startup rule delivery found — returned once, then cleared. */

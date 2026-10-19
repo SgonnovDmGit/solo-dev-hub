@@ -94,6 +94,37 @@ comments:
       CHECK enforces it; without that one logical pair could be stored twice and
       the channel would sync twice per pass.
 
+  - table: rule_events
+    tableComment: >-
+      v33 (T-000174) — append-only history of the workflow rules: the sdh-*
+      skills and the global CLAUDE.md section. Answers where a rule's current
+      text came from, which until v1.19.0 lived only in a toast. Keyed by the
+      rule name, not a templates row, so a re-seed never orphans the history.
+    columnComments:
+      rule: Skill name (sdh-retro) or 'claude.md.global' for the global CLAUDE.md section.
+      kind: >-
+        taken / saved / reset / superseded / lost / conflict / conflict_resolved,
+        enforced by a CHECK. taken, saved, reset and a conflict_resolved with repo
+        set wrote the text (the rule's origin); the others left it alone.
+      repo: >-
+        The repo copy involved, as owner/name or the checkout path of a
+        local-only repo; NULL for an edit made in the app. On conflict_resolved,
+        set = the text from this repo was accepted, NULL = nothing was accepted.
+      note: >-
+        The approval line from the hand-back marker (taken), or how a conflict
+        was resolved (conflict_resolved).
+      created_at: RFC 3339 UTC.
+
+  - table: rule_conflicts
+    tableComment: >-
+      v33 (T-000206) — one row per rule whose hand-backs currently conflict (two
+      repos handed back different texts). Lets a repeated pass tell a conflict it
+      already reported from a new one instead of raising the same error on every
+      sync. The conflicting texts are not stored: they stay in the repo copies.
+    columnComments:
+      rule: Skill name; the primary key, so a rule has at most one open conflict.
+      opened_at: RFC 3339 UTC, when the conflict was first seen.
+
   - table: project_renames
     tableComment: >-
       Project-level twin of repo_renames (v24). Needed because

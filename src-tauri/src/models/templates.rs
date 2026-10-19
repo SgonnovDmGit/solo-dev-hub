@@ -68,6 +68,23 @@ impl RulesRefresh {
     }
 }
 
+/// T-000174: one entry of a rule's history (`rule_events`, migration v33).
+/// `rule` is a skill name or `claude.md.global`; `kind` is one of the
+/// `db::rules::rule_event` constants.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct RuleEvent {
+    pub id: i64,
+    pub rule: String,
+    pub kind: String,
+    /// `rule_copy_label` of the repo copy involved; `None` for an edit made in
+    /// the app.
+    pub repo: Option<String>,
+    /// The approval line from the marker (`taken`), or how a conflict was
+    /// resolved (`conflict_resolved`).
+    pub note: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TemplateLanguage {
     pub language_key: String,

@@ -3,7 +3,7 @@
 // (`~/.claude/skills/<name>/SKILL.md`) and per-repo reference copies
 // (`<repo>/docs/sdh_skills/<name>.md`). Single source -> two render targets.
 
-use crate::db::AppDb;
+use crate::db::{rule_event, AppDb};
 use crate::models::{lookup, Repository, RulesRefresh, SyncIssue, SyncIssueCode};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -25,6 +25,20 @@ pub fn skill_name_of(file_name: &str) -> Option<&str> {
         .strip_prefix(SKILL_PREFIX)?
         .strip_suffix(SKILL_SUFFIX)
         .filter(|name| !name.is_empty())
+}
+
+/// The `_global` template of the global CLAUDE.md section, and the rule name it
+/// goes by in the rule history.
+pub const GLOBAL_SECTION_FILE: &str = "claude.md.global.tmpl";
+pub const GLOBAL_SECTION_RULE: &str = "claude.md.global";
+
+/// T-000174: the rule a `_global` template file stands for — a skill name, or
+/// `claude.md.global` for the global CLAUDE.md section. `None` for every other
+/// template. The single place that decides "this file is a rule": its history,
+/// its reset and what the frontend lists as a rule all follow from it.
+pub fn rule_name_of(file_name: &str) -> Option<&str> {
+    skill_name_of(file_name)
+        .or_else(|| (file_name == GLOBAL_SECTION_FILE).then_some(GLOBAL_SECTION_RULE))
 }
 
 /// Enumerate bundled skill templates as (skill_name, content).
@@ -177,6 +191,31 @@ struct Collected {
     errors: Vec<SyncIssue>,
 }
 
+impl Collected {
+    /// T-000174: append an outcome to the rule's history. A failure is one
+    /// more `RuleFailed` issue, never a reason to stop the pass.
+    fn record(&mut self, db: &AppDb, rule: &str, kind: &str, repo: &str, note: Option<&str>) {
+        if let Err(e) = db.insert_rule_event(rule, kind, Some(repo), note) {
+            self.errors.push(
+                SyncIssue::new(SyncIssueCode::RuleFailed, rule)
+                    .target(format!("{}: rule_events", repo))
+                    .detail(e),
+            );
+        }
+    }
+}
+
+/// One repo's handed-back copy of a skill, as found beside its marker.
+#[derive(Debug)]
+struct HandedCopy {
+    /// `rule_copy_label` of the repo.
+    label: String,
+    content: String,
+    marker: PathBuf,
+    /// The marker's approval line, trimmed; `None` when the marker is empty.
+    note: Option<String>,
+}
+
 /// T-000205: take an approved rule edit back out of a repo's own copy.
 ///
 /// The copies under `docs/sdh_skills/` are normally outputs, rewritten on every
@@ -207,6 +246,14 @@ struct Collected {
 ///
 /// Lost and superseded entries read `<skill> (<repo>)`, the repo labelled by
 /// `rule_copy_label` (full `owner/name`, or the path of a local-only repo).
+///
+/// T-000174: every outcome that is not an error is also written to the rule's
+/// history (`rule_events`) — `taken` once per repo whose copy was taken, with
+/// the marker's approval line, plus `lost` and `superseded` with their repo.
+/// The report above is a toast that is gone in seconds; the history is what
+/// answers "where did this rule's text come from" afterwards. A failed history
+/// write is reported as `RuleFailed` like any other step here and never undoes
+/// or blocks the outcome it describes.
 fn collect_approved_skill_edits(
     db: &AppDb,
     repos: &[Repository],
@@ -223,7 +270,7 @@ fn collect_approved_skill_edits(
     };
 
     // skill name -> handed-back copies, one per repo that flagged it.
-    let mut handed: HashMap<String, Vec<(String, String, PathBuf)>> = HashMap::new();
+    let mut handed: HashMap<String, Vec<HandedCopy>> = HashMap::new();
 
     for repo in repos {
         let Some(path) = repo.local_path.as_deref() else {
@@ -255,7 +302,10 @@ fn collect_approved_skill_edits(
             };
             if settings_edit == Some(name) {
                 match clear_marker(&entry.path()) {
-                    Ok(()) => out.superseded.push(format!("{} ({})", name, label)),
+                    Ok(()) => {
+                        out.superseded.push(format!("{} ({})", name, label));
+                        out.record(db, name, rule_event::SUPERSEDED, &label, None);
+                    }
                     Err(e) => out.errors.push(
                         SyncIssue::new(SyncIssueCode::RuleFailed, name)
                             .target(format!("{}: {}", label, marker))
@@ -267,7 +317,10 @@ fn collect_approved_skill_edits(
             let copy = dir.join(stem);
             match fs::read_to_string(&copy) {
                 Ok(content) if content == *current => match clear_marker(&entry.path()) {
-                    Ok(()) => out.lost.push(format!("{} ({})", name, label)),
+                    Ok(()) => {
+                        out.lost.push(format!("{} ({})", name, label));
+                        out.record(db, name, rule_event::LOST, &label, None);
+                    }
                     Err(e) => out.errors.push(
                         SyncIssue::new(SyncIssueCode::RuleFailed, name)
                             .target(format!("{}: {}", label, marker))
@@ -276,18 +329,24 @@ fn collect_approved_skill_edits(
                 },
                 Ok(content) => {
                     // The marker may carry the approval line. Empty is allowed;
-                    // when present it is worth having in the log.
-                    if let Ok(note) = fs::read_to_string(entry.path()) {
-                        let note = note.trim();
-                        if !note.is_empty() {
-                            eprintln!("[skills] {} hands back {}: {}", label, name, note);
-                        }
+                    // when present it is worth having in the log and, since
+                    // T-000174, in the rule's history.
+                    let note = fs::read_to_string(entry.path())
+                        .ok()
+                        .map(|note| note.trim().to_string())
+                        .filter(|note| !note.is_empty());
+                    if let Some(note) = &note {
+                        eprintln!("[skills] {} hands back {}: {}", label, name, note);
                     }
-                    handed.entry(name.to_string()).or_default().push((
-                        label.clone(),
-                        content,
-                        entry.path(),
-                    ));
+                    handed
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(HandedCopy {
+                            label: label.clone(),
+                            content,
+                            marker: entry.path(),
+                            note,
+                        });
                 }
                 Err(e) => out.errors.push(
                     SyncIssue::new(SyncIssueCode::RuleFailed, name)
@@ -299,11 +358,11 @@ fn collect_approved_skill_edits(
     }
 
     for (name, copies) in handed {
-        let first = &copies[0].1;
-        if let Some(other) = copies.iter().find(|(_, content, _)| content != first) {
+        let first = &copies[0].content;
+        if let Some(other) = copies.iter().find(|copy| copy.content != *first) {
             out.errors.push(
                 SyncIssue::new(SyncIssueCode::VersionConflict, name.clone())
-                    .target(format!("{}, {}", copies[0].0, other.0)),
+                    .target(format!("{}, {}", copies[0].label, other.label)),
             );
             continue; // markers stay put: nobody's edit is thrown away
         }
@@ -316,7 +375,17 @@ fn collect_approved_skill_edits(
             );
             continue;
         }
-        for (_, _, marker) in &copies {
+        for copy in &copies {
+            // Recorded before the marker is cleared, and whether or not that
+            // succeeds: the text is already the rule at this point.
+            out.record(
+                db,
+                &name,
+                rule_event::TAKEN,
+                &copy.label,
+                copy.note.as_deref(),
+            );
+            let marker = &copy.marker;
             if let Err(e) = clear_marker(marker) {
                 // The text is already stored; a surviving marker now sits beside
                 // a copy equal to the rule, so the next pass reports it as lost
@@ -675,6 +744,18 @@ mod tests {
     }
 
     #[test]
+    fn test_rule_name_of() {
+        assert_eq!(rule_name_of("skill.sdh-retro.md.tmpl"), Some("sdh-retro"));
+        assert_eq!(
+            rule_name_of("claude.md.global.tmpl"),
+            Some("claude.md.global")
+        );
+        assert_eq!(rule_name_of("claude.md.section.tmpl"), None);
+        assert_eq!(rule_name_of(".gitignore.tmpl"), None);
+        assert_eq!(rule_name_of("skill.md.tmpl"), None);
+    }
+
+    #[test]
     fn test_clearing_a_marker_that_is_already_gone_is_not_an_error() {
         let tmp = TempDir::new().unwrap();
         assert!(clear_marker(&tmp.path().join("sdh-alpha.md.approved")).is_ok());
@@ -1006,6 +1087,99 @@ mod tests {
         assert_eq!(
             errors[0].target.as_deref(),
             Some("sdh-invented.md.approved")
+        );
+    }
+
+    // ── T-000174: the collection leaves a history behind ─────────────────────
+
+    /// `(kind, repo, note)` of a rule's history, oldest first.
+    fn history(db: &AppDb, rule: &str) -> Vec<(String, Option<String>, Option<String>)> {
+        let mut events: Vec<_> = db
+            .list_rule_events(rule)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.kind, e.repo, e.note))
+            .collect();
+        events.reverse();
+        events
+    }
+
+    /// One `taken` per repo whose copy was taken, carrying that repo's approval
+    /// line — the toast that used to be the only trace is gone in seconds.
+    #[test]
+    fn test_an_uptake_records_taken_per_repo_with_the_marker_note() {
+        let db = db_with_skill();
+        let one = TempDir::new().unwrap();
+        let two = TempDir::new().unwrap();
+        let (r1, s1) = rendered_repo(&db, &one, "one");
+        let (r2, s2) = rendered_repo(&db, &two, "two");
+        hand_back(
+            &s1,
+            "sdh-beta",
+            "AGREED TEXT",
+            "  approved in chat 2026-10-19
+",
+        );
+        hand_back(&s2, "sdh-beta", "AGREED TEXT", "");
+        let (l1, l2) = (rule_copy_label(&r1), rule_copy_label(&r2));
+
+        let Collected { taken, errors, .. } = collect_approved_skill_edits(&db, &[r1, r2], None);
+
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        assert_eq!(taken, vec!["sdh-beta".to_string()]);
+        let mut events = history(&db, "sdh-beta");
+        events.sort();
+        let mut expected = vec![
+            (
+                "taken".to_string(),
+                Some(l1),
+                Some("approved in chat 2026-10-19".to_string()),
+            ),
+            ("taken".to_string(), Some(l2), None),
+        ];
+        expected.sort();
+        assert_eq!(events, expected);
+        assert!(
+            history(&db, "sdh-alpha").is_empty(),
+            "nothing else recorded"
+        );
+    }
+
+    #[test]
+    fn test_a_lost_edit_is_recorded_with_its_repo() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        let label = rule_copy_label(&repo);
+        // A marker beside an unchanged copy: the edit never reached the rule.
+        fs::write(skills.join("sdh-alpha.md.approved"), "approved").unwrap();
+
+        let Collected { lost, .. } = collect_approved_skill_edits(&db, &[repo], None);
+
+        assert_eq!(lost.len(), 1);
+        assert_eq!(
+            history(&db, "sdh-alpha"),
+            vec![("lost".to_string(), Some(label), None)]
+        );
+    }
+
+    #[test]
+    fn test_a_superseded_handback_is_recorded_with_its_repo() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        let label = rule_copy_label(&repo);
+        hand_back(&skills, "sdh-alpha", "AGENT TEXT", "approved");
+
+        let Collected {
+            superseded, taken, ..
+        } = collect_approved_skill_edits(&db, &[repo], Some("sdh-alpha"));
+
+        assert_eq!(superseded.len(), 1);
+        assert!(taken.is_empty());
+        assert_eq!(
+            history(&db, "sdh-alpha"),
+            vec![("superseded".to_string(), Some(label), None)]
         );
     }
 
