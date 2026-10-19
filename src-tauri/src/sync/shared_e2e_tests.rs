@@ -854,9 +854,20 @@ fn v4_different_tasks_of_one_todo_are_both_kept_everywhere() {
             text
         );
     }
-    // The files of the two checkouts are identical. (The tasks table does not
-    // mirror descriptions at all: BUG-2 below.)
+    // The files of the two checkouts are identical, and so are the databases.
     assert_eq!(places[0].1, places[1].1);
+    w.open_owner();
+    w.open_helper();
+    for (db, repo) in [(&fx.main_db, fx.main_repo), (&fx.helper_db, fx.helper_repo)] {
+        assert_eq!(
+            task_db_description(db, repo, "T-000002").as_deref(),
+            Some("second task, edited by the owner")
+        );
+        assert_eq!(
+            task_db_description(db, repo, "T-000003").as_deref(),
+            Some("third task, edited by the helper")
+        );
+    }
     w.check_origin();
 }
 
@@ -994,7 +1005,17 @@ fn v6_a_local_ai_edit_of_a_bug_is_undone_and_a_committed_task_edit_is_taken() {
         todo_field(&w.owner_file("docs/todo.md"), "T-500000", 1).as_deref(),
         Some("reworded by the helper")
     );
-    // (The owner's tasks table still holds the old text: BUG-2 below.)
+    // The tasks table (what the TasksTab shows) takes the new text too, and the
+    // disk run of the tab does not bring the old one back.
+    assert_eq!(
+        task_db_description(&fx.main_db, fx.main_repo, "T-500000").as_deref(),
+        Some("reworded by the helper")
+    );
+    w.open_owner();
+    assert_eq!(
+        task_db_description(&fx.main_db, fx.main_repo, "T-500000").as_deref(),
+        Some("reworded by the helper")
+    );
     w.check_origin();
 }
 
@@ -1301,18 +1322,16 @@ fn bug1_a_contributors_rendered_skills_do_not_block_the_fast_forward() {
 }
 
 // ---------------------------------------------------------------------------
-// BUG-2 and BUG-3 (found by these scenarios, not fixed here)
+// BUG-2 (fixed) and BUG-3 (found by these scenarios)
 // ---------------------------------------------------------------------------
 
-/// BUG-2, minimal repro (ignored until decided; run with `--ignored`). Not a
-/// shared-mode defect: the tasks table mirrors status, source and version of a
+/// BUG-2, minimal repro (fixed). Not a shared-mode defect: the tasks table mirrored status, source and version of a
 /// task but never its description, effort or priority after the row is
 /// inserted. The TasksTab reads that table, so a description reworded in
 /// `todo.md` -- by a local AI in an ordinary repo, or by a helper's commit in a
 /// shared one (items 4 and 6 of the spec) -- shows the OLD text there while the
 /// file has the new one.
 #[test]
-#[ignore = "BUG-2: the tasks table never takes a reworded description from todo.md"]
 fn bug2_a_reworded_task_description_reaches_the_tasks_table() {
     let fx = two_installs();
     write(&fx.main_dir, "docs/todo.md", &todo(&["T-000002"]));

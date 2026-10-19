@@ -378,6 +378,20 @@ fn sync_tasks_core(
                 db.update_task_version(existing.id, new_version_opt)
                     .map_err(|e| e.to_string())?;
             }
+            // BUG-2: description, effort and priority follow the file too.
+            let new_effort = tt.effort.parse::<f64>().ok();
+            let new_priority = if tt.priority.is_empty() {
+                None
+            } else {
+                Some(tt.priority.as_str())
+            };
+            if tt.description != existing.description
+                || new_effort != existing.effort
+                || new_priority != existing.priority.as_deref()
+            {
+                db.update_task_fields(existing.id, &tt.description, new_effort, new_priority)
+                    .map_err(|e| e.to_string())?;
+            }
             // Row exists in DB as todo — check for status change
             let new_status = if tt.status.is_empty() {
                 None
@@ -738,6 +752,44 @@ mod tests {
 
         let r = sync_tasks_for_repo(&db, repo.id).unwrap();
         assert_eq!(r.events_emitted, 0, "a re-sync must stay quiet");
+        std::mem::forget(tmp);
+    }
+
+    /// BUG-2: the file is canonical for description, effort and priority of a
+    /// task that is already mirrored; no event is written for those edits.
+    #[test]
+    fn test_sync_tasks_takes_description_effort_priority_from_the_file() {
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_path.join("docs")).unwrap();
+        let todo = repo_path.join("docs/todo.md");
+        std::fs::write(
+            &todo,
+            "- [ ] T-001 | Task A | 2 | high | open | 2026-10-01\n",
+        )
+        .unwrap();
+        let repo = db
+            .insert_local_repository(repo_path.to_str().unwrap(), "test_repo", None, None)
+            .unwrap();
+        sync_tasks_for_repo(&db, repo.id).unwrap();
+
+        std::fs::write(
+            &todo,
+            "- [ ] T-001 | Task A, reworded | 5 | low | open | 2026-10-01\n",
+        )
+        .unwrap();
+        let r = sync_tasks_for_repo(&db, repo.id).unwrap();
+        assert_eq!(r.events_emitted, 0);
+        let row = db
+            .list_tasks_by_repo(repo.id, "todo")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(row.description, "Task A, reworded");
+        assert_eq!(row.effort, Some(5.0));
+        assert_eq!(row.priority.as_deref(), Some("low"));
+        assert_eq!(row.status.as_deref(), Some("open"));
         std::mem::forget(tmp);
     }
 

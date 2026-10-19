@@ -75,6 +75,24 @@ impl AppDb {
         Ok(())
     }
 
+    /// BUG-2: take description, effort and priority of an existing todo row from
+    /// `todo.md` (the file is canonical). No event: these are edits, not workflow.
+    pub fn update_task_fields(
+        &self,
+        task_id: i64,
+        description: &str,
+        effort: Option<f64>,
+        priority: Option<&str>,
+    ) -> SqlResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET description = ?1, effort = ?2, priority = ?3, updated_at = ?4 WHERE id = ?5",
+            rusqlite::params![description, effort, priority, now, task_id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_task_source(&self, task_id: i64, new_source: &str) -> SqlResult<()> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
