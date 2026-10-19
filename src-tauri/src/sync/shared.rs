@@ -497,33 +497,86 @@ fn is_approved_request(path: &str, approved: &[String]) -> bool {
         .is_some_and(|stem| approved.iter().any(|l| ss::logins_equal(l, stem)))
 }
 
-/// Did `path` ever have the blob `sha` in HEAD's history (as the old or the
-/// new side of any commit touching it)?
-fn blob_in_head_history(git: &GitBinary, root: &Path, path: &str, sha: &str) -> bool {
-    if let Ok(Some(head)) = git_sync::blob_sha_at(git, root, "HEAD", path) {
-        if head == sha {
-            return true;
-        }
-    }
+/// How many commits of a path's history are looked at.
+const HISTORY_CAP: usize = 200;
+
+/// The blobs `path` had in the history of `rev`, newest first (at most
+/// `HISTORY_CAP` commits, a blob once per commit that gave it to the file): one
+/// `git log --raw` call.
+fn blobs_in_history(git: &GitBinary, root: &Path, rev: &str, path: &str) -> Vec<String> {
+    let cap = format!("-n{}", HISTORY_CAP);
     let Ok(out) = spawn_cmd(&git.0)
         .args([
             "log",
             "--raw",
             "--no-abbrev",
-            "--format=",
-            "HEAD",
+            "-m",
+            "--format=%H",
+            cap.as_str(),
+            rev,
             "--",
             path,
         ])
         .current_dir(root)
         .output()
     else {
-        return false;
+        return Vec::new();
     };
-    out.status.success()
-        && String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .any(|l| l.split_whitespace().any(|t| t == sha))
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let zero = "0".repeat(40);
+    let mut blobs: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if !line.starts_with(':') {
+            continue;
+        }
+        // :<old mode> <new mode> <old sha> <new sha> <status>
+        if let Some(new) = line.split_whitespace().nth(3) {
+            if new != zero {
+                blobs.push(new.to_string());
+            }
+        }
+    }
+    blobs
+}
+
+/// Index of the OLDEST occurrence of every blob of a newest-first list: the
+/// point where that content first appeared in the history.
+fn oldest_positions(blobs: &[String]) -> HashMap<&str, usize> {
+    let mut m = HashMap::new();
+    for (i, b) in blobs.iter().enumerate() {
+        m.insert(b.as_str(), i);
+    }
+    m
+}
+
+/// The last version of `path` the histories of `ours_rev` and `theirs_rev`
+/// agreed on (each looked at to `HISTORY_CAP` commits). Two branches that only
+/// ever exchange plumbed commits share no merge-base after the file was born,
+/// but they do share its blobs; this is the base of a three-way merge between
+/// them. Content recurs (a task moves out of a file and the file equals an
+/// older version), so a blob is judged by where it FIRST appeared on each side,
+/// not by its latest occurrence: the shared blob whose first appearances are
+/// the most recent on both sides wins (smallest sum of ages, ours first on a
+/// tie). `None` when they never held the same version.
+fn last_common_blob(
+    git: &GitBinary,
+    root: &Path,
+    ours_rev: &str,
+    theirs_rev: &str,
+    path: &str,
+) -> Option<String> {
+    let ours = blobs_in_history(git, root, ours_rev, path);
+    if ours.is_empty() {
+        return None;
+    }
+    let theirs = blobs_in_history(git, root, theirs_rev, path);
+    let (po, pt) = (oldest_positions(&ours), oldest_positions(&theirs));
+    po.iter()
+        .filter_map(|(b, i)| pt.get(b).map(|j| (i + j, *i, *b)))
+        .min()
+        .map(|(_, _, b)| b.to_string())
 }
 
 /// What to do with one file of the target branch.
@@ -536,12 +589,13 @@ enum Plan {
 
 /// Commit our version of the shared files into `branch` (a local branch that is
 /// not checked out). Task files (`todo.md` / `done.md` / `bug-reports.md`) are
-/// merged by id (base = the file at the merge-base of HEAD and the branch,
-/// ours = the work tree, theirs = the branch). Every other file is a three-way
-/// copy: the work tree wins only when we changed the file since the merge-base
-/// AND the branch either still holds the merge-base's version or a version that
-/// is in HEAD's history for that path (a version this checkout never had is
-/// newer foreign work and is never clobbered; the owner's own
+/// merged by id (ours = the work tree, theirs = the branch, base = the last blob
+/// of the file both histories held, else the file at the merge-base, else
+/// nothing: a row that is in the base but missing on one side was deleted
+/// there and stays deleted). Every other file is a three-way copy with the same
+/// base: the work tree wins only when we changed the file since the base AND
+/// the branch is still at the base (a version this checkout never had is newer
+/// foreign work and is never clobbered; the owner's own
 /// `.sdh/project.json` and rule files are exempt). A file we deleted (the
 /// branch still holds the version we last had) is deleted from the branch, and
 /// so is the request file of an approved participant. A file the branch deleted
@@ -585,7 +639,15 @@ fn plumb_into_branch(
         }
         let wt = wt_sha.get(path).map(String::as_str);
         let br = br_tree.get(path).map(String::as_str);
-        let bs = base_tree.get(path).map(String::as_str);
+        let merge_base_blob = base_tree.get(path).map(String::as_str);
+        // The version both sides last had; only looked up for a file that
+        // differs (equal files need no base).
+        let common = if wt != br {
+            last_common_blob(git, root, "HEAD", &refname, path)
+        } else {
+            None
+        };
+        let bs: Option<&str> = common.as_deref().or(merge_base_blob);
         let plan = match (wt, br) {
             (Some(w), Some(b)) => {
                 if w == b {
@@ -606,10 +668,7 @@ fn plumb_into_branch(
                 } else if Some(w) == bs {
                     // Unchanged on our side: the branch's version stands.
                     Plan::Skip
-                } else if Some(b) == bs
-                    || sole_writer(path)
-                    || blob_in_head_history(git, root, path, b)
-                {
+                } else if Some(b) == bs || sole_writer(path) {
                     read_worktree(root, path).map_or(Plan::Skip, Plan::Write)
                 } else {
                     // The branch holds a version this checkout never had: newer
@@ -3616,16 +3675,16 @@ mod tests {
         let git = gb();
         // present: HEAD's own copy
         assert_eq!(last_version_sha(&git, d, "f.md"), Some(v2.clone()));
-        assert!(blob_in_head_history(&git, d, "f.md", &v1));
-        assert!(blob_in_head_history(&git, d, "f.md", &v2));
+        assert!(blobs_in_history(&git, d, "HEAD", "f.md").contains(&v1));
+        assert!(blobs_in_history(&git, d, "HEAD", "f.md").contains(&v2));
         // deleted: the version before the deleting commit
         g(d, &["rm", "-q", "f.md"]);
         g(d, &["commit", "-q", "-m", "gone"]);
         assert_eq!(last_version_sha(&git, d, "f.md"), Some(v2));
-        assert!(blob_in_head_history(&git, d, "f.md", &v1));
+        assert!(blobs_in_history(&git, d, "HEAD", "f.md").contains(&v1));
         // a blob this history never held, and a file it never had
         let foreign = "1".repeat(40);
-        assert!(!blob_in_head_history(&git, d, "f.md", &foreign));
+        assert!(!blobs_in_history(&git, d, "HEAD", "f.md").contains(&foreign));
         assert_eq!(last_version_sha(&git, d, "never.md"), None);
     }
 
@@ -4167,40 +4226,25 @@ mod tests {
         fx.main_db
             .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
             .unwrap();
+        // helper-dev must exist on origin so that the owner plumbs into it.
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        fx.sync_helper();
+        fx.sync_main();
         owner_bug(&fx, 1, "verdict given", "confirmed", 1);
         owner_bug(&fx, 2, "still open", "testing", 1);
         crate::sync::bugs::regenerate_bugs_md(&fx.main_db, fx.main_repo).unwrap();
-        fx.sync_main();
+        fx.sync_main(); // committed to dev and plumbed into helper-dev
+        fx.sync_helper(); // the helper receives the file
 
-        // Another install commits a version of the file without both rows onto
-        // origin's dev (a hand-made commit with the participant trailer: the
-        // merge by id cannot carry a deletion between two plumbed branches).
-        g(&fx.helper_dir, &["fetch", "-q", "origin"]);
-        let wt = fx._tmp.path().join("wt");
-        g(
-            &fx.helper_dir,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "tmpdev",
-                wt.to_str().unwrap(),
-                "origin/dev",
-            ],
-        );
-        write(&wt, "docs/bug-reports.md", &bugs_md(&[]));
-        g(&wt, &["add", "docs/bug-reports.md"]);
-        g(
-            &wt,
-            &[
-                "commit",
-                "-q",
-                "-m",
-                "chore(sdh-sync): sync shared files\n\nSDH-Participant: helper",
-            ],
-        );
-        g(&wt, &["push", "-q", "origin", "tmpdev:dev"]);
+        // The helper's local AI deletes both rows. The live one is restored, the
+        // confirmed one is acknowledged; the sync commits and plumbs that into
+        // origin's dev, which still holds both rows from the owner.
+        write(&fx.helper_dir, "docs/bug-reports.md", &bugs_md(&[]));
+        fx.sync_helper();
+        assert!(!fx
+            .remote_file("dev", "docs/bug-reports.md")
+            .unwrap()
+            .contains("B-000001"));
 
         fx.sync_main();
         let confirmed = fx
@@ -4219,6 +4263,19 @@ mod tests {
         let rendered = fs::read_to_string(fx.main_dir.join("docs/bug-reports.md")).unwrap();
         assert!(rendered.contains("B-000002"), "re-rendered:\n{}", rendered);
         assert!(!rendered.contains("B-000001"));
+        // The deletion stays deleted on both branches after the next rounds.
+        fx.sync_main();
+        fx.sync_helper();
+        for branch in ["dev", "helper-dev"] {
+            let t = fx.remote_file(branch, "docs/bug-reports.md").unwrap();
+            assert!(!t.contains("B-000001"), "{} resurrected it:\n{}", branch, t);
+            assert!(
+                t.contains("B-000002"),
+                "{} lost the live bug:\n{}",
+                branch,
+                t
+            );
+        }
     }
 
     #[test]
@@ -4500,5 +4557,178 @@ mod tests {
             ss::read_shared_import(&fx.main_db, fx.main_repo).disabling,
             None
         );
+    }
+
+    #[test]
+    fn last_common_blob_finds_the_shared_version_of_unrelated_lineages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        write(d, "f.md", "A\n");
+        g(d, &["add", "."]);
+        g(d, &["commit", "-q", "-m", "a"]);
+        let a = g(d, &["rev-parse", "HEAD:f.md"]);
+        write(d, "f.md", "C\n");
+        g(d, &["commit", "-q", "-am", "c"]);
+        // A second root that never shares a commit with `dev`, only the blob A.
+        g(d, &["checkout", "-q", "--orphan", "other"]);
+        g(d, &["rm", "-rfq", "."]);
+        write(d, "f.md", "X\n");
+        g(d, &["add", "."]);
+        g(d, &["commit", "-q", "-m", "x"]);
+        write(d, "f.md", "A\n");
+        g(d, &["commit", "-q", "-am", "a again"]);
+        write(d, "f.md", "B\n");
+        g(d, &["commit", "-q", "-am", "b"]);
+        let git = gb();
+        assert_eq!(git_sync::merge_base(&git, d, "dev", "other").unwrap(), None);
+        assert_eq!(
+            last_common_blob(&git, d, "dev", "other", "f.md"),
+            Some(a.clone())
+        );
+        assert_eq!(last_common_blob(&git, d, "other", "dev", "f.md"), Some(a));
+        // Content recurs: the other side's tip equals an old version, but the
+        // last state both held is the one in between.
+        g(d, &["checkout", "-q", "dev"]);
+        write(
+            d, "r.md", "A
+",
+        );
+        g(d, &["add", "r.md"]);
+        g(d, &["commit", "-q", "-m", "r1"]);
+        write(
+            d, "r.md", "X
+",
+        );
+        g(d, &["commit", "-q", "-am", "r2"]);
+        let x = g(d, &["rev-parse", "HEAD:r.md"]);
+        write(
+            d, "r.md", "Z
+",
+        );
+        g(d, &["commit", "-q", "-am", "r3"]);
+        g(d, &["checkout", "-q", "other"]);
+        write(
+            d, "r.md", "A
+",
+        );
+        g(d, &["add", "r.md"]);
+        g(d, &["commit", "-q", "-m", "o1"]);
+        write(
+            d, "r.md", "X
+",
+        );
+        g(d, &["commit", "-q", "-am", "o2"]);
+        write(
+            d, "r.md", "A
+",
+        );
+        g(d, &["commit", "-q", "-am", "o3"]);
+        assert_eq!(last_common_blob(&git, d, "dev", "other", "r.md"), Some(x));
+        // nothing in common, and a file neither has
+        write(d, "g.md", "only other\n");
+        g(d, &["add", "g.md"]);
+        g(d, &["commit", "-q", "-m", "g"]);
+        assert_eq!(last_common_blob(&git, d, "dev", "other", "g.md"), None);
+        assert_eq!(last_common_blob(&git, d, "dev", "other", "nope.md"), None);
+    }
+
+    fn done_md(ids: &[&str]) -> String {
+        let mut s = String::from("## 2026-10-20\n\n");
+        for id in ids {
+            s.push_str(&format!("- {} | task {} | v1.0.0\n", id, id));
+        }
+        s
+    }
+
+    #[test]
+    fn a_task_moved_to_done_stays_moved_and_nothing_resurrects() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The helper's task reaches origin's dev and helper-dev.
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        fx.sync_helper();
+        fx.sync_main(); // dev fast-forwards; main gets its copy of helper-dev
+                        // The owner adds a task; it is plumbed into helper-dev.
+        write(
+            &fx.main_dir,
+            "docs/todo.md",
+            &todo(&["T-000001", "T-500000"]),
+        );
+        fx.sync_main();
+        assert!(fx
+            .remote_file("helper-dev", "docs/todo.md")
+            .unwrap()
+            .contains("T-000001"));
+        fx.sync_helper(); // fast-forwards onto it
+
+        // The owner finishes T-000001: it leaves todo and enters done.
+        write(&fx.main_dir, "docs/todo.md", &todo(&["T-500000"]));
+        write(&fx.main_dir, "docs/done.md", &done_md(&["T-000001"]));
+        fx.sync_main();
+        for branch in ["dev", "helper-dev"] {
+            let t = fx.remote_file(branch, "docs/todo.md").unwrap();
+            assert!(
+                !t.contains("T-000001"),
+                "{} todo resurrected it:\n{}",
+                branch,
+                t
+            );
+            assert!(
+                fx.remote_file(branch, "docs/done.md")
+                    .unwrap()
+                    .contains("T-000001"),
+                "{} lacks it in done",
+                branch
+            );
+        }
+
+        // The helper still has the stale todo and adds a row of its own; its
+        // sync must neither bring T-000001 back to dev nor lose the new row.
+        let stale = fs::read_to_string(fx.helper_dir.join("docs/todo.md")).unwrap();
+        assert!(stale.contains("T-000001"));
+        write(
+            &fx.helper_dir,
+            "docs/todo.md",
+            &format!("{}{}", stale, task("T-500001")),
+        );
+        fx.sync_helper();
+        let dev_todo = fx.remote_file("dev", "docs/todo.md").unwrap();
+        assert!(
+            dev_todo.contains("T-500001"),
+            "the new row arrives:\n{}",
+            dev_todo
+        );
+        assert!(
+            !dev_todo.contains("T-000001"),
+            "no resurrection:\n{}",
+            dev_todo
+        );
+
+        // And the owner's next sync does not bounce it back either.
+        fx.sync_main();
+        for branch in ["dev", "helper-dev"] {
+            let t = fx.remote_file(branch, "docs/todo.md").unwrap();
+            assert!(
+                !t.contains("T-000001"),
+                "{} after the owner's sync:\n{}",
+                branch,
+                t
+            );
+            assert!(
+                t.contains("T-500001"),
+                "{} lost the new row:\n{}",
+                branch,
+                t
+            );
+            assert!(fx
+                .remote_file(branch, "docs/done.md")
+                .unwrap()
+                .contains("T-000001"));
+        }
+        let mine = fs::read_to_string(fx.main_dir.join("docs/todo.md")).unwrap();
+        assert!(!mine.contains("T-000001") && mine.contains("T-500001"));
     }
 }
