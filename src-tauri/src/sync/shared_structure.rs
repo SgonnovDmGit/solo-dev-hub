@@ -567,6 +567,107 @@ pub fn band_for(structure: &ProjectStructure, login: &str) -> Option<(u32, u32)>
 }
 
 // ---------------------------------------------------------------------------
+// Bug number bands (Р12)
+// ---------------------------------------------------------------------------
+
+/// Which numbers this install may give to a new bug of a repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BandDecision {
+    /// Not a shared repo: the plain per-repo counter.
+    Unbanded,
+    /// Inclusive id range of this install.
+    Band(i64, i64),
+    /// Creating a bug is not allowed now; the text says why.
+    Refused(String),
+}
+
+fn band_of(structure: &ProjectStructure, login: &str) -> BandDecision {
+    match band_for(structure, login) {
+        Some((lo, hi)) => BandDecision::Band(lo as i64, hi as i64),
+        None => BandDecision::Refused("this install has no number range in the project".into()),
+    }
+}
+
+/// Pure decision. `structure` is the outcome of `read_structure_file`;
+/// `shared_mode` / `shared_role` are the cached columns of the repo.
+pub fn decide_band(
+    structure: Result<Option<ProjectStructure>, String>,
+    shared_mode: bool,
+    shared_role: Option<&str>,
+    my_login: Option<&str>,
+) -> BandDecision {
+    let structure = match structure {
+        Ok(s) => s,
+        Err(reason) => {
+            return BandDecision::Refused(format!(
+                "the shared project structure is not trusted: {}",
+                reason
+            ))
+        }
+    };
+    let Some(s) = structure else {
+        // No structure file in the working tree.
+        if !shared_mode && shared_role.is_none() {
+            return BandDecision::Unbanded;
+        }
+        return match shared_role {
+            // The owner switched sharing on but the file is not written yet.
+            None | Some("main") => BandDecision::Band(1, MAIN_BAND_CEILING as i64),
+            Some("pending") => BandDecision::Refused(PENDING_REASON.into()),
+            Some(_) => BandDecision::Refused(
+                "the shared project structure is not available yet - sync the project first".into(),
+            ),
+        };
+    };
+    match derive_role(Some(&s), my_login) {
+        None => BandDecision::Refused(UNKNOWN_LOGIN_REASON.into()),
+        Some(Role::Pending) => BandDecision::Refused(PENDING_REASON.into()),
+        Some(Role::Main | Role::Contributor) => band_of(&s, my_login.unwrap_or_default().trim()),
+    }
+}
+
+const PENDING_REASON: &str = "waiting for the owner to approve your join request";
+const UNKNOWN_LOGIN_REASON: &str = "GitHub login of this install is unknown - save the token again";
+
+/// The decision for a repo of the local DB: reads the shared state, the
+/// working-tree structure file and this install's login.
+pub fn bug_band_for_repo(db: &AppDb, repo_id: i64) -> BandDecision {
+    let state = match db.get_shared_state(repo_id) {
+        Ok(s) => s,
+        Err(e) => return BandDecision::Refused(e.to_string()),
+    };
+    let repo = match db.get_repository(repo_id) {
+        Ok(r) => r,
+        Err(e) => return BandDecision::Refused(e.to_string()),
+    };
+    let structure = match (repo.local_path.as_deref(), repo.github_name.as_deref()) {
+        (Some(path), Some(name)) if !path.trim().is_empty() => {
+            read_structure_file(Path::new(path), name)
+        }
+        _ => Ok(None),
+    };
+    decide_band(
+        structure,
+        state.shared_mode,
+        state.shared_role.as_deref(),
+        db.github_login().as_deref(),
+    )
+}
+
+/// Allocate the number of a new bug of `repo_id`: the plain counter for a repo
+/// that is not shared, the next free id of this install's band otherwise.
+pub fn allocate_bug_numeric_id(db: &AppDb, repo_id: i64) -> Result<i64, String> {
+    match bug_band_for_repo(db, repo_id) {
+        BandDecision::Unbanded => db.next_numeric_id(repo_id).map_err(|e| e.to_string()),
+        BandDecision::Band(lo, hi) => db
+            .next_numeric_id_in_band(repo_id, lo, hi)
+            .map_err(|e| e.to_string())?
+            .map_err(|full| full.to_string()),
+        BandDecision::Refused(reason) => Err(reason),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Join requests
 // ---------------------------------------------------------------------------
 
@@ -2119,5 +2220,250 @@ mod tests {
         ] {
             assert!(kept.exists(), "{}", kept.display());
         }
+    }
+
+    // ----- bug number bands (R12) -------------------------------------------
+
+    fn ok(s: ProjectStructure) -> Result<Option<ProjectStructure>, String> {
+        Ok(Some(s))
+    }
+
+    #[test]
+    fn decide_band_not_shared_is_unbanded() {
+        assert_eq!(
+            decide_band(Ok(None), false, None, Some("owner")),
+            BandDecision::Unbanded
+        );
+        assert_eq!(
+            decide_band(Ok(None), false, None, None),
+            BandDecision::Unbanded
+        );
+    }
+
+    #[test]
+    fn decide_band_shared_mode_without_file_is_main_band() {
+        assert_eq!(
+            decide_band(Ok(None), true, None, Some("owner")),
+            BandDecision::Band(1, 499_999)
+        );
+        assert_eq!(
+            decide_band(Ok(None), true, Some("main"), Some("owner")),
+            BandDecision::Band(1, 499_999)
+        );
+    }
+
+    #[test]
+    fn decide_band_cached_role_without_file() {
+        assert_eq!(
+            decide_band(Ok(None), false, Some("pending"), Some("helper")),
+            BandDecision::Refused(PENDING_REASON.into())
+        );
+        assert!(matches!(
+            decide_band(Ok(None), false, Some("contributor"), Some("helper")),
+            BandDecision::Refused(r) if r.contains("sync the project")
+        ));
+    }
+
+    #[test]
+    fn decide_band_with_structure_by_role() {
+        let mut s = sample();
+        s.participants = vec![participant("Helper", 500_000), participant("two", 600_000)];
+        assert_eq!(
+            decide_band(ok(s.clone()), true, None, Some("OWNER")),
+            BandDecision::Band(1, 499_999)
+        );
+        assert_eq!(
+            decide_band(ok(s.clone()), false, None, Some("helper")),
+            BandDecision::Band(500_000, 599_999)
+        );
+        assert_eq!(
+            decide_band(ok(s.clone()), false, None, Some(" two ")),
+            BandDecision::Band(600_000, 699_999)
+        );
+        assert_eq!(
+            decide_band(ok(s.clone()), false, None, Some("stranger")),
+            BandDecision::Refused(PENDING_REASON.into())
+        );
+        assert_eq!(
+            decide_band(ok(s.clone()), false, None, None),
+            BandDecision::Refused(UNKNOWN_LOGIN_REASON.into())
+        );
+        assert_eq!(
+            decide_band(ok(s), false, None, Some("  ")),
+            BandDecision::Refused(UNKNOWN_LOGIN_REASON.into())
+        );
+    }
+
+    #[test]
+    fn decide_band_untrusted_structure_is_refused_with_the_reason() {
+        let d = decide_band(
+            Err("main is not the repo owner".into()),
+            true,
+            None,
+            Some("owner"),
+        );
+        assert!(matches!(d, BandDecision::Refused(r) if r.contains("main is not the repo owner")));
+    }
+
+    /// Repo `github_name` in the DB with a working tree at `root`.
+    fn repo_at(db: &AppDb, github_name: &str, root: &Path) -> i64 {
+        let id = local_repo(db, github_name);
+        db.set_repo_local_path(id, Some(root.to_str().unwrap()))
+            .unwrap();
+        id
+    }
+
+    fn seed_numeric(db: &AppDb, repo_id: i64, nid: i64) {
+        db.insert_bug(
+            repo_id,
+            nid,
+            "2026-03-29T00:00:00Z",
+            "seed",
+            "minor",
+            "other",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bug_band_for_repo_branches_with_real_files() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_db();
+        db.set_setting("github_login", "Owner").unwrap();
+        let rid = repo_at(&db, "Owner/web", tmp.path());
+
+        // not shared, no file
+        assert_eq!(bug_band_for_repo(&db, rid), BandDecision::Unbanded);
+        // shared mode on, file not written yet
+        db.set_shared_mode(rid, true).unwrap();
+        assert_eq!(bug_band_for_repo(&db, rid), BandDecision::Band(1, 499_999));
+
+        // file written, main
+        let mut s = sample();
+        s.participants.push(participant("helper", 500_000));
+        write_structure_if_changed(tmp.path(), &s).unwrap();
+        assert_eq!(bug_band_for_repo(&db, rid), BandDecision::Band(1, 499_999));
+
+        // the same install as a contributor
+        db.set_setting("github_login", "helper").unwrap();
+        assert_eq!(
+            bug_band_for_repo(&db, rid),
+            BandDecision::Band(500_000, 599_999)
+        );
+        // a login that is not in the structure
+        db.set_setting("github_login", "stranger").unwrap();
+        assert_eq!(
+            bug_band_for_repo(&db, rid),
+            BandDecision::Refused(PENDING_REASON.into())
+        );
+        // login unknown
+        db.set_setting("github_login", "").unwrap();
+        assert_eq!(
+            bug_band_for_repo(&db, rid),
+            BandDecision::Refused(UNKNOWN_LOGIN_REASON.into())
+        );
+    }
+
+    #[test]
+    fn bug_band_for_repo_file_wins_over_cleared_shared_mode() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_db();
+        db.set_setting("github_login", "owner").unwrap();
+        let rid = repo_at(&db, "Owner/web", tmp.path());
+        write_structure_if_changed(tmp.path(), &sample()).unwrap();
+        // shared_mode off, but the file is there: still banded
+        assert_eq!(bug_band_for_repo(&db, rid), BandDecision::Band(1, 499_999));
+    }
+
+    #[test]
+    fn bug_band_for_repo_refuses_a_foreign_structure() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_db();
+        db.set_setting("github_login", "owner").unwrap();
+        // the repo is owned by someone else than main.login of the file
+        let rid = repo_at(&db, "Mallory/web", tmp.path());
+        write_structure_if_changed(tmp.path(), &sample()).unwrap();
+        assert!(matches!(
+            bug_band_for_repo(&db, rid),
+            BandDecision::Refused(r) if r.contains("main is not the repo owner")
+        ));
+        // garbage file
+        fs::write(tmp.path().join(".sdh/project.json"), "nope").unwrap();
+        assert!(matches!(
+            bug_band_for_repo(&db, rid),
+            BandDecision::Refused(r) if r.contains("not trusted")
+        ));
+    }
+
+    #[test]
+    fn bug_band_for_repo_without_local_path_uses_the_cached_state_only() {
+        let db = make_db();
+        let rid = local_repo(&db, "Owner/web");
+        assert_eq!(bug_band_for_repo(&db, rid), BandDecision::Unbanded);
+        db.set_shared_mode(rid, true).unwrap();
+        assert_eq!(bug_band_for_repo(&db, rid), BandDecision::Band(1, 499_999));
+    }
+
+    #[test]
+    fn allocate_bug_numeric_id_unshared_uses_plain_counter() {
+        let db = make_db();
+        let rid = local_repo(&db, "Owner/web");
+        assert_eq!(allocate_bug_numeric_id(&db, rid), Ok(1));
+        seed_numeric(&db, rid, 500_001);
+        // no sharing: the old behaviour, untouched
+        assert_eq!(allocate_bug_numeric_id(&db, rid), Ok(500_002));
+    }
+
+    #[test]
+    fn allocate_bug_numeric_id_main_stays_below_imported_helper_bugs() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_db();
+        db.set_setting("github_login", "Owner").unwrap();
+        let rid = repo_at(&db, "Owner/web", tmp.path());
+        let mut s = sample();
+        s.participants.push(participant("helper", 500_000));
+        write_structure_if_changed(tmp.path(), &s).unwrap();
+        seed_numeric(&db, rid, 35);
+        seed_numeric(&db, rid, 500_001);
+        assert_eq!(allocate_bug_numeric_id(&db, rid), Ok(36));
+    }
+
+    #[test]
+    fn allocate_bug_numeric_id_helper_counts_in_its_own_band() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_helper_db();
+        let rid = repo_at(&db, "Owner/web", tmp.path());
+        let mut s = sample();
+        s.participants.push(participant("helper", 500_000));
+        write_structure_if_changed(tmp.path(), &s).unwrap();
+        // the owner's bugs were imported
+        seed_numeric(&db, rid, 35);
+        assert_eq!(allocate_bug_numeric_id(&db, rid), Ok(500_000));
+        seed_numeric(&db, rid, 500_000);
+        assert_eq!(allocate_bug_numeric_id(&db, rid), Ok(500_001));
+    }
+
+    #[test]
+    fn allocate_bug_numeric_id_refusals_and_full_band() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_helper_db();
+        let rid = repo_at(&db, "Owner/web", tmp.path());
+        write_structure_if_changed(tmp.path(), &sample()).unwrap();
+        // helper is not approved yet
+        assert_eq!(
+            allocate_bug_numeric_id(&db, rid),
+            Err(PENDING_REASON.to_string())
+        );
+
+        let mut s = sample();
+        s.participants.push(participant("helper", 500_000));
+        write_structure_if_changed(tmp.path(), &s).unwrap();
+        seed_numeric(&db, rid, 599_999);
+        let err = allocate_bug_numeric_id(&db, rid).unwrap_err();
+        assert!(err.contains("B-500000..B-599999"), "{}", err);
     }
 }

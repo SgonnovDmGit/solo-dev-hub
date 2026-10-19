@@ -3,6 +3,23 @@
 
 use super::*;
 
+/// Every id of a participant's number band is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandFull {
+    pub lo: i64,
+    pub hi: i64,
+}
+
+impl std::fmt::Display for BandFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the bug number range B-{:06}..B-{:06} of this install is full",
+            self.lo, self.hi
+        )
+    }
+}
+
 impl AppDb {
     // ── Bugs (v0.16.0, SQLite = SoT) ──────────────────────────────────────────
 
@@ -16,6 +33,31 @@ impl AppDb {
             |row| row.get(0),
         )?;
         Ok(next)
+    }
+
+    /// Next numeric_id for a new bug inside the inclusive band `lo..=hi` (F-000044:
+    /// each participant of a shared repo owns its own id band). Only ids inside
+    /// the band count, so an imported bug from another band never moves the
+    /// counter. An empty band starts at `lo`; `Err(BandFull)` when the next id
+    /// would pass `hi`.
+    pub fn next_numeric_id_in_band(
+        &self,
+        repo_id: i64,
+        lo: i64,
+        hi: i64,
+    ) -> SqlResult<Result<i64, BandFull>> {
+        let conn = self.conn.lock().unwrap();
+        let next: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(numeric_id), ?2 - 1) + 1 FROM bugs
+             WHERE repository_id = ?1 AND numeric_id BETWEEN ?2 AND ?3",
+            rusqlite::params![repo_id, lo, hi],
+            |row| row.get(0),
+        )?;
+        Ok(if next > hi {
+            Err(BandFull { lo, hi })
+        } else {
+            Ok(next)
+        })
     }
 
     /// Insert a new bug row. `numeric_id` is pre-computed by caller via `next_numeric_id`
@@ -613,6 +655,89 @@ mod tests {
         seed_bug(&db, r1, "2026-03-29", "minor", "ui_ux", 0, "created");
         assert_eq!(db.next_numeric_id(r2).unwrap(), 1);
         assert_eq!(db.next_numeric_id(r1).unwrap(), 3);
+    }
+
+    fn seed_numeric(db: &AppDb, repo_id: i64, nid: i64) {
+        db.insert_bug(
+            repo_id,
+            nid,
+            "2026-03-29T00:00:00Z",
+            "seed",
+            "minor",
+            "other",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_next_numeric_id_in_band_empty_starts_at_lo() {
+        let db = make_db();
+        let rid = make_repo(&db);
+        assert_eq!(db.next_numeric_id_in_band(rid, 1, 499_999).unwrap(), Ok(1));
+        assert_eq!(
+            db.next_numeric_id_in_band(rid, 500_000, 599_999).unwrap(),
+            Ok(500_000)
+        );
+    }
+
+    #[test]
+    fn test_next_numeric_id_in_band_ignores_ids_of_other_bands() {
+        let db = make_db();
+        let rid = make_repo(&db);
+        seed_numeric(&db, rid, 35);
+        seed_numeric(&db, rid, 500_001); // imported from a helper
+                                         // main keeps counting below its ceiling even though MAX is 500_001
+        assert_eq!(db.next_numeric_id_in_band(rid, 1, 499_999).unwrap(), Ok(36));
+        // the plain counter would have jumped to the helper's band
+        assert_eq!(db.next_numeric_id(rid).unwrap(), 500_002);
+        // a helper band with nothing in it starts at its lo; with one id, +1
+        assert_eq!(
+            db.next_numeric_id_in_band(rid, 600_000, 699_999).unwrap(),
+            Ok(600_000)
+        );
+        assert_eq!(
+            db.next_numeric_id_in_band(rid, 500_000, 599_999).unwrap(),
+            Ok(500_002)
+        );
+    }
+
+    #[test]
+    fn test_next_numeric_id_in_band_is_per_repo() {
+        let db = make_db();
+        let r1 = make_repo(&db);
+        let r2 = db
+            .upsert_repository("owner/other-repo", None, None, None, None, None)
+            .unwrap()
+            .id;
+        seed_numeric(&db, r1, 7);
+        assert_eq!(db.next_numeric_id_in_band(r2, 1, 499_999).unwrap(), Ok(1));
+    }
+
+    #[test]
+    fn test_next_numeric_id_in_band_full_is_an_error() {
+        let db = make_db();
+        let rid = make_repo(&db);
+        seed_numeric(&db, rid, 499_999);
+        let full = db
+            .next_numeric_id_in_band(rid, 1, 499_999)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(full, BandFull { lo: 1, hi: 499_999 });
+        assert!(full.to_string().contains("B-000001..B-499999"));
+        // the last free id is still handed out
+        let r2 = db
+            .upsert_repository("owner/other-repo", None, None, None, None, None)
+            .unwrap()
+            .id;
+        seed_numeric(&db, r2, 499_998);
+        assert_eq!(
+            db.next_numeric_id_in_band(r2, 1, 499_999).unwrap(),
+            Ok(499_999)
+        );
     }
 
     #[test]
