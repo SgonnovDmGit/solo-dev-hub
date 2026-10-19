@@ -50,6 +50,9 @@ pub enum SyncIssueCode {
     PeerChannelFailed,
     /// Two writers left different versions of one item. subject = item, target = the sides.
     VersionConflict,
+    /// Two repos handed back different texts of one rule (skill). subject = skill,
+    /// target = the sides. Resolved in the app: Settings -> AI rules.
+    RuleConflict,
     /// A `.impl.md` auto-close of REQ pairs failed. subject = counterpart.
     ReqAutoCloseFailed,
     /// A one-time folder/file migration failed or was left alone. subject = what.
@@ -379,6 +382,7 @@ mod tests {
             (SyncIssueCode::ManagedFileFailed, "managed_file_failed"),
             (SyncIssueCode::PeerChannelFailed, "peer_channel_failed"),
             (SyncIssueCode::VersionConflict, "version_conflict"),
+            (SyncIssueCode::RuleConflict, "rule_conflict"),
             (SyncIssueCode::ReqAutoCloseFailed, "req_auto_close_failed"),
             (SyncIssueCode::MigrationFailed, "migration_failed"),
             (
@@ -410,6 +414,7 @@ mod tests {
             ManagedFileFailed,
             PeerChannelFailed,
             VersionConflict,
+            RuleConflict,
             ReqAutoCloseFailed,
             MigrationFailed,
             MigrationLeftInPlace,
@@ -423,9 +428,9 @@ mod tests {
             match code {
                 CopyFailed | NoLocalPath | RootMissing | RenameCollision | RenameReplayFailed
                 | LookupFailed | MissingCounterpart | ManagedFileFailed | PeerChannelFailed
-                | VersionConflict | ReqAutoCloseFailed | MigrationFailed | MigrationLeftInPlace
-                | MigrationDiverged | AutocommitFailed | RuleUnknownSkill | RuleHeld
-                | RuleFailed => {}
+                | VersionConflict | RuleConflict | ReqAutoCloseFailed | MigrationFailed
+                | MigrationLeftInPlace | MigrationDiverged | AutocommitFailed
+                | RuleUnknownSkill | RuleHeld | RuleFailed => {}
             }
         }
         all

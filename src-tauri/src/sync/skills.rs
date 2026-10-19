@@ -205,7 +205,7 @@ const APPROVED_SUFFIX: &str = ".approved";
 const CONFLICT_SUFFIX: &str = ".conflict";
 
 /// T-000206: separator of the repo labels of a conflict — in its `conflict`
-/// event and in the `VersionConflict` target. For display only: the sides a
+/// event and in the `RuleConflict` target. For display only: the sides a
 /// conflict is decided on are its stored repo ids, never these labels.
 const CONFLICT_REPOS_SEPARATOR: &str = ", ";
 
@@ -590,7 +590,7 @@ fn close_conflict(
 ///
 /// - **open** — no conflict was open before this pass: the row is opened with
 ///   the repo ids of the sides, a `conflict` event names them, and one
-///   `VersionConflict` reports it. This is the only pass that reports it.
+///   `RuleConflict` reports it. This is the only pass that reports it.
 /// - **quiet** — it was open already: listed in `quiet_conflicts`, no report.
 ///   A repo that joined since is added to the stored sides (sides only grow
 ///   while the conflict lives) and a new `conflict` event shows it joined.
@@ -618,7 +618,7 @@ fn record_conflict(
             }
             out.record(db, name, rule_event::CONFLICT, Some(&labels), None);
             out.errors
-                .push(SyncIssue::new(SyncIssueCode::VersionConflict, name).target(labels));
+                .push(SyncIssue::new(SyncIssueCode::RuleConflict, name).target(labels));
         }
         Some(OpenConflict { sides: Ok(sides) }) => {
             out.quiet_conflicts.push(name.to_string());
@@ -1553,12 +1553,7 @@ mod tests {
 
         assert!(taken.is_empty(), "nothing is taken up on a conflict");
         assert_eq!(errors.len(), 1);
-        assert_eq!(
-            errors[0].code,
-            SyncIssueCode::VersionConflict,
-            "{}",
-            errors[0]
-        );
+        assert_eq!(errors[0].code, SyncIssueCode::RuleConflict, "{}", errors[0]);
         assert_eq!(errors[0].subject, "sdh-alpha");
         assert_eq!(
             db.get_template_file("_global", "skill.sdh-alpha.md.tmpl")
@@ -1805,7 +1800,7 @@ mod tests {
             .count()
     }
 
-    /// The conflict used to fire a `VersionConflict` toast, plus a `RuleHeld`
+    /// The conflict used to fire a `RuleConflict` toast, plus a `RuleHeld`
     /// line per held copy, on EVERY sync, and lived nowhere else. Now the pass
     /// that opens it reports it in full, records it, and leaves each agent a
     /// note; every later pass keeps quiet about it.
@@ -1818,7 +1813,7 @@ mod tests {
         let first = refresh_rules(&db, Some(home.path()), RenderScope::Everywhere, None);
 
         assert_eq!(
-            count(&first.errors, SyncIssueCode::VersionConflict, "sdh-alpha"),
+            count(&first.errors, SyncIssueCode::RuleConflict, "sdh-alpha"),
             1,
             "{:?}",
             first.errors
@@ -1851,7 +1846,7 @@ mod tests {
         let second = refresh_rules(&db, Some(home.path()), RenderScope::Everywhere, None);
 
         assert_eq!(
-            count(&second.errors, SyncIssueCode::VersionConflict, "sdh-alpha"),
+            count(&second.errors, SyncIssueCode::RuleConflict, "sdh-alpha"),
             0,
             "{:?}",
             second.errors
@@ -2081,7 +2076,7 @@ mod tests {
         let conflict: Vec<_> = first
             .errors
             .iter()
-            .filter(|e| e.code == SyncIssueCode::VersionConflict)
+            .filter(|e| e.code == SyncIssueCode::RuleConflict)
             .collect();
         assert_eq!(conflict.len(), 1, "{:?}", first.errors);
         assert_eq!(
@@ -2184,7 +2179,7 @@ mod tests {
         assert!(
             c.errors
                 .iter()
-                .all(|e| e.code != SyncIssueCode::VersionConflict),
+                .all(|e| e.code != SyncIssueCode::RuleConflict),
             "{:?}",
             c.errors
         );
@@ -2245,7 +2240,7 @@ mod tests {
             again
                 .errors
                 .iter()
-                .filter(|e| e.code == SyncIssueCode::VersionConflict)
+                .filter(|e| e.code == SyncIssueCode::RuleConflict)
                 .count(),
             1,
             "{:?}",

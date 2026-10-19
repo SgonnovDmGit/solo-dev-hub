@@ -1453,19 +1453,9 @@ mod tests {
         let first = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
         let second = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
 
-        assert_eq!(
-            count(&first, Code::VersionConflict),
-            1,
-            "{:?}",
-            first.errors
-        );
+        assert_eq!(count(&first, Code::RuleConflict), 1, "{:?}", first.errors);
         assert_eq!(count(&first, Code::RuleHeld), 2, "{:?}", first.errors);
-        assert_eq!(
-            count(&second, Code::VersionConflict),
-            0,
-            "{:?}",
-            second.errors
-        );
+        assert_eq!(count(&second, Code::RuleConflict), 0, "{:?}", second.errors);
         assert_eq!(count(&second, Code::RuleHeld), 0, "{:?}", second.errors);
         for dir in &dirs {
             assert!(dir

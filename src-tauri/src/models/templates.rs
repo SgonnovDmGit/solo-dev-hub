@@ -58,7 +58,7 @@ pub struct RulesRefresh {
     pub repos: usize,
     /// T-000206: skills whose hand-back conflict was already open before this
     /// pass. It was reported once, when it opened; a repeat is not reported
-    /// again — neither as `VersionConflict` nor as `RuleHeld` for its held
+    /// again — neither as `RuleConflict` nor as `RuleHeld` for its held
     /// copies — so a conflict no longer fires a toast on every sync.
     #[serde(default)]
     pub quiet_conflicts: Vec<String>,
