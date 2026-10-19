@@ -21,50 +21,42 @@
 {#if $toasts.length > 0}
   <div class="toast-container" role="status" aria-live="polite">
     {#each $toasts as toast (toast.id)}
-      {#if toast.type === 'error' || toast.type === 'warning'}
-        <!-- B-000027: errors/warnings are persistent, selectable, copyable and
-             scroll when long — a plain <button> made the text unselectable and
-             dismissed on any click, so a long error could not be read/copied. -->
-        <div class="toast toast-{toast.type} toast-persistent">
-          <span class="toast-message selectable">{toast.message}</span>
-          <div class="toast-tools">
-            <button
-              class="toast-tool"
-              onclick={() => copyToast(toast.id, toast.message)}
-              title={copiedId === toast.id ? $tStore('toast.copied') : $tStore('toast.copy')}
-              aria-label={$tStore('toast.copy')}
-            >
-              {copiedId === toast.id ? '✓' : '⧉'}
-            </button>
-            <button
-              class="toast-tool"
-              onclick={() => dismissToast(toast.id)}
-              title={$tStore('toast.dismiss')}
-              aria-label={$tStore('toast.dismiss')}
-            >
-              ×
-            </button>
-          </div>
+      <!-- B-000027: every toast has selectable text, a copy button and a close
+           button; clicking the text never dismisses. Error/warning toasts also
+           stretch full-width (see .toast-persistent) for long messages. -->
+      <div
+        class="toast toast-{toast.type}"
+        class:toast-persistent={toast.type === 'error' || toast.type === 'warning'}
+      >
+        <span class="toast-message selectable">{toast.message}</span>
+        <div class="toast-tools">
+          <button
+            class="toast-tool"
+            onclick={() => copyToast(toast.id, toast.message)}
+            title={copiedId === toast.id ? $tStore('toast.copied') : $tStore('toast.copy')}
+            aria-label={$tStore('toast.copy')}
+          >
+            {copiedId === toast.id ? '✓' : '⧉'}
+          </button>
+          <button
+            class="toast-tool"
+            onclick={() => dismissToast(toast.id)}
+            title={$tStore('toast.dismiss')}
+            aria-label={$tStore('toast.dismiss')}
+          >
+            ×
+          </button>
         </div>
-      {:else}
-        <button
-          class="toast toast-{toast.type}"
-          onclick={() => dismissToast(toast.id)}
-          title={$tStore('toast.clickToDismiss')}
-        >
-          <span class="toast-message">{toast.message}</span>
-          <span class="toast-close" aria-hidden="true">×</span>
-        </button>
-      {/if}
+      </div>
     {/each}
   </div>
 {/if}
 
 <style>
   .toast-container {
-    /* B-000027: container spans the full width at the bottom. Transient
-       success/info toasts hug the right (flex-end); persistent error/warning
-       toasts override to stretch full-width (see .toast-persistent). */
+    /* B-000027: container spans the full width at the bottom. Other
+       toasts hug the right (flex-end); error/warning toasts override to
+       stretch full-width (see .toast-persistent). */
     position: fixed;
     bottom: 16px;
     left: 16px;
@@ -84,7 +76,7 @@
     padding: 10px 14px;
     border-radius: 4px;
     border: none;
-    cursor: pointer;
+    cursor: default;
     font-size: 13px;
     font-family: inherit;
     font-weight: 400;
@@ -96,20 +88,11 @@
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
   }
 
-  .toast:hover {
-    opacity: 0.9;
-  }
-
-  /* B-000027: persistent errors/warnings are non-dismiss-on-click divs AND span
-     the full bottom width, so long messages get horizontal room instead of
-     wrapping in a narrow 460px column. */
+  /* B-000027: persistent errors/warnings span the full bottom width, so long
+     messages get horizontal room instead of wrapping in a narrow 460px column. */
   .toast-persistent {
-    cursor: default;
     align-self: stretch;
     max-width: none;
-  }
-  .toast-persistent:hover {
-    opacity: 1;
   }
 
   .toast-success {
@@ -132,7 +115,7 @@
     flex: 1;
   }
 
-  /* B-000027: long errors are readable (scroll) and selectable (copy by hand). */
+  /* B-000027: long messages are readable (scroll) and selectable (copy by hand). */
   .toast-message.selectable {
     user-select: text;
     cursor: text;
@@ -166,10 +149,4 @@
     background: rgba(255, 255, 255, 0.18);
   }
 
-  .toast-close {
-    font-size: 16px;
-    line-height: 1;
-    opacity: 0.8;
-    flex-shrink: 0;
-  }
 </style>
