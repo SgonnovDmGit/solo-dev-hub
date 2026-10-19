@@ -11,6 +11,7 @@ pub mod fs;
 pub mod gitattributes;
 pub mod gitignore;
 pub mod managed_block;
+pub mod merge_by_id;
 pub mod peer_channels;
 pub mod project_md;
 pub mod project_sync;

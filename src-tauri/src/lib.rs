@@ -4,6 +4,7 @@ mod export;
 mod git_ops;
 mod git_sync;
 mod keyring_store;
+mod merge_driver;
 mod models;
 mod sync;
 mod template_meta;
@@ -45,6 +46,14 @@ fn get_db_path() -> PathBuf {
 mod commands;
 
 // ── App entry point ───────────────────────────────────────────────────────────
+
+/// F-000044 / T-000218: `main` calls this FIRST. When git invoked us as a merge
+/// driver (`--merge-driver O A B P`) it does the merge and returns the exit
+/// code; no database, keyring, window or Tauri runtime is touched. `None`
+/// means a normal launch.
+pub fn merge_driver_entry(args: Vec<String>) -> Option<i32> {
+    merge_driver::run_from_args(&args)
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
