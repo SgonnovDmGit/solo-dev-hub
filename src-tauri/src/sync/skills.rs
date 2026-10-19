@@ -4,7 +4,7 @@
 // (`<repo>/docs/sdh_skills/<name>.md`). Single source -> two render targets.
 
 use crate::db::{conflict_note, rule_event, AppDb};
-use crate::models::{lookup, Repository, RulesRefresh, SyncIssue, SyncIssueCode};
+use crate::models::{lookup, Repository, RuleConflictSide, RulesRefresh, SyncIssue, SyncIssueCode};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -759,7 +759,9 @@ fn take_up(db: &AppDb, name: String, copies: &[HandedCopy], out: &mut Collected)
 /// **Order matters and is the whole trap.** This must run before any render pass
 /// touches these repos: the render overwrites unconditionally, so rendering
 /// first destroys the edit at the exact moment it was about to be collected.
-/// That is why it is private and reached only through `refresh_rules`.
+/// That is why it is private and reached only through `refresh_rules_locked`
+/// (and `refresh_rules`, which takes the lock around it) or, at launch, through
+/// `deliver_rules_at_startup`, which collects before it seeds.
 ///
 /// The pass, in order:
 /// 1. read the conflicts open before it (`read_open_conflicts`);
@@ -814,6 +816,142 @@ fn collect_approved_skill_edits(
         }
     }
     out.sorted()
+}
+
+/// T-000206: the error of `resolve_conflict` when the rule has no open
+/// conflict (it was decided meanwhile). The frontend matches the string.
+pub const ERR_CONFLICT_GONE: &str = "rule_conflict_gone";
+/// T-000206: the error of `resolve_conflict` when the side to accept is no
+/// longer there — its marker was removed or its copy is unreadable.
+pub const ERR_CONFLICT_SIDE_GONE: &str = "rule_conflict_side_gone";
+
+/// T-000206: the markers of one rule across the portfolio, as they are on disk
+/// right now.
+#[derive(Debug, Default)]
+struct LiveConflict {
+    /// Sides whose copy could be read, sorted by label.
+    sides: Vec<RuleConflictSide>,
+    /// Every marker of the rule, readable copy or not — all of them are cleared
+    /// when the conflict is decided.
+    markers: Vec<PathBuf>,
+}
+
+/// Read the markers of `rule` in every repo of `repos`. Nothing is written. A
+/// side whose copy cannot be read is left out of `sides` (the screen has
+/// nothing to show for it) but its marker is still listed, so deciding the
+/// conflict clears it too.
+fn live_conflict(repos: &[Repository], rule: &str) -> LiveConflict {
+    let mut live = LiveConflict::default();
+    for scan in repos.iter().filter_map(scan_repo_markers) {
+        for marker in scan.markers.iter().filter(|m| m.name == rule) {
+            live.markers.push(marker.path.clone());
+            let content = match fs::read_to_string(scan.dir.join(&marker.stem)) {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!(
+                        "[skills] {}: {} unreadable, left out of the conflict view: {}",
+                        scan.label, marker.stem, e
+                    );
+                    continue;
+                }
+            };
+            live.sides.push(RuleConflictSide {
+                repo: scan.label.clone(),
+                marked_at: fs::metadata(&marker.path)
+                    .and_then(|m| m.modified())
+                    .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+                    .unwrap_or_default(),
+                note: fs::read_to_string(&marker.path)
+                    .ok()
+                    .map(|note| note.trim().to_string())
+                    .filter(|note| !note.is_empty()),
+                content,
+            });
+        }
+    }
+    live.sides.sort_by(|a, b| a.repo.cmp(&b.repo));
+    live
+}
+
+/// T-000206: the sides of the hand-back conflict on `rule`, read live from the
+/// portfolio — what the owner chooses between. Under the rules lock, so a
+/// collection cannot clear a marker halfway through the read.
+pub fn conflict_sides(db: &AppDb, rule: &str) -> Result<Vec<RuleConflictSide>, String> {
+    let _guard = rules_guard();
+    let repos = db
+        .list_repos_with_local_path(None)
+        .map_err(|e| e.to_string())?;
+    Ok(live_conflict(&repos, rule).sides)
+}
+
+/// T-000206: the owner decides the open conflict on `rule`, all under ONE hold
+/// of the rules lock so no collection runs between the steps.
+///
+/// `accept` = the label of the side whose text becomes the rule; `None`
+/// rejects every side and leaves the text as it is. Then, in this order:
+/// 1. the accepted text is stored as a custom rule;
+/// 2. every approval marker of the rule is cleared across the portfolio;
+/// 3. the conflict is closed (`close_conflict`): row gone, `conflict_resolved`
+///    recorded — with the label when a side was accepted, which makes it the
+///    rule's origin — and the reason files removed;
+/// 4. the rule is delivered everywhere, with `rule` as the settings edit: a
+///    marker that could not be cleared in step 2 is superseded, not taken.
+///
+/// Errors are the two `ERR_*` codes (checked before anything is touched) or a
+/// failed store of the accepted text. Past that point the decision is made: a
+/// step that fails is reported in the returned report's errors and the
+/// remaining steps still run, as in every other pass.
+///
+/// A conflict closes even when the live scan finds no side at all (markers
+/// removed by hand, checkouts gone): the owner must be able to clear a state
+/// the portfolio can no longer explain.
+pub fn resolve_conflict(
+    db: &AppDb,
+    claude_dir: Option<&Path>,
+    rule: &str,
+    accept: Option<&str>,
+) -> Result<RulesRefresh, String> {
+    let _guard = rules_guard();
+    let open = db.open_rule_conflicts().map_err(|e| e.to_string())?;
+    if !open.contains(rule) {
+        return Err(ERR_CONFLICT_GONE.to_string());
+    }
+    let mut early = RulesRefresh::default();
+    let repos = portfolio_repos(db, &mut early);
+    let live = live_conflict(&repos, rule);
+    let accepted = match accept {
+        Some(label) => Some(
+            live.sides
+                .iter()
+                .find(|side| side.repo == label)
+                .ok_or_else(|| ERR_CONFLICT_SIDE_GONE.to_string())?,
+        ),
+        None => None,
+    };
+
+    if let Some(side) = accepted {
+        let file_name = format!("{}{}{}", SKILL_PREFIX, rule, SKILL_SUFFIX);
+        db.upsert_template_file("_global", &file_name, &side.content, true)
+            .map_err(|e| e.to_string())?;
+    }
+    let mut out = Collected::default();
+    for marker in &live.markers {
+        if let Err(e) = remove_if_present(marker) {
+            out.rule_failed(rule, marker.display().to_string(), e);
+        }
+    }
+    let (repo, note) = match accepted {
+        Some(side) => (Some(side.repo.as_str()), conflict_note::ACCEPTED),
+        None => (None, conflict_note::REJECTED_BY_OWNER),
+    };
+    close_conflict(db, &repos, rule, repo, note, &mut out);
+
+    let mut report = refresh_rules_locked(db, claude_dir, RenderScope::Everywhere, Some(rule));
+    let mut errors = early.errors;
+    errors.extend(out.errors);
+    errors.append(&mut report.errors);
+    report.errors = errors;
+    Ok(report)
 }
 
 /// What a `refresh_rules` pass renders when nothing was taken up. An uptake
@@ -871,6 +1009,26 @@ pub(crate) fn refresh_rules_locked(
     let everywhere = !report.taken.is_empty();
     render_scope(db, claude_dir, scope, everywhere, &repos, &mut report);
     report
+}
+
+/// T-000174: the checkout of `repo` on THIS machine — `None` without a local
+/// path or when the directory is not there. The one predicate for "a rule is
+/// rendered into this repo": the render and the Rules screen's repo count both
+/// follow it, so the number shown is the number written to.
+pub(crate) fn existing_checkout(repo: &Repository) -> Option<&Path> {
+    let base = Path::new(repo.local_path.as_deref()?);
+    base.is_dir().then_some(base)
+}
+
+/// T-000174: how many repos a rule reaches (`existing_checkout`).
+pub fn count_render_targets(db: &AppDb) -> Result<usize, String> {
+    let repos = db
+        .list_repos_with_local_path(None)
+        .map_err(|e| e.to_string())?;
+    Ok(repos
+        .iter()
+        .filter(|repo| existing_checkout(repo).is_some())
+        .count())
 }
 
 /// Every repo with a local path — what a collection covers. A failed listing
@@ -957,7 +1115,8 @@ impl RulesRefresh {
 /// (automatic solely for projects opted into auto-sync). An agreed rule could
 /// therefore sit undelivered for days while agents kept working off the old text.
 ///
-/// Private since T-000207: reached only through `refresh_rules`, which collects
+/// Private since T-000207: reached only through `render_scope`, from
+/// `refresh_rules_locked` and `deliver_rules_at_startup`, both of which collect
 /// the hand-backs in `repos` before this overwrites them.
 ///
 /// Returns `(skills, repos, errors)`. Errors are per-target and non-fatal: one
@@ -979,16 +1138,12 @@ fn render_skills_everywhere(
     };
     let mut touched = 0;
     for repo in repos {
-        let Some(path) = repo.local_path.as_deref() else {
-            continue;
-        };
-        let base = Path::new(path);
         // A stored local_path can point at a checkout that only exists on
         // another machine. That is normal portfolio state, not a failure —
-        // skip it silently rather than drowning the real errors.
-        if !base.is_dir() {
+        // skipped silently rather than drowning the real errors.
+        let Some(base) = existing_checkout(repo) else {
             continue;
-        }
+        };
         // T-000198: the same label the project-sync skeleton pass uses, so a
         // held copy seen by both renders of one pass is reported once.
         let label = rule_copy_label(repo);
@@ -2006,7 +2161,7 @@ mod tests {
     #[test]
     fn test_a_repo_joining_an_open_conflict_is_recorded_quietly() {
         let db = db_with_skill();
-        let _dirs = conflict_of(&db, 2);
+        let dirs = conflict_of(&db, 2);
         collect_approved_skill_edits(&db, &portfolio(&db), None);
         let third = TempDir::new().unwrap();
         insert_repo(&db, "acme/r2", &third.path().to_string_lossy());
@@ -2039,14 +2194,25 @@ mod tests {
         );
         assert!(reason_file(&third, "sdh-alpha").exists());
 
-        // The newcomer is a side now: left out of a pass, it blocks closing.
-        fs::remove_file(third.path().join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap();
+        // The join pass stored the newcomer as a side.
+        let stored = db.list_rule_conflicts().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            crate::db::parse_conflict_repo_ids(&stored[0].1).unwrap(),
+            portfolio(&db).iter().map(|r| r.id).collect::<BTreeSet<_>>(),
+            "the join pass recorded r0, r1 and r2 as the sides"
+        );
+
+        // The newcomer is a side now: the other two give up, but a pass that
+        // leaves it out has not seen it, so it must not close the conflict.
+        drop_out(&dirs[0]);
+        drop_out(&dirs[1]);
         let without: Vec<Repository> = portfolio(&db)
             .into_iter()
             .filter(|r| r.github_name.as_deref() != Some("acme/r2"))
             .collect();
-        let dirs_left = collect_approved_skill_edits(&db, &without, None);
-        assert_eq!(dirs_left.quiet_conflicts, vec!["sdh-alpha".to_string()]);
+        let c = collect_approved_skill_edits(&db, &without, None);
+        assert_conflict_still_open(&db, &c.taken, &c.quiet_conflicts, &third, "VERSION 2");
     }
 
     /// Once closed, a conflict that comes back is a new one: reported in full.

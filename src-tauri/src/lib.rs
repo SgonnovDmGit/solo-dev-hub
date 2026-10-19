@@ -227,6 +227,10 @@ pub fn run() {
             commands::templates::save_template_file,
             commands::templates::reset_template_file,
             commands::templates::take_startup_rules_report,
+            commands::templates::list_rules,
+            commands::templates::list_rule_events,
+            commands::templates::get_rule_conflict,
+            commands::templates::resolve_rule_conflict,
             // Deploy (0.7.0 / v0.18.0 multi-env)
             commands::deploy::set_deploy_target,
             commands::deploy::get_repo_deploy_config,

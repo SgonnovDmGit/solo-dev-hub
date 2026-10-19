@@ -47,6 +47,10 @@ pub mod conflict_note {
     /// The conflict vanished on its own — a marker was removed, or the texts
     /// became equal — before anyone decided it in the app.
     pub const RESOLVED_OUTSIDE: &str = "resolved outside the app";
+    /// The owner picked one side in the app: that side's text is now the rule.
+    pub const ACCEPTED: &str = "accepted by the owner";
+    /// The owner rejected every side in the app: the rule's text stayed as it was.
+    pub const REJECTED_BY_OWNER: &str = "rejected by the owner";
 }
 
 /// T-000206: `rule_conflicts.repo_ids` — the sides of a conflict as a JSON

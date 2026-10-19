@@ -91,6 +91,54 @@ pub struct RuleEvent {
     pub created_at: String,
 }
 
+/// T-000174: one workflow rule as the Rules screen lists it. A rule is a skill
+/// or the global CLAUDE.md section — see `sync::rule_name_of`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct RuleInfo {
+    /// `sdh-*` skill name, or `claude.md.global`.
+    pub rule: String,
+    /// The `_global` template file that stores it.
+    pub file_name: String,
+    /// The text in force.
+    pub content: String,
+    /// The text bundled with this build. `None` when the bundle has no such file.
+    pub canon: Option<String>,
+    /// The text differs from `canon` — not the same as `is_custom`, which stays
+    /// set after the owner saves text that happens to equal the bundle.
+    pub changed: bool,
+    /// The rule has an open hand-back conflict.
+    pub conflict: bool,
+    /// Where the text came from (`db::rules::latest_origin_event`); `None` when
+    /// it predates the history.
+    pub origin: Option<RuleEvent>,
+}
+
+/// T-000174: the Rules screen's whole listing.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct RulesOverview {
+    /// The global CLAUDE.md section first, then the skills alphabetically.
+    pub rules: Vec<RuleInfo>,
+    /// Repos a rule is delivered to: those with a local checkout that exists on
+    /// this machine.
+    pub repos: usize,
+}
+
+/// T-000206: one side of a hand-back conflict, read live from a repo's
+/// `docs/sdh_skills/`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct RuleConflictSide {
+    /// `rule_copy_label` of the repo. Also the key `resolve_rule_conflict`
+    /// accepts a side by.
+    pub repo: String,
+    /// The approval marker's modification time, RFC 3339. Empty when the
+    /// filesystem would not say.
+    pub marked_at: String,
+    /// The approval line the agent put in the marker, trimmed.
+    pub note: Option<String>,
+    /// The handed-back text.
+    pub content: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TemplateLanguage {
     pub language_key: String,

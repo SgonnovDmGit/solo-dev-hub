@@ -73,6 +73,13 @@ fn save_template_file_in(
     file_name: &str,
     content: &str,
 ) -> Result<TemplateSaveOutcome, String> {
+    // T-000174: a rule save is read-old-text, write, record, deliver — one
+    // step as far as every other pass is concerned. Held across all of it, so
+    // an auto-sync cannot slip between the write and the event and leave the
+    // origin history disagreeing with the stored text. An ordinary template
+    // needs no lock. `after_rule_write` runs the unlocked delivery
+    // (`refresh_rules_locked`); the lock is not re-entrant.
+    let _guard = rule_of(language_key, file_name).map(|_| sync::rules_guard());
     // T-000206: a save of the very text already stored changes nothing, so it
     // is no event of the rule's history. Compared before the write, which is
     // what replaces the old text. An unreadable old row counts as a change:
@@ -118,6 +125,10 @@ fn rule_of<'a>(language_key: &str, file_name: &'a str) -> Option<&'a str> {
 ///
 /// The global CLAUDE.md section is recorded but not rendered — it goes out
 /// through its own sync button.
+///
+/// **The caller holds `sync::rules_guard()`** for a rule (T-000174): the write,
+/// the event and the delivery are one hold, and the delivery therefore calls
+/// `refresh_rules_locked`.
 fn after_rule_write(
     db: &AppDb,
     home: Option<PathBuf>,
@@ -154,14 +165,25 @@ fn after_rule_write(
     // portfolio are collected before this render overwrites them. A pending
     // hand-back of THIS skill is superseded: the owner's explicit edit wins.
     let claude_dir = home.map(|h| h.join(".claude"));
-    let rules = sync::refresh_rules(
+    let rules = sync::refresh_rules_locked(
         db,
         claude_dir.as_deref(),
         sync::RenderScope::Everywhere,
         Some(skill_name),
     );
+    rendered_outcome(rules, errors, claude_dir.is_none())
+}
+
+/// The outcome of a delivery to the whole portfolio: `errors` first, then the
+/// pass's own, plus the missing home directory when `~/.claude` was not
+/// reachable. Shared by a rule write and a conflict resolution.
+fn rendered_outcome(
+    rules: RulesRefresh,
+    mut errors: Vec<SyncIssue>,
+    home_missing: bool,
+) -> TemplateSaveOutcome {
     errors.extend(rules.errors);
-    if claude_dir.is_none() {
+    if home_missing {
         errors.push(SyncIssue::lookup(lookup::HOME_DIR, ""));
     }
     TemplateSaveOutcome {
@@ -173,6 +195,85 @@ fn after_rule_write(
         lost: rules.lost,
         superseded: rules.superseded,
     }
+}
+
+// ── Rules screen (T-000174, T-000206) ───────────────────────────────────────
+
+/// Every workflow rule with its status. Async: reads the filesystem to count
+/// the repos a rule reaches.
+#[tauri::command(async)]
+pub fn list_rules(db: State<AppDb>) -> Result<RulesOverview, String> {
+    list_rules_in(&db)
+}
+
+/// The global CLAUDE.md section first, then the skills alphabetically.
+fn list_rules_in(db: &AppDb) -> Result<RulesOverview, String> {
+    let files = db
+        .list_template_files("_global")
+        .map_err(|e| e.to_string())?;
+    let conflicts = db.open_rule_conflicts().map_err(|e| e.to_string())?;
+    let mut rules = Vec::new();
+    for file in files {
+        let Some(rule) = sync::rule_name_of(&file.file_name).map(str::to_string) else {
+            continue;
+        };
+        let canon = template_seeder::bundled_file_content("_global", &file.file_name);
+        rules.push(RuleInfo {
+            // Text against the bundle, not `is_custom`: a save of text equal to
+            // the bundle leaves the flag set but changes nothing.
+            changed: canon.as_deref().is_some_and(|canon| canon != file.content),
+            conflict: conflicts.contains(&rule),
+            origin: db.latest_origin_event(&rule).map_err(|e| e.to_string())?,
+            canon,
+            file_name: file.file_name,
+            content: file.content,
+            rule,
+        });
+    }
+    rules.sort_by(|a, b| {
+        (a.rule != sync::GLOBAL_SECTION_RULE, &a.rule)
+            .cmp(&(b.rule != sync::GLOBAL_SECTION_RULE, &b.rule))
+    });
+    Ok(RulesOverview {
+        rules,
+        repos: sync::count_render_targets(db)?,
+    })
+}
+
+/// A rule's history, newest first.
+#[tauri::command]
+pub fn list_rule_events(db: State<AppDb>, rule: String) -> Result<Vec<RuleEvent>, String> {
+    db.list_rule_events(&rule).map_err(|e| e.to_string())
+}
+
+/// The sides of a rule's hand-back conflict, read live from the repos.
+#[tauri::command(async)]
+pub fn get_rule_conflict(db: State<AppDb>, rule: String) -> Result<Vec<RuleConflictSide>, String> {
+    sync::conflict_sides(&db, &rule)
+}
+
+/// The owner decides a conflict: `accept` = the label of the side to take,
+/// `None` = reject both. Errors `rule_conflict_gone` / `rule_conflict_side_gone`
+/// are matched by the frontend. Async: delivers to the whole portfolio.
+#[tauri::command(async)]
+pub fn resolve_rule_conflict(
+    db: State<AppDb>,
+    rule: String,
+    accept: Option<String>,
+) -> Result<TemplateSaveOutcome, String> {
+    resolve_rule_conflict_in(&db, dirs::home_dir(), &rule, accept.as_deref())
+}
+
+/// The body of `resolve_rule_conflict`, home injected like the save's.
+fn resolve_rule_conflict_in(
+    db: &AppDb,
+    home: Option<PathBuf>,
+    rule: &str,
+    accept: Option<&str>,
+) -> Result<TemplateSaveOutcome, String> {
+    let claude_dir = home.map(|h| h.join(".claude"));
+    let rules = sync::resolve_conflict(db, claude_dir.as_deref(), rule, accept)?;
+    Ok(rendered_outcome(rules, Vec::new(), claude_dir.is_none()))
 }
 
 /// T-000207: what the startup rule delivery found, held until the frontend has
@@ -215,6 +316,8 @@ fn reset_template_file_in(
 ) -> Result<TemplateSaveOutcome, String> {
     let bundled = template_seeder::bundled_file_content(language_key, file_name)
         .ok_or_else(|| format!("No bundled default for {}/{}", language_key, file_name))?;
+    // T-000174: same hold as a save — see `save_template_file_in`.
+    let _guard = rule_of(language_key, file_name).map(|_| sync::rules_guard());
     db.upsert_template_file(language_key, file_name, &bundled, false)
         .map_err(|e| e.to_string())?;
     Ok(after_rule_write(
@@ -642,6 +745,85 @@ mod tests {
         }
     }
 
+    /// T-000174: the DB write and the history event of a rule save/reset run
+    /// under the rules lock, like the collection they precede. Without it an
+    /// auto-sync could interleave between the write and the event, and the
+    /// recorded origin would disagree with the stored text. Held from outside
+    /// here: the operation must not touch the rule until the lock is free.
+    #[test]
+    fn test_saving_or_resetting_a_rule_waits_for_the_rules_lock() {
+        use std::time::Duration;
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let stored = || {
+            db.get_template_file("_global", "skill.sdh-retro.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content
+        };
+        let bundle = stored();
+        let events = || db.list_rule_events("sdh-retro").unwrap().len();
+
+        let guard = sync::rules_guard();
+        std::thread::scope(|s| {
+            let save = s.spawn(|| {
+                save_template_file_in(
+                    &db,
+                    Some(home.path().to_path_buf()),
+                    "_global",
+                    "skill.sdh-retro.md.tmpl",
+                    "OWNER TEXT",
+                )
+                .unwrap()
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(stored() == bundle, "the save wrote before it had the lock");
+            assert_eq!(events(), 0);
+            drop(guard);
+            save.join().unwrap();
+        });
+        assert_eq!(stored(), "OWNER TEXT");
+        assert_eq!(events(), 1);
+
+        let guard = sync::rules_guard();
+        std::thread::scope(|s| {
+            let reset = s.spawn(|| {
+                reset_template_file_in(
+                    &db,
+                    Some(home.path().to_path_buf()),
+                    "_global",
+                    "skill.sdh-retro.md.tmpl",
+                )
+                .unwrap()
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(stored(), "OWNER TEXT", "the reset wrote before the lock");
+            assert_eq!(events(), 1);
+            drop(guard);
+            reset.join().unwrap();
+        });
+        assert!(stored() == bundle);
+        assert_eq!(events(), 2);
+    }
+
+    /// An ordinary template is no rule: it never waits for the rules lock.
+    #[test]
+    fn test_saving_an_ordinary_template_does_not_wait_for_the_rules_lock() {
+        let (db, _db_dir) = seeded();
+        let _guard = sync::rules_guard();
+        std::thread::scope(|s| {
+            let save = s.spawn(|| {
+                save_template_file_in(&db, None, "_global", ".gitignore.tmpl", "custom").unwrap()
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                save.is_finished(),
+                "an ordinary save blocked on the rules lock"
+            );
+            save.join().unwrap();
+        });
+    }
+
     /// Saving the text that is already stored changes nothing, so it is not an
     /// event of the rule's history either.
     #[test]
@@ -711,5 +893,336 @@ mod tests {
             template_seeder::bundled_file_content("_global", "skill.sdh-retro.md.tmpl").unwrap()
         );
         assert!(failed(&reset), "{:?}", reset.errors);
+    }
+
+    // ── Rules screen: listing and deciding a conflict ────────────────────────
+
+    const SKILL: &str = "sdh-debugging";
+
+    fn skills_dir(dir: &TempDir) -> PathBuf {
+        dir.path().join("docs/sdh_skills")
+    }
+
+    fn rule_row(db: &AppDb) -> TemplateFile {
+        db.get_template_file("_global", "skill.sdh-debugging.md.tmpl")
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Two local repos, each handing back its own text of `SKILL`, and a pass
+    /// that opens the conflict. Returns the checkouts, their labels (a
+    /// local-only repo is labelled by its path) and the texts they handed back.
+    fn open_conflict(db: &AppDb) -> (Vec<TempDir>, Vec<String>, Vec<String>) {
+        let dirs = vec![TempDir::new().unwrap(), TempDir::new().unwrap()];
+        let mut labels = Vec::new();
+        let mut texts = Vec::new();
+        for (i, dir) in dirs.iter().enumerate() {
+            let path = dir.path().to_string_lossy().to_string();
+            db.insert_local_repository(&path, &format!("r{}", i), None, None)
+                .unwrap();
+            sync::render_skills_to_repo(db, dir.path()).unwrap();
+            texts.push(hand_back_edit(dir.path(), SKILL));
+            labels.push(path);
+        }
+        sync::refresh_rules(db, None, sync::RenderScope::UptakeOnly, None);
+        assert!(db.open_rule_conflicts().unwrap().contains(SKILL));
+        (dirs, labels, texts)
+    }
+
+    fn resolutions(db: &AppDb) -> Vec<RuleEvent> {
+        rule_history(db, SKILL)
+            .into_iter()
+            .filter(|e| e.kind == rule_event::CONFLICT_RESOLVED)
+            .collect()
+    }
+
+    /// Accepting a side makes its text the rule, everywhere, and the history
+    /// names the side as the text's origin.
+    #[test]
+    fn test_accepting_a_conflict_side_makes_its_text_the_rule_everywhere() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let (dirs, labels, texts) = open_conflict(&db);
+
+        let outcome = resolve_rule_conflict_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            SKILL,
+            Some(&labels[1]),
+        )
+        .unwrap();
+
+        let row = rule_row(&db);
+        assert_eq!(row.content, texts[1]);
+        assert!(row.is_custom);
+        for dir in &dirs {
+            assert!(!skills_dir(dir).join("sdh-debugging.md.approved").exists());
+            assert!(!skills_dir(dir).join("sdh-debugging.md.conflict").exists());
+            assert_eq!(
+                fs::read_to_string(skills_dir(dir).join("sdh-debugging.md")).unwrap(),
+                texts[1],
+                "every copy carries the accepted text"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(home.path().join(".claude/skills/sdh-debugging/SKILL.md")).unwrap(),
+            texts[1]
+        );
+        let resolved = resolutions(&db);
+        assert_eq!(resolved.len(), 1, "{:?}", resolved);
+        assert_eq!(resolved[0].repo.as_deref(), Some(labels[1].as_str()));
+        assert_eq!(resolved[0].note.as_deref(), Some(conflict_note::ACCEPTED));
+        assert_eq!(db.latest_origin_event(SKILL).unwrap().unwrap(), resolved[0]);
+        assert!(db.open_rule_conflicts().unwrap().is_empty());
+        assert!(outcome.rendered);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(outcome.taken.is_empty() && outcome.lost.is_empty());
+    }
+
+    /// Rejecting every side leaves the rule alone and puts it back in every copy.
+    #[test]
+    fn test_rejecting_a_conflict_keeps_the_rule_and_restores_the_copies() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let (dirs, _labels, _texts) = open_conflict(&db);
+        let before = rule_row(&db);
+
+        let outcome =
+            resolve_rule_conflict_in(&db, Some(home.path().to_path_buf()), SKILL, None).unwrap();
+
+        let row = rule_row(&db);
+        assert_eq!(row.content, before.content);
+        assert_eq!(row.is_custom, before.is_custom);
+        for dir in &dirs {
+            assert!(!skills_dir(dir).join("sdh-debugging.md.approved").exists());
+            assert!(!skills_dir(dir).join("sdh-debugging.md.conflict").exists());
+            assert_eq!(
+                fs::read_to_string(skills_dir(dir).join("sdh-debugging.md")).unwrap(),
+                before.content,
+                "both hand-backs are overwritten by the rule"
+            );
+        }
+        let resolved = resolutions(&db);
+        assert_eq!(resolved.len(), 1, "{:?}", resolved);
+        assert_eq!(resolved[0].repo, None);
+        assert_eq!(
+            resolved[0].note.as_deref(),
+            Some(conflict_note::REJECTED_BY_OWNER)
+        );
+        assert!(
+            db.latest_origin_event(SKILL).unwrap().is_none(),
+            "a rejection writes no text, so it is no origin"
+        );
+        assert!(db.open_rule_conflicts().unwrap().is_empty());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    }
+
+    /// Nothing open to decide, or a side that is not there any more: refused
+    /// by an exact code, with nothing touched.
+    #[test]
+    fn test_deciding_a_conflict_that_is_gone_or_a_side_that_is_gone_touches_nothing() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let (dirs, labels, texts) = open_conflict(&db);
+        let resolve = |rule: &str, accept: Option<&str>| {
+            resolve_rule_conflict_in(&db, Some(home.path().to_path_buf()), rule, accept)
+        };
+        let untouched = || {
+            assert!(db.open_rule_conflicts().unwrap().contains(SKILL));
+            assert!(resolutions(&db).is_empty());
+            for (dir, text) in dirs.iter().zip(&texts) {
+                assert!(skills_dir(dir).join("sdh-debugging.md.approved").exists());
+                assert!(skills_dir(dir).join("sdh-debugging.md.conflict").exists());
+                assert_eq!(
+                    &fs::read_to_string(skills_dir(dir).join("sdh-debugging.md")).unwrap(),
+                    text
+                );
+            }
+            assert!(!rule_row(&db).is_custom);
+            assert!(!home.path().join(".claude").exists(), "nothing rendered");
+        };
+
+        // A rule with no open conflict, accepting or rejecting.
+        assert_eq!(
+            resolve("sdh-retro", None).unwrap_err(),
+            "rule_conflict_gone"
+        );
+        assert_eq!(
+            resolve("sdh-retro", Some(&labels[0])).unwrap_err(),
+            "rule_conflict_gone"
+        );
+        untouched();
+
+        // A label no marker carries.
+        assert_eq!(
+            resolve(SKILL, Some("nobody/nothing")).unwrap_err(),
+            "rule_conflict_side_gone"
+        );
+        untouched();
+
+        // A side whose marker went away between the screen and the click.
+        fs::remove_file(skills_dir(&dirs[0]).join("sdh-debugging.md.approved")).unwrap();
+        assert_eq!(
+            resolve(SKILL, Some(&labels[0])).unwrap_err(),
+            "rule_conflict_side_gone"
+        );
+        assert!(db.open_rule_conflicts().unwrap().contains(SKILL));
+        assert!(!rule_row(&db).is_custom);
+        assert!(resolutions(&db).is_empty());
+    }
+
+    /// An open row with no marker left anywhere (removed by hand, checkouts
+    /// gone) must still be closable, or the screen is stuck on it for good.
+    #[test]
+    fn test_a_conflict_with_no_live_side_can_still_be_rejected() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        db.open_rule_conflict(SKILL, &std::collections::BTreeSet::from([41, 42]))
+            .unwrap();
+
+        resolve_rule_conflict_in(&db, Some(home.path().to_path_buf()), SKILL, None).unwrap();
+
+        assert!(db.open_rule_conflicts().unwrap().is_empty());
+        let resolved = resolutions(&db);
+        assert_eq!(resolved.len(), 1, "{:?}", resolved);
+        assert_eq!(
+            resolved[0].note.as_deref(),
+            Some(conflict_note::REJECTED_BY_OWNER)
+        );
+    }
+
+    /// The Rules screen reads the sides from the repos, not from the stored row:
+    /// label, when, what the agent wrote, and the text itself.
+    #[test]
+    fn test_the_conflict_view_lists_both_sides_with_their_notes_and_texts() {
+        let (db, _db_dir) = seeded();
+        let dirs = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        let mut labels = Vec::new();
+        for (i, dir) in dirs.iter().enumerate() {
+            let path = dir.path().to_string_lossy().to_string();
+            db.insert_local_repository(&path, &format!("r{}", i), None, None)
+                .unwrap();
+            sync::render_skills_to_repo(&db, dir.path()).unwrap();
+            labels.push(path);
+        }
+        crate::sync::skills::test_support::hand_back(
+            &skills_dir(&dirs[0]),
+            SKILL,
+            "TEXT ZERO",
+            "  approved in chat \n",
+        );
+        crate::sync::skills::test_support::hand_back(&skills_dir(&dirs[1]), SKILL, "TEXT ONE", "");
+
+        let sides = sync::conflict_sides(&db, SKILL).unwrap();
+
+        let mut expected = vec![
+            (labels[0].clone(), Some("approved in chat"), "TEXT ZERO"),
+            (labels[1].clone(), None, "TEXT ONE"),
+        ];
+        expected.sort();
+        let got: Vec<_> = sides
+            .iter()
+            .map(|s| (s.repo.clone(), s.note.as_deref(), s.content.as_str()))
+            .collect();
+        assert_eq!(got, expected, "sorted by label");
+        for side in &sides {
+            chrono::DateTime::parse_from_rfc3339(&side.marked_at).expect("an RFC 3339 time");
+        }
+        assert!(
+            sync::conflict_sides(&db, "sdh-retro").unwrap().is_empty(),
+            "markers of other skills are not sides of this one"
+        );
+    }
+
+    fn add_checkout(db: &AppDb, path: &str, name: &str) {
+        db.insert_local_repository(path, name, None, None).unwrap();
+    }
+
+    /// The listing: the global section first, then the skills alphabetically;
+    /// `changed` is the text against the bundle, never the `is_custom` flag.
+    #[test]
+    fn test_listing_rules_orders_them_and_compares_the_text_with_the_bundle() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+
+        let fresh = list_rules_in(&db).unwrap();
+
+        assert_eq!(fresh.rules[0].rule, "claude.md.global");
+        assert_eq!(fresh.rules[0].file_name, "claude.md.global.tmpl");
+        let skills: Vec<&str> = fresh.rules[1..].iter().map(|r| r.rule.as_str()).collect();
+        assert!(skills.len() > 1);
+        assert!(skills.iter().all(|s| s.starts_with("sdh-")));
+        let mut sorted = skills.clone();
+        sorted.sort();
+        assert_eq!(skills, sorted);
+        for rule in &fresh.rules {
+            assert!(!rule.changed && !rule.conflict, "{}", rule.rule);
+            assert_eq!(rule.canon.as_deref(), Some(rule.content.as_str()));
+            assert_eq!(rule.origin, None);
+        }
+
+        // A row marked custom that holds exactly the bundled text is unchanged.
+        let canon =
+            template_seeder::bundled_file_content("_global", "skill.sdh-retro.md.tmpl").unwrap();
+        save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "skill.sdh-retro.md.tmpl",
+            &canon,
+        )
+        .unwrap();
+        save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "skill.sdh-debugging.md.tmpl",
+            "OWNER TEXT",
+        )
+        .unwrap();
+
+        let listed = list_rules_in(&db).unwrap();
+        let get = |name: &str| listed.rules.iter().find(|r| r.rule == name).unwrap();
+        assert!(
+            db.get_template_file("_global", "skill.sdh-retro.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .is_custom
+        );
+        assert!(!get("sdh-retro").changed, "custom flag is not a change");
+        assert!(get("sdh-debugging").changed);
+        assert_eq!(get("sdh-debugging").content, "OWNER TEXT");
+        assert_eq!(
+            get("sdh-debugging").canon.as_deref(),
+            Some(
+                template_seeder::bundled_file_content("_global", "skill.sdh-debugging.md.tmpl")
+                    .unwrap()
+                    .as_str()
+            )
+        );
+        let origin = get("sdh-debugging").origin.as_ref().unwrap();
+        assert_eq!(origin.kind, "saved");
+        assert_eq!(get("claude.md.global").origin, None);
+    }
+
+    /// The conflict flag, and the repo count: only checkouts that exist on this
+    /// machine are delivered to, so only those are counted.
+    #[test]
+    fn test_listing_rules_flags_conflicts_and_counts_existing_checkouts_only() {
+        let (db, _db_dir) = seeded();
+        let (_dirs, _labels, _texts) = open_conflict(&db);
+        let elsewhere = TempDir::new().unwrap().path().join("not-on-this-machine");
+        add_checkout(&db, &elsewhere.to_string_lossy(), "elsewhere");
+
+        let listed = list_rules_in(&db).unwrap();
+
+        let flagged: Vec<&str> = listed
+            .rules
+            .iter()
+            .filter(|r| r.conflict)
+            .map(|r| r.rule.as_str())
+            .collect();
+        assert_eq!(flagged, vec![SKILL]);
+        assert_eq!(listed.repos, 2, "the missing checkout is not counted");
     }
 }

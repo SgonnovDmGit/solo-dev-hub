@@ -1,5 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { TemplateFile, TemplateLanguage, TemplateSaveOutcome, RulesRefresh } from '$lib/types';
+import type {
+  TemplateFile,
+  TemplateLanguage,
+  TemplateSaveOutcome,
+  RulesRefresh,
+  RulesOverview,
+  RuleEvent,
+  RuleConflictSide,
+} from '$lib/types';
 
 
 // ── Templates (0.6.0) ─────────────────────────────────────────────────────────
@@ -29,4 +37,26 @@ export async function resetTemplateFile(languageKey: string, fileName: string): 
 /** T-000207: what the startup rule delivery found — returned once, then cleared. */
 export async function takeStartupRulesReport(): Promise<RulesRefresh | null> {
   return invoke<RulesRefresh | null>('take_startup_rules_report');
+}
+
+/** T-000174: every workflow rule with its status, plus how many repos receive them. */
+export async function listRules(): Promise<RulesOverview> {
+  return invoke<RulesOverview>('list_rules');
+}
+
+/** T-000174: a rule's history, newest first. */
+export async function listRuleEvents(rule: string): Promise<RuleEvent[]> {
+  return invoke<RuleEvent[]>('list_rule_events', { rule });
+}
+
+/** T-000206: the sides of a hand-back conflict, read live from the repos. */
+export async function getRuleConflict(rule: string): Promise<RuleConflictSide[]> {
+  return invoke<RuleConflictSide[]>('get_rule_conflict', { rule });
+}
+
+/** T-000206: decide a conflict. `accept` = a side's `repo` label to take its text;
+ *  null rejects every side. Rejects with `rule_conflict_gone` (nothing open) or
+ *  `rule_conflict_side_gone` (that side no longer exists). */
+export async function resolveRuleConflict(rule: string, accept: string | null): Promise<TemplateSaveOutcome> {
+  return invoke<TemplateSaveOutcome>('resolve_rule_conflict', { rule, accept });
 }
