@@ -8,6 +8,7 @@ import {
 } from '$lib/api/tauri-commands';
 import { fetchAuthenticatedLogin } from '$lib/api/github';
 import { addToast } from './ui';
+import { githubLogin, refreshShared } from './shared';
 import { t, tf, initLocale } from '$lib/i18n';
 import {
   uiScaleMode,
@@ -96,7 +97,13 @@ async function ensureGithubLogin(token: string): Promise<void> {
   try {
     if (await getSetting('github_login')) return;
     const login = await fetchAuthenticatedLogin(token);
-    if (login) await setSetting('github_login', login);
+    if (login) {
+      await setSetting('github_login', login);
+      // The owner's switch and the contributor view depend on the login: show
+      // them now, not after the next sync.
+      githubLogin.set(login);
+      void refreshShared();
+    }
   } catch {
     /* offline or token rejected: retried on the next start */
   }

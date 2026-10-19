@@ -11,7 +11,7 @@ import {
   myBandLabel,
   parseMergeDetail,
   parseRejectedDetail,
-  isDevBranchChangedReason,
+  parseDevBranchChanged,
   describeSharedStatus,
   fillParams,
   sidebarBadge,
@@ -127,11 +127,14 @@ describe('status details', () => {
     expect(parseRejectedDetail('GH006 plain')).toBeNull();
   });
 
-  it('recognises a changed dev branch reason', () => {
-    expect(isDevBranchChangedReason('.sdh/project.json: dev branch changed from dev to next')).toBe(true);
-    expect(isDevBranchChangedReason('origin/dev: dev branch changed from dev to next')).toBe(true);
-    expect(isDevBranchChangedReason('main is not the repo owner')).toBe(false);
-    expect(isDevBranchChangedReason(null)).toBe(false);
+  it('parses the coded dev branch change', () => {
+    expect(parseDevBranchChanged('dev_branch_changed:dev→next')).toEqual({ pin: 'dev', next: 'next' });
+    expect(parseDevBranchChanged('dev_branch_changed:a/b→c-d')).toEqual({ pin: 'a/b', next: 'c-d' });
+    // the old English text no longer counts
+    expect(parseDevBranchChanged('.sdh/project.json: dev branch changed from dev to next')).toBeNull();
+    expect(parseDevBranchChanged('dev_branch_changed:nodelimiter')).toBeNull();
+    expect(parseDevBranchChanged('main is not the repo owner')).toBeNull();
+    expect(parseDevBranchChanged(null)).toBeNull();
   });
 });
 
@@ -192,17 +195,23 @@ describe('describeSharedStatus', () => {
     expect(p.severity).toBe('info');
   });
 
-  it('offers to accept a changed dev branch only for that untrusted reason', () => {
+  it('offers to accept a changed dev branch only for that untrusted code', () => {
     const changed = describeSharedStatus(
-      state({ shared_status: 'shared_untrusted', shared_status_detail: '.sdh/project.json: dev branch changed from dev to next' }),
+      state({ shared_status: 'shared_untrusted', shared_status_detail: 'dev_branch_changed:dev→next' }),
     )!;
     expect(changed.action).toBe('accept_branch');
-    expect(changed.params).toEqual(['.sdh/project.json: dev branch changed from dev to next']);
+    expect(changed.textKey).toBe('shared.status.devBranchChanged');
+    expect(changed.params).toEqual(['dev', 'next']);
     const other = describeSharedStatus(
       state({ shared_status: 'shared_untrusted', shared_status_detail: 'main is not the repo owner' }),
     )!;
     expect(other.action).toBeNull();
     expect(other.textKey).toBe('shared.status.untrusted');
+    // the English wording of an old backend does not unlock the button
+    const legacy = describeSharedStatus(
+      state({ shared_status: 'shared_untrusted', shared_status_detail: 'origin/dev: dev branch changed from dev to next' }),
+    )!;
+    expect(legacy.action).toBeNull();
   });
 
   it('shows a code of a newer backend rather than hiding it', () => {

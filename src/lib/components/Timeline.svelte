@@ -3,7 +3,7 @@
   import { tStore, locale } from '$lib/i18n';
   import { readTimeline, getRepoStructure } from '$lib/api/tauri-commands';
   import { sharedStates, githubLogin } from '$lib/stores/shared';
-  import { sameLogin } from '$lib/utils/shared-mode';
+  import { sameLogin, isSharedRepo } from '$lib/utils/shared-mode';
   import { allRepos } from '$lib/stores/repos';
   import { selectedRepoId, currentScreen, timelineInitialRepoIds } from '$lib/stores/ui';
   import { get } from 'svelte/store';
@@ -38,9 +38,12 @@
     if (fresh.length > 0) knownAuthors = [...knownAuthors, ...fresh].sort((a, b) => a.localeCompare(b));
   }
 
-  async function seedAuthorsFromStructures() {
-    for (const [repoId, st] of $sharedStates) {
-      if (!st.shared_mode && st.shared_role === null) continue;
+  // The author filter exists only where a repo is shared.
+  const hasSharedRepos = $derived([...$sharedStates.values()].some((st) => isSharedRepo(st)));
+
+  async function seedAuthorsFromStructures(states: Map<number, import('$lib/types').RepoSharedState>) {
+    for (const [repoId, st] of states) {
+      if (!isSharedRepo(st)) continue;
       try {
         const s = await getRepoStructure(repoId);
         if (s) rememberAuthors([s.main.login, ...s.participants.map((p) => p.login)]);
@@ -97,7 +100,6 @@
   }
 
   onMount(() => {
-    void seedAuthorsFromStructures();
     // v0.22.0 (T-000056): consume transient repo-filter from RecentActivityFeed
     // deep-link. The $effect below will pick up the assignment and fire
     // loadFirstPage once — no explicit call needed (M3 review-fix: previous
@@ -108,6 +110,16 @@
       selectedRepos = initRepoIds;
       timelineInitialRepoIds.set(null);  // one-shot: clear after consume
     }
+  });
+
+  // Re-seed the logins whenever the shared repos change (a sync, a new role).
+  $effect(() => {
+    void seedAuthorsFromStructures($sharedStates);
+  });
+
+  // No shared repo left: an author filter would hide events for nothing.
+  $effect(() => {
+    if (!hasSharedRepos && authorFilter !== 'all') authorFilter = 'all';
   });
 
   let filterChangeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -256,7 +268,7 @@
       </div>
     </details>
 
-    {#if $githubLogin || knownAuthors.length > 0}
+    {#if hasSharedRepos}
       <label class="author-filter">
         <span>{$tStore('timeline.filter.author' as any)}:</span>
         <select bind:value={authorFilter}>

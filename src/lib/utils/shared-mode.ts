@@ -109,13 +109,20 @@ function parseObject(detail: string | null | undefined): Record<string, unknown>
   }
 }
 
+/** Start of the `shared_untrusted` detail when the owner's dev branch changed (backend `DEV_BRANCH_CHANGED_PREFIX`). */
+export const DEV_BRANCH_CHANGED_PREFIX = 'dev_branch_changed:';
+
 /**
- * The reason of `shared_untrusted` is a changed dev branch of the owner
- * ("... dev branch changed from X to Y", text of the backend's
- * `discover_structure`): then the contributor may accept the new branch.
+ * `shared_untrusted` detail `dev_branch_changed:<pin>→<new>`: the owner's dev
+ * branch differs from the pinned one. Then the contributor may accept the new
+ * branch.
  */
-export function isDevBranchChangedReason(reason: string | null | undefined): boolean {
-  return /dev branch changed/i.test(reason ?? '');
+export function parseDevBranchChanged(detail: string | null | undefined): { pin: string; next: string } | null {
+  if (!detail || !detail.startsWith(DEV_BRANCH_CHANGED_PREFIX)) return null;
+  const rest = detail.slice(DEV_BRANCH_CHANGED_PREFIX.length);
+  const at = rest.indexOf('\u2192');
+  if (at < 0) return null;
+  return { pin: rest.slice(0, at), next: rest.slice(at + 1) };
 }
 
 export type StatusAction = 'merge' | 'accept_branch';
@@ -166,15 +173,12 @@ export function describeSharedStatus(
       return line(code, 'warn', '⚠', 'shared.status.noOwnBranch', [], null);
     case 'pending_approval':
       return line(code, 'info', '⏳', 'shared.status.pendingApproval', [ownerLogin ?? '?'], null);
-    case 'shared_untrusted':
-      return line(
-        code,
-        'error',
-        '✕',
-        'shared.status.untrusted',
-        [detail ?? '?'],
-        isDevBranchChangedReason(detail) ? 'accept_branch' : null,
-      );
+    case 'shared_untrusted': {
+      const changed = parseDevBranchChanged(detail);
+      return changed
+        ? line(code, 'error', '✕', 'shared.status.devBranchChanged', [changed.pin, changed.next], 'accept_branch')
+        : line(code, 'error', '✕', 'shared.status.untrusted', [detail ?? '?'], null);
+    }
     case 'shared_no_login':
       return line(code, 'warn', '⚠', 'shared.status.noLogin', [], null);
     default:

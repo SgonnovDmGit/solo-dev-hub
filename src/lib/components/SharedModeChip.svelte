@@ -2,6 +2,7 @@
   // F-000044 / T-000223 (frames 1 and 3): the owner's "Общий режим" switch with
   // its enable dialog (preflight, public-repo warning, blocking .gitignore
   // lines) and the switch-off confirmation.
+  import { onDestroy } from 'svelte';
   import { tStore } from '$lib/i18n';
   import { pat } from '$lib/stores/settings';
   import { addToast } from '$lib/stores/ui';
@@ -27,6 +28,13 @@
 
   let { repoId, repoName, githubName, devBranch, checked, onPreflightErrors, onChanged }: Props = $props();
 
+  // The card may be switched to another repo while a check is in flight: the
+  // answer of the old one must not open a dialog or set errors on the new one.
+  let alive = true;
+  onDestroy(() => {
+    alive = false;
+  });
+
   let busy = $state(false);
   let showEnable = $state(false);
   let showDisable = $state(false);
@@ -49,6 +57,7 @@
     onPreflightErrors([]);
     try {
       const pre = await sharedModePreflight(repoId);
+      if (!alive) return;
       const problems: string[] = [];
       if (pre.missing_project) problems.push($tStore('shared.preflight.missingProject' as any));
       if (pre.missing_dev_branch) problems.push($tStore('shared.preflight.missingDevBranch' as any));
@@ -58,9 +67,10 @@
       }
       blockingLines = pre.blocking_lines;
       isPublic = await checkPublic();
+      if (!alive) return;
       showEnable = true;
     } catch (err) {
-      addToast($tStore('shared.preflight.failed' as any).replace('{0}', String(err)), 'error');
+      if (alive) addToast($tStore('shared.preflight.failed' as any).replace('{0}', String(err)), 'error');
     } finally {
       busy = false;
     }

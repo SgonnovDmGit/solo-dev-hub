@@ -76,6 +76,8 @@
   );
   let structure = $state<ProjectStructure | null>(null);
   let joinRequests = $state<JoinRequest[]>([]);
+  // The repo `structure` and `joinRequests` were loaded for; null while loading.
+  let sharedDataRepoId = $state<number | null>(null);
   let approving = $state<string | null>(null);
   // Why switching shared mode on was refused (project / dev branch missing).
   let preflightErrors = $state<string[]>([]);
@@ -98,6 +100,7 @@
     if (id === undefined || !isShared) {
       structure = null;
       joinRequests = [];
+      sharedDataRepoId = null;
       return;
     }
     const owner = isOwnerInstall;
@@ -109,19 +112,31 @@
       if (repo?.id === id) {
         structure = s;
         joinRequests = r;
+        sharedDataRepoId = id;
       }
     } catch {
       if (repo?.id === id) {
         structure = null;
         joinRequests = [];
+        sharedDataRepoId = null;
       }
     }
   }
 
+  // Another repo: drop the previous one's structure and requests at once, so
+  // they are never shown (or approved) under the new repo while it loads.
+  // Declared before the loader: effects run in declaration order.
+  $effect(() => {
+    void $selectedRepoId;
+    structure = null;
+    joinRequests = [];
+    sharedDataRepoId = null;
+    preflightErrors = [];
+  });
+
   $effect(() => {
     void $selectedRepoId;
     void sharedSignature;
-    preflightErrors = [];
     void loadSharedDetails();
   });
 
@@ -132,10 +147,12 @@
   }
 
   async function handleApprove(login: string) {
-    if (!repo || approving) return;
+    // Only for the repo the requests on screen were loaded for.
+    if (!repo || approving || sharedDataRepoId !== repo.id) return;
+    const repoId = sharedDataRepoId;
     approving = login;
     try {
-      await approveJoinRequest(repo.id, login);
+      await approveJoinRequest(repoId, login);
       addToast($tStore('shared.approved' as any).replace('{0}', login), 'success');
       await handleSharedChanged();
     } catch (err) {
@@ -594,15 +611,19 @@
         </div>
 
         {#if showSharedToggle}
-          <SharedModeChip
-            repoId={repo.id}
-            repoName={getDisplayName(repo)}
-            githubName={repo.github_name}
-            devBranch={autocommitBranch}
-            checked={sharedState?.shared_mode ?? false}
-            onPreflightErrors={(m) => (preflightErrors = m)}
-            onChanged={handleSharedChanged}
-          />
+          <!-- One instance per repo: an in-flight check of the previous repo
+               cannot open its dialog on this one. -->
+          {#key repo.id}
+            <SharedModeChip
+              repoId={repo.id}
+              repoName={getDisplayName(repo)}
+              githubName={repo.github_name}
+              devBranch={autocommitBranch}
+              checked={sharedState?.shared_mode ?? false}
+              onPreflightErrors={(m) => (preflightErrors = m)}
+              onChanged={handleSharedChanged}
+            />
+          {/key}
         {/if}
 
         {#if myBand}

@@ -741,6 +741,7 @@
                 <li class="repo-empty">{$tStore('sidebar.noReposAssigned')}</li>
               {:else}
                 {#each repos as repo (repo.id)}
+                  {@const badge = sharedBadgeOf(repo.id)}
                   <li
                     role="listitem"
                     class="repo-draggable"
@@ -762,8 +763,7 @@
                         <span class="role-icon" title={$tStore('sidebar.roleTooltip').replace('{0}', repo.role)}>{getRoleIcon(repo.role)}</span>
                       {/if}
                       <span class="repo-name">{getDisplayName(repo)}</span>
-                      {#if sharedBadgeOf(repo.id)}
-                        {@const badge = sharedBadgeOf(repo.id)!}
+                      {#if badge}
                         <span class="shared-badge" class:problem={badge.problem} title={badge.title}>{badge.glyph}</span>
                       {/if}
                     </div>
@@ -800,6 +800,7 @@
           {#if !unassignedCollapsed}
             <ul class="repo-list">
               {#each unassignedRepos as repo (repo.id)}
+                {@const badge = sharedBadgeOf(repo.id)}
                 <li
                   role="listitem"
                   class="repo-draggable"
@@ -817,8 +818,7 @@
                     tabindex="0"
                   >
                     <span class="repo-name">{getDisplayName(repo)}</span>
-                    {#if sharedBadgeOf(repo.id)}
-                      {@const badge = sharedBadgeOf(repo.id)!}
+                    {#if badge}
                       <span class="shared-badge" class:problem={badge.problem} title={badge.title}>{badge.glyph}</span>
                     {/if}
                   </div>

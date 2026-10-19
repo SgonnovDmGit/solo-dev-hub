@@ -22,6 +22,11 @@ vi.mock('../projects', () => ({
   projects: writable([{ id: 7, auto_sync_enabled: true }]),
 }));
 
+const refreshAfterSync = vi.fn(async () => undefined);
+vi.mock('../shared', () => ({
+  refreshAfterSync: () => refreshAfterSync(),
+}));
+
 const addToast = vi.fn();
 vi.mock('$lib/stores/ui', () => ({
   addToast: (...args: unknown[]) => addToast(...args),
@@ -51,6 +56,7 @@ describe('auto-sync rule findings', () => {
     vi.useFakeTimers();
     syncProject.mockReset();
     addToast.mockReset();
+    refreshAfterSync.mockClear();
   });
   afterEach(() => {
     vi.useRealTimers();
@@ -70,6 +76,12 @@ describe('auto-sync rule findings', () => {
     expect(syncProject).toHaveBeenCalledWith(7);
     expect(addToast).toHaveBeenCalledWith('toast.rulesTaken: sdh-retro', 'info', { persist: true });
     expect(addToast).toHaveBeenCalledWith('toast.rulesLost: sdh-debugging (beta)', 'warning');
+  });
+
+  it('reloads repos, projects and shared states after the sync', async () => {
+    syncProject.mockResolvedValue(result({}));
+    await runOneTick();
+    expect(refreshAfterSync).toHaveBeenCalledTimes(1);
   });
 
   it('stays quiet on ordinary errors and when no rule changed', async () => {

@@ -4,34 +4,64 @@
 import { writable, get } from 'svelte/store';
 import type { RepoSharedState } from '$lib/types';
 import { listRepoSharedStates, getSetting } from '$lib/api/tauri-commands';
+import { loadAllRepos } from './repos';
+import { loadProjects } from './projects';
 
 /** Shared state by repo id (only repos that take part in shared mode). */
 export const sharedStates = writable<Map<number, RepoSharedState>>(new Map());
 /** GitHub login of this install; null while unknown. */
 export const githubLogin = writable<string | null>(null);
 
-let inFlight: Promise<void> | null = null;
+async function runRefresh(): Promise<void> {
+  try {
+    const [states, login] = await Promise.all([
+      listRepoSharedStates(),
+      getSetting('github_login').catch(() => null),
+    ]);
+    sharedStates.set(new Map(states.map((s) => [s.repo_id, s])));
+    const trimmed = (login ?? '').trim();
+    githubLogin.set(trimmed === '' ? null : trimmed);
+  } catch {
+    /* keep what is shown */
+  }
+}
 
-/** Reload the shared states and the login. Quiet on failure: the badge is optional. */
+let current: Promise<void> | null = null;
+let followUp: Promise<void> | null = null;
+
+/**
+ * Reload the shared states and the login. Quiet on failure: the badge is
+ * optional. A call made while a refresh is running is not answered with that
+ * (possibly stale) run: exactly one more run is scheduled after it, and every
+ * caller in between gets that one.
+ */
 export function refreshShared(): Promise<void> {
-  // Coalesce parallel refreshes (a sync of several projects ends in a burst).
-  if (inFlight) return inFlight;
-  inFlight = (async () => {
-    try {
-      const [states, login] = await Promise.all([
-        listRepoSharedStates(),
-        getSetting('github_login').catch(() => null),
-      ]);
-      sharedStates.set(new Map(states.map((s) => [s.repo_id, s])));
-      const trimmed = (login ?? '').trim();
-      githubLogin.set(trimmed === '' ? null : trimmed);
-    } catch {
-      /* keep what is shown */
-    } finally {
-      inFlight = null;
-    }
-  })();
-  return inFlight;
+  if (!current) {
+    current = runRefresh().finally(() => {
+      current = null;
+    });
+    return current;
+  }
+  if (!followUp) {
+    followUp = current.then(() => {
+      followUp = null;
+      return refreshShared();
+    });
+  }
+  return followUp;
+}
+
+/**
+ * After a sync finished (manual or automatic): the sync may have changed the
+ * statuses, linked a contributor's repo to a project or created one, so reload
+ * the shared states, the repos and the projects. Quiet on failure.
+ */
+export async function refreshAfterSync(): Promise<void> {
+  await Promise.all([
+    refreshShared(),
+    loadAllRepos().catch(() => {}),
+    loadProjects().catch(() => {}),
+  ]);
 }
 
 export function sharedStateOf(repoId: number | null | undefined): RepoSharedState | null {

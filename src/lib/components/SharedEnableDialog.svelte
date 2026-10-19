@@ -22,12 +22,15 @@
   const hasBlocking = $derived(blockingLines.length > 0);
 </script>
 
+<!-- Escape closes the dialog wherever the focus is (the dialog is modal). -->
+<svelte:window onkeydown={(e) => e.key === 'Escape' && !busy && onCancel()} />
+
 <div
   class="overlay"
   role="presentation"
   onclick={() => !busy && onCancel()}
-  onkeydown={(e) => e.key === 'Escape' && !busy && onCancel()}
 >
+  <!-- svelte-ignore a11y_click_events_have_key_events: the click only stops the overlay's close; Escape is handled on the window -->
   <div
     class="dialog"
     role="dialog"
@@ -35,7 +38,6 @@
     aria-labelledby="shared-enable-title"
     tabindex="-1"
     onclick={(e) => e.stopPropagation()}
-    onkeydown={(e) => e.key === 'Escape' && !busy && onCancel()}
   >
     <h3 id="shared-enable-title" class="title">
       {$tStore('shared.enable.title' as any).replace('{0}', repoName)}
@@ -49,6 +51,8 @@
 
       {#if isPublic === true}
         <div class="banner warning">{$tStore('shared.enable.public' as any)}</div>
+      {:else if isPublic === null}
+        <div class="banner neutral">{$tStore('shared.enable.visibilityUnknown' as any)}</div>
       {/if}
 
       {#if hasBlocking}
@@ -142,6 +146,11 @@
     background: color-mix(in srgb, var(--toast-warning) 14%, transparent);
     color: var(--toast-warning);
     border: 1px solid color-mix(in srgb, var(--toast-warning) 45%, transparent);
+  }
+
+  .banner.neutral {
+    border: 1px solid var(--border);
+    color: var(--text-muted);
   }
 
   .banner.caution {
