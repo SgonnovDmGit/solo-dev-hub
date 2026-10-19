@@ -10,6 +10,25 @@ use crate::db::AppDb;
 use crate::export;
 use std::path::Path;
 
+/// Timestamp for a `done` task event, derived from the completion day in
+/// done.md's `## YYYY-MM-DD` section header (`date`).
+///
+/// T-000202: the event used to carry `Utc::now()` at sync time. Measured on the
+/// owner's DB (2026-10-19): of 2266 `done` events in 30 days, 1527 came from the
+/// "brand new done row" branch and 1369 of those were 1-30+ days later than the
+/// real completion day, so Timeline / Dashboard showed completion spikes on sync
+/// days. Rules: a past date -> `<date>T12:00:00+00:00` (midday, so no timezone
+/// shifts it to a neighbouring day); today's date (exact time is better), an
+/// empty / unparseable date or a future date -> `now`.
+///
+/// Affects new events only: existing `task_events` rows are not rewritten.
+fn done_event_ts(date: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    match chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d") {
+        Ok(day) if day < now.date_naive() => format!("{}T12:00:00+00:00", day.format("%Y-%m-%d")),
+        _ => now.to_rfc3339(),
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct SyncTasksReport {
     pub imported: u32,
@@ -352,7 +371,7 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
             db.insert_task_event(
                 was_in_todo.id,
                 "done",
-                &chrono::Utc::now().to_rfc3339(),
+                &done_event_ts(&dt.date, chrono::Utc::now()),
                 was_in_todo.status.as_deref(),
                 None,
             )
@@ -388,8 +407,14 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
             imported += 1;
 
             if !suppress_created_events {
-                db.insert_task_event(row.id, "done", &chrono::Utc::now().to_rfc3339(), None, None)
-                    .map_err(|e| e.to_string())?;
+                db.insert_task_event(
+                    row.id,
+                    "done",
+                    &done_event_ts(&dt.date, chrono::Utc::now()),
+                    None,
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
                 events_emitted += 1;
             }
         }
@@ -887,6 +912,154 @@ mod tests {
             db.list_tasks_by_repo(repo.id, "done").unwrap().len(),
             1,
             "done row must survive"
+        );
+        std::mem::forget(tmp);
+    }
+
+    // ── T-000202: done events are dated by the done.md day ──────────────────
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn test_done_event_ts_past_date_is_midday_utc() {
+        let now = utc("2026-10-19T08:30:00+00:00");
+        assert_eq!(
+            done_event_ts("2026-01-15", now),
+            "2026-01-15T12:00:00+00:00"
+        );
+        assert_eq!(
+            done_event_ts("2026-10-18", now),
+            "2026-10-18T12:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn test_done_event_ts_today_keeps_exact_now() {
+        let now = utc("2026-10-19T08:30:00+00:00");
+        assert_eq!(done_event_ts("2026-10-19", now), now.to_rfc3339());
+    }
+
+    #[test]
+    fn test_done_event_ts_future_date_falls_back_to_now() {
+        let now = utc("2026-10-19T08:30:00+00:00");
+        assert_eq!(done_event_ts("2026-10-20", now), now.to_rfc3339());
+    }
+
+    #[test]
+    fn test_done_event_ts_empty_or_garbage_falls_back_to_now() {
+        let now = utc("2026-10-19T08:30:00+00:00");
+        for bad in ["", "   ", "not-a-date", "2026-13-40", "15.01.2026"] {
+            assert_eq!(done_event_ts(bad, now), now.to_rfc3339(), "input {:?}", bad);
+        }
+    }
+
+    /// Repo set up as already migrated (an empty first sync done), so `done`
+    /// events are not suppressed.
+    fn migrated_repo(db: &AppDb, repo_path: &Path) -> i64 {
+        std::fs::create_dir_all(repo_path.join("docs")).unwrap();
+        std::fs::write(repo_path.join("docs/todo.md"), "").unwrap();
+        std::fs::write(repo_path.join("docs/done.md"), "").unwrap();
+        let repo = db
+            .insert_local_repository(repo_path.to_str().unwrap(), "r1", None, None)
+            .unwrap();
+        sync_tasks_for_repo(db, repo.id).unwrap();
+        assert!(db.get_tasks_migrated_at(repo.id).unwrap().is_some());
+        repo.id
+    }
+
+    fn done_event_ts_of(db: &AppDb, repo_id: i64, task_id: &str) -> String {
+        let dones = db.list_tasks_by_repo(repo_id, "done").unwrap();
+        let row = dones.iter().find(|t| t.task_id == task_id).unwrap();
+        let events = db.list_task_events_by_task(row.id).unwrap();
+        let ev = events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == "done")
+            .expect("a done event");
+        ev.ts.clone()
+    }
+
+    #[test]
+    fn test_sync_tasks_brand_new_done_entry_dated_by_section_header() {
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        let repo_id = migrated_repo(&db, &repo_path);
+
+        std::fs::write(
+            repo_path.join("docs/done.md"),
+            "## 2026-01-15
+- T-000001 | Created and closed between syncs | v1.0.0
+",
+        )
+        .unwrap();
+        sync_tasks_for_repo(&db, repo_id).unwrap();
+
+        let ts = done_event_ts_of(&db, repo_id, "T-000001");
+        assert!(ts.starts_with("2026-01-15T12:00"), "got {}", ts);
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn test_sync_tasks_todo_to_done_move_dated_by_section_header() {
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        let repo_id = migrated_repo(&db, &repo_path);
+
+        std::fs::write(
+            repo_path.join("docs/todo.md"),
+            "- [ ] T-000002 | Task | 2 | high | review
+",
+        )
+        .unwrap();
+        sync_tasks_for_repo(&db, repo_id).unwrap();
+
+        std::fs::write(repo_path.join("docs/todo.md"), "").unwrap();
+        std::fs::write(
+            repo_path.join("docs/done.md"),
+            "## 2026-01-15
+- T-000002 | Task | v1.0.0
+",
+        )
+        .unwrap();
+        sync_tasks_for_repo(&db, repo_id).unwrap();
+
+        let ts = done_event_ts_of(&db, repo_id, "T-000002");
+        assert!(ts.starts_with("2026-01-15T12:00"), "got {}", ts);
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn test_sync_tasks_done_under_todays_header_keeps_today() {
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        let repo_id = migrated_repo(&db, &repo_path);
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        std::fs::write(
+            repo_path.join("docs/done.md"),
+            format!(
+                "## {}
+- T-000003 | Closed today | v1.0.0
+",
+                today
+            ),
+        )
+        .unwrap();
+        sync_tasks_for_repo(&db, repo_id).unwrap();
+
+        let ts = done_event_ts_of(&db, repo_id, "T-000003");
+        assert!(ts.starts_with(&today), "got {}", ts);
+        assert_ne!(
+            ts,
+            format!("{}T12:00:00+00:00", today),
+            "today's event keeps the exact sync time, not the midday placeholder"
         );
         std::mem::forget(tmp);
     }
