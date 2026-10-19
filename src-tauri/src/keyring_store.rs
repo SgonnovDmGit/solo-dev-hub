@@ -1,3 +1,4 @@
+#[cfg(not(test))]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use keyring::Entry;
 
@@ -61,11 +62,23 @@ pub fn migrate_legacy_pat() {
     let _ = legacy_entry.delete_credential();
 }
 
+#[cfg(not(test))]
 const BUNDLE_KEY: &str = "secret-bundle-key";
 
 /// v1.3.0: get the 32-byte data key used to encrypt secret-bundle values,
 /// generating + persisting it on first use. Stored base64 in the OS keyring
 /// under the same service as the PAT — trust model identical to the PAT.
+///
+/// T-000210: unit tests get a per-process key instead. They used to read — and
+/// on a fresh machine create — the owner's real data key in the OS store, and on
+/// a CI runner with no usable Secret Service they could not run at all.
+#[cfg(test)]
+pub fn get_or_create_bundle_key() -> Result<[u8; 32], String> {
+    static TEST_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    Ok(*TEST_KEY.get_or_init(crate::crypto::bundle_cipher::generate_data_key))
+}
+
+#[cfg(not(test))]
 pub fn get_or_create_bundle_key() -> Result<[u8; 32], String> {
     let entry = Entry::new(SERVICE_NAME, BUNDLE_KEY).map_err(|e| e.to_string())?;
     match entry.get_password() {

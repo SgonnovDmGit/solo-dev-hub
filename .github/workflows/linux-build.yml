@@ -27,8 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential curl wget file libssl-dev libxdo-dev \
-            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev \
-            gnome-keyring dbus-x11
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -48,16 +47,8 @@ jobs:
           workspaces: './src-tauri -> target'
 
       - name: Rust tests
-        # The secrets tests store their data key in the real OS keyring. A bare
-        # runner has no Secret Service, so start gnome-keyring (unlocked, empty
-        # password) inside a private D-Bus session — this also exercises the
-        # Linux keyring path the app uses (T-000210).
         working-directory: src-tauri
-        run: |
-          dbus-run-session -- sh -c '
-            printf "" | gnome-keyring-daemon --unlock --components=secrets >/dev/null
-            cargo test --lib
-          '
+        run: cargo test --lib
 
       - name: Build bundles
         # createUpdaterArtifacts needs the signing key; its password is empty.
