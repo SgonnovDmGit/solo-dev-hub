@@ -113,14 +113,22 @@ export async function listBranches(token: string, owner: string, repo: string): 
   return branches;
 }
 
-export async function validateToken(token: string): Promise<boolean> {
+/**
+ * Login of the account the token belongs to, or null when the token is not
+ * accepted. T-000216: contributor mode identifies this install by that login.
+ */
+export async function fetchAuthenticatedLogin(token: string): Promise<string | null> {
   try {
     const octokit = new Octokit({ auth: token });
-    await octokit.users.getAuthenticated();
-    return true;
+    const resp = await octokit.users.getAuthenticated();
+    return resp.data.login || null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export async function validateToken(token: string): Promise<boolean> {
+  return (await fetchAuthenticatedLogin(token)) !== null;
 }
 
 // ── v0.18.0: GitHub Environments + env-scoped secrets ────────────────────────

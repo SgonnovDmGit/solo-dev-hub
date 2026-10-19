@@ -6,7 +6,7 @@ import {
   getSetting,
   setSetting,
 } from '$lib/api/tauri-commands';
-import { validateToken } from '$lib/api/github';
+import { fetchAuthenticatedLogin } from '$lib/api/github';
 import { addToast } from './ui';
 import { t, tf, initLocale } from '$lib/i18n';
 import {
@@ -34,6 +34,7 @@ export async function loadSettings(): Promise<void> {
       getSetting('workspace_root'),
     ]);
     pat.set(storedPat);
+    if (storedPat) void ensureGithubLogin(storedPat);
     workspaceRoot.set(storedWorkspaceRoot);
     const storedTheme = await getSetting('theme');
     if (storedTheme) {
@@ -86,14 +87,30 @@ export async function saveUiScaleManual(scale: number): Promise<void> {
   }
 }
 
+/**
+ * T-000216: an install whose token was saved before the login was recorded has
+ * no `github_login` yet; fetch it once, quietly. Failure is harmless - the
+ * next successful token save or app start tries again.
+ */
+async function ensureGithubLogin(token: string): Promise<void> {
+  try {
+    if (await getSetting('github_login')) return;
+    const login = await fetchAuthenticatedLogin(token);
+    if (login) await setSetting('github_login', login);
+  } catch {
+    /* offline or token rejected: retried on the next start */
+  }
+}
+
 export async function savePat(token: string): Promise<boolean> {
   try {
-    const valid = await validateToken(token);
-    if (!valid) {
+    const login = await fetchAuthenticatedLogin(token);
+    if (!login) {
       addToast(t('toast.invalidToken'), 'error');
       return false;
     }
     await tauriStorePat(token);
+    await setSetting('github_login', login);
     pat.set(token);
     addToast(t('toast.tokenSaved'), 'success');
     return true;
@@ -106,6 +123,7 @@ export async function savePat(token: string): Promise<boolean> {
 export async function removePat(): Promise<void> {
   try {
     await tauriDeletePat();
+    await setSetting('github_login', '');
     pat.set(null);
     addToast(t('toast.tokenRemoved'), 'info');
   } catch (err) {

@@ -29,6 +29,16 @@ export interface Repository {
   deploy_target: string | null;
 }
 
+/** T-000216: contributor-mode state of one repository (F-000044). */
+export interface RepoSharedState {
+  repo_id: number;
+  shared_mode: boolean;
+  /** Derived role of this install; null when the repo is not shared. */
+  shared_role: 'main' | 'contributor' | 'pending' | null;
+  /** Status code, e.g. 'needs_manual_merge'. */
+  shared_status: string | null;
+}
+
 export interface RenderedFile {
   path: string;
   content: string;

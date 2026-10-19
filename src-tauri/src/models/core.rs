@@ -27,6 +27,19 @@ pub struct Repository {
     pub deploy_target: Option<String>,
 }
 
+/// T-000216 (F-000044): contributor-mode state of one repository. Kept apart
+/// from `Repository` on purpose - far too many SELECTs build that struct.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct RepoSharedState {
+    pub repo_id: i64,
+    /// Owner's switch (main side).
+    pub shared_mode: bool,
+    /// Cached derived role of this install: "main" | "contributor" | "pending".
+    pub shared_role: Option<String>,
+    /// Status code, e.g. "needs_manual_merge".
+    pub shared_status: Option<String>,
+}
+
 impl Repository {
     /// Display-friendly name. For GitHub repos returns the last segment of
     /// `github_name` (mirrors frontend `getDisplayName`). Falls back to

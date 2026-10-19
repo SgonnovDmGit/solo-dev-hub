@@ -17,21 +17,22 @@ CREATE TABLE task_events (
              ts TEXT NOT NULL,
              from_status TEXT,
              to_status TEXT
-         )
+         , author TEXT)
 ```
 
 </details>
 
 ## Columns
 
-| Name        | Type    | Default | Nullable | Children | Parents           | Comment                                                                    |
-| ----------- | ------- | ------- | -------- | -------- | ----------------- | -------------------------------------------------------------------------- |
-| id          | INTEGER |         | true     |          |                   |                                                                            |
-| task_id     | INTEGER |         | false    |          | [tasks](tasks.md) | INTEGER FK to tasks.id — not the display id (that is tasks.task_id, TEXT). |
-| event_type  | TEXT    |         | false    |          |                   |                                                                            |
-| ts          | TEXT    |         | false    |          |                   |                                                                            |
-| from_status | TEXT    |         | true     |          |                   |                                                                            |
-| to_status   | TEXT    |         | true     |          |                   |                                                                            |
+| Name        | Type    | Default | Nullable | Children | Parents           | Comment                                                                                   |
+| ----------- | ------- | ------- | -------- | -------- | ----------------- | ----------------------------------------------------------------------------------------- |
+| id          | INTEGER |         | true     |          |                   |                                                                                           |
+| task_id     | INTEGER |         | false    |          | [tasks](tasks.md) | INTEGER FK to tasks.id — not the display id (that is tasks.task_id, TEXT).                |
+| event_type  | TEXT    |         | false    |          |                   |                                                                                           |
+| ts          | TEXT    |         | false    |          |                   |                                                                                           |
+| from_status | TEXT    |         | true     |          |                   |                                                                                           |
+| to_status   | TEXT    |         | true     |          |                   |                                                                                           |
+| author      | TEXT    |         | true     |          |                   | v34 — GitHub login of whoever made the event on another install; NULL means this install. |
 
 ## Constraints
 

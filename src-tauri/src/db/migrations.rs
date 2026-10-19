@@ -84,6 +84,7 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         "rule_events_and_conflicts",
         mig_v33_rule_events_and_conflicts,
     ),
+    (34, "contributor_mode", mig_v34_contributor_mode),
 ];
 
 impl AppDb {
@@ -1071,6 +1072,32 @@ fn mig_v33_rule_events_and_conflicts(conn: &Connection) -> SqlResult<()> {
     )
 }
 
+fn mig_v34_contributor_mode(conn: &Connection) -> SqlResult<()> {
+    // T-000216 (v1.20.0, F-000044): storage for contributor mode - a second
+    // person with their own install working in the same repos.
+    //
+    // `shared_mode` is the owner's switch (main side). `shared_role` caches the
+    // derived role of THIS install for the repo: 'main' (owner, publishes the
+    // structure), 'contributor', or 'pending' (a contributor who has requested
+    // access); NULL = the repo is not shared. `shared_status` is a nullable
+    // status code (e.g. `needs_manual_merge`). `shared_import` is JSON: the last
+    // imported blob sha per shared file, so an unchanged file is not re-imported.
+    //
+    // `author` on the event logs is the GitHub login of whoever made the event
+    // on another install; NULL = this install, so every existing row keeps its
+    // meaning without a backfill.
+    conn.execute_batch(
+        "ALTER TABLE repositories ADD COLUMN shared_mode INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE repositories ADD COLUMN shared_role TEXT
+             CHECK (shared_role IN ('main','contributor','pending'));
+         ALTER TABLE repositories ADD COLUMN shared_status TEXT;
+         ALTER TABLE repositories ADD COLUMN shared_import TEXT;
+         ALTER TABLE task_events ADD COLUMN author TEXT;
+         ALTER TABLE bug_events ADD COLUMN author TEXT;
+         PRAGMA user_version = 34;",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1266,6 +1293,101 @@ mod tests {
         );
     }
 
+    /// T-000216: v34 adds the contributor-mode columns. Rows that existed
+    /// before it survive with the defaults (not shared, author NULL = this
+    /// install), and the role vocabulary is closed by a CHECK while NULL stays
+    /// legal.
+    #[test]
+    fn test_db_migration_v34_contributor_mode_columns() {
+        // Build a v33 database, put rows in it, then apply v34 on top.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        for &(target, _name, mig_fn) in MIGRATIONS {
+            if target <= 33 {
+                mig_fn(&conn).unwrap();
+            }
+        }
+        conn.execute(
+            "INSERT INTO repositories (github_name, github_url, role) VALUES ('o/r', 'u', 'client')",
+            [],
+        )
+        .unwrap();
+        let repo_id: i64 = conn
+            .query_row("SELECT id FROM repositories WHERE github_name='o/r'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (repository_id, task_id, prefix, description, source, created_at, updated_at)              VALUES (?1, 'T-000001', 'T', 'd', 'todo', 'x', 'x')",
+            [repo_id],
+        )
+        .unwrap();
+        let task_row: i64 = conn
+            .query_row("SELECT id FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO task_events (task_id, event_type, ts) VALUES (?1, 'created', 'x')",
+            [task_row],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bugs (repository_id, numeric_id, display_id, created_at, description, severity, category, status)              VALUES (?1, 1, 'B-000001', 'x', 'd', 'minor', 'other', 'created')",
+            [repo_id],
+        )
+        .unwrap();
+        let bug_row: i64 = conn
+            .query_row("SELECT id FROM bugs", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO bug_events (bug_id, event_type, ts) VALUES (?1, 'created', 'x')",
+            [bug_row],
+        )
+        .unwrap();
+
+        mig_v34_contributor_mode(&conn).unwrap();
+
+        let (mode, role, status, import): (i64, Option<String>, Option<String>, Option<String>) =
+            conn.query_row(
+                "SELECT shared_mode, shared_role, shared_status, shared_import                  FROM repositories WHERE id = ?1",
+                [repo_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, 0, "shared_mode defaults to off");
+        assert!(role.is_none() && status.is_none() && import.is_none());
+
+        for table in ["task_events", "bug_events"] {
+            let author: Option<String> = conn
+                .query_row(&format!("SELECT author FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert!(author.is_none(), "{table}: old rows keep author NULL");
+        }
+
+        for ok in ["main", "contributor", "pending"] {
+            conn.execute(
+                "UPDATE repositories SET shared_role = ?1 WHERE id = ?2",
+                rusqlite::params![ok, repo_id],
+            )
+            .unwrap_or_else(|_| panic!("role {ok} must be accepted"));
+        }
+        assert!(
+            conn.execute(
+                "UPDATE repositories SET shared_role = 'owner' WHERE id = ?1",
+                [repo_id],
+            )
+            .is_err(),
+            "an unknown role must be rejected"
+        );
+        conn.execute(
+            "UPDATE repositories SET shared_role = NULL WHERE id = ?1",
+            [repo_id],
+        )
+        .expect("NULL role is allowed");
+
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 34);
+    }
+
     #[test]
     fn test_db_migration_version() {
         let db = make_db();
@@ -1274,7 +1396,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         // Update this when a new migration is added.
-        assert!(version >= 33);
+        assert!(version >= 34);
     }
 
     #[test]
@@ -1622,11 +1744,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v33 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v34 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 34);
 
         drop(conn);
         let _ = repo;
@@ -1693,7 +1815,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 34);
     }
 
     #[test]

@@ -131,6 +131,8 @@ pub fn run() {
             // Repositories
             commands::repo::create_local_repository,
             commands::repo::upsert_repository,
+            commands::repo::get_repo_shared_state,
+            commands::repo::list_repo_shared_states,
             commands::repo::resolve_merge_with_local,
             commands::repo::force_insert_github_repo,
             commands::repo::assign_repository,
