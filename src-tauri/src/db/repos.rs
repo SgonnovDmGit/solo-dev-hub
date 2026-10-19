@@ -701,6 +701,7 @@ impl AppDb {
             shared_mode: row.get::<_, i64>(1)? != 0,
             shared_role: row.get(2)?,
             shared_status: row.get(3)?,
+            shared_status_detail: status_detail_of(row.get::<_, Option<String>>(4)?.as_deref()),
         })
     }
 
@@ -708,7 +709,8 @@ impl AppDb {
     pub fn get_shared_state(&self, repo_id: i64) -> SqlResult<RepoSharedState> {
         let conn = self.conn.lock().unwrap();
         match conn.query_row(
-            "SELECT id, shared_mode, shared_role, shared_status FROM repositories WHERE id = ?1",
+            "SELECT id, shared_mode, shared_role, shared_status, shared_import
+             FROM repositories WHERE id = ?1",
             rusqlite::params![repo_id],
             Self::row_to_shared_state,
         ) {
@@ -718,6 +720,7 @@ impl AppDb {
                 shared_mode: false,
                 shared_role: None,
                 shared_status: None,
+                shared_status_detail: None,
             }),
             Err(e) => Err(e),
         }
@@ -727,7 +730,7 @@ impl AppDb {
     pub fn list_shared_states(&self) -> SqlResult<Vec<RepoSharedState>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, shared_mode, shared_role, shared_status FROM repositories
+            "SELECT id, shared_mode, shared_role, shared_status, shared_import FROM repositories
              WHERE shared_mode = 1 OR shared_role IS NOT NULL OR shared_status IS NOT NULL
              ORDER BY id",
         )?;
@@ -759,14 +762,47 @@ impl AppDb {
     }
 
     /// Set/clear the shared-mode status code. Empty string is stored as NULL.
+    /// The status detail (see `set_shared_status_with_detail`) is cleared with
+    /// the code: a detail never outlives the status it explains.
     #[allow(dead_code)]
     pub fn set_shared_status(&self, repo_id: i64, status: Option<&str>) -> SqlResult<()> {
+        self.set_shared_status_with_detail(repo_id, status, None)
+    }
+
+    /// Set the status code together with its detail (T-000223). The detail is
+    /// kept in `shared_import` JSON (`status_detail`); `None`, or a cleared
+    /// status, removes it. Formats, by status:
+    /// * `needs_manual_merge`: `{"branch":"dev","current":true}`;
+    /// * the others: the plain reason / message text (`shared_untrusted`,
+    ///   `push_rejected`, ...).
+    pub fn set_shared_status_with_detail(
+        &self,
+        repo_id: i64,
+        status: Option<&str>,
+        detail: Option<&str>,
+    ) -> SqlResult<()> {
         let normalized = status.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let detail = detail
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty() && normalized.is_some());
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE repositories SET shared_status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             rusqlite::params![normalized, repo_id],
         )?;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT shared_import FROM repositories WHERE id = ?1",
+                rusqlite::params![repo_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(None);
+        if let Some(next) = with_status_detail(current.as_deref(), detail) {
+            conn.execute(
+                "UPDATE repositories SET shared_import = ?1 WHERE id = ?2",
+                rusqlite::params![next, repo_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -839,6 +875,37 @@ impl AppDb {
             |row| row.get(0),
         )
     }
+}
+
+/// `status_detail` of a `shared_import` JSON; `None` for absent / unparsable.
+fn status_detail_of(import: Option<&str>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(import?).ok()?;
+    v.get("status_detail")?
+        .as_str()
+        .map(str::to_string)
+        .filter(|d| !d.is_empty())
+}
+
+/// The `shared_import` JSON with `status_detail` set (or removed for `None`).
+/// `None` when nothing has to be written: the value is already the same.
+fn with_status_detail(import: Option<&str>, detail: Option<&str>) -> Option<String> {
+    if status_detail_of(import).as_deref() == detail {
+        return None;
+    }
+    let mut v: serde_json::Value = import
+        .and_then(|j| serde_json::from_str(j).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let obj = v.as_object_mut()?;
+    match detail {
+        Some(d) => {
+            obj.insert("status_detail".into(), serde_json::Value::String(d.into()));
+        }
+        None => {
+            obj.remove("status_detail");
+        }
+    }
+    serde_json::to_string(&v).ok()
 }
 
 #[cfg(test)]
@@ -1676,6 +1743,7 @@ mod tests {
                 shared_mode: false,
                 shared_role: None,
                 shared_status: None,
+                shared_status_detail: None,
             }
         );
         // Unknown repo id: still the "not shared" state, no error.
@@ -1738,6 +1806,59 @@ mod tests {
         db.set_shared_status(repo.id, Some("x")).unwrap();
         db.set_shared_status(repo.id, None).unwrap();
         assert_eq!(db.get_shared_state(repo.id).unwrap().shared_status, None);
+    }
+
+    #[test]
+    fn test_shared_status_detail_lives_and_dies_with_the_code() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/sh-d2", "sh-d2", None, None)
+            .unwrap();
+        let detail = r#"{"branch":"dev","current":true}"#;
+        db.set_shared_status_with_detail(repo.id, Some("needs_manual_merge"), Some(detail))
+            .unwrap();
+        let st = db.get_shared_state(repo.id).unwrap();
+        assert_eq!(st.shared_status.as_deref(), Some("needs_manual_merge"));
+        assert_eq!(st.shared_status_detail.as_deref(), Some(detail));
+        assert_eq!(
+            db.list_shared_states().unwrap()[0]
+                .shared_status_detail
+                .as_deref(),
+            Some(detail)
+        );
+        // other keys of the import JSON survive a detail change
+        db.set_shared_import(repo.id, Some(r#"{"pinned_dev_branch":"dev"}"#))
+            .unwrap();
+        db.set_shared_status_with_detail(
+            repo.id,
+            Some("shared_untrusted"),
+            Some("dev branch changed"),
+        )
+        .unwrap();
+        let import = db.get_shared_import(repo.id).unwrap().unwrap();
+        assert!(import.contains("pinned_dev_branch"), "{}", import);
+        assert_eq!(
+            db.get_shared_state(repo.id)
+                .unwrap()
+                .shared_status_detail
+                .as_deref(),
+            Some("dev branch changed")
+        );
+        // the plain setter clears the detail with the code
+        db.set_shared_status(repo.id, Some("push_failed")).unwrap();
+        assert_eq!(
+            db.get_shared_state(repo.id).unwrap().shared_status_detail,
+            None
+        );
+        let import = db.get_shared_import(repo.id).unwrap().unwrap();
+        assert!(import.contains("pinned_dev_branch") && !import.contains("status_detail"));
+        // a detail without a status is dropped; no import is invented for it
+        let other = db
+            .insert_local_repository("/tmp/sh-d3", "sh-d3", None, None)
+            .unwrap();
+        db.set_shared_status_with_detail(other.id, None, Some("orphan"))
+            .unwrap();
+        assert_eq!(db.get_shared_import(other.id).unwrap(), None);
     }
 
     #[test]

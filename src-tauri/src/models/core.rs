@@ -38,6 +38,10 @@ pub struct RepoSharedState {
     pub shared_role: Option<String>,
     /// Status code, e.g. "needs_manual_merge".
     pub shared_status: Option<String>,
+    /// What the status code is about (T-000223), kept in `shared_import`:
+    /// `needs_manual_merge` -> JSON `{"branch":"dev","current":true}`; the other
+    /// codes -> a plain reason / message. `None` when the code needs none.
+    pub shared_status_detail: Option<String>,
 }
 
 impl Repository {

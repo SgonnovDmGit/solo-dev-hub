@@ -104,6 +104,42 @@ impl SharedStatus {
 struct StatusNote {
     status: SharedStatus,
     detail: String,
+    /// `NeedsManualMerge` only: the diverged branch and whether it is checked
+    /// out here (drives the Merge button of the UI).
+    diverged: Option<(String, bool)>,
+    /// `PushRejected` only: the branch the push was refused on.
+    rejected_branch: Option<String>,
+}
+
+impl StatusNote {
+    /// The detail stored next to the status code for the UI
+    /// (`repositories.shared_import.status_detail`, see
+    /// `AppDb::set_shared_status_with_detail`).
+    ///
+    /// * `needs_manual_merge`: `{"branch":"dev","current":true}`
+    /// * `push_rejected`: `{"branch":"dev","message":"<git message>"}`
+    /// * the others: the plain reason / message, if any.
+    fn ui_detail(&self) -> Option<String> {
+        if let Some((branch, current)) = &self.diverged {
+            return Some(
+                serde_json::json!({ "branch": branch, "current": current }).to_string(),
+            );
+        }
+        if let Some(branch) = &self.rejected_branch {
+            return Some(
+                serde_json::json!({ "branch": branch, "message": self.detail.trim() }).to_string(),
+            );
+        }
+        let d = self.detail.trim();
+        (!d.is_empty()).then(|| d.to_string())
+    }
+
+    /// Among notes of one status the one the UI should show: a diverged
+    /// current branch (it has the Merge button) comes first.
+    fn rank(&self) -> (SharedStatus, bool) {
+        let current = self.diverged.as_ref().is_some_and(|(_, c)| *c);
+        (self.status, !current)
+    }
 }
 
 /// What a shared pass reports back to the project sync.
@@ -1146,6 +1182,28 @@ impl RepoPass {
         self.notes.push(StatusNote {
             status,
             detail: detail.into(),
+            diverged: None,
+            rejected_branch: None,
+        });
+    }
+
+    /// `PushRejected` (protected branch) for `branch`.
+    fn note_push_rejected(&mut self, branch: &str, message: String) {
+        self.notes.push(StatusNote {
+            status: SharedStatus::PushRejected,
+            detail: message,
+            diverged: None,
+            rejected_branch: Some(branch.to_string()),
+        });
+    }
+
+    /// `NeedsManualMerge` for `branch`; `current` is true when it is checked out.
+    fn note_diverged(&mut self, branch: &str, current: bool) {
+        self.notes.push(StatusNote {
+            status: SharedStatus::NeedsManualMerge,
+            detail: diverged_detail(branch, current),
+            diverged: Some((branch.to_string(), current)),
+            rejected_branch: None,
         });
     }
 
@@ -2081,7 +2139,7 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
             }
             match ff_current(git, &pass.root, &remote, &pathspec) {
                 Ok(true) => {}
-                Ok(false) => pass.note(SharedStatus::NeedsManualMerge, diverged_detail(b, true)),
+                Ok(false) => pass.note_diverged(b, true),
                 Err(e) => {
                     let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
                     pass.issue(issue)
@@ -2104,7 +2162,7 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
                         .is_some_and(|t| reset_to_origin(git, &pass.root, b, &t).unwrap_or(false));
                     if !reset {
                         pass.blocked.insert(b.to_ascii_lowercase());
-                        pass.note(SharedStatus::NeedsManualMerge, diverged_detail(b, false));
+                        pass.note_diverged(b, false);
                     }
                 }
                 Ok(FfOutcome::LocalAhead) => {}
@@ -2125,7 +2183,7 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
                 Ok(true) => {}
                 Ok(false) => {
                     pass.blocked.insert(b.to_ascii_lowercase());
-                    pass.note(SharedStatus::NeedsManualMerge, diverged_detail(b, false));
+                    pass.note_diverged(b, false);
                 }
                 Err(e) => {
                     pass.blocked.insert(b.to_ascii_lowercase());
@@ -2233,16 +2291,21 @@ impl SharedSync {
 }
 
 fn settle_status(db: &AppDb, pass: &RepoPass, out: &mut SharedOutcome) {
-    let best = pass.notes.iter().min_by_key(|n| n.status);
+    let best = pass.notes.iter().min_by_key(|n| n.rank());
     let new = best.map(|n| n.status.as_str());
-    let old = db
-        .get_shared_state(pass.repo.id)
-        .ok()
-        .and_then(|s| s.shared_status);
+    let new_detail = best.and_then(|n| n.ui_detail());
+    let old_state = db.get_shared_state(pass.repo.id).ok();
+    let old = old_state.as_ref().and_then(|s| s.shared_status.clone());
     if old.as_deref() == new {
+        // The code is the same; its detail may still have moved (another
+        // branch, another reason): keep it fresh without announcing again.
+        let old_detail = old_state.and_then(|s| s.shared_status_detail);
+        if new.is_some() && old_detail != new_detail {
+            let _ = db.set_shared_status_with_detail(pass.repo.id, new, new_detail.as_deref());
+        }
         return;
     }
-    let _ = db.set_shared_status(pass.repo.id, new);
+    let _ = db.set_shared_status_with_detail(pass.repo.id, new, new_detail.as_deref());
     if let Some(n) = best {
         let mut issue = repo_issue(n.status.issue_code(), &pass.repo);
         if !n.detail.is_empty() {
@@ -2434,7 +2497,7 @@ fn push_recipients(git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
         }
         if !is_current && !local_only_commits_are_ours(git, &root, &b).unwrap_or(false) {
             pass.blocked.insert(b.to_ascii_lowercase());
-            pass.note(SharedStatus::NeedsManualMerge, diverged_detail(&b, false));
+            pass.note_diverged(&b, false);
             continue;
         }
         to_push.push(b);
@@ -2454,12 +2517,9 @@ fn push_recipients(git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
                     PushOutcome::Pushed | PushOutcome::UpToDate => {}
                     PushOutcome::RejectedNonFastForward => {
                         let current = cur.is_some_and(|c| same_branch(c, &branch));
-                        pass.note(
-                            SharedStatus::NeedsManualMerge,
-                            diverged_detail(&branch, current),
-                        )
+                        pass.note_diverged(&branch, current)
                     }
-                    PushOutcome::RejectedProtected(m) => pass.note(SharedStatus::PushRejected, m),
+                    PushOutcome::RejectedProtected(m) => pass.note_push_rejected(&branch, m),
                     PushOutcome::RejectedOther(m) => pass.note(SharedStatus::PushFailed, m),
                 }
             }
@@ -3221,6 +3281,20 @@ pub(crate) mod test_support {
                 .shared_status
         }
 
+        pub fn main_status_detail(&self) -> Option<String> {
+            self.main_db
+                .get_shared_state(self.main_repo)
+                .unwrap()
+                .shared_status_detail
+        }
+
+        pub fn helper_status_detail(&self) -> Option<String> {
+            self.helper_db
+                .get_shared_state(self.helper_repo)
+                .unwrap()
+                .shared_status_detail
+        }
+
         pub fn helper_status(&self) -> Option<String> {
             self.helper_db
                 .get_shared_state(self.helper_repo)
@@ -3441,6 +3515,7 @@ mod tests {
             shared_mode: mode,
             shared_role: role.map(String::from),
             shared_status: None,
+            shared_status_detail: None,
         };
         assert!(!is_shared_state(&st(false, None)));
         assert!(is_shared_state(&st(true, None)));
@@ -3719,6 +3794,11 @@ mod tests {
         write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
         let first = fx.sync_helper();
         assert_eq!(fx.helper_status().as_deref(), Some("push_rejected"));
+        // The UI names the branch the push was refused on (T-000223).
+        let detail: serde_json::Value =
+            serde_json::from_str(&fx.helper_status_detail().unwrap()).unwrap();
+        assert_eq!(detail["branch"], "dev");
+        assert!(detail["message"].as_str().unwrap().contains("GH006"));
         assert_eq!(
             codes(&first)
                 .iter()
@@ -3768,6 +3848,11 @@ mod tests {
             "{}",
             detail
         );
+        // The UI gets the branch and whether it is checked out (T-000223).
+        assert_eq!(
+            fx.main_status_detail().as_deref(),
+            Some(r#"{"branch":"dev","current":true}"#)
+        );
         assert!(!fx.main_dir.join(".sdh/requests/helper.json").exists());
         // Nothing was forced.
         assert!(fx.remote_file("dev", "src.rs").is_none());
@@ -3776,6 +3861,8 @@ mod tests {
         assert_eq!(res.outcome, "merged");
         assert!(fx.main_dir.join(".sdh/requests/helper.json").exists());
         assert_eq!(fx.main_status(), None);
+        // The detail goes with the code.
+        assert_eq!(fx.main_status_detail(), None);
         // The next sync pushes the merge.
         fx.sync_main();
         assert!(fx.remote_file("dev", "src.rs").is_some());
@@ -3800,6 +3887,10 @@ mod tests {
         write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
         let out = fx.sync_helper();
         assert_eq!(fx.helper_status().as_deref(), Some("shared_untrusted"));
+        // The reason is kept for the UI line.
+        assert!(fx
+            .helper_status_detail()
+            .is_some_and(|d| d.contains("main is not the repo owner")));
         let issue = out
             .issues
             .iter()

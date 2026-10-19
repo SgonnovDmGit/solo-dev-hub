@@ -597,7 +597,7 @@ pub enum BandDecision {
 fn band_of(structure: &ProjectStructure, login: &str) -> BandDecision {
     match band_for(structure, login) {
         Some((lo, hi)) => BandDecision::Band(lo as i64, hi as i64),
-        None => BandDecision::Refused("this install has no number range in the project".into()),
+        None => BandDecision::Refused(NO_RANGE_REASON.into()),
     }
 }
 
@@ -612,10 +612,7 @@ pub fn decide_band(
     let structure = match structure {
         Ok(s) => s,
         Err(reason) => {
-            return BandDecision::Refused(format!(
-                "the shared project structure is not trusted: {}",
-                reason
-            ))
+            return BandDecision::Refused(format!("{}{}", UNTRUSTED_REASON_PREFIX, reason))
         }
     };
     let Some(s) = structure else {
@@ -627,9 +624,7 @@ pub fn decide_band(
             // The owner switched sharing on but the file is not written yet.
             None | Some("main") => BandDecision::Band(1, MAIN_BAND_CEILING as i64),
             Some("pending") => BandDecision::Refused(PENDING_REASON.into()),
-            Some(_) => BandDecision::Refused(
-                "the shared project structure is not available yet - sync the project first".into(),
-            ),
+            Some(_) => BandDecision::Refused(NO_STRUCTURE_REASON.into()),
         };
     };
     match derive_role(Some(&s), my_login) {
@@ -639,8 +634,22 @@ pub fn decide_band(
     }
 }
 
-const PENDING_REASON: &str = "waiting for the owner to approve your join request";
-const UNKNOWN_LOGIN_REASON: &str = "GitHub login of this install is unknown - save the token again";
+// Machine-readable refusal codes of `create_bug` in a shared repo (T-000223).
+// The UI maps the stable `band_refused:` prefix and code to a translated text
+// (`mapBugRefusal` in src/lib/stores/bug-refusal.ts); the part after the code
+// is a payload (a reason, or `<lo>-<hi>` for a full band).
+/// Prefix shared by every refusal code.
+pub const REFUSAL_PREFIX: &str = "band_refused:";
+/// The owner has not approved this install's join request yet.
+const PENDING_REASON: &str = "band_refused:pending";
+/// The GitHub login of this install is unknown.
+const UNKNOWN_LOGIN_REASON: &str = "band_refused:no_login";
+/// The structure file failed validation; the reason follows the second colon.
+const UNTRUSTED_REASON_PREFIX: &str = "band_refused:untrusted:";
+/// The structure file is not in the working tree yet.
+const NO_STRUCTURE_REASON: &str = "band_refused:no_structure";
+/// The structure has no number range for this install.
+const NO_RANGE_REASON: &str = "band_refused:no_range";
 
 /// The decision for a repo of the local DB: reads the shared state, the
 /// working-tree structure file and this install's login.
@@ -675,7 +684,7 @@ pub fn allocate_bug_numeric_id(db: &AppDb, repo_id: i64) -> Result<i64, String> 
         BandDecision::Band(lo, hi) => db
             .next_numeric_id_in_band(repo_id, lo, hi)
             .map_err(|e| e.to_string())?
-            .map_err(|full| full.to_string()),
+            .map_err(|full| format!("{}full:{}-{}", REFUSAL_PREFIX, full.lo, full.hi)),
         BandDecision::Refused(reason) => Err(reason),
     }
 }
@@ -909,6 +918,11 @@ pub struct SharedImport {
     /// still has to be pushed along with the dev branch.
     #[serde(default)]
     pub disabling_branches: Vec<String>,
+    /// What the repo's status code is about (see
+    /// `AppDb::set_shared_status_with_detail`); written and cleared together
+    /// with `repositories.shared_status`, exposed as `shared_status_detail`.
+    #[serde(default)]
+    pub status_detail: Option<String>,
 }
 
 /// Tolerant parse: empty or invalid JSON (or a different shape) -> default.
@@ -2323,9 +2337,33 @@ mod tests {
             decide_band(Ok(None), false, Some("pending"), Some("helper")),
             BandDecision::Refused(PENDING_REASON.into())
         );
-        assert!(matches!(
+        assert_eq!(
             decide_band(Ok(None), false, Some("contributor"), Some("helper")),
-            BandDecision::Refused(r) if r.contains("sync the project")
+            BandDecision::Refused("band_refused:no_structure".into())
+        );
+    }
+
+    /// The refusal texts are stable machine-readable codes: the UI maps them to
+    /// translated texts (src/lib/stores/bug-refusal.ts).
+    #[test]
+    fn refusal_codes_are_stable() {
+        assert_eq!(PENDING_REASON, "band_refused:pending");
+        assert_eq!(UNKNOWN_LOGIN_REASON, "band_refused:no_login");
+        assert_eq!(NO_STRUCTURE_REASON, "band_refused:no_structure");
+        assert_eq!(NO_RANGE_REASON, "band_refused:no_range");
+        assert!(UNTRUSTED_REASON_PREFIX.starts_with(REFUSAL_PREFIX));
+        let untrusted = decide_band(Err("bad file".into()), false, None, Some("x"));
+        assert_eq!(
+            untrusted,
+            BandDecision::Refused("band_refused:untrusted:bad file".into())
+        );
+        // a structure without a range for a participant-less contributor login
+        let mut s = sample();
+        s.participants.clear();
+        // main is fine, so use a login that is known but gets no band
+        assert!(matches!(
+            band_of(&s, "nobody"),
+            BandDecision::Refused(r) if r == "band_refused:no_range"
         ));
     }
 
@@ -2460,7 +2498,7 @@ mod tests {
         fs::write(tmp.path().join(".sdh/project.json"), "nope").unwrap();
         assert!(matches!(
             bug_band_for_repo(&db, rid),
-            BandDecision::Refused(r) if r.contains("not trusted")
+            BandDecision::Refused(r) if r.starts_with("band_refused:untrusted:")
         ));
     }
 
@@ -2529,6 +2567,6 @@ mod tests {
         write_structure_if_changed(tmp.path(), &s).unwrap();
         seed_numeric(&db, rid, 599_999);
         let err = allocate_bug_numeric_id(&db, rid).unwrap_err();
-        assert!(err.contains("B-500000..B-599999"), "{}", err);
+        assert_eq!(err, "band_refused:full:500000-599999");
     }
 }
