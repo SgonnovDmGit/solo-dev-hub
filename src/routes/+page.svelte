@@ -31,7 +31,7 @@
   import ReportsHub from '$lib/components/ReportsHub.svelte';
   import SecretAudit from '$lib/components/SecretAudit.svelte';
   import SecretBundles from '$lib/components/SecretBundles.svelte';
-  import GlobalClaudeEditor from '$lib/components/GlobalClaudeEditor.svelte';
+  import RulesScreen from '$lib/components/RulesScreen.svelte';
   import Help from '$lib/components/Help.svelte';
   import InputContextMenu from '$lib/components/InputContextMenu.svelte';
   import logo from '$lib/assets/logo.png';
@@ -319,8 +319,8 @@
         <SecretAudit />
       {:else if $currentScreen.name === 'secret_bundles'}
         <SecretBundles />
-      {:else if $currentScreen.name === 'global_claude_editor'}
-        <GlobalClaudeEditor />
+      {:else if $currentScreen.name === 'rules'}
+        <RulesScreen />
       {:else if $currentScreen.name === 'help'}
         <Help />
       {/if}

@@ -1,13 +1,12 @@
 <script lang="ts">
-  import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { addToast } from '$lib/stores/ui';
   import { tStore } from '$lib/i18n';
   import { listTemplateFiles, saveTemplateFile, resetTemplateFile } from '$lib/api/tauri-commands';
   import type { TemplateFile } from '$lib/types';
   import ConfirmDialog from './ConfirmDialog.svelte';
-  import { toastRulesFindings } from '$lib/utils/rules-report';
+  import { reportRuleOutcome } from '$lib/utils/rules-actions';
 
-  let { languageKey, excludeFiles = [] }: { languageKey: string; excludeFiles?: string[] } = $props();
+  let { languageKey, exclude }: { languageKey: string; exclude?: (fileName: string) => boolean } = $props();
 
   let files = $state<TemplateFile[]>([]);
   let selectedFileName = $state<string | null>(null);
@@ -23,7 +22,7 @@
   async function loadFiles(key: string) {
     try {
       const all = await listTemplateFiles(key);
-      files = all.filter((f) => !excludeFiles.includes(f.file_name));
+      files = exclude ? all.filter((f) => !exclude(f.file_name)) : all;
       if (files.length > 0 && !selectedFileName) {
         selectFile(files[0].file_name);
       }
@@ -61,25 +60,7 @@
       // T-000203: saving a rule also delivers it. Report where it landed —
       // "saved" alone left the owner unable to tell an applied rule from one
       // still sitting in the database.
-      if (outcome.rendered) {
-        addToast(
-          $tStore('toast.ruleApplied' as any)
-            .replace('{0}', String(outcome.skills))
-            .replace('{1}', String(outcome.repos)),
-          'success'
-        );
-        // T-000207: the save collected pending hand-backs across the portfolio
-        // before rendering — name what was taken up, lost or set aside.
-        toastRulesFindings(outcome);
-        if (outcome.errors.length > 0) {
-          addToast(
-            $tStore('toast.ruleApplyErrors' as any).replace('{0}', formatSyncIssues(outcome.errors)),
-            'error'
-          );
-        }
-      } else {
-        addToast($tStore('toast.templateSaved' as any), 'success');
-      }
+      reportRuleOutcome(outcome, 'toast.templateSaved');
       await loadFiles(languageKey);
     } catch (err) {
       addToast(String(err), 'error');
@@ -89,8 +70,9 @@
   async function handleReset() {
     if (!selectedFileName) return;
     try {
-      await resetTemplateFile(languageKey, selectedFileName);
-      addToast($tStore('toast.templateReset' as any), 'success');
+      // T-000212: resetting a skill re-renders it everywhere, like a save.
+      const outcome = await resetTemplateFile(languageKey, selectedFileName);
+      reportRuleOutcome(outcome, 'toast.templateReset');
       await loadFiles(languageKey);
       showResetConfirm = false;
     } catch (err) {
@@ -100,7 +82,7 @@
   }
 
   $effect(() => {
-    void excludeFiles;
+    void exclude;
     loadFiles(languageKey);
   });
 </script>
