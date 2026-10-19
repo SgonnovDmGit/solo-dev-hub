@@ -109,6 +109,9 @@ struct StatusNote {
     diverged: Option<(String, bool)>,
     /// `PushRejected` only: the branch the push was refused on.
     rejected_branch: Option<String>,
+    /// A coded detail for the UI that replaces the human `detail`
+    /// (`Untrusted` with a dev-branch-changed reason).
+    ui: Option<String>,
 }
 
 impl StatusNote {
@@ -120,6 +123,9 @@ impl StatusNote {
     /// * `push_rejected`: `{"branch":"dev","message":"<git message>"}`
     /// * the others: the plain reason / message, if any.
     fn ui_detail(&self) -> Option<String> {
+        if let Some(ui) = &self.ui {
+            return Some(ui.clone());
+        }
         if let Some((branch, current)) = &self.diverged {
             return Some(
                 serde_json::json!({ "branch": branch, "current": current }).to_string(),
@@ -1184,6 +1190,20 @@ impl RepoPass {
             detail: detail.into(),
             diverged: None,
             rejected_branch: None,
+            ui: None,
+        });
+    }
+
+    /// `Untrusted` with the reason of the structure check. A coded reason (a
+    /// changed dev branch) goes to the UI as is and is spelled out for the issue.
+    fn note_untrusted(&mut self, reason: String) {
+        let coded = ss::parse_dev_branch_changed(&reason).is_some();
+        self.notes.push(StatusNote {
+            status: SharedStatus::Untrusted,
+            detail: ss::humanize_untrusted_reason(&reason),
+            diverged: None,
+            rejected_branch: None,
+            ui: coded.then_some(reason),
         });
     }
 
@@ -1194,6 +1214,7 @@ impl RepoPass {
             detail: message,
             diverged: None,
             rejected_branch: Some(branch.to_string()),
+            ui: None,
         });
     }
 
@@ -1204,6 +1225,7 @@ impl RepoPass {
             detail: diverged_detail(branch, current),
             diverged: Some((branch.to_string(), current)),
             rejected_branch: None,
+            ui: None,
         });
     }
 
@@ -1639,7 +1661,7 @@ fn phase_a_main(
     match ss::read_structure_file(root, &gh) {
         Ok(s) => pass.structure = s,
         Err(reason) => {
-            pass.note(SharedStatus::Untrusted, reason);
+            pass.note_untrusted(reason);
             pass.role = None;
             return pass;
         }
@@ -1699,7 +1721,7 @@ fn phase_a_foreign(
             None
         }
         DiscoverOutcome::Untrusted(reason) => {
-            pass.note(SharedStatus::Untrusted, reason);
+            pass.note_untrusted(reason);
             Some(pass)
         }
         DiscoverOutcome::Found(s, _source) => {
@@ -3078,7 +3100,22 @@ pub fn approve_join_request(
 
 /// Contributor: trust the owner's current dev branch again (after the pin
 /// refused a changed one).
+///
+/// Only offered for what the status says: a `shared_untrusted` status whose
+/// detail is a changed dev branch, on an install that is not the owner.
 pub fn accept_new_main_branch(db: &AppDb, repo_id: i64) -> Result<(), String> {
+    let st = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if st.shared_mode || st.shared_role.as_deref() == Some("main") {
+        return Err("only a contributor can accept a new dev branch of the owner".into());
+    }
+    let changed = st.shared_status.as_deref() == Some(SharedStatus::Untrusted.as_str())
+        && st
+            .shared_status_detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with(ss::DEV_BRANCH_CHANGED_PREFIX));
+    if !changed {
+        return Err("the owner's dev branch has not changed: nothing to accept".into());
+    }
     let mut v = ss::read_shared_import(db, repo_id);
     v.pinned_dev_branch = None;
     ss::write_shared_import(db, repo_id, &v)?;
@@ -3506,6 +3543,28 @@ mod tests {
             first,
             fs::read_to_string(tmp.path().join(".gitignore")).unwrap()
         );
+    }
+
+    #[test]
+    fn status_note_ui_detail_is_coded_where_the_ui_needs_a_code() {
+        let note = |detail: &str, ui: Option<&str>| StatusNote {
+            status: SharedStatus::Untrusted,
+            detail: detail.to_string(),
+            diverged: None,
+            rejected_branch: None,
+            ui: ui.map(String::from),
+        };
+        // A changed dev branch: the UI gets the code, the issue keeps the text.
+        let coded = ss::dev_branch_changed_reason("dev", "next");
+        let n = note(&ss::humanize_untrusted_reason(&coded), Some(&coded));
+        assert_eq!(n.ui_detail().as_deref(), Some(coded.as_str()));
+        assert_eq!(n.detail, "dev branch changed from dev to next");
+        // Any other reason is shown as text.
+        assert_eq!(
+            note("main is not the repo owner", None).ui_detail().as_deref(),
+            Some("main is not the repo owner")
+        );
+        assert_eq!(note("  ", None).ui_detail(), None);
     }
 
     #[test]
@@ -4060,8 +4119,31 @@ mod tests {
         fx.make_participant();
         let v = ss::read_shared_import(&fx.helper_db, fx.helper_repo);
         assert_eq!(v.pinned_dev_branch.as_deref(), Some("dev"));
+        // Refused while the status is not a changed dev branch.
+        assert!(accept_new_main_branch(&fx.helper_db, fx.helper_repo).is_err());
         fx.helper_db
-            .set_shared_status(fx.helper_repo, Some("shared_untrusted"))
+            .set_shared_status_with_detail(
+                fx.helper_repo,
+                Some("shared_untrusted"),
+                Some("main is not the repo owner"),
+            )
+            .unwrap();
+        assert!(accept_new_main_branch(&fx.helper_db, fx.helper_repo).is_err());
+        // Refused on the owner's own install.
+        fx.main_db
+            .set_shared_status_with_detail(
+                fx.main_repo,
+                Some("shared_untrusted"),
+                Some("dev_branch_changed:dev\u{2192}next"),
+            )
+            .unwrap();
+        assert!(accept_new_main_branch(&fx.main_db, fx.main_repo).is_err());
+        fx.helper_db
+            .set_shared_status_with_detail(
+                fx.helper_repo,
+                Some("shared_untrusted"),
+                Some("dev_branch_changed:dev\u{2192}next"),
+            )
             .unwrap();
         accept_new_main_branch(&fx.helper_db, fx.helper_repo).unwrap();
         assert_eq!(

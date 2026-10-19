@@ -636,7 +636,7 @@ pub fn decide_band(
 
 // Machine-readable refusal codes of `create_bug` in a shared repo (T-000223).
 // The UI maps the stable `band_refused:` prefix and code to a translated text
-// (`mapBugRefusal` in src/lib/stores/bug-refusal.ts); the part after the code
+// (`parseBugRefusal` / `bugRefusalMessage` in src/lib/utils/bug-refusal.ts); the part after the code
 // is a payload (a reason, or `<lo>-<hi>` for a full band).
 /// Prefix shared by every refusal code.
 pub const REFUSAL_PREFIX: &str = "band_refused:";
@@ -891,6 +891,40 @@ pub enum DiscoverOutcome {
     Untrusted(String),
 }
 
+/// Machine-readable start of the `Untrusted` reason (and of the stored status
+/// detail) when the owner's dev branch differs from the pinned one:
+/// `dev_branch_changed:<pin>→<new>`. The UI offers "accept the new branch" on
+/// this code (src/lib/utils/shared-mode.ts `parseDevBranchChanged`); the human
+/// text of the sync issue is built by `humanize_untrusted_reason`.
+pub const DEV_BRANCH_CHANGED_PREFIX: &str = "dev_branch_changed:";
+
+/// Separator between the pinned and the new branch in the coded reason.
+const DEV_BRANCH_CHANGED_ARROW: char = '\u{2192}';
+
+/// The coded `Untrusted` reason of a changed dev branch.
+pub fn dev_branch_changed_reason(pin: &str, new: &str) -> String {
+    format!(
+        "{}{}{}{}",
+        DEV_BRANCH_CHANGED_PREFIX, pin, DEV_BRANCH_CHANGED_ARROW, new
+    )
+}
+
+/// `(pin, new)` of a coded dev-branch-changed reason.
+pub fn parse_dev_branch_changed(reason: &str) -> Option<(&str, &str)> {
+    reason
+        .strip_prefix(DEV_BRANCH_CHANGED_PREFIX)?
+        .split_once(DEV_BRANCH_CHANGED_ARROW)
+}
+
+/// The English text of an `Untrusted` reason for the sync issue: a coded reason
+/// is spelled out, any other reason is already text.
+pub fn humanize_untrusted_reason(reason: &str) -> String {
+    match parse_dev_branch_changed(reason) {
+        Some((pin, new)) => format!("dev branch changed from {} to {}", pin, new),
+        None => reason.to_string(),
+    }
+}
+
 /// What this install remembers about the shared files of a repo, stored as JSON
 /// in `repositories.shared_import`. `pinned_dev_branch` is the trust-on-first-use
 /// pin of the owner's dev branch. `blobs` maps a repo-relative path of a shared
@@ -962,7 +996,8 @@ pub fn pin_after_accept(db: &AppDb, repo_id: i64, s: &ProjectStructure) -> Resul
 /// * `pinned` is `Some(dev_branch)` once a structure was accepted before (see
 ///   `pin_after_accept`). Then ONLY `origin/<pinned>` is consulted (and the
 ///   worktree file, if it names the same dev branch). A structure there whose
-///   `dev_branch` differs from the pin is `Untrusted("dev branch changed ...")`.
+///   `dev_branch` differs from the pin is `Untrusted("dev_branch_changed:<pin>→<new>")`
+///   (see `DEV_BRANCH_CHANGED_PREFIX`).
 /// * Unpinned, every remote ref that sits on `origin/<its own main.dev_branch>`
 ///   and validates is a candidate. One candidate is the answer; two or more
 ///   are `Untrusted("ambiguous structure: ...")` - none is ever picked.
@@ -998,10 +1033,7 @@ pub fn discover_structure(
         Ok(Some(s)) => match validate_structure(&s, github_name) {
             Ok(()) => match pinned {
                 Some(pin) if s.main.dev_branch != pin => {
-                    untrusted = Some(format!(
-                        "{}: dev branch changed from {} to {}",
-                        STRUCTURE_REL_PATH, pin, s.main.dev_branch
-                    ));
+                    untrusted = Some(dev_branch_changed_reason(pin, &s.main.dev_branch));
                 }
                 _ => return Ok(DiscoverOutcome::Found(s, SOURCE_WORKTREE.to_string())),
             },
@@ -1028,10 +1060,7 @@ pub fn discover_structure(
         let full = format!("refs/remotes/origin/{}", pin);
         if let Some(s) = read_ref(&full) {
             if s.main.dev_branch != pin {
-                untrusted = Some(format!(
-                    "origin/{}: dev branch changed from {} to {}",
-                    pin, pin, s.main.dev_branch
-                ));
+                untrusted = Some(dev_branch_changed_reason(pin, &s.main.dev_branch));
             } else {
                 match validate_structure(&s, github_name) {
                     Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", pin))),
@@ -2169,11 +2198,11 @@ mod tests {
         let c = contributor(&fx);
         match discover_structure(&gb(), &c, REPO, Some("dev")).unwrap() {
             DiscoverOutcome::Untrusted(reason) => {
-                assert!(
-                    reason.contains("dev branch changed from dev to other"),
-                    "{}",
-                    reason
-                )
+                assert_eq!(reason, "dev_branch_changed:dev\u{2192}other");
+                assert_eq!(
+                    humanize_untrusted_reason(&reason),
+                    "dev branch changed from dev to other"
+                );
             }
             other => panic!("expected Untrusted, got {:?}", other),
         }
@@ -2344,7 +2373,20 @@ mod tests {
     }
 
     /// The refusal texts are stable machine-readable codes: the UI maps them to
-    /// translated texts (src/lib/stores/bug-refusal.ts).
+    /// translated texts (`bugRefusalMessage` in src/lib/utils/bug-refusal.ts).
+    #[test]
+    fn dev_branch_changed_code_is_stable() {
+        assert_eq!(DEV_BRANCH_CHANGED_PREFIX, "dev_branch_changed:");
+        let r = dev_branch_changed_reason("dev", "next");
+        assert_eq!(r, "dev_branch_changed:dev\u{2192}next");
+        assert_eq!(parse_dev_branch_changed(&r), Some(("dev", "next")));
+        assert_eq!(parse_dev_branch_changed("main is not the repo owner"), None);
+        assert_eq!(
+            humanize_untrusted_reason("main is not the repo owner"),
+            "main is not the repo owner"
+        );
+    }
+
     #[test]
     fn refusal_codes_are_stable() {
         assert_eq!(PENDING_REASON, "band_refused:pending");
