@@ -1071,29 +1071,18 @@ pub(crate) fn run_project_sync_in(
         write_repo_skeletons(db, *ms_id, base, &ms_server, &tpl, &quiet_conflicts, &mut c);
     }
 
-    // Server/client checks only matter for `standard` project type. A
-    // `microservice` project intentionally has neither — surfacing those as
-    // errors produces false-positive warning toasts on every sync.
-    let project = db.get_project(project_id).ok();
-    let project_name = project
-        .as_ref()
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| format!("#{}", project_id));
-    let project_type = project
+    // A project without a server (or a server without clients yet) is not an
+    // error: the user knows their own project shape, and a warning on every
+    // sync only trains them to ignore warnings. Owner's decision, 2026-10-19
+    // ("no server - so what, who cares"); the "no client" case was softened
+    // for the same reason earlier. Real delivery failures (connected
+    // microservice without a server repo, parent project without a server,
+    // codex consumer without a matching role) still raise MissingCounterpart.
+    let project_type = db
+        .get_project(project_id)
+        .ok()
         .map(|p| p.project_type)
         .unwrap_or_else(|| "standard".to_string());
-    if project_type == "standard" {
-        // P6 review-fix: "No clients" is only relevant once the server is
-        // in place. Server-only build-out phase (server first, clients
-        // later) shouldn't generate a warning toast on every sync — that
-        // trains the user to ignore them. The "No server" case stays a
-        // warning because the server is the core of the standard flow.
-        if server.is_none() {
-            c.push(SyncIssue::new(Code::MissingCounterpart, project_name.clone()).target("server"));
-        } else if clients.is_empty() {
-            c.push(SyncIssue::new(Code::MissingCounterpart, project_name.clone()).target("client"));
-        }
-    }
 
     if let Some(srv) = server {
         if srv.local_path.is_none() {
@@ -1260,6 +1249,42 @@ mod tests {
             .unwrap(),
             edited,
             "and the user-level skills were refreshed in the same pass"
+        );
+    }
+
+    /// Owner's decision 2026-10-19: a standard project with no server repo is
+    /// not an error. The rest of the pass still runs (skeletons are written to
+    /// the repos it does have), it just raises no MissingCounterpart.
+    #[test]
+    fn test_standard_project_without_server_raises_no_missing_counterpart() {
+        let db_dir = TempDir::new().unwrap();
+        let db = AppDb::new(db_dir.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let project = db.create_project("NoServer", None, "standard").unwrap();
+        db.insert_local_repository(
+            &repo_dir.path().to_string_lossy(),
+            "only-tool",
+            Some(project.id),
+            Some("tool"),
+        )
+        .unwrap();
+
+        let result = run_project_sync_in(&db, project.id, Some(home.path().to_path_buf())).unwrap();
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.code == crate::models::SyncIssueCode::MissingCounterpart),
+            "no server is not an error: {:?}",
+            result.errors
+        );
+        assert!(
+            repo_dir.path().join("docs").join("sdh_skills").is_dir(),
+            "the rest of the pass still ran for the repo that exists"
         );
     }
 
