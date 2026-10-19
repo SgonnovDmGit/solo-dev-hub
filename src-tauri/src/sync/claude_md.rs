@@ -191,7 +191,11 @@ fn render_claude_section(
         .replace("{{PROJECT_DESCRIPTION}}", &description)
         .replace("{{REPOS_TABLE}}", &repos_table)
         .replace("{{MICROSERVICES_BLOCK}}", &ms_block)
-        .replace("{{PARENTS_BLOCK}}", &parents_block);
+        .replace("{{PARENTS_BLOCK}}", &parents_block)
+        // F-000044: filled for shared repos by the band step; empty elsewhere,
+        // together with the blank line that separates it.
+        .replace("{{SHARED_BLOCK}}\n\n", "")
+        .replace("{{SHARED_BLOCK}}", "");
 
     Ok(rendered)
 }
