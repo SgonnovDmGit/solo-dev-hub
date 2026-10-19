@@ -688,6 +688,37 @@ pub fn serialize_request(r: &JoinRequest) -> String {
     out
 }
 
+/// Largest request file that is read, for callers that read blobs themselves.
+pub const MAX_REQUEST_FILE_BYTES: u64 = MAX_REQUEST_BYTES;
+
+/// A request from the bytes of `.sdh/requests/<stem>.json`: `None` when it is
+/// unparsable, names another login than the file, has an unusable branch, or
+/// is the request of the owner / of an existing participant of `structure`.
+pub fn request_from_bytes(
+    stem: &str,
+    bytes: &[u8],
+    structure: Option<&ProjectStructure>,
+) -> Option<JoinRequest> {
+    if bytes.len() as u64 > MAX_REQUEST_BYTES || !is_valid_request_login(stem) {
+        return None;
+    }
+    let mut req = serde_json::from_slice::<JoinRequest>(bytes).ok()?;
+    req.branch = req.branch.trim().to_string();
+    if !logins_equal(&req.login, stem) || !is_valid_branch_name(&req.branch) {
+        return None;
+    }
+    if let Some(s) = structure {
+        if logins_equal(&s.main.login, &req.login)
+            || s.participants
+                .iter()
+                .any(|p| logins_equal(&p.login, &req.login))
+        {
+            return None;
+        }
+    }
+    Some(req)
+}
+
 /// Pending requests of the working tree of the repo `github_name`, sorted by
 /// login. Looks at no more than `MAX_REQUEST_FILES` files (by file name).
 /// Skips unparsable, oversized or symlinked files, names that are not usable
@@ -733,24 +764,11 @@ pub fn list_requests(repo_root: &Path, github_name: &str) -> Vec<JoinRequest> {
             continue;
         }
         let Ok(bytes) = fs::read(&path) else { continue };
-        let Ok(mut req) = serde_json::from_slice::<JoinRequest>(&bytes) else {
+        let Some(req) = request_from_bytes(stem, &bytes, structure.as_ref()) else {
             continue;
         };
-        req.branch = req.branch.trim().to_string();
-        if !logins_equal(&req.login, stem) || !is_valid_branch_name(&req.branch) {
-            continue;
-        }
         if out.iter().any(|r| logins_equal(&r.login, &req.login)) {
             continue;
-        }
-        if let Some(s) = &structure {
-            if logins_equal(&s.main.login, &req.login)
-                || s.participants
-                    .iter()
-                    .any(|p| logins_equal(&p.login, &req.login))
-            {
-                continue;
-            }
         }
         out.push(req);
     }
@@ -861,6 +879,15 @@ pub struct SharedImport {
     pub pinned_dev_branch: Option<String>,
     #[serde(default)]
     pub blobs: BTreeMap<String, String>,
+    /// Unix seconds of the last probe of this repo for a shared structure
+    /// (role-less foreign repos only); persisted so a restart does not probe
+    /// every repo at once.
+    #[serde(default)]
+    pub last_probe_unix: Option<i64>,
+    /// Set while the owner's switch-off of sharing has not reached the remote:
+    /// the dev branch whose deletion of `.sdh/` still has to be pushed.
+    #[serde(default)]
+    pub disabling: Option<String>,
 }
 
 /// Tolerant parse: empty or invalid JSON (or a different shape) -> default.

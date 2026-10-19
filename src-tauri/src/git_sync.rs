@@ -769,7 +769,7 @@ fn refuse_checked_out(
 
 /// Repo state from the real git dir (`rev-parse --git-path`), so it also works
 /// when `.git` is a file (linked worktree, submodule).
-fn repo_state(git: &GitBinary, repo: &Path) -> Result<RepoState, String> {
+pub(crate) fn repo_state(git: &GitBinary, repo: &Path) -> Result<RepoState, String> {
     let out = run_ok(
         git,
         repo,

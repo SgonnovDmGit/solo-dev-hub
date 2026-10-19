@@ -44,7 +44,7 @@ pub fn approve_join_request(
     repo_id: i64,
     login: String,
 ) -> Result<ProjectStructure, String> {
-    shared::approve_join_request(&db, repo_id, &login)
+    shared::approve_join_request(&db, cached_git().as_ref(), repo_id, &login)
 }
 
 /// Contributor: trust the owner's changed dev branch.
@@ -61,7 +61,7 @@ pub fn merge_shared_upstream(db: State<AppDb>, repo_id: i64) -> Result<SharedMer
 
 #[tauri::command(async)]
 pub fn list_join_requests(db: State<AppDb>, repo_id: i64) -> Result<Vec<JoinRequest>, String> {
-    shared::list_join_requests(&db, repo_id)
+    shared::list_join_requests(&db, cached_git().as_ref(), repo_id)
 }
 
 #[tauri::command(async)]

@@ -485,6 +485,47 @@ fn last_version_sha(git: &GitBinary, root: &Path, path: &str) -> Option<String> 
         .flatten()
 }
 
+/// Files only the owner writes: the owner's copy always wins.
+fn sole_writer(path: &str) -> bool {
+    path == STRUCTURE_REL_PATH || path.starts_with("docs/sdh_skills/")
+}
+
+/// `.sdh/requests/<login>.json` of a login that is a participant by now.
+fn is_approved_request(path: &str, approved: &[String]) -> bool {
+    path.strip_prefix(&format!("{}/", REQUESTS_REL_DIR))
+        .and_then(|n| n.strip_suffix(".json"))
+        .is_some_and(|stem| approved.iter().any(|l| ss::logins_equal(l, stem)))
+}
+
+/// Did `path` ever have the blob `sha` in HEAD's history (as the old or the
+/// new side of any commit touching it)?
+fn blob_in_head_history(git: &GitBinary, root: &Path, path: &str, sha: &str) -> bool {
+    if let Ok(Some(head)) = git_sync::blob_sha_at(git, root, "HEAD", path) {
+        if head == sha {
+            return true;
+        }
+    }
+    let Ok(out) = spawn_cmd(&git.0)
+        .args([
+            "log",
+            "--raw",
+            "--no-abbrev",
+            "--format=",
+            "HEAD",
+            "--",
+            path,
+        ])
+        .current_dir(root)
+        .output()
+    else {
+        return false;
+    };
+    out.status.success()
+        && String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.split_whitespace().any(|t| t == sha))
+}
+
 /// What to do with one file of the target branch.
 #[derive(Debug, PartialEq, Eq)]
 enum Plan {
@@ -496,17 +537,23 @@ enum Plan {
 /// Commit our version of the shared files into `branch` (a local branch that is
 /// not checked out). Task files (`todo.md` / `done.md` / `bug-reports.md`) are
 /// merged by id (base = the file at the merge-base of HEAD and the branch,
-/// ours = the work tree, theirs = the branch). Every other file is a plain
-/// three-way copy: the work tree wins only when we changed the file since the
-/// merge-base; a file we deleted (present at the merge-base, unchanged on the
-/// branch) is deleted from the branch; a file the branch deleted is not
-/// resurrected unless we changed it. Files outside `pathspec` are never touched.
+/// ours = the work tree, theirs = the branch). Every other file is a three-way
+/// copy: the work tree wins only when we changed the file since the merge-base
+/// AND the branch either still holds the merge-base's version or a version that
+/// is in HEAD's history for that path (a version this checkout never had is
+/// newer foreign work and is never clobbered; the owner's own
+/// `.sdh/project.json` and rule files are exempt). A file we deleted (the
+/// branch still holds the version we last had) is deleted from the branch, and
+/// so is the request file of an approved participant. A file the branch deleted
+/// is not resurrected unless we changed it. Files outside `pathspec` are never
+/// touched; the caller leaves the managed root files out of it.
 fn plumb_into_branch(
     git: &GitBinary,
     root: &Path,
     branch: &str,
     pathspec: &[String],
     login: &str,
+    approved: &[String],
 ) -> Result<BranchCommit, String> {
     let refname = local_ref(branch);
     let base_rev = git_sync::merge_base(git, root, "HEAD", &refname)?;
@@ -557,9 +604,17 @@ fn plumb_into_branch(
                         Err(_) => Plan::Skip,
                     }
                 } else if Some(w) == bs {
+                    // Unchanged on our side: the branch's version stands.
                     Plan::Skip
-                } else {
+                } else if Some(b) == bs
+                    || sole_writer(path)
+                    || blob_in_head_history(git, root, path, b)
+                {
                     read_worktree(root, path).map_or(Plan::Skip, Plan::Write)
+                } else {
+                    // The branch holds a version this checkout never had: newer
+                    // foreign work, never clobbered.
+                    Plan::Skip
                 }
             }
             (Some(w), None) => {
@@ -569,6 +624,7 @@ fn plumb_into_branch(
                     read_worktree(root, path).map_or(Plan::Skip, Plan::Write)
                 }
             }
+            (None, Some(_)) if is_approved_request(path, approved) => Plan::Delete,
             (None, Some(b)) => {
                 // We deleted it iff the branch still holds the version we last
                 // had: the merge-base's, or (the histories of two plumbed
@@ -643,7 +699,16 @@ struct RepoPass {
     own_branch: Option<String>,
     recipients: Vec<String>,
     notes: Vec<StatusNote>,
+    /// Recurring non-status problems of this pass (reported when they change).
+    issues: Vec<SyncIssue>,
+    /// No fetch or push of this pass failed.
     net_ok: bool,
+    /// `git fetch` really ran (and succeeded) in this pass.
+    fetched: bool,
+    /// Lower-cased non-current recipient branches that hold commits that are
+    /// not ours: never plumbed into, never pushed.
+    blocked: HashSet<String>,
+    committed: bool,
 }
 
 impl RepoPass {
@@ -653,6 +718,14 @@ impl RepoPass {
             detail: detail.into(),
         });
     }
+
+    fn issue(&mut self, issue: SyncIssue) {
+        self.issues.push(issue);
+    }
+
+    fn is_blocked(&self, branch: &str) -> bool {
+        self.blocked.contains(&branch.to_ascii_lowercase())
+    }
 }
 
 /// The result of phase A, consumed by `finish`.
@@ -660,7 +733,6 @@ pub struct SharedSync {
     passes: Vec<RepoPass>,
     /// Repos the shared path took over: the ordinary auto-commit skips them.
     pub handled: HashSet<i64>,
-    outcome: SharedOutcome,
 }
 
 impl SharedSync {
@@ -668,19 +740,38 @@ impl SharedSync {
         SharedSync {
             passes: Vec::new(),
             handled: HashSet::new(),
-            outcome: SharedOutcome::default(),
         }
     }
 }
 
-fn probe_due(repo_id: i64, root: &Path) -> bool {
-    static LAST: OnceLock<Mutex<HashMap<(i64, String), Instant>>> = OnceLock::new();
+// ----- throttles ------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum NetKind {
+    Fetch,
+    Push,
+}
+
+/// Minimum time between two fetches (and between two pushes) of one repo, so
+/// two project syncs in the same tick do not redo the network work.
+fn min_net_interval() -> Duration {
+    if cfg!(test) {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
+/// True (and the slot is taken) when `interval` has passed since the last slot
+/// of this kind for this repo.
+fn net_slot(kind: NetKind, repo_id: i64, root: &Path, interval: Duration) -> bool {
+    static LAST: OnceLock<Mutex<HashMap<(NetKind, i64, String), Instant>>> = OnceLock::new();
     let map = LAST.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (repo_id, root.to_string_lossy().into_owned());
+    let key = (kind, repo_id, root.to_string_lossy().into_owned());
     let mut m = map.lock().unwrap();
     let now = Instant::now();
     match m.get(&key) {
-        Some(t) if now.duration_since(*t) < PROBE_INTERVAL => false,
+        Some(t) if now.duration_since(*t) < interval => false,
         _ => {
             m.insert(key, now);
             true
@@ -688,20 +779,194 @@ fn probe_due(repo_id: i64, root: &Path) -> bool {
     }
 }
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Is a role-less foreign repo due for a probe? Takes the slot (persisted in
+/// `SharedImport`) when it is.
+fn probe_due(db: &AppDb, repo_id: i64, now: i64) -> bool {
+    let mut imp = ss::read_shared_import(db, repo_id);
+    if let Some(t) = imp.last_probe_unix {
+        if now - t < PROBE_INTERVAL.as_secs() as i64 {
+            return false;
+        }
+    }
+    imp.last_probe_unix = Some(now);
+    let _ = ss::write_shared_import(db, repo_id, &imp);
+    true
+}
+
+// ----- recurring issues ---------------------------------------------------------
+
+fn fingerprint(i: &SyncIssue) -> String {
+    format!(
+        "{:?}|{}|{}",
+        i.code,
+        i.target.as_deref().unwrap_or(""),
+        i.detail.as_deref().unwrap_or("")
+    )
+}
+
+/// The issues of this pass that were not already reported by the previous pass
+/// of the same repo: a problem that keeps recurring is shown once.
+fn fresh_issues(repo_id: i64, root: &Path, issues: Vec<SyncIssue>) -> Vec<SyncIssue> {
+    static SEEN: OnceLock<Mutex<HashMap<(i64, String), HashSet<String>>>> = OnceLock::new();
+    let map = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (repo_id, root.to_string_lossy().into_owned());
+    let current: HashSet<String> = issues.iter().map(fingerprint).collect();
+    let previous = map.lock().unwrap().insert(key, current).unwrap_or_default();
+    issues
+        .into_iter()
+        .filter(|i| !previous.contains(&fingerprint(i)))
+        .collect()
+}
+
 fn repo_issue(code: Code, repo: &Repository) -> SyncIssue {
     SyncIssue::new(code, repo.display_name())
 }
+
+// ----- safety guards ----------------------------------------------------------------
+
+/// The repo may be touched: no merge or rebase in progress, HEAD on a branch,
+/// no unmerged paths.
+fn repo_ready(git: &GitBinary, root: &Path) -> bool {
+    if !matches!(
+        git_sync::repo_state(git, root),
+        Ok(crate::git_ops::RepoState::Clean)
+    ) {
+        return false;
+    }
+    if !matches!(current_branch(git, root), Ok(Some(_))) {
+        return false;
+    }
+    match spawn_cmd(&git.0)
+        .args(["ls-files", "-u"])
+        .current_dir(root)
+        .output()
+    {
+        Ok(o) => o.status.success() && o.stdout.is_empty(),
+        Err(_) => false,
+    }
+}
+
+fn path_in_specs(file: &str, specs: &[String]) -> bool {
+    specs
+        .iter()
+        .any(|s| file == s || file.starts_with(&format!("{}/", s)))
+}
+
+/// Are all commits of `branch` that origin does not have commits this app made?
+/// Each must be authored by the SDH identity, have exactly one parent, carry the
+/// exact sync subject and an `SDH-Participant:` trailer, and touch shared files
+/// only. `true` when there are none.
+fn local_only_commits_are_ours(git: &GitBinary, root: &Path, branch: &str) -> Result<bool, String> {
+    let local = local_ref(branch);
+    let remote = remote_ref(branch);
+    let mut args: Vec<String> = vec!["rev-list".into(), "--reverse".into()];
+    if git_sync::rev_parse(git, root, &remote)?.is_some() {
+        args.push(format!("{}..{}", remote, local));
+    } else {
+        args.push(local);
+        args.push("--not".into());
+        args.push(format!("--remotes={}", REMOTE));
+    }
+    let out = spawn_cmd(&git.0)
+        .args(&args)
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("git rev-list failed to start: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let specs = shared_pathspec(Role::Main, "");
+    for commit in String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        let shown = spawn_cmd(&git.0)
+            .args(["show", "-s", "--format=%an%n%ae%n%P%n%s%n%b", commit])
+            .current_dir(root)
+            .output()
+            .map_err(|e| format!("git show failed to start: {}", e))?;
+        if !shown.status.success() {
+            return Err(format!(
+                "git show failed: {}",
+                String::from_utf8_lossy(&shown.stderr).trim()
+            ));
+        }
+        let text = String::from_utf8_lossy(&shown.stdout).into_owned();
+        let mut lines = text.lines();
+        let (name, email, parents, subject) = (
+            lines.next().unwrap_or(""),
+            lines.next().unwrap_or(""),
+            lines.next().unwrap_or(""),
+            lines.next().unwrap_or(""),
+        );
+        let has_trailer = lines.any(|l| l.starts_with("SDH-Participant:"));
+        if name != SDH_COMMIT_NAME
+            || email != SDH_COMMIT_EMAIL
+            || parents.split_whitespace().count() != 1
+            || subject != "chore(sdh-sync): sync shared files"
+            || !has_trailer
+        {
+            return Ok(false);
+        }
+        let files = git_bytes(
+            git,
+            root,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-z",
+                commit,
+            ],
+            &[],
+        )?;
+        if split_nul(&files).iter().any(|f| !path_in_specs(f, &specs)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn diverged_detail(branch: &str, current: bool) -> String {
+    if current {
+        format!(
+            "{b}: the local branch and origin/{b} have diverged (use the Merge button)",
+            b = branch
+        )
+    } else {
+        format!(
+            "{b}: the branch is not checked out and has diverged or holds commits that are not sync commits - run `git fetch`, then merge origin/{b} into {b} by hand",
+            b = branch
+        )
+    }
+}
+
+// ----- phase A ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FetchMode {
     /// A repo known to be shared: a failed fetch is a status.
     Always,
-    /// Not known to be shared: fetch at most every `PROBE_INTERVAL`, silently.
+    /// Not known to be shared: a failed fetch is silent.
     Probe,
 }
 
-/// Phase A. `git` `None` (no git on this machine) yields an empty pass.
-pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>) -> SharedSync {
+/// Phase A for the shared repos of `project_id` and a throttled probe of the
+/// role-less foreign repos of the portfolio. `git` `None` (no git on this
+/// machine) yields an empty pass.
+pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>, project_id: Option<i64>) -> SharedSync {
     let mut sync = SharedSync::empty();
     let Some(git) = git else {
         return sync;
@@ -711,6 +976,7 @@ pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>) -> SharedSync {
         Err(_) => return sync,
     };
     let login = db.github_login();
+    let now = unix_now();
     for repo in repos {
         let Some(gh) = repo.github_name.clone() else {
             continue;
@@ -725,9 +991,13 @@ pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>) -> SharedSync {
         let Ok(state) = db.get_shared_state(repo.id) else {
             continue;
         };
+        let in_project = project_id.is_some() && repo.project_id == project_id;
         let owned_by_me = login.as_deref().is_some_and(|l| ss::repo_owner_is(&gh, l));
 
         if state.shared_mode {
+            if !in_project {
+                continue;
+            }
             let Some(login) = login.as_deref() else {
                 // Shared mode on, but this install does not know its login.
                 let mut pass = new_pass(&repo, &root, "");
@@ -737,8 +1007,14 @@ pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>) -> SharedSync {
                 continue;
             };
             sync.handled.insert(repo.id);
-            let pass = phase_a_main(db, git, &repo, &root, login, &mut sync.outcome);
-            sync.passes.push(pass);
+            sync.passes.push(phase_a_main(db, git, &repo, &root, login));
+            continue;
+        }
+        if ss::read_shared_import(db, repo.id).disabling.is_some() {
+            // Switched off, but the deletion of `.sdh/` did not reach the remote.
+            if let Some(pass) = retry_disabling(db, git, &repo, &root) {
+                sync.passes.push(pass);
+            }
             continue;
         }
         if state.shared_role.as_deref() == Some("main") {
@@ -754,14 +1030,20 @@ pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>) -> SharedSync {
             continue;
         }
         let known = state.shared_role.is_some();
+        if known && !in_project {
+            continue;
+        }
+        // A role-less repo is probed at most every 10 minutes (persisted); one
+        // that was refused as untrusted is looked at again on every sync.
+        if !known && state.shared_status.is_none() && !probe_due(db, repo.id, now) {
+            continue;
+        }
         let mode = if known {
             FetchMode::Always
         } else {
             FetchMode::Probe
         };
-        if let Some(pass) =
-            phase_a_foreign(db, git, &repo, &root, &gh, login, mode, &mut sync.outcome)
-        {
+        if let Some(pass) = phase_a_foreign(db, git, &repo, &root, &gh, login, mode) {
             sync.handled.insert(repo.id);
             sync.passes.push(pass);
         }
@@ -779,14 +1061,27 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         own_branch: None,
         recipients: Vec::new(),
         notes: Vec::new(),
+        issues: Vec::new(),
         net_ok: true,
+        fetched: false,
+        blocked: HashSet::new(),
+        committed: false,
     }
 }
 
-fn fetch_into(git: &GitBinary, pass: &mut RepoPass) {
-    if let Err(e) = git_sync::fetch(git, &pass.root, REMOTE) {
-        pass.net_ok = false;
-        pass.note(SharedStatus::FetchFailed, e.to_string());
+/// `git fetch origin`, unless this repo was fetched less than 30 s ago.
+fn fetch_into(git: &GitBinary, pass: &mut RepoPass, mode: FetchMode) {
+    if !net_slot(NetKind::Fetch, pass.repo.id, &pass.root, min_net_interval()) {
+        return;
+    }
+    match git_sync::fetch(git, &pass.root, REMOTE) {
+        Ok(()) => pass.fetched = true,
+        Err(e) => {
+            pass.net_ok = false;
+            if mode == FetchMode::Always {
+                pass.note(SharedStatus::FetchFailed, e.to_string());
+            }
+        }
     }
 }
 
@@ -804,14 +1099,13 @@ fn phase_a_main(
     repo: &Repository,
     root: &Path,
     login: &str,
-    out: &mut SharedOutcome,
 ) -> RepoPass {
     let mut pass = new_pass(repo, root, login);
     let gh = repo.github_name.clone().unwrap_or_default();
     pass.role = Some(Role::Main);
     let _ = db.set_shared_role(repo.id, Some("main"));
-    register_driver(git, &pass, out);
-    fetch_into(git, &mut pass);
+    register_driver(git, &mut pass);
+    fetch_into(git, &mut pass, FetchMode::Always);
     match ss::read_structure_file(root, &gh) {
         Ok(s) => pass.structure = s,
         Err(reason) => {
@@ -831,11 +1125,10 @@ fn phase_a_main(
             pass.recipients = clean_recipients(rec);
         }
     }
-    after_fetch(db, git, &mut pass, out);
+    after_fetch(db, git, &mut pass);
     pass
 }
 
-#[allow(clippy::too_many_arguments)]
 fn phase_a_foreign(
     db: &AppDb,
     git: &GitBinary,
@@ -844,28 +1137,15 @@ fn phase_a_foreign(
     gh: &str,
     login: &str,
     mode: FetchMode,
-    out: &mut SharedOutcome,
 ) -> Option<RepoPass> {
     let mut pass = new_pass(repo, root, login);
-    let fetch_now = match mode {
-        FetchMode::Always => true,
-        FetchMode::Probe => probe_due(repo.id, root),
-    };
-    if fetch_now {
-        let ok = git_sync::fetch(git, root, REMOTE);
-        if let Err(e) = ok {
-            pass.net_ok = false;
-            if mode == FetchMode::Always {
-                pass.note(SharedStatus::FetchFailed, e.to_string());
-            }
-        }
-    }
+    fetch_into(git, &mut pass, mode);
     let pinned = ss::read_shared_import(db, repo.id).pinned_dev_branch;
     let found = match ss::discover_structure(git, root, gh, pinned.as_deref()) {
         Ok(f) => f,
         Err(e) => {
             if mode == FetchMode::Always {
-                out.issues.push(
+                pass.issue(
                     repo_issue(Code::ManagedFileFailed, repo)
                         .target(STRUCTURE_REL_PATH)
                         .detail(e),
@@ -891,7 +1171,7 @@ fn phase_a_foreign(
         }
         DiscoverOutcome::Found(s, _source) => {
             if let Err(e) = ss::apply_structure_locally(db, repo.id, &s) {
-                out.issues.push(
+                pass.issue(
                     repo_issue(Code::ManagedFileFailed, repo)
                         .target(STRUCTURE_REL_PATH)
                         .detail(e),
@@ -906,7 +1186,7 @@ fn phase_a_foreign(
             };
             let _ = db.set_shared_role(repo.id, Some(role.as_str()));
             pass.role = Some(role);
-            register_driver(git, &pass, out);
+            register_driver(git, &mut pass);
             pass.own_branch = own_branch_of(db, repo.id)
                 .filter(|b| !same_branch(b, &s.main.dev_branch) || role != Role::Pending);
             let main_dev = s.main.dev_branch.clone();
@@ -926,19 +1206,75 @@ fn phase_a_foreign(
                 remove_own_stale_request(git, &pass);
             }
             pass.structure = Some(s);
-            after_fetch(db, git, &mut pass, out);
+            after_fetch(db, git, &mut pass);
             Some(pass)
         }
     }
 }
 
-fn register_driver(git: &GitBinary, pass: &RepoPass, out: &mut SharedOutcome) {
+/// The owner's deletion of `.sdh/` was committed but not pushed: push it now.
+/// The repo is not shared any more; this is the only thing left to do for it.
+fn retry_disabling(
+    db: &AppDb,
+    git: &GitBinary,
+    repo: &Repository,
+    root: &Path,
+) -> Option<RepoPass> {
+    let imp = ss::read_shared_import(db, repo.id);
+    let dev = imp.disabling.clone()?;
+    let mut pass = new_pass(repo, root, "");
+    if !net_slot(NetKind::Push, repo.id, root, min_net_interval()) {
+        return None;
+    }
+    let local = git_sync::rev_parse(git, root, &local_ref(&dev))
+        .ok()
+        .flatten();
+    let Some(local) = local else {
+        // The branch is gone: nothing to push.
+        let _ = clear_disabling(db, repo.id);
+        return None;
+    };
+    let remote = git_sync::rev_parse(git, root, &remote_ref(&dev))
+        .ok()
+        .flatten();
+    if remote.as_deref() == Some(local.as_str()) {
+        let _ = clear_disabling(db, repo.id);
+        return None;
+    }
+    match git_sync::push_branches(git, root, REMOTE, &[dev.as_str()]) {
+        Ok(results)
+            if results
+                .iter()
+                .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)) =>
+        {
+            let _ = clear_disabling(db, repo.id);
+            None
+        }
+        Ok(results) => {
+            pass.note(SharedStatus::PushFailed, format!("{:?}", results));
+            Some(pass)
+        }
+        Err(e) => {
+            pass.note(SharedStatus::PushFailed, e.to_string());
+            Some(pass)
+        }
+    }
+}
+
+fn clear_disabling(db: &AppDb, repo_id: i64) -> Result<(), String> {
+    let mut imp = ss::read_shared_import(db, repo_id);
+    imp.disabling = None;
+    ss::write_shared_import(db, repo_id, &imp)?;
+    db.set_shared_status(repo_id, None)
+        .map_err(|e| e.to_string())
+}
+
+fn register_driver(git: &GitBinary, pass: &mut RepoPass) {
     if let Err(e) = register_merge_driver(git, &pass.root) {
-        out.issues.push(
-            repo_issue(Code::ManagedFileFailed, &pass.repo)
-                .target(".git/config")
-                .detail(e),
-        );
+        let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+            .target(".git/config")
+            .detail(e);
+        pass.issue(issue);
     }
 }
 
@@ -975,40 +1311,96 @@ fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass) {
     }
 }
 
-/// Fast-forward the recipients, then the import hook.
-fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, out: &mut SharedOutcome) {
+/// Move the local branch back onto origin's when everything it holds over origin
+/// is ours, keeping the old tip in `refs/sdh-backup/<branch>`. The branch is not
+/// checked out in any worktree (`fast_forward_ref` already refused those).
+/// `Ok(false)` when the ref moved meanwhile.
+fn reset_to_origin(git: &GitBinary, root: &Path, branch: &str) -> Result<bool, String> {
+    let observed = git_sync::rev_parse(git, root, &local_ref(branch))?
+        .ok_or_else(|| format!("branch '{}' does not exist", branch))?;
+    let target = git_sync::rev_parse(git, root, &remote_ref(branch))?
+        .ok_or_else(|| format!("origin/{} does not exist", branch))?;
+    let backup = format!("refs/sdh-backup/{}", branch);
+    let old_backup = git_sync::rev_parse(git, root, &backup)?;
+    if !git_sync::update_ref_cas(git, root, &backup, &observed, old_backup.as_deref())? {
+        return Ok(false);
+    }
+    git_sync::update_ref_cas(git, root, &local_ref(branch), &target, Some(&observed))
+}
+
+/// Fast-forward the recipients, guard the non-current ones, then the import hook.
+/// Nothing is touched unless the repo is `repo_ready`.
+fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     let Some(role) = pass.role else { return };
+    if !repo_ready(git, &pass.root) {
+        return;
+    }
     let cur = current_branch(git, &pass.root).ok().flatten();
     let pathspec = shared_pathspec(role, &pass.login);
     let recipients = pass.recipients.clone();
     for b in &recipients {
         let remote = remote_ref(b);
-        match git_sync::rev_parse(git, &pass.root, &remote) {
-            Ok(Some(_)) => {}
-            _ => continue,
-        }
+        let has_remote = matches!(git_sync::rev_parse(git, &pass.root, &remote), Ok(Some(_)));
         let is_current = cur.as_deref().is_some_and(|c| same_branch(c, b));
         if is_current {
+            if !has_remote {
+                continue;
+            }
             match ff_current(git, &pass.root, &remote, &pathspec) {
                 Ok(true) => {}
-                Ok(false) => pass.note(SharedStatus::NeedsManualMerge, b.clone()),
-                Err(e) => out
-                    .issues
-                    .push(repo_issue(Code::AutocommitFailed, &pass.repo).detail(e)),
+                Ok(false) => pass.note(SharedStatus::NeedsManualMerge, diverged_detail(b, true)),
+                Err(e) => {
+                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                    pass.issue(issue)
+                }
             }
-        } else {
+            continue;
+        }
+        // Not the current branch: it may only ever hold our own sync commits.
+        let mut check = true;
+        if has_remote {
             match git_sync::fast_forward_ref(git, &pass.root, b, &remote) {
-                Ok(FfOutcome::Diverged) => pass.note(SharedStatus::NeedsManualMerge, b.clone()),
-                Ok(_) => {}
-                Err(e) => out
-                    .issues
-                    .push(repo_issue(Code::AutocommitFailed, &pass.repo).detail(e)),
+                Ok(FfOutcome::Diverged) => {
+                    check = false;
+                    let ours = pass.fetched
+                        && local_only_commits_are_ours(git, &pass.root, b).unwrap_or(false);
+                    let reset = ours && reset_to_origin(git, &pass.root, b).unwrap_or(false);
+                    if !reset {
+                        pass.blocked.insert(b.to_ascii_lowercase());
+                        pass.note(SharedStatus::NeedsManualMerge, diverged_detail(b, false));
+                    }
+                }
+                Ok(FfOutcome::LocalAhead) => {}
+                Ok(_) => check = false,
+                Err(e) => {
+                    check = false;
+                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                    pass.issue(issue)
+                }
+            }
+        }
+        let exists = matches!(
+            git_sync::rev_parse(git, &pass.root, &local_ref(b)),
+            Ok(Some(_))
+        );
+        if check && exists {
+            match local_only_commits_are_ours(git, &pass.root, b) {
+                Ok(true) => {}
+                Ok(false) => {
+                    pass.blocked.insert(b.to_ascii_lowercase());
+                    pass.note(SharedStatus::NeedsManualMerge, diverged_detail(b, false));
+                }
+                Err(e) => {
+                    pass.blocked.insert(b.to_ascii_lowercase());
+                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                    pass.issue(issue)
+                }
             }
         }
     }
     if let Err(e) = import_incoming(db, git, pass.repo.id, &pass.root) {
-        out.issues
-            .push(repo_issue(Code::AutocommitFailed, &pass.repo).detail(e));
+        let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+        pass.issue(issue)
     }
 }
 
@@ -1044,10 +1436,19 @@ impl SharedSync {
     /// Phase B: write, commit, push and settle the statuses.
     pub fn finish(mut self, db: &AppDb, git: Option<&GitBinary>) -> SharedOutcome {
         let passes = std::mem::take(&mut self.passes);
-        let mut out = std::mem::take(&mut self.outcome);
+        let mut out = SharedOutcome::default();
         for mut pass in passes {
             if let (Some(git), Some(_)) = (git, pass.role) {
-                phase_b_repo(db, git, &mut pass, &mut out);
+                phase_b_repo(db, git, &mut pass);
+            }
+            let issues = std::mem::take(&mut pass.issues);
+            out.issues
+                .extend(fresh_issues(pass.repo.id, &pass.root, issues));
+            if pass.committed {
+                let name = pass.repo.display_name();
+                if !out.committed.contains(&name) {
+                    out.committed.push(name);
+                }
             }
             settle_status(db, &pass, &mut out);
         }
@@ -1075,8 +1476,21 @@ fn settle_status(db: &AppDb, pass: &RepoPass, out: &mut SharedOutcome) {
     }
 }
 
-fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, out: &mut SharedOutcome) {
+/// What a plumbed commit may touch: the role's shared files without the managed
+/// root files, which are committed on the current branch only.
+fn plumb_pathspec(role: Role, login: &str) -> Vec<String> {
+    shared_pathspec(role, login)
+        .into_iter()
+        .filter(|p| !MANAGED_ROOT_FILES.contains(&p.as_str()))
+        .collect()
+}
+
+fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     let Some(role) = pass.role else { return };
+    // Same guard as phase A, checked again: the repo may have changed since.
+    if !repo_ready(git, &pass.root) {
+        return;
+    }
     let root = pass.root.clone();
     let login = pass.login.clone();
 
@@ -1088,11 +1502,10 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, out: &mut Shar
                 Ok(())
             };
             if let Err(e) = written {
-                out.issues.push(
-                    repo_issue(Code::ManagedFileFailed, &pass.repo)
-                        .target(STRUCTURE_REL_PATH)
-                        .detail(e),
-                );
+                let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                    .target(STRUCTURE_REL_PATH)
+                    .detail(e);
+                pass.issue(issue);
             }
             if let Some(s) = &pass.structure {
                 prune_approved_requests(&root, s);
@@ -1105,11 +1518,10 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, out: &mut Shar
                     branch: own,
                 };
                 if let Err(e) = ss::write_request_if_changed(&root, &req) {
-                    out.issues.push(
-                        repo_issue(Code::ManagedFileFailed, &pass.repo)
-                            .target(REQUESTS_REL_DIR)
-                            .detail(e),
-                    );
+                    let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                        .target(REQUESTS_REL_DIR)
+                        .detail(e);
+                    pass.issue(issue);
                 }
             }
         }
@@ -1120,11 +1532,16 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, out: &mut Shar
         return;
     }
     let pathspec = shared_pathspec(role, &login);
+    let plumb_spec = plumb_pathspec(role, &login);
+    let approved: Vec<String> = match (role, &pass.structure) {
+        (Role::Main, Some(s)) => s.participants.iter().map(|p| p.login.clone()).collect(),
+        _ => Vec::new(),
+    };
     let active = match active_paths(git, &root, &pathspec) {
         Ok(a) => a,
         Err(e) => {
-            out.issues
-                .push(repo_issue(Code::AutocommitFailed, &pass.repo).detail(e));
+            let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+            pass.issue(issue);
             return;
         }
     };
@@ -1135,7 +1552,6 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, out: &mut Shar
     }
 
     let recipients = pass.recipients.clone();
-    let mut committed = false;
     for b in &recipients {
         let is_current = cur.as_deref().is_some_and(|c| same_branch(c, b));
         if is_current {
@@ -1155,36 +1571,35 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, out: &mut Shar
                 SDH_COMMIT_NAME,
                 SDH_COMMIT_EMAIL,
             ) {
-                Ok(CommitOutcome::Committed { .. }) => committed = true,
+                Ok(CommitOutcome::Committed { .. }) => pass.committed = true,
                 Ok(_) => {}
-                Err(e) => out
-                    .issues
-                    .push(repo_issue(Code::AutocommitFailed, &pass.repo).detail(e)),
+                Err(e) => {
+                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                    pass.issue(issue)
+                }
             }
         } else {
+            if pass.is_blocked(b) {
+                continue;
+            }
             // The branch must exist locally (phase A creates it from origin).
             if !matches!(git_sync::rev_parse(git, &root, &local_ref(b)), Ok(Some(_))) {
                 continue;
             }
-            match plumb_into_branch(git, &root, b, &pathspec, &login) {
-                Ok(BranchCommit::Committed { .. }) => committed = true,
+            match plumb_into_branch(git, &root, b, &plumb_spec, &login, &approved) {
+                Ok(BranchCommit::Committed { .. }) => pass.committed = true,
                 // RefMoved: left for the next sync.
                 Ok(_) => {}
-                Err(e) => out
-                    .issues
-                    .push(repo_issue(Code::AutocommitFailed, &pass.repo).detail(e)),
+                Err(e) => {
+                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                    pass.issue(issue)
+                }
             }
-        }
-    }
-    if committed {
-        let name = pass.repo.display_name();
-        if !out.committed.contains(&name) {
-            out.committed.push(name);
         }
     }
 
     if pass.net_ok {
-        push_recipients(git, pass);
+        push_recipients(git, pass, cur.as_deref());
     }
 }
 
@@ -1217,21 +1632,36 @@ fn prune_approved_requests(root: &Path, s: &ProjectStructure) {
     }
 }
 
-fn push_recipients(git: &GitBinary, pass: &mut RepoPass) {
+/// Push the recipient branches whose tip origin does not have. A non-current
+/// branch that holds anything but our own sync commits is never pushed.
+fn push_recipients(git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
     let root = pass.root.clone();
     let mut to_push: Vec<String> = Vec::new();
-    for b in &pass.recipients {
-        let Ok(Some(local)) = git_sync::rev_parse(git, &root, &local_ref(b)) else {
+    for b in pass.recipients.clone() {
+        let is_current = cur.is_some_and(|c| same_branch(c, &b));
+        if !is_current && pass.is_blocked(&b) {
+            continue;
+        }
+        let Ok(Some(local)) = git_sync::rev_parse(git, &root, &local_ref(&b)) else {
             continue;
         };
-        let remote = git_sync::rev_parse(git, &root, &remote_ref(b))
+        let remote = git_sync::rev_parse(git, &root, &remote_ref(&b))
             .ok()
             .flatten();
-        if remote.as_deref() != Some(local.as_str()) {
-            to_push.push(b.clone());
+        if remote.as_deref() == Some(local.as_str()) {
+            continue;
         }
+        if !is_current && !local_only_commits_are_ours(git, &root, &b).unwrap_or(false) {
+            pass.blocked.insert(b.to_ascii_lowercase());
+            pass.note(SharedStatus::NeedsManualMerge, diverged_detail(&b, false));
+            continue;
+        }
+        to_push.push(b);
     }
     if to_push.is_empty() {
+        return;
+    }
+    if !net_slot(NetKind::Push, pass.repo.id, &root, min_net_interval()) {
         return;
     }
     let refs: Vec<&str> = to_push.iter().map(String::as_str).collect();
@@ -1242,7 +1672,11 @@ fn push_recipients(git: &GitBinary, pass: &mut RepoPass) {
                 match outcome {
                     PushOutcome::Pushed | PushOutcome::UpToDate => {}
                     PushOutcome::RejectedNonFastForward => {
-                        pass.note(SharedStatus::NeedsManualMerge, branch)
+                        let current = cur.is_some_and(|c| same_branch(c, &branch));
+                        pass.note(
+                            SharedStatus::NeedsManualMerge,
+                            diverged_detail(&branch, current),
+                        )
                     }
                     PushOutcome::RejectedProtected(m) => pass.note(SharedStatus::PushRejected, m),
                     PushOutcome::RejectedOther(m) => pass.note(SharedStatus::PushFailed, m),
@@ -1436,27 +1870,17 @@ pub fn enable_shared_mode(
     Ok(())
 }
 
-/// Switch shared mode off (spec R15). The deletion of `.sdh/project.json` and
-/// `.sdh/requests/*` is committed and pushed HERE, on the dev branch, rather
-/// than by the next sync: once the switch is off the sync no longer treats the
-/// repo as shared, so nothing there would commit or push the deletion.
-pub fn disable_shared_mode(
-    db: &AppDb,
-    git: &GitBinary,
-    repo_id: i64,
-) -> Result<SharedDisableResult, String> {
-    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
-    let root = repo_root(&repo)?;
-    db.set_shared_mode(repo_id, false)
-        .map_err(|e| e.to_string())?;
-    db.set_shared_role(repo_id, None)
-        .map_err(|e| e.to_string())?;
-    db.set_shared_status(repo_id, None)
-        .map_err(|e| e.to_string())?;
+/// Tracked files only (no untracked ones) under `paths`.
+fn ls_files_tracked(git: &GitBinary, root: &Path, paths: &[String]) -> Result<Vec<String>, String> {
+    Ok(split_nul(&git_bytes(
+        git,
+        root,
+        &["ls-files", "-z"],
+        paths,
+    )?))
+}
 
-    // Everything git knows under the two paths, before the files are removed.
-    let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
-    let tracked: Vec<String> = ls_files(git, &root, &sdh)?;
+fn remove_sdh_files(root: &Path) {
     let _ = std::fs::remove_file(root.join(STRUCTURE_REL_PATH));
     if let Ok(entries) = std::fs::read_dir(root.join(REQUESTS_REL_DIR)) {
         for e in entries.flatten() {
@@ -1467,98 +1891,203 @@ pub fn disable_shared_mode(
     }
     let _ = std::fs::remove_dir(root.join(REQUESTS_REL_DIR));
     let _ = std::fs::remove_dir(root.join(".sdh"));
+}
 
-    let dev = db
-        .get_autocommit_branch(repo_id)
-        .map_err(|e| e.to_string())?
-        .map(|b| b.trim().to_string())
-        .filter(|b| ss::is_valid_branch_name(b));
-    let Some(dev) = dev else {
-        return Ok(SharedDisableResult {
-            pushed: false,
-            note: Some("no dev branch is set: the deletion of .sdh/ is not committed".into()),
-        });
-    };
+/// Switch shared mode off (spec R15). Only the owner (shared mode on, role main)
+/// can. The deletion of the tracked `.sdh/project.json` and `.sdh/requests/*` is
+/// committed HERE on the dev branch, after a fetch: once the switch is off the
+/// sync no longer treats the repo as shared. The database is flipped LAST, after
+/// the commit succeeded. If the push fails the repo keeps a `push_failed` status
+/// and a `disabling` marker, and the next sync retries the push until the
+/// deletion reached origin. With nothing tracked (never synced) only the files
+/// are removed.
+pub fn disable_shared_mode(
+    db: &AppDb,
+    git: &GitBinary,
+    repo_id: i64,
+) -> Result<SharedDisableResult, String> {
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let root = repo_root(&repo)?;
+    let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if !state.shared_mode || state.shared_role.as_deref().is_some_and(|r| r != "main") {
+        return Err("shared mode can only be switched off by the owner of the repo".into());
+    }
+    let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
+    let tracked = ls_files_tracked(git, &root, &sdh)?;
+    let dev = own_branch_of(db, repo_id);
+    let fetch_ok = git_sync::fetch(git, &root, REMOTE).is_ok();
     let login = db.github_login().unwrap_or_default();
     let (_, body) = commit_message(&login);
-    let subject = "chore(sdh-sync): remove shared project structure".to_string();
-    let cur = current_branch(git, &root).ok().flatten();
-    let committed = if cur.as_deref().is_some_and(|c| same_branch(c, &dev)) {
-        // Only files git knows: a pathspec with nothing behind it fails the add.
-        let paths: Vec<PathBuf> = tracked.iter().map(PathBuf::from).collect();
-        if paths.is_empty() {
-            Ok(false)
-        } else {
-            commit_paths(
+    let subject = "chore(sdh-sync): remove shared project structure";
+    let mut committed = false;
+
+    if tracked.is_empty() {
+        remove_sdh_files(&root);
+    } else {
+        let dev = dev.clone().ok_or_else(|| {
+            "no dev branch is set: cannot commit the removal of .sdh/".to_string()
+        })?;
+        let cur = current_branch(git, &root).ok().flatten();
+        if cur.as_deref().is_some_and(|c| same_branch(c, &dev)) {
+            remove_sdh_files(&root);
+            let paths: Vec<PathBuf> = tracked.iter().map(PathBuf::from).collect();
+            match commit_paths(
                 git,
                 &root,
                 &dev,
                 &paths,
-                &subject,
+                subject,
                 Some(&body),
                 SDH_COMMIT_NAME,
                 SDH_COMMIT_EMAIL,
-            )
-            .map(|o| matches!(o, CommitOutcome::Committed { .. }))
+            ) {
+                Ok(o) => committed = matches!(o, CommitOutcome::Committed { .. }),
+                Err(e) => {
+                    // Put the files back: nothing was switched off.
+                    let _ = git_bytes(git, &root, &["checkout", "HEAD"], &tracked);
+                    return Err(e);
+                }
+            }
+        } else {
+            if !matches!(
+                git_sync::rev_parse(git, &root, &local_ref(&dev)),
+                Ok(Some(_))
+            ) {
+                return Err(format!("the dev branch '{}' does not exist locally", dev));
+            }
+            if matches!(
+                git_sync::rev_parse(git, &root, &remote_ref(&dev)),
+                Ok(Some(_))
+            ) && git_sync::fast_forward_ref(git, &root, &dev, &remote_ref(&dev))?
+                == FfOutcome::Diverged
+            {
+                return Err(format!(
+                    "{} has diverged from origin/{}: merge it first",
+                    dev, dev
+                ));
+            }
+            let in_branch = ls_tree(git, &root, &local_ref(&dev), &sdh)?;
+            let changes: Vec<FileChange> = in_branch
+                .keys()
+                .map(|p| FileChange {
+                    rel_path: PathBuf::from(p),
+                    content: None,
+                })
+                .collect();
+            let res = git_sync::commit_files_to_branch(
+                git,
+                &root,
+                &dev,
+                &changes,
+                &format!("{}\n\n{}", subject, body),
+                SDH_COMMIT_NAME,
+                SDH_COMMIT_EMAIL,
+            )?;
+            if matches!(res, BranchCommit::RefMoved) {
+                return Err("the dev branch moved meanwhile: try again".into());
+            }
+            committed = matches!(res, BranchCommit::Committed { .. });
+            remove_sdh_files(&root);
         }
-    } else if matches!(
-        git_sync::rev_parse(git, &root, &local_ref(&dev)),
-        Ok(Some(_))
-    ) {
-        let in_branch = ls_tree(git, &root, &local_ref(&dev), &sdh)?;
-        let changes: Vec<FileChange> = in_branch
-            .keys()
-            .map(|p| FileChange {
-                rel_path: PathBuf::from(p),
-                content: None,
-            })
-            .collect();
-        git_sync::commit_files_to_branch(
-            git,
-            &root,
-            &dev,
-            &changes,
-            &format!("{}\n\n{}", subject, body),
-            SDH_COMMIT_NAME,
-            SDH_COMMIT_EMAIL,
-        )
-        .map(|o| matches!(o, BranchCommit::Committed { .. }))
-    } else {
-        Ok(false)
-    };
-    let committed = committed?;
-    if !committed {
+    }
+
+    // The commit is done: now the switch.
+    db.set_shared_mode(repo_id, false)
+        .map_err(|e| e.to_string())?;
+    db.set_shared_role(repo_id, None)
+        .map_err(|e| e.to_string())?;
+    db.set_shared_status(repo_id, None)
+        .map_err(|e| e.to_string())?;
+
+    let Some(dev) = dev.filter(|_| committed) else {
         return Ok(SharedDisableResult {
             pushed: false,
             note: Some("nothing to commit".into()),
         });
-    }
-    match git_sync::push_branches(git, &root, REMOTE, &[dev.as_str()]) {
-        Ok(results) => {
-            let ok = results
+    };
+    let failure = match git_sync::push_branches(git, &root, REMOTE, &[dev.as_str()]) {
+        Ok(results)
+            if results
                 .iter()
-                .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate));
-            Ok(SharedDisableResult {
-                pushed: ok,
-                note: if ok {
+                .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)) =>
+        {
+            return Ok(SharedDisableResult {
+                pushed: true,
+                note: if fetch_ok {
                     None
                 } else {
-                    Some(format!("push of {} was refused: {:?}", dev, results))
+                    Some("fetch failed before committing".into())
                 },
             })
         }
-        Err(e) => Ok(SharedDisableResult {
-            pushed: false,
-            note: Some(format!("push failed: {}", e)),
-        }),
-    }
+        Ok(results) => format!("push of {} was refused: {:?}", dev, results),
+        Err(e) => format!("push failed: {}", e),
+    };
+    // Keep the repo in the shared pass until the deletion reaches origin.
+    let mut imp = ss::read_shared_import(db, repo_id);
+    imp.disabling = Some(dev);
+    ss::write_shared_import(db, repo_id, &imp)?;
+    db.set_shared_status(repo_id, Some(SharedStatus::PushFailed.as_str()))
+        .map_err(|e| e.to_string())?;
+    Ok(SharedDisableResult {
+        pushed: false,
+        note: Some(format!("{} - it is retried on the next sync", failure)),
+    })
 }
 
-/// Main: approve the join request of `login`. The structure file gains the
-/// participant (with a number band) and the request file is deleted; the next
-/// sync commits both.
+/// Join requests in the work tree plus, when the owner's current branch is not
+/// the dev branch, those published on `origin/<dev>`.
+fn all_join_requests(
+    git: Option<&GitBinary>,
+    root: &Path,
+    gh: &str,
+    dev: Option<&str>,
+) -> Vec<JoinRequest> {
+    let structure = ss::read_structure_file(root, gh).ok().flatten();
+    let mut out = ss::list_requests(root, gh);
+    let (Some(git), Some(dev)) = (git, dev) else {
+        return out;
+    };
+    let cur = current_branch(git, root).ok().flatten();
+    if cur.as_deref().is_some_and(|c| same_branch(c, dev)) {
+        return out;
+    }
+    let remote = remote_ref(dev);
+    let Ok(tree) = ls_tree(git, root, &remote, &[REQUESTS_REL_DIR.to_string()]) else {
+        return out;
+    };
+    for path in tree.keys().take(ss::MAX_REQUEST_FILES) {
+        let Some(stem) = path
+            .rsplit('/')
+            .next()
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let Ok(Some(bytes)) =
+            git_sync::show_file_capped(git, root, &remote, path, ss::MAX_REQUEST_FILE_BYTES)
+        else {
+            continue;
+        };
+        let Some(req) = ss::request_from_bytes(stem, &bytes, structure.as_ref()) else {
+            continue;
+        };
+        if !out.iter().any(|r| ss::logins_equal(&r.login, &req.login)) {
+            out.push(req);
+        }
+    }
+    out.sort_by_key(|r| r.login.to_ascii_lowercase());
+    out
+}
+
+/// Main: approve the join request of `login` (from the work tree or, when the
+/// owner is on another branch, from `origin/<dev>`). The structure file gains
+/// the participant (with a number band) and a work-tree request file is
+/// deleted; the next sync commits the structure and prunes the request from
+/// the dev branch.
 pub fn approve_join_request(
     db: &AppDb,
+    git: Option<&GitBinary>,
     repo_id: i64,
     login: &str,
 ) -> Result<ProjectStructure, String> {
@@ -1577,7 +2106,7 @@ pub fn approve_join_request(
         .ok_or_else(|| "the GitHub login of this install is unknown".to_string())?;
     let existing = ss::read_structure_file(&root, &gh)?;
     let base = ss::build_structure(db, repo_id, &me, existing.as_ref())?;
-    let req = ss::list_requests(&root, &gh)
+    let req = all_join_requests(git, &root, &gh, Some(&base.main.dev_branch))
         .into_iter()
         .find(|r| ss::logins_equal(&r.login, login))
         .ok_or_else(|| format!("no join request from {}", login))?;
@@ -1645,12 +2174,17 @@ pub fn merge_shared_upstream(
     })
 }
 
-pub fn list_join_requests(db: &AppDb, repo_id: i64) -> Result<Vec<JoinRequest>, String> {
+pub fn list_join_requests(
+    db: &AppDb,
+    git: Option<&GitBinary>,
+    repo_id: i64,
+) -> Result<Vec<JoinRequest>, String> {
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
     let (Some(lp), Some(gh)) = (repo.local_path.as_deref(), repo.github_name.as_deref()) else {
         return Ok(Vec::new());
     };
-    Ok(ss::list_requests(Path::new(lp), gh))
+    let dev = own_branch_of(db, repo_id);
+    Ok(all_join_requests(git, Path::new(lp), gh, dev.as_deref()))
 }
 
 /// The trusted structure of a shared repo for the UI: the work-tree file, or
@@ -1755,6 +2289,7 @@ pub(crate) mod test_support {
         pub helper_db: AppDb,
         pub main_repo: i64,
         pub helper_repo: i64,
+        pub project_id: i64,
     }
 
     impl TwoInstalls {
@@ -1821,7 +2356,7 @@ pub(crate) mod test_support {
                 "{\"login\":\"helper\",\"branch\":\"helper-dev\"}
 ",
             );
-            approve_join_request(&self.main_db, self.main_repo, "helper").unwrap();
+            approve_join_request(&self.main_db, Some(&gb()), self.main_repo, "helper").unwrap();
             g(&self.main_dir, &["add", ".sdh"]);
             g(&self.main_dir, &["commit", "-q", "-m", "structure"]);
             g(&self.main_dir, &["push", "-q", "origin", "dev"]);
@@ -1833,7 +2368,7 @@ pub(crate) mod test_support {
             self.enable_main();
             self.sync_helper(); // pending: the request lands in origin/dev
             self.sync_main(); // the request arrives
-            approve_join_request(&self.main_db, self.main_repo, "helper").unwrap();
+            approve_join_request(&self.main_db, Some(&gb()), self.main_repo, "helper").unwrap();
             self.sync_main(); // approval committed + pushed
             self.sync_helper(); // contributor now
         }
@@ -1841,7 +2376,12 @@ pub(crate) mod test_support {
 
     pub fn sync_once(db: &AppDb) -> SharedOutcome {
         let git = gb();
-        run_phase_a(db, Some(&git)).finish(db, Some(&git))
+        let project = db
+            .list_all_repos()
+            .unwrap()
+            .into_iter()
+            .find_map(|r| r.project_id);
+        run_phase_a(db, Some(&git), project).finish(db, Some(&git))
     }
 
     pub fn codes(out: &SharedOutcome) -> Vec<Code> {
@@ -1924,6 +2464,7 @@ pub(crate) mod test_support {
             helper_db,
             main_repo,
             helper_repo,
+            project_id: project.id,
         }
     }
 }
@@ -2256,7 +2797,7 @@ mod tests {
         // The request file is gone from main's checkout and from the remote.
         assert!(!fx.main_dir.join(".sdh/requests/helper.json").exists());
         assert_eq!(fx.remote_file("dev", ".sdh/requests/helper.json"), None);
-        assert!(list_join_requests(&fx.main_db, fx.main_repo)
+        assert!(list_join_requests(&fx.main_db, Some(&gb()), fx.main_repo)
             .unwrap()
             .is_empty());
         // The helper's leftover request file is cleaned up and its status is clear.
@@ -2326,6 +2867,17 @@ mod tests {
         let out = fx.sync_main();
         assert_eq!(fx.main_status().as_deref(), Some("needs_manual_merge"));
         assert!(codes(&out).contains(&Code::SharedNeedsManualMerge));
+        let detail = out
+            .issues
+            .iter()
+            .find(|i| i.code == Code::SharedNeedsManualMerge)
+            .and_then(|i| i.detail.clone())
+            .unwrap();
+        assert!(
+            detail.contains("dev") && detail.contains("Merge button"),
+            "{}",
+            detail
+        );
         assert!(!fx.main_dir.join(".sdh/requests/helper.json").exists());
         // Nothing was forced.
         assert!(fx.remote_file("dev", "src.rs").is_none());
@@ -2406,7 +2958,7 @@ mod tests {
     #[test]
     fn phase_a_leaves_ordinary_repos_alone() {
         let fx = two_installs();
-        let sync = run_phase_a(&fx.main_db, Some(&gb()));
+        let sync = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
         assert!(sync.handled.is_empty());
         let out = sync.finish(&fx.main_db, Some(&gb()));
         assert!(out.issues.is_empty());
@@ -2505,7 +3057,9 @@ mod tests {
         let st = fx.main_db.get_shared_state(fx.main_repo).unwrap();
         assert!(!st.shared_mode && st.shared_role.is_none());
         // The repo is ordinary now: the shared pass ignores it.
-        assert!(run_phase_a(&fx.main_db, Some(&gb())).handled.is_empty());
+        assert!(run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id))
+            .handled
+            .is_empty());
     }
 
     #[test]
@@ -2542,7 +3096,7 @@ mod tests {
         fx.enable_main();
         fx.sync_helper();
         fx.sync_main();
-        let reqs = list_join_requests(&fx.main_db, fx.main_repo).unwrap();
+        let reqs = list_join_requests(&fx.main_db, Some(&gb()), fx.main_repo).unwrap();
         assert_eq!(
             reqs,
             vec![JoinRequest {
@@ -2551,7 +3105,9 @@ mod tests {
             }]
         );
         // Only the owner can approve.
-        assert!(approve_join_request(&fx.helper_db, fx.helper_repo, "helper").is_err());
+        assert!(
+            approve_join_request(&fx.helper_db, Some(&gb()), fx.helper_repo, "helper").is_err()
+        );
         // A pending helper sees the owner's structure from the remote refs.
         let s = get_repo_structure(&fx.helper_db, Some(&gb()), fx.helper_repo)
             .unwrap()
@@ -2627,5 +3183,370 @@ mod tests {
             None
         );
         assert_eq!(fx.remote_file("dev", "docs/sdh_skills/sdh-y.md"), None);
+    }
+
+    // ----- review round: guards, classifier, throttles ------------------------------
+
+    fn block_pushes_to(fx: &TwoInstalls, refname: &str) -> PathBuf {
+        let hook = fx.origin.join("hooks/update");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"{}\" ]; then\n  echo \"error: GH006: Protected branch update failed for $1\" >&2\n  exit 1\nfi\nexit 0\n",
+                refname
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        hook
+    }
+
+    #[test]
+    fn net_slot_throttles_each_kind_and_repo_separately() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let long = Duration::from_secs(3600);
+        assert!(net_slot(NetKind::Fetch, 1, dir.path(), long));
+        assert!(!net_slot(NetKind::Fetch, 1, dir.path(), long));
+        // another kind, another repo, and a zero interval are independent
+        assert!(net_slot(NetKind::Push, 1, dir.path(), long));
+        assert!(net_slot(NetKind::Fetch, 2, dir.path(), long));
+        assert!(net_slot(NetKind::Fetch, 1, dir.path(), Duration::ZERO));
+    }
+
+    #[test]
+    fn a_recurring_issue_is_reported_once_until_it_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let issue = |d: &str| SyncIssue::new(Code::AutocommitFailed, "api").detail(d);
+        assert_eq!(fresh_issues(7, dir.path(), vec![issue("boom")]).len(), 1);
+        assert!(fresh_issues(7, dir.path(), vec![issue("boom")]).is_empty());
+        // a different detail is a new problem
+        assert_eq!(fresh_issues(7, dir.path(), vec![issue("other")]).len(), 1);
+        // it went away and came back: reported again
+        assert!(fresh_issues(7, dir.path(), vec![]).is_empty());
+        assert_eq!(fresh_issues(7, dir.path(), vec![issue("other")]).len(), 1);
+    }
+
+    #[test]
+    fn head_history_lookups_for_plumbing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        write(d, "f.md", "v1\n");
+        g(d, &["add", "."]);
+        g(d, &["commit", "-q", "-m", "one"]);
+        let v1 = g(d, &["rev-parse", "HEAD:f.md"]);
+        write(d, "f.md", "v2\n");
+        g(d, &["commit", "-q", "-am", "two"]);
+        let v2 = g(d, &["rev-parse", "HEAD:f.md"]);
+        let git = gb();
+        // present: HEAD's own copy
+        assert_eq!(last_version_sha(&git, d, "f.md"), Some(v2.clone()));
+        assert!(blob_in_head_history(&git, d, "f.md", &v1));
+        assert!(blob_in_head_history(&git, d, "f.md", &v2));
+        // deleted: the version before the deleting commit
+        g(d, &["rm", "-q", "f.md"]);
+        g(d, &["commit", "-q", "-m", "gone"]);
+        assert_eq!(last_version_sha(&git, d, "f.md"), Some(v2));
+        assert!(blob_in_head_history(&git, d, "f.md", &v1));
+        // a blob this history never held, and a file it never had
+        let foreign = "1".repeat(40);
+        assert!(!blob_in_head_history(&git, d, "f.md", &foreign));
+        assert_eq!(last_version_sha(&git, d, "never.md"), None);
+    }
+
+    #[test]
+    fn a_repo_in_the_middle_of_a_merge_or_detached_is_left_alone() {
+        let fx = two_installs();
+        fx.make_participant();
+        let dev_before = fx.remote_rev("dev").unwrap();
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        let head = g(&fx.helper_dir, &["rev-parse", "HEAD"]);
+        let merge_head = fx.helper_dir.join(".git/MERGE_HEAD");
+        fs::write(&merge_head, format!("{}\n", head)).unwrap();
+        let out = fx.sync_helper();
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(out.committed.is_empty());
+        assert_eq!(fx.remote_rev("dev").unwrap(), dev_before);
+        assert_eq!(g(&fx.helper_dir, &["rev-parse", "HEAD"]), head);
+        assert_eq!(fx.helper_status(), None);
+
+        fs::remove_file(&merge_head).unwrap();
+        g(&fx.helper_dir, &["checkout", "-q", "--detach"]);
+        let out = fx.sync_helper();
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert_eq!(fx.remote_rev("dev").unwrap(), dev_before);
+
+        g(&fx.helper_dir, &["checkout", "-q", "helper-dev"]);
+        assert_eq!(fx.sync_helper().committed, vec!["api".to_string()]);
+    }
+
+    #[test]
+    fn the_old_autocommit_never_touches_a_repo_the_shared_pass_took_over() {
+        let fx = two_installs();
+        fx.enable_main();
+        // In the middle of a merge the shared pass leaves the repo alone; the
+        // ordinary auto-commit would try a partial commit there and fail.
+        let head = g(&fx.main_dir, &["rev-parse", "HEAD"]);
+        fs::write(fx.main_dir.join(".git/MERGE_HEAD"), format!("{}\n", head)).unwrap();
+        write(&fx.main_dir, "docs/server-api/api.md", "# API\n");
+        let home = tempfile::TempDir::new().unwrap();
+        let res = crate::sync::run_project_sync_in(
+            &fx.main_db,
+            fx.project_id,
+            Some(home.path().to_path_buf()),
+        )
+        .unwrap();
+        assert!(
+            !res.errors.iter().any(|i| i.code == Code::AutocommitFailed),
+            "{:?}",
+            res.errors
+        );
+        assert!(res.committed.is_empty());
+        assert_eq!(g(&fx.main_dir, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn non_sync_commits_on_a_non_current_branch_block_plumbing_and_push() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        fx.sync_helper(); // creates the local dev with our commit and pushes it
+                          // The user commits code on the local `dev`, then goes back to its own branch.
+        g(&fx.helper_dir, &["checkout", "-q", "dev"]);
+        write(&fx.helper_dir, "src.rs", "fn main() {}\n");
+        g(&fx.helper_dir, &["add", "src.rs"]);
+        g(&fx.helper_dir, &["commit", "-q", "-m", "my code"]);
+        g(&fx.helper_dir, &["checkout", "-q", "helper-dev"]);
+        let local_dev = g(&fx.helper_dir, &["rev-parse", "dev"]);
+        let remote_dev = fx.remote_rev("dev").unwrap();
+
+        write(
+            &fx.helper_dir,
+            "docs/todo.md",
+            &todo(&["T-500000", "T-500001"]),
+        );
+        let out = fx.sync_helper();
+        assert_eq!(fx.remote_rev("dev").unwrap(), remote_dev, "never pushed");
+        assert_eq!(
+            g(&fx.helper_dir, &["rev-parse", "dev"]),
+            local_dev,
+            "never plumbed"
+        );
+        assert_eq!(fx.remote_file("dev", "src.rs"), None);
+        assert_eq!(fx.helper_status().as_deref(), Some("needs_manual_merge"));
+        let issue = out
+            .issues
+            .iter()
+            .find(|i| i.code == Code::SharedNeedsManualMerge)
+            .unwrap();
+        let detail = issue.detail.as_deref().unwrap();
+        assert!(
+            detail.contains("dev") && detail.contains("git fetch"),
+            "{}",
+            detail
+        );
+        // The own branch still went through.
+        assert!(fx
+            .remote_file("helper-dev", "docs/todo.md")
+            .unwrap()
+            .contains("T-500001"));
+    }
+
+    #[test]
+    fn a_diverged_branch_holding_only_our_commits_is_reset_with_a_backup() {
+        let fx = two_installs();
+        fx.make_participant();
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        fx.sync_helper(); // local dev gets our commit; the push of dev is refused
+        assert_eq!(fx.helper_status().as_deref(), Some("push_rejected"));
+        fs::remove_file(&hook).unwrap();
+        // Meanwhile the owner moves origin/dev.
+        write(&fx.main_dir, "docs/server-api/api.md", "# API\n");
+        fx.sync_main();
+        assert!(fx.remote_file("dev", "docs/server-api/api.md").is_some());
+        let old_local = g(&fx.helper_dir, &["rev-parse", "dev"]);
+
+        let out = fx.sync_helper();
+        assert_eq!(
+            g(&fx.helper_dir, &["rev-parse", "refs/sdh-backup/dev"]),
+            old_local
+        );
+        // Re-plumbed on top of origin's dev and pushed.
+        assert!(fx
+            .remote_file("dev", "docs/todo.md")
+            .unwrap()
+            .contains("T-500000"));
+        assert!(fx.remote_file("dev", "docs/server-api/api.md").is_some());
+        assert_eq!(fx.helper_status(), None, "{:?}", out.issues);
+    }
+
+    #[test]
+    fn a_newer_foreign_version_is_not_clobbered_by_plumbing() {
+        let fx = two_installs();
+        fx.make_participant();
+        let req = "docs/server-requirements/x/REQ-001.md";
+        write(&fx.helper_dir, req, "theirs\n");
+        fx.sync_helper(); // helper-dev and dev now hold the helper's version
+        write(&fx.main_dir, req, "mine\n");
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("helper-dev", req).as_deref(),
+            Some("theirs\n"),
+            "the helper's branch keeps a version this checkout never had"
+        );
+    }
+
+    #[test]
+    fn managed_root_files_are_committed_on_the_current_branch_only() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        fx.sync_helper(); // helper-dev exists on origin now
+        fx.sync_main(); // main creates its local copy of helper-dev
+        write(&fx.main_dir, ".gitignore", "target\n");
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("dev", ".gitignore").as_deref(),
+            Some("target\n")
+        );
+        assert_eq!(fx.remote_file("helper-dev", ".gitignore"), None);
+    }
+
+    #[test]
+    fn owner_off_the_dev_branch_still_sees_and_prunes_join_requests() {
+        let fx = two_installs();
+        fx.enable_main();
+        g(&fx.main_dir, &["checkout", "-q", "-b", "feature"]);
+        fx.sync_helper(); // pending: the request lands in origin/dev
+        fx.sync_main(); // fetch; the owner is on `feature`
+        assert!(!fx.main_dir.join(".sdh/requests/helper.json").exists());
+        let reqs = list_join_requests(&fx.main_db, Some(&gb()), fx.main_repo).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].login, "helper");
+
+        let s = approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper").unwrap();
+        assert_eq!(s.participants[0].band_start, 500_000);
+        fx.sync_main();
+        assert!(fx
+            .remote_file("dev", ".sdh/project.json")
+            .unwrap()
+            .contains("\"helper\""));
+        assert_eq!(fx.remote_file("dev", ".sdh/requests/helper.json"), None);
+        assert_eq!(g(&fx.main_dir, &["branch", "--show-current"]), "feature");
+    }
+
+    // ----- project scope and probes ---------------------------------------------------
+
+    #[test]
+    fn phase_a_only_reaches_the_shared_repos_of_the_synced_project() {
+        let fx = two_installs();
+        fx.enable_main();
+        let other = fx
+            .main_db
+            .create_project("Other", None, "standard")
+            .unwrap();
+        let none = run_phase_a(&fx.main_db, Some(&gb()), Some(other.id));
+        assert!(none.handled.is_empty());
+        let some = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        assert!(some.handled.contains(&fx.main_repo));
+    }
+
+    #[test]
+    fn a_role_less_repo_is_probed_at_most_every_ten_minutes_across_restarts() {
+        let fx = two_installs();
+        fx.enable_main();
+        let mut imp = ss::read_shared_import(&fx.helper_db, fx.helper_repo);
+        imp.last_probe_unix = Some(unix_now());
+        ss::write_shared_import(&fx.helper_db, fx.helper_repo, &imp).unwrap();
+        fx.sync_helper();
+        assert_eq!(
+            fx.helper_db
+                .get_shared_state(fx.helper_repo)
+                .unwrap()
+                .shared_role,
+            None,
+            "probed a minute ago: not looked at again"
+        );
+        assert_eq!(fx.remote_file("dev", ".sdh/requests/helper.json"), None);
+
+        imp.last_probe_unix = Some(unix_now() - 700);
+        ss::write_shared_import(&fx.helper_db, fx.helper_repo, &imp).unwrap();
+        fx.sync_helper();
+        assert_eq!(
+            fx.helper_db
+                .get_shared_state(fx.helper_repo)
+                .unwrap()
+                .shared_role
+                .as_deref(),
+            Some("pending")
+        );
+        assert!(fx.remote_file("dev", ".sdh/requests/helper.json").is_some());
+    }
+
+    // ----- switching off, review round -------------------------------------------------
+
+    #[test]
+    fn disable_before_any_sync_just_removes_the_files() {
+        let fx = two_installs();
+        enable_shared_mode(&fx.main_db, &gb(), fx.main_repo, false).unwrap();
+        assert!(fx.main_dir.join(".sdh/project.json").exists());
+        let head = g(&fx.main_dir, &["rev-parse", "HEAD"]);
+        let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!res.pushed);
+        assert!(!fx.main_dir.join(".sdh").exists());
+        assert_eq!(g(&fx.main_dir, &["rev-parse", "HEAD"]), head);
+        let st = fx.main_db.get_shared_state(fx.main_repo).unwrap();
+        assert!(!st.shared_mode && st.shared_role.is_none());
+    }
+
+    #[test]
+    fn only_the_owner_can_disable_and_nothing_flips_on_a_refusal() {
+        let fx = two_installs();
+        fx.make_participant();
+        assert!(disable_shared_mode(&fx.helper_db, &gb(), fx.helper_repo).is_err());
+        let st = fx.helper_db.get_shared_state(fx.helper_repo).unwrap();
+        assert_eq!(st.shared_role.as_deref(), Some("contributor"));
+        // the owner without the switch on is refused as well
+        fx.main_db.set_shared_mode(fx.main_repo, false).unwrap();
+        assert!(disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).is_err());
+    }
+
+    #[test]
+    fn a_refused_push_of_the_removal_is_retried_by_the_next_sync() {
+        let fx = two_installs();
+        fx.enable_main();
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+        let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!res.pushed, "{:?}", res);
+        assert!(
+            !fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .shared_mode
+        );
+        assert_eq!(fx.main_status().as_deref(), Some("push_failed"));
+        assert_eq!(
+            ss::read_shared_import(&fx.main_db, fx.main_repo)
+                .disabling
+                .as_deref(),
+            Some("dev")
+        );
+        assert!(fx.remote_file("dev", ".sdh/project.json").is_some());
+
+        fs::remove_file(&hook).unwrap();
+        fx.sync_main();
+        assert_eq!(fx.remote_file("dev", ".sdh/project.json"), None);
+        assert_eq!(fx.main_status(), None);
+        assert_eq!(
+            ss::read_shared_import(&fx.main_db, fx.main_repo).disabling,
+            None
+        );
     }
 }

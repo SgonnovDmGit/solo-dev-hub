@@ -1021,7 +1021,7 @@ pub(crate) fn run_project_sync_in(
     // belongs to and how its managed blocks render -- before anything below
     // reads or writes. Phase B (commit + push) follows the other steps.
     let git = crate::git_ops::check_git_available();
-    let shared = sync::shared::run_phase_a(db, git.as_ref());
+    let shared = sync::shared::run_phase_a(db, git.as_ref(), Some(project_id));
 
     let all_repos = db
         .list_repos_by_project(Some(project_id))
