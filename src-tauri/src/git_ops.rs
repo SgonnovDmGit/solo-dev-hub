@@ -23,7 +23,7 @@ pub struct GitBinary(pub PathBuf);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-fn spawn_cmd(program: impl AsRef<OsStr>) -> Command {
+pub(crate) fn spawn_cmd(program: impl AsRef<OsStr>) -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(program);
     #[cfg(windows)]

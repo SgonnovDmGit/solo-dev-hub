@@ -2,6 +2,7 @@ mod crypto;
 mod db;
 mod export;
 mod git_ops;
+mod git_sync;
 mod keyring_store;
 mod models;
 mod sync;
