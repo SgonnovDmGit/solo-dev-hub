@@ -554,6 +554,7 @@ fn blobs_in_history(git: &GitBinary, root: &Path, rev: &str, path: &str) -> Vec<
             "log",
             "--raw",
             "--no-abbrev",
+            "--topo-order",
             "-m",
             "--format=%H",
             cap.as_str(),
@@ -677,8 +678,9 @@ fn cat_blobs(
 
 /// The versions of a shared file the two histories held, as the inputs of the
 /// per-entity merge: the distinct normalized texts and, per side, the index of
-/// each commit's version OLDEST first. `None` when a blob cannot be read as
-/// text (the caller then merges against the single whole-file base).
+/// each commit's version OLDEST first. A blob that is missing or not text is
+/// left out of both histories; `None` only when git cannot be asked at all (the
+/// caller then merges against the single whole-file base).
 fn history_versions(
     git: &GitBinary,
     root: &Path,
@@ -696,12 +698,22 @@ fn history_versions(
     let mut versions: Vec<String> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
     for sha in &uniq {
-        let text = String::from_utf8(normalize(blobs.get(*sha)?.clone())).ok()?;
+        // A blob that is missing or not text drops out of the histories alone.
+        let Some(raw) = blobs.get(*sha) else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(normalize(raw.clone())) else {
+            continue;
+        };
         index.insert(sha, versions.len());
         versions.push(text);
     }
-    let seq =
-        |list: &[String]| -> Vec<usize> { list.iter().rev().map(|b| index[b.as_str()]).collect() };
+    let seq = |list: &[String]| -> Vec<usize> {
+        list.iter()
+            .rev()
+            .filter_map(|b| index.get(b.as_str()).copied())
+            .collect()
+    };
     Some((versions, seq(ours), seq(theirs)))
 }
 
@@ -5609,7 +5621,13 @@ mod tests {
             g(d, &["checkout", "-q", "-B", branch]);
         }
         for (i, v) in versions.iter().enumerate() {
-            write(d, "docs/todo.md", v);
+            if *v == "<binary>" {
+                // A version that is not text.
+                fs::create_dir_all(d.join("docs")).unwrap();
+                fs::write(d.join("docs/todo.md"), [0xffu8, 0xfe, 0x00, 0x80]).unwrap();
+            } else {
+                write(d, "docs/todo.md", v);
+            }
             g(d, &["add", "docs/todo.md"]);
             g(d, &["commit", "-q", "-m", &format!("{} {}", branch, i)]);
         }
@@ -5638,6 +5656,15 @@ mod tests {
         let s0 = todo(&["T-000001", "T-000002"]);
         let k = todo(&["T-000002"]);
         let got = plumb_lineages(&[&s0, &k, &s0, &k], &[&s0, &k, &s0]);
+        assert!(!got.contains("T-000001"), "resurrected:\n{}", got);
+        assert!(got.contains("T-000002"));
+    }
+
+    #[test]
+    fn one_unreadable_old_version_does_not_spoil_the_per_row_base() {
+        let s0 = todo(&["T-000001", "T-000002"]);
+        let k = todo(&["T-000002"]);
+        let got = plumb_lineages(&["<binary>", &s0, &k, &s0, &k], &[&s0, &k, &s0]);
         assert!(!got.contains("T-000001"), "resurrected:\n{}", got);
         assert!(got.contains("T-000002"));
     }

@@ -702,6 +702,17 @@ fn entity_bases(
         let a = state_seq(ours_seq, &states, key);
         let bb = state_seq(theirs_seq, &states, key);
         if let Some(found) = lcs_last(&a, &bb) {
+            // Absence as the only shared state, while both histories held the
+            // row in versions of their own, says nothing about the row: the
+            // texts diverged with no shared version. Keep the whole-file base.
+            let shared_text = a
+                .iter()
+                .flatten()
+                .any(|x| bb.iter().flatten().any(|y| same(x, y)));
+            let both_held = a.iter().any(|s| s.is_some()) && bb.iter().any(|s| s.is_some());
+            if found.is_none() && both_held && !shared_text {
+                continue;
+            }
             let whole = b.by_key.get(key).map(|&i| &b.ents[i]);
             if !same_state(found, whole) {
                 overrides.insert(key.clone(), found.cloned());
@@ -1503,6 +1514,24 @@ mod tests {
         assert!(r.contains("## v1.20.0 — contributor mode (renamed)"));
         assert_eq!(r.matches("## v1.20.0").count(), 1);
         assert!(r.contains("first task v2"));
+    }
+
+    #[test]
+    fn diverged_row_texts_with_only_absence_in_common_keep_the_whole_file_base() {
+        let with = TODO_BASE.to_string();
+        let without = with.replace(
+            "- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n",
+            "",
+        );
+        let edited = with.replace("second task", "second task edited");
+        let v = vec![without.clone(), with.clone(), edited];
+        // ours: absent, then the row; theirs: absent, an edited row, deleted
+        // again. The row never had a shared text, so absence is no base: the
+        // whole-file base (the row present) makes theirs' deletion stand.
+        let merged =
+            merge_shared_file_per_entity(Todo, &with, &v, &[0, 1], &[0, 2, 0], &with, &without)
+                .unwrap();
+        assert!(!merged.contains("T-000002"), "resurrected:\n{}", merged);
     }
 
     #[test]

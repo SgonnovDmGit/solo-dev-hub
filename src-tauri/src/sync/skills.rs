@@ -1909,11 +1909,10 @@ mod tests {
         assert_eq!(after.superseded, vec![format!("sdh-alpha ({})", label)]);
         assert_eq!(rule_text_of(&db), "OWNER TEXT");
         assert!(!skills.join("sdh-alpha.md.approved").exists());
-        let mut kinds: Vec<String> = rule_history(&db, "sdh-alpha")
+        let kinds: Vec<String> = rule_history(&db, "sdh-alpha")
             .into_iter()
             .map(|e| e.kind)
             .collect();
-        kinds.sort();
         assert_eq!(kinds, vec!["saved", "superseded"]);
     }
 
