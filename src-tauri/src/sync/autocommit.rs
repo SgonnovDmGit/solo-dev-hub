@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::git_ops::{commit_paths, is_gitignored, CommitOutcome, GitBinary};
+use crate::git_ops::{commit_paths, is_ignored_for_add, CommitOutcome, GitBinary};
 
 /// Doc subfolders that hold cross-repo synced content (REQ pairs, API contracts,
 /// announcements). Auto-commit is scoped (git pathspec) to these (plus the
@@ -50,7 +50,7 @@ pub fn autocommit_repo(
         if !repo_root.join(&rel).exists() {
             continue;
         }
-        if is_gitignored(git, repo_root, &rel)? {
+        if is_ignored_for_add(git, repo_root, &rel)? {
             continue;
         }
         tracked.push(rel);
@@ -63,7 +63,7 @@ pub fn autocommit_repo(
         if !repo_root.join(&rel).exists() {
             continue;
         }
-        if is_gitignored(git, repo_root, &rel)? {
+        if is_ignored_for_add(git, repo_root, &rel)? {
             continue;
         }
         tracked.push(rel);
@@ -279,6 +279,47 @@ mod tests {
             "gitignored announcement must NOT be committed, got {:?}",
             hf
         );
+    }
+
+    #[test]
+    fn test_autocommit_repo_skips_ignored_folder_that_holds_tracked_files() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        // The folder was tracked first, and only later added to .gitignore.
+        write_file(
+            tmp.path(),
+            "docs/client-requirements/x.md",
+            "# x
+",
+        );
+        run_git(tmp.path(), &["add", "docs/client-requirements/x.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "track inbox"]);
+        write_file(
+            tmp.path(),
+            ".gitignore",
+            "docs/client-requirements/
+",
+        );
+        write_file(
+            tmp.path(),
+            "docs/server-api/api.md",
+            "# API
+",
+        );
+
+        let git = check_git_available().expect("git available");
+        // `git add -- docs/client-requirements` refuses this path even though
+        // it holds tracked files; the folder must be skipped, the rest commit.
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+        let hf = head_files(tmp.path());
+        assert!(
+            hf.contains(&"docs/server-api/api.md".to_string()),
+            "{:?}",
+            hf
+        );
+        assert!(hf.contains(&".gitignore".to_string()), "{:?}", hf);
     }
 
     #[test]

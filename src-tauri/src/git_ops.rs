@@ -250,9 +250,36 @@ pub fn commit_paths(
 /// ignored path with exit 1, which would otherwise abort the whole scoped
 /// commit for every folder in the batch.
 pub fn is_gitignored(git: &GitBinary, local_path: &Path, rel_path: &Path) -> Result<bool, String> {
-    let out = spawn_cmd(&git.0)
-        .arg("check-ignore")
-        .arg("-q")
+    check_ignore(git, local_path, rel_path, false)
+}
+
+/// Like [`is_gitignored`], but answers the question `git add -- <path>` asks.
+/// For a directory that holds tracked files plain `check-ignore` says "not
+/// ignored" (the index wins), yet `git add -- <dir>` still refuses it. So a
+/// directory is checked with `--no-index`; a single file keeps index
+/// semantics (`git add` accepts an explicitly named tracked file even when a
+/// rule matches it).
+pub fn is_ignored_for_add(
+    git: &GitBinary,
+    local_path: &Path,
+    rel_path: &Path,
+) -> Result<bool, String> {
+    let no_index = local_path.join(rel_path).is_dir();
+    check_ignore(git, local_path, rel_path, no_index)
+}
+
+fn check_ignore(
+    git: &GitBinary,
+    local_path: &Path,
+    rel_path: &Path,
+    no_index: bool,
+) -> Result<bool, String> {
+    let mut cmd = spawn_cmd(&git.0);
+    cmd.arg("check-ignore").arg("-q");
+    if no_index {
+        cmd.arg("--no-index");
+    }
+    let out = cmd
         .arg("--")
         .arg(rel_path)
         .current_dir(local_path)
