@@ -49,10 +49,12 @@ The dependency direction is one-way: the UI calls Rust, Rust never calls back in
 |---|---|
 | `commands/` | The IPC surface. One module per domain (`bug`, `repo`, `project`, `sync`, `deploy`, `dashboard`, `templates`, `timeline`, `misc`). Thin — argument shuffling and delegation, no business logic. |
 | `db/` | SQLite access, one module per domain, plus `migrations.rs` (the schema's source of truth). |
-| `sync/` | The interesting one. Cross-repo file movement, Markdown ↔ DB reconciliation, managed-block rewriting, auto-commit. |
+| `sync/` | The interesting one. Cross-repo file movement, Markdown ↔ DB reconciliation, managed-block rewriting, auto-commit, and shared repositories of contributor mode (fetch, commits into other branches without checking them out, push — see [`flows/contributor-mode.md`](flows/contributor-mode.md)). |
 | `export/` | Parsing and generating the Markdown formats (bug reports, todo, done). |
 | `crypto/` | AES-256-GCM. Encrypts secret values before they touch SQLite. |
 | `git_ops.rs` | Wrapper over the system `git` binary: availability probe, status, `check-ignore`, pathspec-scoped commits. |
+| `git_sync.rs` | The network and plumbing side of git for shared repositories: fetch, fast-forward, commits into a branch that is not checked out, push without force; `master` / `main` refused. |
+| `merge_driver.rs` | The `merge=sdh` git merge driver: the same executable started by git with `--merge-driver`, before the database opens, merges `todo.md` / `done.md` / `bug-reports.md` by id. |
 | `keyring_store.rs` | The GitHub PAT and the encryption data key, in the OS credential store. |
 | `template_render.rs`, `template_meta.rs`, `template_seeder.rs` | Deploy templates: `@@VAR@@` substitution, `meta.json` placeholder metadata, seeding the bundle into SQLite at startup. |
 
@@ -91,7 +93,7 @@ The window is drawn with `decorations: false` and a custom titlebar; window cont
 
 ### SQLite, not JSON files
 
-The data is genuinely relational — a repository belongs to one project, a microservice is shared across many, events reference bugs and tasks which reference repositories. Dashboard and timeline queries are aggregations with date filters. Doing that over JSON means hand-rolling joins and holding everything in memory. Migrations also matter: the schema has moved 28 times, and each step needs to run against existing user data.
+The data is genuinely relational — a repository belongs to one project, a microservice is shared across many, events reference bugs and tasks which reference repositories. Dashboard and timeline queries are aggregations with date filters. Doing that over JSON means hand-rolling joins and holding everything in memory. Migrations also matter: the schema has moved 34 times, and each step needs to run against existing user data.
 
 ### Markdown is the interface, SQLite is the source of truth
 
