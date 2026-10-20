@@ -127,9 +127,7 @@ impl StatusNote {
             return Some(ui.clone());
         }
         if let Some((branch, current)) = &self.diverged {
-            return Some(
-                serde_json::json!({ "branch": branch, "current": current }).to_string(),
-            );
+            return Some(serde_json::json!({ "branch": branch, "current": current }).to_string());
         }
         if let Some(branch) = &self.rejected_branch {
             return Some(
@@ -3581,7 +3579,9 @@ mod tests {
         assert_eq!(n.detail, "dev branch changed from dev to next");
         // Any other reason is shown as text.
         assert_eq!(
-            note("main is not the repo owner", None).ui_detail().as_deref(),
+            note("main is not the repo owner", None)
+                .ui_detail()
+                .as_deref(),
             Some("main is not the repo owner")
         );
         assert_eq!(note("  ", None).ui_detail(), None);

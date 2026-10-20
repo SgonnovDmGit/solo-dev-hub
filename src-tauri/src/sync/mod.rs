@@ -18,9 +18,9 @@ pub mod project_sync;
 pub mod requirements;
 pub mod shared;
 pub mod shared_canon;
-pub mod shared_structure;
 #[cfg(test)]
 mod shared_e2e_tests;
+pub mod shared_structure;
 pub mod skills;
 pub mod tasks;
 
