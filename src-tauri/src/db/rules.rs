@@ -131,6 +131,23 @@ impl AppDb {
         rows.next().transpose()
     }
 
+    /// T-000214: when the owner last saved or reset the rule in the app — the
+    /// newest `saved` / `reset` event's timestamp. A hand-back whose marker is
+    /// older than this was written against text the owner has since replaced.
+    pub fn last_owner_edit_at(&self, rule: &str) -> SqlResult<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT created_at FROM rule_events
+             WHERE rule = ?1 AND kind IN (?2, ?3)
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(
+            rusqlite::params![rule, rule_event::SAVED, rule_event::RESET],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.next().transpose()
+    }
+
     /// Names of the rules whose hand-backs are currently in conflict.
     pub fn open_rule_conflicts(&self) -> SqlResult<HashSet<String>> {
         let conn = self.conn.lock().unwrap();
