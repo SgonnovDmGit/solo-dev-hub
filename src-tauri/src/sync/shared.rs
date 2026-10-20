@@ -35,7 +35,7 @@ use crate::models::{
 use crate::sync::autocommit::{
     CROSS_REPO_DIRS, MANAGED_ROOT_FILES, SDH_COMMIT_EMAIL, SDH_COMMIT_NAME,
 };
-use crate::sync::merge_by_id::{kind_for_path, merge_shared_bytes};
+use crate::sync::merge_by_id::{kind_for_path, merge_shared_bytes, merge_shared_file_per_entity};
 use crate::sync::shared_structure::{
     self as ss, DiscoverOutcome, JoinRequest, ProjectStructure, Role, REQUESTS_REL_DIR,
     STRUCTURE_REL_PATH,
@@ -616,11 +616,93 @@ fn last_common_blob(
         return None;
     }
     let theirs = blobs_in_history(git, root, theirs_rev, path);
-    let (po, pt) = (oldest_positions(&ours), oldest_positions(&theirs));
+    common_of(&ours, &theirs)
+}
+
+/// The heuristic of `last_common_blob` over two newest-first blob lists.
+fn common_of(ours: &[String], theirs: &[String]) -> Option<String> {
+    let (po, pt) = (oldest_positions(ours), oldest_positions(theirs));
     po.iter()
         .filter_map(|(b, i)| pt.get(b).map(|j| (i + j, *i, *b)))
         .min()
         .map(|(_, _, b)| b.to_string())
+}
+
+/// Contents of blobs in one `git cat-file --batch` call; a blob git does not
+/// have is left out.
+fn cat_blobs(
+    git: &GitBinary,
+    root: &Path,
+    shas: &[&str],
+) -> Result<HashMap<String, Vec<u8>>, String> {
+    let mut got = HashMap::new();
+    if shas.is_empty() {
+        return Ok(got);
+    }
+    let input = (shas.join("\n") + "\n").into_bytes();
+    let out = run_with_stdin(git, root, &["cat-file", "--batch"], input)?;
+    if !out.status.success() {
+        return Err(format!(
+            "git cat-file failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // <sha> <type> <size>\n<content>\n, or <sha> missing\n
+    let buf = out.stdout;
+    let mut pos = 0;
+    while pos < buf.len() {
+        let Some(nl) = buf[pos..].iter().position(|&c| c == b'\n') else {
+            break;
+        };
+        let header = String::from_utf8_lossy(&buf[pos..pos + nl]).into_owned();
+        pos += nl + 1;
+        let mut it = header.split_whitespace();
+        let (Some(sha), Some(kind)) = (it.next(), it.next()) else {
+            break;
+        };
+        if kind == "missing" {
+            continue;
+        }
+        let Some(size) = it.next().and_then(|s| s.parse::<usize>().ok()) else {
+            break;
+        };
+        if pos + size > buf.len() {
+            break;
+        }
+        got.insert(sha.to_string(), buf[pos..pos + size].to_vec());
+        pos += size + 1;
+    }
+    Ok(got)
+}
+
+/// The versions of a shared file the two histories held, as the inputs of the
+/// per-entity merge: the distinct normalized texts and, per side, the index of
+/// each commit's version OLDEST first. `None` when a blob cannot be read as
+/// text (the caller then merges against the single whole-file base).
+fn history_versions(
+    git: &GitBinary,
+    root: &Path,
+    ours: &[String],
+    theirs: &[String],
+) -> Option<(Vec<String>, Vec<usize>, Vec<usize>)> {
+    let mut uniq: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for b in ours.iter().chain(theirs.iter()) {
+        if seen.insert(b.as_str()) {
+            uniq.push(b.as_str());
+        }
+    }
+    let blobs = cat_blobs(git, root, &uniq).ok()?;
+    let mut versions: Vec<String> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for sha in &uniq {
+        let text = String::from_utf8(normalize(blobs.get(*sha)?.clone())).ok()?;
+        index.insert(sha, versions.len());
+        versions.push(text);
+    }
+    let seq =
+        |list: &[String]| -> Vec<usize> { list.iter().rev().map(|b| index[b.as_str()]).collect() };
+    Some((versions, seq(ours), seq(theirs)))
 }
 
 /// What to do with one file of the target branch.
@@ -633,9 +715,10 @@ enum Plan {
 
 /// Commit our version of the shared files into `branch` (a local branch that is
 /// not checked out). Task files (`todo.md` / `done.md` / `bug-reports.md`) are
-/// merged by id (ours = the work tree, theirs = the branch, base = the last blob
-/// of the file both histories held, else the file at the merge-base, else
-/// nothing: a row that is in the base but missing on one side was deleted
+/// merged by id (ours = the work tree, theirs = the branch, base = per row the
+/// last state of that row both histories held, with the last blob of the file
+/// both held, else the file at the merge-base, else nothing as the fallback for
+/// structure: a row that is in the base but missing on one side was deleted
 /// there and stays deleted). Every other file is a three-way copy with the same
 /// base: the work tree wins only when we changed the file since the base AND
 /// the branch is still at the base (a version this checkout never had is newer
@@ -686,11 +769,20 @@ fn plumb_into_branch(
         let merge_base_blob = base_tree.get(path).map(String::as_str);
         // The version both sides last had; only looked up for a file that
         // differs (equal files need no base).
-        let common = if wt != br {
-            last_common_blob(git, root, "HEAD", &refname, path)
+        let hist: Option<(Vec<String>, Vec<String>)> = if wt != br {
+            let ours = blobs_in_history(git, root, "HEAD", path);
+            let theirs = if ours.is_empty() {
+                Vec::new()
+            } else {
+                blobs_in_history(git, root, &refname, path)
+            };
+            Some((ours, theirs))
         } else {
             None
         };
+        let common = hist
+            .as_ref()
+            .and_then(|(o, t)| if o.is_empty() { None } else { common_of(o, t) });
         let bs: Option<&str> = common.as_deref().or(merge_base_blob);
         let plan = match (wt, br) {
             (Some(w), Some(b)) => {
@@ -703,7 +795,26 @@ fn plumb_into_branch(
                         Some(s) => normalize(cat_blob(git, root, s)?),
                         None => Vec::new(),
                     };
-                    match merge_shared_bytes(kind, &base, &ours, &theirs) {
+                    // Each row gets its own base from the two histories.
+                    let per_entity = hist
+                        .as_ref()
+                        .filter(|(o, t)| !o.is_empty() && !t.is_empty())
+                        .and_then(|(o, t)| history_versions(git, root, o, t))
+                        .and_then(|(versions, os, ts)| {
+                            let (b, o, t) = (
+                                std::str::from_utf8(&base).ok()?,
+                                std::str::from_utf8(&ours).ok()?,
+                                std::str::from_utf8(&theirs).ok()?,
+                            );
+                            Some(merge_shared_file_per_entity(
+                                kind, b, &versions, &os, &ts, o, t,
+                            ))
+                        });
+                    let merged = match per_entity {
+                        Some(r) => r,
+                        None => merge_shared_bytes(kind, &base, &ours, &theirs),
+                    };
+                    match merged {
                         Ok(m) if m.as_bytes() == theirs.as_slice() => Plan::Skip,
                         Ok(m) => Plan::Write(m.into_bytes()),
                         // Not text: leave the branch's copy alone.
@@ -5486,6 +5597,60 @@ mod tests {
         g(d, &["commit", "-q", "-m", "g"]);
         assert_eq!(last_common_blob(&git, d, "dev", "other", "g.md"), None);
         assert_eq!(last_common_blob(&git, d, "dev", "other", "nope.md"), None);
+    }
+
+    /// Commit each version of `docs/todo.md` in turn on `branch`; an `orphan`
+    /// branch shares no commit with the others, only blobs.
+    fn commit_lineage(d: &Path, branch: &str, orphan: bool, versions: &[&str]) {
+        if orphan {
+            g(d, &["checkout", "-q", "--orphan", branch]);
+            g(d, &["rm", "-rfq", "--ignore-unmatch", "."]);
+        } else {
+            g(d, &["checkout", "-q", "-B", branch]);
+        }
+        for (i, v) in versions.iter().enumerate() {
+            write(d, "docs/todo.md", v);
+            g(d, &["add", "docs/todo.md"]);
+            g(d, &["commit", "-q", "-m", &format!("{} {}", branch, i)]);
+        }
+    }
+
+    /// `ours` is HEAD's history (the work tree is its tip), `theirs` the
+    /// plumbed branch's; returns the todo.md the branch holds afterwards.
+    fn plumb_lineages(ours: &[&str], theirs: &[&str]) -> String {
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        commit_lineage(d, "other", true, theirs);
+        commit_lineage(d, "dev", true, ours);
+        let spec = vec!["docs/todo.md".to_string()];
+        plumb_into_branch(&gb(), d, "other", &spec, "me", &[]).unwrap();
+        g(d, &["show", "other:docs/todo.md"])
+    }
+
+    #[test]
+    fn a_repeating_history_does_not_resurrect_a_row_we_deleted() {
+        // S0 = both rows, K = T-000001 deleted. Our history ends one deletion
+        // after the branch's tip: the branch is a prefix of ours, so it simply
+        // missed the last deletion.
+        let s0 = todo(&["T-000001", "T-000002"]);
+        let k = todo(&["T-000002"]);
+        let got = plumb_lineages(&[&s0, &k, &s0, &k], &[&s0, &k, &s0]);
+        assert!(!got.contains("T-000001"), "resurrected:\n{}", got);
+        assert!(got.contains("T-000002"));
+    }
+
+    #[test]
+    fn a_repeating_history_keeps_a_byte_identical_row_we_re_added() {
+        // Our history is one re-add past the branch's tip (S0 again, same bytes
+        // as the first time): the row is ours to add back, not a deletion.
+        let s0 = todo(&["T-000001", "T-000002"]);
+        let k = todo(&["T-000002"]);
+        let got = plumb_lineages(&[&k, &s0, &k, &s0], &[&k, &s0, &k]);
+        assert!(got.contains("T-000001"), "re-added row lost:\n{}", got);
+        assert!(got.contains("T-000002"));
     }
 
     fn done_md(ids: &[&str]) -> String {

@@ -82,6 +82,7 @@ pub fn merge_shared_bytes(
 // Parsing
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Ent {
     key: String,
     /// Line prefix after the indentation: `- `, `- [ ] `, `- [x] `.
@@ -579,12 +580,156 @@ pub fn merge_shared_file(
     ours: &str,
     theirs: &str,
 ) -> Result<String, MergeError> {
-    // Trivial merges: exactly what git itself would do.
-    if base == ours {
-        return Ok(theirs.to_string());
+    merge_with_bases(kind, base, ours, theirs, &HashMap::new())
+}
+
+/// Per-entity base (T-000226). `versions` are the distinct texts of the file
+/// that the two histories held; `ours_seq` / `theirs_seq` index into it, OLDEST
+/// first, one entry per commit. The whole-file `base` still serves the
+/// structure (headers, prose); the base of every entity whose row differs
+/// between `ours` and `theirs` is the last state of THAT row (a version of the
+/// row, or its absence) common to both histories, found as the last element of
+/// the longest common subsequence of the two histories projected on the row.
+/// Judging a whole file by when its bytes first appeared goes wrong when the
+/// same file content comes back three or more times; aligned as sequences, the
+/// branch that is a prefix of the other ends exactly at the shared state. An
+/// entity the histories never both held keeps the whole-file base.
+pub fn merge_shared_file_per_entity(
+    kind: SharedFileKind,
+    base: &str,
+    versions: &[String],
+    ours_seq: &[usize],
+    theirs_seq: &[usize],
+    ours: &str,
+    theirs: &str,
+) -> Result<String, MergeError> {
+    let overrides = entity_bases(kind, base, versions, ours_seq, theirs_seq, ours, theirs);
+    merge_with_bases(kind, base, ours, theirs, &overrides)
+}
+
+/// Do two states of one row (`None` = absent) agree?
+fn same_state(a: Option<&Ent>, b: Option<&Ent>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => same(x, y),
+        _ => false,
     }
-    if base == theirs || ours == theirs {
+}
+
+/// The state sequence of one row over a history, consecutive repeats dropped.
+fn state_seq<'a>(
+    seq: &[usize],
+    states: &'a [HashMap<String, Ent>],
+    key: &str,
+) -> Vec<Option<&'a Ent>> {
+    let mut out: Vec<Option<&Ent>> = Vec::new();
+    for &i in seq {
+        let st = states.get(i).and_then(|m| m.get(key));
+        if out.last().map_or(true, |p| !same_state(*p, st)) {
+            out.push(st);
+        }
+    }
+    out
+}
+
+/// Last element of the longest common subsequence (latest on ours, then on
+/// theirs, among equals); `None` when the sequences share no state.
+fn lcs_last<'a>(a: &[Option<&'a Ent>], b: &[Option<&'a Ent>]) -> Option<Option<&'a Ent>> {
+    let (n, m) = (a.len(), b.len());
+    let mut f = vec![vec![0u32; m + 1]; n + 1];
+    for i in 1..=n {
+        for j in 1..=m {
+            f[i][j] = if same_state(a[i - 1], b[j - 1]) {
+                f[i - 1][j - 1] + 1
+            } else {
+                f[i - 1][j].max(f[i][j - 1])
+            };
+        }
+    }
+    let total = f[n][m];
+    if total == 0 {
+        return None;
+    }
+    for i in (1..=n).rev() {
+        for j in (1..=m).rev() {
+            if same_state(a[i - 1], b[j - 1]) && f[i][j] == total && f[i - 1][j - 1] + 1 == total {
+                return Some(a[i - 1]);
+            }
+        }
+    }
+    None
+}
+
+fn entity_bases(
+    kind: SharedFileKind,
+    base: &str,
+    versions: &[String],
+    ours_seq: &[usize],
+    theirs_seq: &[usize],
+    ours: &str,
+    theirs: &str,
+) -> HashMap<String, Option<Ent>> {
+    let mut overrides = HashMap::new();
+    let (b, o, t) = (parse(kind, base), parse(kind, ours), parse(kind, theirs));
+    // Only a row that differs between the sides needs a base.
+    let mut diff: HashSet<String> = HashSet::new();
+    for e in o.ents.iter().chain(t.ents.iter()) {
+        let eo = o.by_key.get(&e.key).map(|&i| &o.ents[i]);
+        let et = t.by_key.get(&e.key).map(|&i| &t.ents[i]);
+        if !same_state(eo, et) {
+            diff.insert(e.key.clone());
+        }
+    }
+    if diff.is_empty() {
+        return overrides;
+    }
+    // One parse per version, keeping only the rows in question.
+    let used: HashSet<usize> = ours_seq.iter().chain(theirs_seq.iter()).copied().collect();
+    let mut states: Vec<HashMap<String, Ent>> = vec![HashMap::new(); versions.len()];
+    for &i in &used {
+        let Some(text) = versions.get(i) else {
+            continue;
+        };
+        let mut m = HashMap::new();
+        for e in parse(kind, text).ents {
+            if diff.contains(&e.key) {
+                m.insert(e.key.clone(), e);
+            }
+        }
+        states[i] = m;
+    }
+    for key in &diff {
+        let a = state_seq(ours_seq, &states, key);
+        let bb = state_seq(theirs_seq, &states, key);
+        if let Some(found) = lcs_last(&a, &bb) {
+            let whole = b.by_key.get(key).map(|&i| &b.ents[i]);
+            if !same_state(found, whole) {
+                overrides.insert(key.clone(), found.cloned());
+            }
+        }
+    }
+    overrides
+}
+
+fn merge_with_bases(
+    kind: SharedFileKind,
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    overrides: &HashMap<String, Option<Ent>>,
+) -> Result<String, MergeError> {
+    // Trivial merges: exactly what git itself would do. The base ones stand
+    // for the whole file only while no row has a base of its own.
+    if ours == theirs {
         return Ok(ours.to_string());
+    }
+    if overrides.is_empty() {
+        if base == ours {
+            return Ok(theirs.to_string());
+        }
+        if base == theirs {
+            return Ok(ours.to_string());
+        }
     }
 
     let b = parse(kind, base);
@@ -597,7 +742,10 @@ pub fn merge_shared_file(
         if merged.contains_key(&e.key) {
             continue;
         }
-        let eb = b.by_key.get(&e.key).map(|&i| &b.ents[i]);
+        let eb = match overrides.get(&e.key) {
+            Some(x) => x.as_ref(),
+            None => b.by_key.get(&e.key).map(|&i| &b.ents[i]),
+        };
         let eo = o.by_key.get(&e.key).map(|&i| &o.ents[i]);
         let et = t.by_key.get(&e.key).map(|&i| &t.ents[i]);
         merged.insert(e.key.clone(), decide(kind, eb, eo, et));
@@ -1355,5 +1503,39 @@ mod tests {
         assert!(r.contains("## v1.20.0 — contributor mode (renamed)"));
         assert_eq!(r.matches("## v1.20.0").count(), 1);
         assert!(r.contains("first task v2"));
+    }
+
+    #[test]
+    fn per_entity_base_is_the_last_state_both_histories_held() {
+        let with = TODO_BASE.to_string();
+        let without = with.replace(
+            "- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n",
+            "",
+        );
+        let v = vec![with.clone(), without.clone()];
+        // ours: with, without, with, without; theirs is its prefix.
+        let deleted = merge_shared_file_per_entity(
+            Todo,
+            &with,
+            &v,
+            &[0, 1, 0, 1],
+            &[0, 1, 0],
+            &without,
+            &with,
+        )
+        .unwrap();
+        assert!(!deleted.contains("T-000002"));
+        // ours: without, with, without, with; theirs is its prefix.
+        let readded = merge_shared_file_per_entity(
+            Todo,
+            &with,
+            &v,
+            &[1, 0, 1, 0],
+            &[1, 0, 1],
+            &with,
+            &without,
+        )
+        .unwrap();
+        assert!(readded.contains("T-000002"));
     }
 }
