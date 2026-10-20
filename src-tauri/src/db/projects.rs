@@ -776,6 +776,17 @@ impl AppDb {
         }
     }
 
+    /// T-000216: GitHub login of this install, stored by the frontend whenever a
+    /// token validates (setting `github_login`). Empty/missing -> None.
+    #[allow(dead_code)]
+    pub fn github_login(&self) -> Option<String> {
+        self.get_setting("github_login")
+            .ok()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn set_setting(&self, key: &str, value: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -883,6 +894,18 @@ mod tests {
 
     fn make_db() -> AppDb {
         AppDb::new(PathBuf::from(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn test_github_login_reads_setting_and_treats_empty_as_none() {
+        let db = make_db();
+        assert_eq!(db.github_login(), None);
+        db.set_setting("github_login", "octocat").unwrap();
+        assert_eq!(db.github_login().as_deref(), Some("octocat"));
+        db.set_setting("github_login", "  ").unwrap();
+        assert_eq!(db.github_login(), None);
+        db.set_setting("github_login", "").unwrap();
+        assert_eq!(db.github_login(), None);
     }
 
     // ── Project tests ─────────────────────────────────────────────────────────

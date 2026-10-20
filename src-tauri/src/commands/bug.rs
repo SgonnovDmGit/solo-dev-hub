@@ -177,7 +177,8 @@ pub fn count_confirmed_bugs(db: State<AppDb>, repo_id: i64) -> Result<i64, Strin
 }
 
 /// Create a new bug via app UI (+ Add button). Starts in `created` status
-/// with `fix_attempts=0`. `numeric_id` auto-allocated as max+1 per-repo.
+/// with `fix_attempts=0`. `numeric_id` auto-allocated as max+1 per-repo, or
+/// max+1 inside this install's number band when the repo is shared.
 /// Regenerates `docs/bug-reports.md` from DB so the new row is visible to LLM.
 #[tauri::command]
 pub fn create_bug(
@@ -191,7 +192,8 @@ pub fn create_bug(
     // DB mutation so the final regen doesn't overwrite them with stale DB
     // state. "not migrated" errors are expected on first call and ignored.
     let _ = sync::reconcile_bugs_for_repo(&db, repo_id);
-    let nid = db.next_numeric_id(repo_id).map_err(|e| e.to_string())?;
+    // F-000044: in a shared repo the number comes from this install's band.
+    let nid = sync::shared_structure::allocate_bug_numeric_id(&db, repo_id)?;
     let now = db::utc_now_rfc3339();
     let bug = db
         .insert_bug(

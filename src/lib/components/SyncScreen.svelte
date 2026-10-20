@@ -7,6 +7,7 @@
   import { tStore } from '$lib/i18n';
   import { syncProject, listProjectRequirements, confirmRequirement, listCodexEdges, listPeerChannels } from '$lib/api/tauri-commands';
   import { noteManualSync } from '$lib/stores/autosync';
+  import { refreshAfterSync } from '$lib/stores/shared';
   import { toastRulesFindings } from '$lib/utils/rules-report';
   import { getDisplayName, type RequirementInfo, type CodexEdgeInfo, type PeerChannelInfo } from '$lib/types';
 
@@ -88,6 +89,9 @@
       addToast(String(e), 'error');
     } finally {
       syncing = false;
+      // F-000044: statuses of shared repos are settled by the sync, and it may
+      // have linked a contributor's repo to a project.
+      void refreshAfterSync();
     }
   }
 

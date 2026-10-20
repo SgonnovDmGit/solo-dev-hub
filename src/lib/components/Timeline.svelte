@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { tStore, locale } from '$lib/i18n';
-  import { readTimeline } from '$lib/api/tauri-commands';
+  import { readTimeline, getRepoStructure } from '$lib/api/tauri-commands';
+  import { sharedStates, githubLogin } from '$lib/stores/shared';
+  import { sameLogin, isSharedRepo } from '$lib/utils/shared-mode';
   import { allRepos } from '$lib/stores/repos';
   import { selectedRepoId, currentScreen, timelineInitialRepoIds } from '$lib/stores/ui';
   import { get } from 'svelte/store';
@@ -22,6 +24,34 @@
   let selectedKinds = $state<string[]>([...ALL_KINDS]);
   let selectedRepos = $state<number[]>([]);
   let searchText = $state('');
+  // F-000044: author filter — 'all', 'me' (this install) or a GitHub login.
+  let authorFilter = $state<string>('all');
+  // Logins seen so far (events and the structures of shared repos); only grows,
+  // so choosing one login does not drop the others from the list.
+  let knownAuthors = $state<string[]>([]);
+
+  function rememberAuthors(logins: (string | null | undefined)[]) {
+    const fresh = logins.filter(
+      (l): l is string =>
+        !!l && !sameLogin(l, $githubLogin) && !knownAuthors.some((k) => sameLogin(k, l)),
+    );
+    if (fresh.length > 0) knownAuthors = [...knownAuthors, ...fresh].sort((a, b) => a.localeCompare(b));
+  }
+
+  // The author filter exists only where a repo is shared.
+  const hasSharedRepos = $derived([...$sharedStates.values()].some((st) => isSharedRepo(st)));
+
+  async function seedAuthorsFromStructures(states: Map<number, import('$lib/types').RepoSharedState>) {
+    for (const [repoId, st] of states) {
+      if (!isSharedRepo(st)) continue;
+      try {
+        const s = await getRepoStructure(repoId);
+        if (s) rememberAuthors([s.main.login, ...s.participants.map((p) => p.login)]);
+      } catch {
+        /* the filter still works from the events */
+      }
+    }
+  }
 
   let events = $state<ActivityEvent[]>([]);
   let offset = $state(0);
@@ -36,6 +66,8 @@
       project_ids: undefined,
       repo_ids: selectedRepos.length === 0 ? undefined : selectedRepos,
       search: searchText.trim() || undefined,
+      author_is_me: authorFilter === 'me' ? true : undefined,
+      author: authorFilter !== 'all' && authorFilter !== 'me' ? authorFilter : undefined,
     };
   }
 
@@ -45,6 +77,7 @@
     try {
       const r = await readTimeline(buildFilter(), 0, PAGE_SIZE);
       events = r;
+      rememberAuthors(r.map((e) => e.author));
       offset = r.length;
       hasMore = r.length === PAGE_SIZE;
     } finally {
@@ -58,6 +91,7 @@
     try {
       const r = await readTimeline(buildFilter(), offset, PAGE_SIZE);
       events = [...events, ...r];
+      rememberAuthors(r.map((e) => e.author));
       offset += r.length;
       hasMore = r.length === PAGE_SIZE;
     } finally {
@@ -78,9 +112,19 @@
     }
   });
 
+  // Re-seed the logins whenever the shared repos change (a sync, a new role).
+  $effect(() => {
+    void seedAuthorsFromStructures($sharedStates);
+  });
+
+  // No shared repo left: an author filter would hide events for nothing.
+  $effect(() => {
+    if (!hasSharedRepos && authorFilter !== 'all') authorFilter = 'all';
+  });
+
   let filterChangeTimer: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
-    void startDate; void endDate; void selectedKinds; void selectedRepos; void searchText;
+    void startDate; void endDate; void selectedKinds; void selectedRepos; void searchText; void authorFilter;
     if (filterChangeTimer) clearTimeout(filterChangeTimer);
     filterChangeTimer = setTimeout(loadFirstPage, 200);
   });
@@ -224,6 +268,19 @@
       </div>
     </details>
 
+    {#if hasSharedRepos}
+      <label class="author-filter">
+        <span>{$tStore('timeline.filter.author' as any)}:</span>
+        <select bind:value={authorFilter}>
+          <option value="all">{$tStore('timeline.filter.authorAll' as any)}</option>
+          <option value="me">{$tStore('timeline.filter.authorMe' as any)}</option>
+          {#each knownAuthors as login (login)}
+            <option value={login}>{login}</option>
+          {/each}
+        </select>
+      </label>
+    {/if}
+
     <input type="search" placeholder={$tStore('timeline.filter.search' as any)} bind:value={searchText} class="search" />
   </div>
 
@@ -246,6 +303,7 @@
                 <span class="label">· {eventLabel(ev)}</span>
                 {#if ev.kind === 'repo_rename' && ev.old_canonical}<span class="meta">({ev.old_canonical} → {ev.new_canonical})</span>{/if}
                 {#if ev.change_count != null && ev.change_count > 0}<span class="meta">[{ev.change_count}]</span>{/if}
+                {#if ev.author}<span class="author" title={$tStore('timeline.authorTitle' as any).replace('{0}', ev.author)}>@{ev.author}</span>{/if}
                 <span class="time">· {timeOfDay(ev.ts)}</span>
               </button>
             </li>
@@ -273,6 +331,8 @@
   .dropdown summary { cursor: pointer; font-size: 12px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 4px; list-style: none; user-select: none; }
   .dropdown-list { position: absolute; background: var(--bg); border: 1px solid var(--border); padding: 6px; max-height: 300px; overflow-y: auto; z-index: 5; display: flex; flex-direction: column; gap: 2px; min-width: 200px; }
   .dropdown-list label { display: flex; gap: 4px; font-size: 12px; cursor: pointer; }
+  .author-filter { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-muted); }
+  .author-filter select { font-size: 12px; padding: 3px 6px; }
   .search { flex: 1; min-width: 100px; max-width: 300px; padding: 4px 8px; font-size: 12px; }
   .body { flex: 1; overflow-y: auto; padding: 8px 0; }
   .muted { color: var(--text-muted); padding: 24px; text-align: center; }
@@ -286,6 +346,7 @@
   .id { font-family: var(--font-mono, monospace); font-size: 11px; }
   .label { color: var(--text-muted); }
   .meta { color: var(--text-muted); font-size: 11px; opacity: 0.8; }
+  .author { color: var(--text-muted); font-size: 11px; border: 1px solid var(--border); border-radius: 8px; padding: 0 6px; }
   .time { color: var(--text-muted); font-size: 11px; margin-left: auto; }
   .load-more { padding: 12px; text-align: center; }
   .load-more button { padding: 6px 18px; font-size: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }

@@ -47,8 +47,34 @@ pub fn parse_bug_reports(content: &str) -> (Vec<FileBugNote>, Vec<String>) {
     let mut bugs = Vec::new();
     let mut warnings = Vec::new();
 
-    for line in content.lines() {
+    // Rows inside an HTML comment are documentation (the scaffold's example row
+    // lives in one), not bugs. A comment block is only recognised when its
+    // opening `<!--` starts a line, so a real row that merely mentions `<!--`
+    // in its description is never swallowed. A block comment also needs its
+    // closing line (one that ends with `-->`) further down: an opener that is
+    // never closed would hide every real row below it, so it is NOT a comment --
+    // it is ordinary text, plus a warning.
+    let lines: Vec<&str> = content.lines().collect();
+    let mut in_comment = false;
+    for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
+        if in_comment {
+            if trimmed.ends_with("-->") {
+                in_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("<!--") {
+            if trimmed.contains("-->") {
+                continue;
+            }
+            if lines[idx + 1..].iter().any(|l| l.trim().ends_with("-->")) {
+                in_comment = true;
+            } else {
+                warnings.push(format!("unterminated <!-- at line {}", idx + 1));
+            }
+            continue;
+        }
         let rest_opt = trimmed.strip_prefix("- [ ] ").or_else(|| {
             trimmed
                 .strip_prefix("- ")
@@ -241,5 +267,65 @@ mod tests {
         assert!(md.contains("B-001"));
         assert!(md.contains("B-002"));
         assert!(md.contains("Confirmed bug"));
+    }
+
+    #[test]
+    fn test_scaffold_template_yields_no_bugs() {
+        // The example row of the shipped template sits inside an HTML comment.
+        let tpl = include_str!("../../templates/_global/bug-reports.md.tmpl");
+        assert!(
+            tpl.contains("B-001 |"),
+            "the template still carries its example"
+        );
+        let (bugs, warnings) = parse_bug_reports(tpl);
+        assert!(bugs.is_empty(), "{:?}", bugs);
+        assert!(warnings.is_empty(), "{:?}", warnings);
+    }
+
+    #[test]
+    fn test_rows_inside_html_comments_are_ignored_rows_around_them_are_not() {
+        let row = |id: &str| {
+            format!(
+                "- {} | 2026-03-29 | text | major | auth | created | 0 |",
+                id
+            )
+        };
+        let md = format!(
+            "## Open bugs\n\n{}\n<!-- one line {} -->\n<!--\n{}\n{}\n-->\n{}\n",
+            row("B-001"),
+            row("B-002"),
+            row("B-003"),
+            row("B-004"),
+            row("B-005")
+        );
+        let ids: Vec<String> = parse_bug_reports(&md).0.into_iter().map(|b| b.id).collect();
+        assert_eq!(ids, vec!["B-001", "B-005"]);
+    }
+
+    #[test]
+    fn test_a_row_that_mentions_a_comment_marker_is_still_a_bug() {
+        let md = "- B-001 | 2026-03-29 | uses <!-- in html | major | ui_ux | created | 0 |\n- B-002 | 2026-03-29 | next | major | ui_ux | created | 0 |\n";
+        let (bugs, _) = parse_bug_reports(md);
+        assert_eq!(bugs.len(), 2);
+    }
+
+    #[test]
+    fn test_an_unterminated_comment_opener_hides_nothing() {
+        // An opener nobody closes is ordinary text: every real row below it is
+        // still a bug, and the stray opener is reported.
+        let md = "## Open bugs\n\n<!-- forgotten\n- B-001 | 2026-03-29 | one | major | auth | created | 0 |\n- B-002 | 2026-03-29 | a --> b | major | auth | created | 0 |\n";
+        let (bugs, warnings) = parse_bug_reports(md);
+        let ids: Vec<&str> = bugs.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["B-001", "B-002"]);
+        assert_eq!(warnings, vec!["unterminated <!-- at line 3".to_string()]);
+    }
+
+    #[test]
+    fn test_a_terminated_block_comment_still_hides_its_rows() {
+        let md = "<!--\n- B-001 | 2026-03-29 | doc | major | auth | created | 0 |\n-->\n- B-002 | 2026-03-29 | real | major | auth | created | 0 |\n";
+        let (bugs, warnings) = parse_bug_reports(md);
+        assert_eq!(bugs.len(), 1);
+        assert_eq!(bugs[0].id, "B-002");
+        assert!(warnings.is_empty());
     }
 }

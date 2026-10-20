@@ -692,6 +692,145 @@ impl AppDb {
         Ok(())
     }
 
+    // ── T-000216: contributor-mode (shared repo) state ────────────────────────
+    // Storage only; the sync that fills and reads it lands in later tasks.
+
+    fn row_to_shared_state(row: &rusqlite::Row) -> SqlResult<RepoSharedState> {
+        Ok(RepoSharedState {
+            repo_id: row.get(0)?,
+            shared_mode: row.get::<_, i64>(1)? != 0,
+            shared_role: row.get(2)?,
+            shared_status: row.get(3)?,
+            shared_status_detail: status_detail_of(row.get::<_, Option<String>>(4)?.as_deref()),
+        })
+    }
+
+    /// Shared-mode state of one repo. A missing repo yields the "not shared" state.
+    pub fn get_shared_state(&self, repo_id: i64) -> SqlResult<RepoSharedState> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT id, shared_mode, shared_role, shared_status, shared_import
+             FROM repositories WHERE id = ?1",
+            rusqlite::params![repo_id],
+            Self::row_to_shared_state,
+        ) {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(RepoSharedState {
+                repo_id,
+                shared_mode: false,
+                shared_role: None,
+                shared_status: None,
+                shared_status_detail: None,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// State of every repo that takes part in shared mode in any way.
+    pub fn list_shared_states(&self) -> SqlResult<Vec<RepoSharedState>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, shared_mode, shared_role, shared_status, shared_import FROM repositories
+             WHERE shared_mode = 1 OR shared_role IS NOT NULL OR shared_status IS NOT NULL
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_shared_state)?;
+        rows.collect()
+    }
+
+    /// Owner's shared-mode switch.
+    #[allow(dead_code)]
+    pub fn set_shared_mode(&self, repo_id: i64, on: bool) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE repositories SET shared_mode = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            rusqlite::params![on as i64, repo_id],
+        )?;
+        Ok(())
+    }
+
+    /// Cache the derived role ("main" | "contributor" | "pending"); None clears it.
+    /// An unknown role is rejected by the column CHECK.
+    #[allow(dead_code)]
+    pub fn set_shared_role(&self, repo_id: i64, role: Option<&str>) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE repositories SET shared_role = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            rusqlite::params![role, repo_id],
+        )?;
+        Ok(())
+    }
+
+    /// Set/clear the shared-mode status code. Empty string is stored as NULL.
+    /// The status detail (see `set_shared_status_with_detail`) is cleared with
+    /// the code: a detail never outlives the status it explains.
+    #[allow(dead_code)]
+    pub fn set_shared_status(&self, repo_id: i64, status: Option<&str>) -> SqlResult<()> {
+        self.set_shared_status_with_detail(repo_id, status, None)
+    }
+
+    /// Set the status code together with its detail (T-000223). The detail is
+    /// kept in `shared_import` JSON (`status_detail`); `None`, or a cleared
+    /// status, removes it. Formats, by status:
+    /// * `needs_manual_merge`: `{"branch":"dev","current":true}`;
+    /// * the others: the plain reason / message text (`shared_untrusted`,
+    ///   `push_rejected`, ...).
+    pub fn set_shared_status_with_detail(
+        &self,
+        repo_id: i64,
+        status: Option<&str>,
+        detail: Option<&str>,
+    ) -> SqlResult<()> {
+        let normalized = status.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let detail = detail
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty() && normalized.is_some());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE repositories SET shared_status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            rusqlite::params![normalized, repo_id],
+        )?;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT shared_import FROM repositories WHERE id = ?1",
+                rusqlite::params![repo_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(None);
+        if let Some(next) = with_status_detail(current.as_deref(), detail) {
+            conn.execute(
+                "UPDATE repositories SET shared_import = ?1 WHERE id = ?2",
+                rusqlite::params![next, repo_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// JSON of the last imported blob sha per shared file, if any.
+    #[allow(dead_code)]
+    pub fn get_shared_import(&self, repo_id: i64) -> SqlResult<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT shared_import FROM repositories WHERE id = ?1",
+            rusqlite::params![repo_id],
+            |row| row.get::<_, Option<String>>(0),
+        ) {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_shared_import(&self, repo_id: i64, json: Option<&str>) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE repositories SET shared_import = ?1 WHERE id = ?2",
+            rusqlite::params![json, repo_id],
+        )?;
+        Ok(())
+    }
+
     /// T-000137: repos opted into auto-commit (non-empty autocommit_branch), each
     /// paired with its target branch. Used by the post-sync auto-commit pass.
     pub fn list_autocommit_repos(&self) -> SqlResult<Vec<(Repository, String)>> {
@@ -736,6 +875,37 @@ impl AppDb {
             |row| row.get(0),
         )
     }
+}
+
+/// `status_detail` of a `shared_import` JSON; `None` for absent / unparsable.
+fn status_detail_of(import: Option<&str>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(import?).ok()?;
+    v.get("status_detail")?
+        .as_str()
+        .map(str::to_string)
+        .filter(|d| !d.is_empty())
+}
+
+/// The `shared_import` JSON with `status_detail` set (or removed for `None`).
+/// `None` when nothing has to be written: the value is already the same.
+fn with_status_detail(import: Option<&str>, detail: Option<&str>) -> Option<String> {
+    if status_detail_of(import).as_deref() == detail {
+        return None;
+    }
+    let mut v: serde_json::Value = import
+        .and_then(|j| serde_json::from_str(j).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let obj = v.as_object_mut()?;
+    match detail {
+        Some(d) => {
+            obj.insert("status_detail".into(), serde_json::Value::String(d.into()));
+        }
+        None => {
+            obj.remove("status_detail");
+        }
+    }
+    serde_json::to_string(&v).ok()
 }
 
 #[cfg(test)]
@@ -1555,6 +1725,188 @@ mod tests {
         db.set_autocommit_branch(repo.id, Some("dev")).unwrap();
         db.set_autocommit_branch(repo.id, None).unwrap();
         assert_eq!(db.get_autocommit_branch(repo.id).unwrap(), None);
+    }
+
+    // ── T-000216: shared-mode state ───────────────────────────────────────────
+
+    #[test]
+    fn test_shared_state_defaults_to_not_shared() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/sh-a", "sh-a", None, None)
+            .unwrap();
+        let st = db.get_shared_state(repo.id).unwrap();
+        assert_eq!(
+            st,
+            RepoSharedState {
+                repo_id: repo.id,
+                shared_mode: false,
+                shared_role: None,
+                shared_status: None,
+                shared_status_detail: None,
+            }
+        );
+        // Unknown repo id: still the "not shared" state, no error.
+        let missing = db.get_shared_state(99999).unwrap();
+        assert!(!missing.shared_mode && missing.shared_role.is_none());
+    }
+
+    #[test]
+    fn test_set_shared_mode_roundtrip() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/sh-b", "sh-b", None, None)
+            .unwrap();
+        db.set_shared_mode(repo.id, true).unwrap();
+        assert!(db.get_shared_state(repo.id).unwrap().shared_mode);
+        db.set_shared_mode(repo.id, false).unwrap();
+        assert!(!db.get_shared_state(repo.id).unwrap().shared_mode);
+    }
+
+    #[test]
+    fn test_set_shared_role_accepts_known_clears_and_rejects_unknown() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/sh-c", "sh-c", None, None)
+            .unwrap();
+        for role in ["main", "contributor", "pending"] {
+            db.set_shared_role(repo.id, Some(role)).unwrap();
+            assert_eq!(
+                db.get_shared_state(repo.id).unwrap().shared_role.as_deref(),
+                Some(role)
+            );
+        }
+        assert!(db.set_shared_role(repo.id, Some("owner")).is_err());
+        // The failed write left the previous value in place.
+        assert_eq!(
+            db.get_shared_state(repo.id).unwrap().shared_role.as_deref(),
+            Some("pending")
+        );
+        db.set_shared_role(repo.id, None).unwrap();
+        assert_eq!(db.get_shared_state(repo.id).unwrap().shared_role, None);
+    }
+
+    #[test]
+    fn test_set_shared_status_roundtrip_and_empty_is_null() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/sh-d", "sh-d", None, None)
+            .unwrap();
+        db.set_shared_status(repo.id, Some("needs_manual_merge"))
+            .unwrap();
+        assert_eq!(
+            db.get_shared_state(repo.id)
+                .unwrap()
+                .shared_status
+                .as_deref(),
+            Some("needs_manual_merge")
+        );
+        db.set_shared_status(repo.id, Some("  ")).unwrap();
+        assert_eq!(db.get_shared_state(repo.id).unwrap().shared_status, None);
+        db.set_shared_status(repo.id, Some("x")).unwrap();
+        db.set_shared_status(repo.id, None).unwrap();
+        assert_eq!(db.get_shared_state(repo.id).unwrap().shared_status, None);
+    }
+
+    #[test]
+    fn test_shared_status_detail_lives_and_dies_with_the_code() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/sh-d2", "sh-d2", None, None)
+            .unwrap();
+        let detail = r#"{"branch":"dev","current":true}"#;
+        db.set_shared_status_with_detail(repo.id, Some("needs_manual_merge"), Some(detail))
+            .unwrap();
+        let st = db.get_shared_state(repo.id).unwrap();
+        assert_eq!(st.shared_status.as_deref(), Some("needs_manual_merge"));
+        assert_eq!(st.shared_status_detail.as_deref(), Some(detail));
+        assert_eq!(
+            db.list_shared_states().unwrap()[0]
+                .shared_status_detail
+                .as_deref(),
+            Some(detail)
+        );
+        // other keys of the import JSON survive a detail change
+        db.set_shared_import(repo.id, Some(r#"{"pinned_dev_branch":"dev"}"#))
+            .unwrap();
+        db.set_shared_status_with_detail(
+            repo.id,
+            Some("shared_untrusted"),
+            Some("dev branch changed"),
+        )
+        .unwrap();
+        let import = db.get_shared_import(repo.id).unwrap().unwrap();
+        assert!(import.contains("pinned_dev_branch"), "{}", import);
+        assert_eq!(
+            db.get_shared_state(repo.id)
+                .unwrap()
+                .shared_status_detail
+                .as_deref(),
+            Some("dev branch changed")
+        );
+        // the plain setter clears the detail with the code
+        db.set_shared_status(repo.id, Some("push_failed")).unwrap();
+        assert_eq!(
+            db.get_shared_state(repo.id).unwrap().shared_status_detail,
+            None
+        );
+        let import = db.get_shared_import(repo.id).unwrap().unwrap();
+        assert!(import.contains("pinned_dev_branch") && !import.contains("status_detail"));
+        // a detail without a status is dropped; no import is invented for it
+        let other = db
+            .insert_local_repository("/tmp/sh-d3", "sh-d3", None, None)
+            .unwrap();
+        db.set_shared_status_with_detail(other.id, None, Some("orphan"))
+            .unwrap();
+        assert_eq!(db.get_shared_import(other.id).unwrap(), None);
+    }
+
+    #[test]
+    fn test_shared_import_roundtrip() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/sh-e", "sh-e", None, None)
+            .unwrap();
+        assert_eq!(db.get_shared_import(repo.id).unwrap(), None);
+        db.set_shared_import(repo.id, Some(r#"{"todo.md":"abc"}"#))
+            .unwrap();
+        assert_eq!(
+            db.get_shared_import(repo.id).unwrap().as_deref(),
+            Some(r#"{"todo.md":"abc"}"#)
+        );
+        db.set_shared_import(repo.id, None).unwrap();
+        assert_eq!(db.get_shared_import(repo.id).unwrap(), None);
+        assert_eq!(db.get_shared_import(99999).unwrap(), None);
+    }
+
+    #[test]
+    fn test_list_shared_states_returns_only_participating_repos() {
+        let db = make_db();
+        let plain = db
+            .insert_local_repository("/tmp/sh-f1", "sh-f1", None, None)
+            .unwrap();
+        let by_mode = db
+            .insert_local_repository("/tmp/sh-f2", "sh-f2", None, None)
+            .unwrap();
+        let by_role = db
+            .insert_local_repository("/tmp/sh-f3", "sh-f3", None, None)
+            .unwrap();
+        let by_status = db
+            .insert_local_repository("/tmp/sh-f4", "sh-f4", None, None)
+            .unwrap();
+        db.set_shared_mode(by_mode.id, true).unwrap();
+        db.set_shared_role(by_role.id, Some("contributor")).unwrap();
+        db.set_shared_status(by_status.id, Some("needs_manual_merge"))
+            .unwrap();
+
+        let ids: Vec<i64> = db
+            .list_shared_states()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.repo_id)
+            .collect();
+        assert_eq!(ids, vec![by_mode.id, by_role.id, by_status.id]);
+        assert!(!ids.contains(&plain.id));
     }
 
     #[test]

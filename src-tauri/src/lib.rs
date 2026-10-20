@@ -2,7 +2,9 @@ mod crypto;
 mod db;
 mod export;
 mod git_ops;
+mod git_sync;
 mod keyring_store;
+mod merge_driver;
 mod models;
 mod sync;
 mod template_meta;
@@ -44,6 +46,14 @@ fn get_db_path() -> PathBuf {
 mod commands;
 
 // ── App entry point ───────────────────────────────────────────────────────────
+
+/// F-000044 / T-000218: `main` calls this FIRST. When git invoked us as a merge
+/// driver (`--merge-driver O A B P`) it does the merge and returns the exit
+/// code; no database, keyring, window or Tauri runtime is touched. `None`
+/// means a normal launch.
+pub fn merge_driver_entry(args: Vec<String>) -> Option<i32> {
+    merge_driver::run_from_args(&args)
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -131,6 +141,8 @@ pub fn run() {
             // Repositories
             commands::repo::create_local_repository,
             commands::repo::upsert_repository,
+            commands::repo::get_repo_shared_state,
+            commands::repo::list_repo_shared_states,
             commands::repo::resolve_merge_with_local,
             commands::repo::force_insert_github_repo,
             commands::repo::assign_repository,
@@ -208,6 +220,7 @@ pub fn run() {
             // Requirements sync
             commands::sync::sync_global_claude_md,
             commands::sync::sync_project,
+            commands::sync::probe_shared_repos,
             commands::sync::init_docs_for_repo,
             commands::sync::list_project_requirements,
             commands::sync::list_codex_edges,
@@ -220,6 +233,15 @@ pub fn run() {
             commands::sync::get_autocommit_branch,
             commands::sync::set_autocommit_branch,
             commands::sync::get_repo_current_branch,
+            // F-000044: shared (contributor-mode) repos
+            commands::shared::shared_mode_preflight,
+            commands::shared::enable_shared_mode,
+            commands::shared::disable_shared_mode,
+            commands::shared::approve_join_request,
+            commands::shared::accept_new_main_branch,
+            commands::shared::merge_shared_upstream,
+            commands::shared::list_join_requests,
+            commands::shared::get_repo_structure,
             // Templates (0.6.0)
             commands::templates::list_template_languages,
             commands::templates::list_template_files,

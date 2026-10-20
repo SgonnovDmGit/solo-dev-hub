@@ -58,6 +58,13 @@ comments:
       tasks_migrated_at: >-
         Lazy-migration marker (v21). While NULL, the first task sync suppresses
         'created' events so backfilling legacy files doesn't flood the timeline.
+      shared_mode: v34 — the owner's switch (main side) that puts this repo into contributor mode. 0 = not shared.
+      shared_role: >-
+        v34 — cached role of THIS install for the repo: 'main' (owner, publishes the
+        structure), 'contributor', or 'pending' (a contributor who has requested
+        access). NULL means the repo is not shared.
+      shared_status: v34 — status code of the shared-mode sync (e.g. 'needs_manual_merge'); NULL means no pending condition.
+      shared_import: v34 — JSON map of the last imported blob sha per shared file, so an unchanged file is not imported again.
 
   - table: settings
     tableComment: >-
@@ -155,6 +162,8 @@ comments:
       Append-only bug lifecycle log (v19), so attempts-per-period metrics are
       computed from events rather than a running counter. Invariant: the count of
       'entered_testing' events for a bug equals bugs.fix_attempts.
+    columnComments:
+      author: v34 — GitHub login of whoever made the event on another install; NULL means this install.
 
   - table: deploy_environments
     tableComment: >-
@@ -209,6 +218,7 @@ comments:
   - table: task_events
     tableComment: Append-only task lifecycle log, the task-side twin of bug_events.
     columnComments:
+      author: v34 — GitHub login of whoever made the event on another install; NULL means this install.
       task_id: INTEGER FK to tasks.id — not the display id (that is tasks.task_id, TEXT).
 
   - table: sync_events

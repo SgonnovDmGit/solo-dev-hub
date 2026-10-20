@@ -6,8 +6,11 @@ import {
   assignRepository as tauriAssignRepository,
   getAutocommitBranch,
   setAutocommitBranch,
+  listRepoSharedStates,
+  getSetting,
 } from '$lib/api/tauri-commands';
 import { fetchAllRepos, listBranches, splitRepoFullName } from '$lib/api/github';
+import { shouldBackfillAutocommit } from '$lib/utils/autocommit-backfill';
 import { addToast } from './ui';
 import { t, tf } from '$lib/i18n';
 
@@ -43,8 +46,21 @@ export async function loadAllRepos(): Promise<void> {
 // once a repo is set, the cheap IPC check short-circuits before any GitHub call,
 // so later startups don't re-fetch branches. Runs in the background; per-repo
 // failures (no access / offline) are skipped silently.
+// F-000044: contributor / pending repos and repos owned by someone else are
+// skipped — `dev` there is the owner's branch, a helper picks their own.
 export async function backfillAutocommitDevBranch(token: string): Promise<void> {
-  const repos = get(allRepos).filter((r) => r.github_name && r.github_name.includes('/'));
+  // Without the shared roles a contributor repo could not be told apart: skip the sweep.
+  let states: Awaited<ReturnType<typeof listRepoSharedStates>>;
+  try {
+    states = await listRepoSharedStates();
+  } catch {
+    return;
+  }
+  const login = await getSetting('github_login').catch(() => null);
+  const sharedById = new Map(states.map((s) => [s.repo_id, s]));
+  const repos = get(allRepos).filter((r) =>
+    shouldBackfillAutocommit(r.github_name, sharedById.get(r.id), login),
+  );
   await Promise.all(
     repos.map(async (r) => {
       try {

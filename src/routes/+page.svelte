@@ -8,6 +8,7 @@
   import { initUiScale } from '$lib/ui-scale';
   import { loadProjects } from '$lib/stores/projects';
   import { startAutoSyncTimer } from '$lib/stores/autosync';
+  import { refreshShared } from '$lib/stores/shared';
   import { loadAllRepos, backfillAutocommitDevBranch, pendingMergeCases, type AmbiguousMergeCase } from '$lib/stores/repos';
   import { addToast } from '$lib/stores/ui';
   import { resolveMergeWithLocal, forceInsertGithubRepo, takeStartupRulesReport } from '$lib/api/tauri-commands';
@@ -77,7 +78,7 @@
     await initLocale();
     await loadSettings();
     await initUiScale();
-    await Promise.all([loadProjects(), loadAllRepos()]);
+    await Promise.all([loadProjects(), loadAllRepos(), refreshShared()]);
     // T-000207: the startup rule delivery (after a seed that changed the bundle)
     // collects pending hand-backs first; show what it found, once.
     void showStartupRulesReport();

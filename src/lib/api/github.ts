@@ -113,14 +113,37 @@ export async function listBranches(token: string, owner: string, repo: string): 
   return branches;
 }
 
-export async function validateToken(token: string): Promise<boolean> {
+/**
+ * Is the repo public? `null` when GitHub could not tell (offline, no access):
+ * the caller then shows no warning rather than a false one. T-000223: shared
+ * mode warns that tasks, bugs and REQs of a public repo are visible to all.
+ */
+export async function isRepoPublic(token: string, owner: string, repo: string): Promise<boolean | null> {
   try {
     const octokit = new Octokit({ auth: token });
-    await octokit.users.getAuthenticated();
-    return true;
+    const resp = await octokit.repos.get({ owner, repo });
+    return resp.data.private === false;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * Login of the account the token belongs to, or null when the token is not
+ * accepted. T-000216: contributor mode identifies this install by that login.
+ */
+export async function fetchAuthenticatedLogin(token: string): Promise<string | null> {
+  try {
+    const octokit = new Octokit({ auth: token });
+    const resp = await octokit.users.getAuthenticated();
+    return resp.data.login || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function validateToken(token: string): Promise<boolean> {
+  return (await fetchAuthenticatedLogin(token)) !== null;
 }
 
 // ── v0.18.0: GitHub Environments + env-scoped secrets ────────────────────────

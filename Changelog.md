@@ -4,6 +4,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.20.0] — 2026-10-20
+
+A helper can now work in your repositories with their own copy of Solo Dev Hub on their own machine. Tasks, done items and bugs travel through git and merge by id. The helper takes your rules as they are.
+
+### Added
+- **Contributor mode (F-000044).** The owner switches a repository to shared mode in the repo card. The app then commits `docs/todo.md`, `docs/done.md`, `docs/bug-reports.md`, REQs, announcements and `docs/InOutBox/` into the repository, and writes the project structure to `.sdh/project.json`.
+  - **Joining.** A helper adds the repository and picks their own branch. Their sync sends a join request. The owner approves it on the new **Participants** tab, and the helper's install becomes a contributor. It creates the project locally from the structure, so the helper does not set anything up by hand. A helper with no project yet starts the join with the sidebar **Sync** button (T-000230).
+  - **Sync.** Each sync fetches, fast-forwards and imports what arrived as the truth, with its author. Then it commits the shared files to every recipient branch and pushes without force: the owner commits to their dev branch and each participant's branch, a contributor to their own branch and the owner's. `master` and `main` are refused at every layer.
+  - **Merge by id.** A git merge driver (`merge=sdh`) merges the three task files by id. The status further along wins, fix attempts take the maximum, a deletion beats a status-only change. Branches that diverged in code show "manual merge needed", and a **Merge** button runs `git merge origin/<branch>`.
+  - **Numbers.** Each install issues ids from its own band for every prefix: the owner below 500000, participants from 500000 in steps of 100000. The bug button explains why it refused when the band is not available.
+  - **Trust.** The structure is trusted only when its owner is the repository's owner on GitHub. The owner's dev branch is pinned on first accept, and a changed one waits for the helper's confirmation. The copy on the owner's dev branch at origin wins over a stale copy in the helper's work tree (T-000229).
+  - **Rules.** A contributor takes the owner's `docs/sdh_skills/` as their canon. The Rules screen marks those rules "owner's canon" and locks them.
+  - **Switching off** removes `.sdh/` from every branch, and the helper's repository becomes ordinary again.
+
+  Migration v34 adds the shared-mode columns to `repositories`; `docs/schema/` regenerated. The sidebar marks shared repositories, the Timeline gets an author filter, and Settings explains that a helper needs a classic token with the `repo` scope. Flow: `docs/flows/contributor-mode.md`.
+- **Global rules for shared repositories.** The global section tells agents to take new ids only from their install's band and to merge shared files through the app. A shared repository's `CLAUDE.md` names the owner, the dev branch and the band. `sdh-project-start` notes that the app commits the task files there.
+
+### Fixed
+- **Auto-commit no longer fails on an ignored folder that holds tracked files (T-000228).** The ignore check said "not ignored" for such a folder, but `git add` refused it, and the whole commit failed. The folder is now skipped and the rest commits.
+- **Task descriptions follow `todo.md`.** An edited description, effort or priority in `todo.md` was not mirrored to the app.
+- **Bug rows inside HTML comments are ignored.** The example row of the `bug-reports.md` template sits in an HTML comment but was parsed as bug B-001, so every fresh repository started with a phantom bug.
+
+### Notes
+- Live check on two machines (Windows owner, Ubuntu helper, one private server repository): switching shared mode on, the join request, the approval and the helper becoming a contributor with band 500000 all passed. It found three defects, fixed in this release (T-000228–T-000230). The rest of the live list is checked in real work (O-000004): tasks and bugs travelling both ways, concurrent edits, manual merge, branch protection, a pull request, contracts, switching off, the rules canon, an AppImage update.
+- Known limit: the merge base for a branch commit is chosen per file, not per entity. Rare histories that repeat the same file content three times can resurrect or drop a line (T-000226, v1.20.1).
+- On Linux, `apt install` does not reinstall a candidate `.deb` that carries the same version number; use `dpkg -i`.
+
+### Tests
+- 901 Rust (+279 over the 622 of v1.19.0: the git layer and its master/main guards, the merge driver, the structure's trust rules and pin, bands, plumbing and import, an end-to-end suite of two installs over one bare remote including the stale-work-tree join; 1 ignored: the schema-export generator), 177 vitest (+53 in 18 files: shared-mode helpers, bug refusals, the followed-rule lock), svelte-check clean. Numbers from `53adb9c`.
+
 ## [1.19.0] — 2026-10-19
 
 The rules get a screen of their own: which rule was changed, where an edit came from, how to settle two repos disagreeing. And the app now builds for Linux.

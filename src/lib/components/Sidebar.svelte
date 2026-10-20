@@ -9,11 +9,24 @@
   import { tStore } from '$lib/i18n';
   import {
     createLocalRepository, getSetting, setSetting,
-    reorderProject, reorderRepo, rebalanceRepoGroup, autoSortAll,
+    reorderProject, reorderRepo, rebalanceRepoGroup, autoSortAll, probeSharedRepos,
   } from '$lib/api/tauri-commands';
+  import { sharedStates, refreshAfterSync } from '$lib/stores/shared';
+  import { formatSyncIssues } from '$lib/utils/sync-issues';
+  import { sidebarBadge, describeSharedStatus, fillParams } from '$lib/utils/shared-mode';
   import EmptyState from './EmptyState.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import SidebarResizer from './SidebarResizer.svelte';
+
+  // F-000044: ⇄ after the name of a shared repo, ⚠ (title = the status text) when it needs attention.
+  function sharedBadgeOf(repoId: number) {
+    const st = $sharedStates.get(repoId) ?? null;
+    const badge = sidebarBadge(st);
+    if (!badge) return null;
+    const line = badge.problem ? describeSharedStatus(st) : null;
+    const title = line ? fillParams($tStore(line.textKey as any), line.params) : $tStore('shared.badge.shared' as any);
+    return { ...badge, title };
+  }
 
   // Collapsible state per project id. Default: all collapsed on first launch; persisted in settings.
   let collapsed = $state<Record<number, boolean>>({});
@@ -150,6 +163,29 @@
     if ($isSyncing) return;
     if (!$pat) return;
     await syncFromGitHub($pat);
+    await probeSharedAfterSync();
+  }
+
+  // F-000044: a contributor who has no project yet has nothing to press a
+  // project sync on. After the repo list is refreshed, probe the repos that are
+  // in no shared project for the owner's structure; the backend runs the sync
+  // of every project they land in, which also sends the join request.
+  async function probeSharedAfterSync() {
+    isSyncing.set(true);
+    try {
+      const result = await probeSharedRepos();
+      if (result.errors.length > 0) {
+        const header = $tStore('sync.errors').replace('{0}', String(result.errors.length));
+        addToast(`${header}
+${formatSyncIssues(result.errors)}`, 'warning');
+      }
+    } catch {
+      // The probe is a side job of the repo-list sync: a failure must not
+      // read as a failed sync.
+    } finally {
+      isSyncing.set(false);
+      await refreshAfterSync();
+    }
   }
 
   async function handleCreateProject() {
@@ -729,6 +765,7 @@
                 <li class="repo-empty">{$tStore('sidebar.noReposAssigned')}</li>
               {:else}
                 {#each repos as repo (repo.id)}
+                  {@const badge = sharedBadgeOf(repo.id)}
                   <li
                     role="listitem"
                     class="repo-draggable"
@@ -750,6 +787,9 @@
                         <span class="role-icon" title={$tStore('sidebar.roleTooltip').replace('{0}', repo.role)}>{getRoleIcon(repo.role)}</span>
                       {/if}
                       <span class="repo-name">{getDisplayName(repo)}</span>
+                      {#if badge}
+                        <span class="shared-badge" class:problem={badge.problem} title={badge.title}>{badge.glyph}</span>
+                      {/if}
                     </div>
                   </li>
                 {/each}
@@ -784,6 +824,7 @@
           {#if !unassignedCollapsed}
             <ul class="repo-list">
               {#each unassignedRepos as repo (repo.id)}
+                {@const badge = sharedBadgeOf(repo.id)}
                 <li
                   role="listitem"
                   class="repo-draggable"
@@ -801,6 +842,9 @@
                     tabindex="0"
                   >
                     <span class="repo-name">{getDisplayName(repo)}</span>
+                    {#if badge}
+                      <span class="shared-badge" class:problem={badge.problem} title={badge.title}>{badge.glyph}</span>
+                    {/if}
                   </div>
                 </li>
               {/each}
@@ -1112,6 +1156,17 @@
     white-space: nowrap;
     flex: 1;
     min-width: 0;
+  }
+
+  /* F-000044 frame 7A: after the repo name. */
+  .shared-badge {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-muted);
+    cursor: help;
+  }
+  .shared-badge.problem {
+    color: var(--toast-warning);
   }
 
   .repo-empty {

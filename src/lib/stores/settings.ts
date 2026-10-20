@@ -6,8 +6,9 @@ import {
   getSetting,
   setSetting,
 } from '$lib/api/tauri-commands';
-import { validateToken } from '$lib/api/github';
+import { fetchAuthenticatedLogin } from '$lib/api/github';
 import { addToast } from './ui';
+import { githubLogin, refreshShared } from './shared';
 import { t, tf, initLocale } from '$lib/i18n';
 import {
   uiScaleMode,
@@ -34,6 +35,7 @@ export async function loadSettings(): Promise<void> {
       getSetting('workspace_root'),
     ]);
     pat.set(storedPat);
+    if (storedPat) void ensureGithubLogin(storedPat);
     workspaceRoot.set(storedWorkspaceRoot);
     const storedTheme = await getSetting('theme');
     if (storedTheme) {
@@ -86,14 +88,36 @@ export async function saveUiScaleManual(scale: number): Promise<void> {
   }
 }
 
+/**
+ * T-000216: an install whose token was saved before the login was recorded has
+ * no `github_login` yet; fetch it once, quietly. Failure is harmless - the
+ * next successful token save or app start tries again.
+ */
+async function ensureGithubLogin(token: string): Promise<void> {
+  try {
+    if (await getSetting('github_login')) return;
+    const login = await fetchAuthenticatedLogin(token);
+    if (login) {
+      await setSetting('github_login', login);
+      // The owner's switch and the contributor view depend on the login: show
+      // them now, not after the next sync.
+      githubLogin.set(login);
+      void refreshShared();
+    }
+  } catch {
+    /* offline or token rejected: retried on the next start */
+  }
+}
+
 export async function savePat(token: string): Promise<boolean> {
   try {
-    const valid = await validateToken(token);
-    if (!valid) {
+    const login = await fetchAuthenticatedLogin(token);
+    if (!login) {
       addToast(t('toast.invalidToken'), 'error');
       return false;
     }
     await tauriStorePat(token);
+    await setSetting('github_login', login);
     pat.set(token);
     addToast(t('toast.tokenSaved'), 'success');
     return true;
@@ -108,6 +132,8 @@ export async function removePat(): Promise<void> {
     await tauriDeletePat();
     pat.set(null);
     addToast(t('toast.tokenRemoved'), 'info');
+    // The token is already gone; a failed login reset must not report it as kept.
+    await setSetting('github_login', '').catch(() => {});
   } catch (err) {
     addToast(tf('toast.failedToRemoveToken', String(err)), 'error');
   }

@@ -182,6 +182,7 @@ fn write_repo_skeletons(
     repo: &Repository,
     tpl: &SkeletonTemplates,
     quiet_conflicts: &[String],
+    shared: &sync::shared::SharedSync,
     c: &mut SyncCounters,
 ) {
     let role = repo.role.as_deref();
@@ -195,9 +196,15 @@ fn write_repo_skeletons(
     if let Err(e) = sync::generate_project_md(db, md_project_id, base) {
         c.push(file_issue("docs/project.md", e));
     }
-    if let Err(e) =
-        sync::update_claude_md_section(db, Some(md_project_id), role, &base.join("CLAUDE.md"))
-    {
+    // F-000044: the shared-repo block (owner, branch, this install's band).
+    let shared_block = sync::shared_block_for(db, repo, shared.structure_of(repo.id));
+    if let Err(e) = sync::update_claude_md_section(
+        db,
+        Some(md_project_id),
+        role,
+        &shared_block,
+        &base.join("CLAUDE.md"),
+    ) {
         c.push(file_issue("CLAUDE.md", e));
     }
     // Runs only after `refresh_rules` collected across the portfolio (see
@@ -205,14 +212,23 @@ fn write_repo_skeletons(
     // After an uptake the refresh has already rendered and reported this repo;
     // `push` keeps each held copy to one line. T-000206: copies of a conflict
     // already reported by an earlier pass stay quiet here too.
-    match sync::render_skills_to_repo(db, base) {
-        Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
-        Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
+    // Р16: not in a repo where this install is a contributor or a pending
+    // helper -- the owner's copies are the ones git carries there.
+    if !sync::skips_rule_copies(db, repo.id) {
+        match sync::render_skills_to_repo(db, base) {
+            Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
+            Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
+        }
     }
-    if let Err(e) = sync::sync_gitignore_section(&tpl.gitignore, base) {
+    // F-000044: a shared repo (any role) renders the blocks without the shared
+    // paths; the same text for the owner and for contributors, so it never churns.
+    let shared = sync::shared::is_shared_repo(db, repo.id);
+    let gitignore = sync::shared::gitignore_template_for(&tpl.gitignore, shared);
+    let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
+    if let Err(e) = sync::sync_gitignore_section(&gitignore, base) {
         c.push(file_issue(".gitignore", e));
     }
-    if let Err(e) = sync::sync_gitattributes_section(&tpl.gitattributes, base) {
+    if let Err(e) = sync::sync_gitattributes_section(&gitattributes, base) {
         c.push(file_issue(".gitattributes", e));
     }
     if let Err(e) = sync::copy_doc_skeleton_if_missing(&tpl.todo, base, "todo.md") {
@@ -976,6 +992,93 @@ fn run_codex_req_channels(db: &AppDb, project_id: i64, project_type: &str, c: &m
     }
 }
 
+/// Phase B of the shared repos: commit, push, settle statuses; its issues and
+/// committed repos join the pass result.
+fn finish_shared(
+    db: &AppDb,
+    git: Option<&crate::git_ops::GitBinary>,
+    shared: sync::shared::SharedSync,
+    c: &mut SyncCounters,
+) {
+    let out = shared.finish(db, git);
+    c.extend(out.issues);
+    for name in out.committed {
+        if !c.committed.contains(&name) {
+            c.committed.push(name);
+        }
+    }
+}
+
+/// Entry point of the sidebar "Sync" button for contributor mode: probe the
+/// role-less foreign repos of the portfolio for a shared structure and, for
+/// every project a probed repo ends up in, run that project's sync -- so the
+/// join really starts (the project is created from the structure, the repo is
+/// assigned with its role, a pending helper's request is committed and pushed
+/// into the owner's dev branch). A contributor who has no project yet has
+/// nothing else to press. The probe bypasses the 10-minute throttle (the user
+/// asked for it); repos owned by this install's login are never touched.
+pub fn probe_shared_repos(db: &AppDb) -> Result<SyncResult, String> {
+    probe_shared_repos_in(db, dirs::home_dir())
+}
+
+pub(crate) fn probe_shared_repos_in(
+    db: &AppDb,
+    home: Option<PathBuf>,
+) -> Result<SyncResult, String> {
+    let git = crate::git_ops::check_git_available();
+    let shared = sync::shared::probe_role_less(db, git.as_ref());
+    // Projects of the repos the probe took over (a repo that was found shared
+    // is in a project by now; one refused as untrusted is not).
+    let mut projects: Vec<i64> = Vec::new();
+    for repo_id in &shared.handled {
+        if let Ok(repo) = db.get_repository(*repo_id) {
+            if let Some(pid) = repo.project_id {
+                if !projects.contains(&pid) {
+                    projects.push(pid);
+                }
+            }
+        }
+    }
+    projects.sort_unstable();
+    let mut c = SyncCounters::new();
+    finish_shared(db, git.as_ref(), shared, &mut c);
+    let mut merged = c.into_result();
+    for pid in projects {
+        // One project failing must not drop the probe's outcome or the others.
+        let r = match run_project_sync_in(db, pid, home.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                let name = db.get_project(pid).map(|p| p.name).unwrap_or_default();
+                merged
+                    .errors
+                    .push(SyncIssue::new(Code::LookupFailed, name).detail(e));
+                continue;
+            }
+        };
+        merged.copied += r.copied;
+        merged.responses += r.responses;
+        merged.migrated += r.migrated;
+        for issue in r.errors {
+            if !merged.errors.contains(&issue) {
+                merged.errors.push(issue);
+            }
+        }
+        for (dst, src) in [
+            (&mut merged.auto_closed, r.auto_closed),
+            (&mut merged.committed, r.committed),
+            (&mut merged.rules_taken, r.rules_taken),
+            (&mut merged.rules_lost, r.rules_lost),
+        ] {
+            for x in src {
+                if !dst.contains(&x) {
+                    dst.push(x);
+                }
+            }
+        }
+    }
+    Ok(merged)
+}
+
 /// Orchestrator for a full project sync — the body of the former
 /// `sync_project` Tauri command. Writes Phase-0 skeletons to every repo, then
 /// runs the directional REQ / api / handlers copies based on project topology.
@@ -994,6 +1097,13 @@ pub(crate) fn run_project_sync_in(
     project_id: i64,
     home: Option<PathBuf>,
 ) -> Result<SyncResult, String> {
+    // F-000044 / T-000220: phase A of the shared repos (portfolio-wide) runs
+    // first: it settles each shared repo's role -- and so which project it
+    // belongs to and how its managed blocks render -- before anything below
+    // reads or writes. Phase B (commit + push) follows the other steps.
+    let git = crate::git_ops::check_git_available();
+    let shared = sync::shared::run_phase_a(db, git.as_ref(), Some(project_id));
+
     let all_repos = db
         .list_repos_by_project(Some(project_id))
         .map_err(|e| e.to_string())?;
@@ -1025,12 +1135,14 @@ pub(crate) fn run_project_sync_in(
     // about to be collected. An uptake is rendered everywhere by `refresh_rules`
     // itself: a rule belongs to the whole portfolio.
     let claude_dir = home.as_ref().map(|h| h.join(".claude"));
-    let rules = sync::refresh_rules(
-        db,
-        claude_dir.as_deref(),
-        sync::RenderScope::UptakeOnly,
-        None,
-    );
+    // T-000224: an owner's rule text taken as this install's canon in phase A
+    // goes everywhere at once -- the contributor's other repos and ~/.claude.
+    let scope = if shared.canon_changed.is_empty() {
+        sync::RenderScope::UptakeOnly
+    } else {
+        sync::RenderScope::Everywhere
+    };
+    let rules = sync::refresh_rules(db, claude_dir.as_deref(), scope, None);
     c.extend(rules.errors);
     c.rules_taken = rules.taken;
     c.rules_lost = rules.lost;
@@ -1052,7 +1164,16 @@ pub(crate) fn run_project_sync_in(
             c.push(root_missing(repo));
             continue;
         }
-        write_repo_skeletons(db, project_id, base, repo, &tpl, &quiet_conflicts, &mut c);
+        write_repo_skeletons(
+            db,
+            project_id,
+            base,
+            repo,
+            &tpl,
+            &quiet_conflicts,
+            &shared,
+            &mut c,
+        );
     }
     for ms_id in &microservice_ids {
         let Ok(ms_server) = db.server_repo_of_microservice(*ms_id) else {
@@ -1068,7 +1189,16 @@ pub(crate) fn run_project_sync_in(
             c.push(root_missing(&ms_server));
             continue;
         }
-        write_repo_skeletons(db, *ms_id, base, &ms_server, &tpl, &quiet_conflicts, &mut c);
+        write_repo_skeletons(
+            db,
+            *ms_id,
+            base,
+            &ms_server,
+            &tpl,
+            &quiet_conflicts,
+            &shared,
+            &mut c,
+        );
     }
 
     // A project without a server (or a server without clients yet) is not an
@@ -1094,6 +1224,7 @@ pub(crate) fn run_project_sync_in(
             // B-001: guard — do not silently recreate a moved/deleted server folder.
             if sync::ensure_root_exists(srv_base).is_err() {
                 c.push(root_missing(srv));
+                finish_shared(db, git.as_ref(), shared, &mut c);
                 return Ok(c.into_result());
             }
 
@@ -1126,10 +1257,17 @@ pub(crate) fn run_project_sync_in(
 
     // T-000137: auto-commit synced cross-repo files in opted-in repos (portfolio-wide;
     // pathspec-scoped, so untouched repos and the dev's own WIP are no-ops).
-    if let Some(git) = crate::git_ops::check_git_available() {
+    // F-000044: shared repos (phase A took them over) are committed and pushed
+    // by `shared`, not by this block.
+    let handled = shared.handled.clone();
+    finish_shared(db, git.as_ref(), shared, &mut c);
+    if let Some(git) = git {
         match db.list_autocommit_repos() {
             Ok(repos) => {
                 for (repo, branch) in repos {
+                    if handled.contains(&repo.id) {
+                        continue;
+                    }
                     let Some(ref lp) = repo.local_path else {
                         continue;
                     };

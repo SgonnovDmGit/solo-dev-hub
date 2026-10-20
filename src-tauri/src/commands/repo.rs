@@ -19,6 +19,18 @@ pub fn create_local_repository(
         .map_err(|e| e.to_string())
 }
 
+/// T-000216: contributor-mode state of one repo.
+#[tauri::command]
+pub fn get_repo_shared_state(db: State<AppDb>, repo_id: i64) -> Result<RepoSharedState, String> {
+    db.get_shared_state(repo_id).map_err(|e| e.to_string())
+}
+
+/// T-000216: contributor-mode state of every repo that takes part in shared mode.
+#[tauri::command]
+pub fn list_repo_shared_states(db: State<AppDb>) -> Result<Vec<RepoSharedState>, String> {
+    db.list_shared_states().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn upsert_repository(
     db: State<AppDb>,

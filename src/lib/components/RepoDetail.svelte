@@ -5,8 +5,8 @@
   import { projects } from '$lib/stores/projects';
   import { currentScreen, selectedRepoId, deployDrillTarget } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
-  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch } from '$lib/api/tauri-commands';
-  import type { RepoRename } from '$lib/types';
+  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch, getRepoStructure, listJoinRequests, approveJoinRequest } from '$lib/api/tauri-commands';
+  import type { RepoRename, ProjectStructure, JoinRequest } from '$lib/types';
   import { deleteRepoOnGitHub, splitRepoFullName, listBranches, type BranchInfo } from '$lib/api/github';
   import { addToast } from '$lib/stores/ui';
   import { getRoleLabel, getDisplayName, type Role } from '$lib/types';
@@ -26,6 +26,14 @@
   import DeployScreen from './DeployScreen.svelte';
   import UntrackGitignoredDialog from './UntrackGitignoredDialog.svelte';
   import { toastRulesFindings } from '$lib/utils/rules-report';
+  import { sharedStates, githubLogin, refreshShared } from '$lib/stores/shared';
+  import SharedModeChip from './SharedModeChip.svelte';
+  import SharedStatusLine from './SharedStatusLine.svelte';
+  import ParticipantsTab from './ParticipantsTab.svelte';
+  import {
+    canToggleSharedMode, isContributorRole, isSharedRepo, buildParticipantRows, pendingRequestCount,
+    myBandLabel, describeSharedStatus, requestsWaitingKey,
+  } from '$lib/utils/shared-mode';
 
   const roleKeys: Role[] = ['server', 'admin_client', 'client', 'test_client', 'landing', 'tool', 'other'];
   const roles = roleKeys.map((key) => [key, getRoleLabel(key)] as [Role, string]);
@@ -55,6 +63,104 @@
   const autocommitPausedParts = $derived(
     $tStore('repoDetail.autocommitPaused' as any).split(/(\{[01]\})/),
   );
+
+  // ── F-000044 / T-000223: contributor mode (shared repos) ───────────────────
+  const sharedState = $derived(repo ? ($sharedStates.get(repo.id) ?? null) : null);
+  const isShared = $derived(isSharedRepo(sharedState));
+  // A contributor (or a helper whose request is pending) of someone else's repo.
+  const isContributor = $derived(isContributorRole(sharedState));
+  // This install is the owner's: the repo is shared and it is not a contributor.
+  const isOwnerInstall = $derived(isShared && !isContributor);
+  const showSharedToggle = $derived(
+    repo ? canToggleSharedMode(repo.github_name, $githubLogin, sharedState) : false,
+  );
+  let structure = $state<ProjectStructure | null>(null);
+  let joinRequests = $state<JoinRequest[]>([]);
+  // The repo `structure` and `joinRequests` were loaded for; null while loading.
+  let sharedDataRepoId = $state<number | null>(null);
+  let approving = $state<string | null>(null);
+  // Why switching shared mode on was refused (project / dev branch missing).
+  let preflightErrors = $state<string[]>([]);
+  // A change of status / role reloads the structure and the requests.
+  const sharedSignature = $derived(
+    `${sharedState?.shared_role ?? ''}|${sharedState?.shared_status ?? ''}|${sharedState?.shared_mode ?? ''}`,
+  );
+
+  const participantRows = $derived(
+    buildParticipantRows(structure, isOwnerInstall ? joinRequests : [], $githubLogin, isOwnerInstall),
+  );
+  const requestCount = $derived(pendingRequestCount(participantRows));
+  const myBand = $derived(
+    sharedState?.shared_role === 'contributor' ? myBandLabel(structure, $githubLogin) : null,
+  );
+  const sharedStatusLine = $derived(describeSharedStatus(sharedState, structure?.main.login ?? null));
+
+  async function loadSharedDetails() {
+    const id = repo?.id;
+    if (id === undefined || !isShared) {
+      structure = null;
+      joinRequests = [];
+      sharedDataRepoId = null;
+      return;
+    }
+    const owner = isOwnerInstall;
+    try {
+      const [s, r] = await Promise.all([
+        getRepoStructure(id),
+        owner ? listJoinRequests(id) : Promise.resolve([] as JoinRequest[]),
+      ]);
+      if (repo?.id === id) {
+        structure = s;
+        joinRequests = r;
+        sharedDataRepoId = id;
+      }
+    } catch {
+      if (repo?.id === id) {
+        structure = null;
+        joinRequests = [];
+        sharedDataRepoId = null;
+      }
+    }
+  }
+
+  // Another repo: drop the previous one's structure and requests at once, so
+  // they are never shown (or approved) under the new repo while it loads.
+  // Declared before the loader: effects run in declaration order.
+  $effect(() => {
+    void $selectedRepoId;
+    structure = null;
+    joinRequests = [];
+    sharedDataRepoId = null;
+    preflightErrors = [];
+  });
+
+  $effect(() => {
+    void $selectedRepoId;
+    void sharedSignature;
+    void loadSharedDetails();
+  });
+
+  // The shared state changed under an action of this screen: reload everything.
+  async function handleSharedChanged() {
+    await refreshShared();
+    await loadSharedDetails();
+  }
+
+  async function handleApprove(login: string) {
+    // Only for the repo the requests on screen were loaded for.
+    if (!repo || approving || sharedDataRepoId !== repo.id) return;
+    const repoId = sharedDataRepoId;
+    approving = login;
+    try {
+      await approveJoinRequest(repoId, login);
+      addToast($tStore('shared.approved' as any).replace('{0}', login), 'success');
+      await handleSharedChanged();
+    } catch (err) {
+      addToast($tStore('shared.approveFailed' as any).replace('{0}', String(err)), 'error');
+    } finally {
+      approving = null;
+    }
+  }
 
   async function loadRenames() {
     if (!repo) { renames = []; return; }
@@ -257,8 +363,15 @@
   });
 
   // F-021: tabs in RepoDetail. T-000080: Deploy moved from separate screen to tab.
-  type Tab = 'bugs' | 'tasks' | 'done' | 'changelog' | 'deploy' | 'secrets' | 'stats';
+  type Tab = 'bugs' | 'tasks' | 'done' | 'changelog' | 'participants' | 'deploy' | 'secrets' | 'stats';
   let activeTab = $state<Tab>('bugs');
+
+  // F-000044: a hidden tab cannot stay active (repo switch, mode switched off,
+  // or a contributor's repo: Deploy and Secrets are the owner's business).
+  $effect(() => {
+    if (activeTab === 'participants' && !isShared) activeTab = 'bugs';
+    if (isContributor && (activeTab === 'deploy' || activeTab === 'secrets')) activeTab = 'bugs';
+  });
 
   // v1.2.0 deploy-report drill-down: when DeployReport arms deployDrillTarget
   // for this repo, jump to the Deploy tab. DeployScreen (keyed by repo.id) then
@@ -433,37 +546,52 @@
 
       <!-- Row 2: editable chips (Project / Role / Шаблон), Delete прижат вправо -->
       <div class="chips-row">
-        <div class="chip">
-          <span class="chip-label">{$tStore('repoDetail.labelProject' as any)}:</span>
-          <select class="chip-select" value={repo.project_id ?? ''} onchange={handleProjectChange} title={$tStore('repoDetail.assignToProject')}>
-            <option value="">{$tStore('repoDetail.unassigned')}</option>
-            {#each $projects as project (project.id)}
-              <option value={project.id}>{project.name}</option>
-            {/each}
-          </select>
-        </div>
+        {#if isContributor}
+          <!-- Frame 5: the owner sets project and role; read-only here. -->
+          <div class="chip ro" title={$tStore('shared.readOnlyHint' as any)}>
+            <span class="chip-label">{$tStore('repoDetail.labelProject' as any)}:</span>
+            <span class="chip-value">{$projects.find((p) => p.id === repo.project_id)?.name ?? $tStore('repoDetail.unassigned')}</span>
+          </div>
+
+          <div class="chip ro" title={$tStore('shared.readOnlyHint' as any)}>
+            <span class="chip-label">{$tStore('repoDetail.labelRole' as any)}:</span>
+            <span class="chip-value">{getRoleLabel((repo.role ?? 'other') as Role)}</span>
+          </div>
+        {:else}
+          <div class="chip">
+            <span class="chip-label">{$tStore('repoDetail.labelProject' as any)}:</span>
+            <select class="chip-select" value={repo.project_id ?? ''} onchange={handleProjectChange} title={$tStore('repoDetail.assignToProject')}>
+              <option value="">{$tStore('repoDetail.unassigned')}</option>
+              {#each $projects as project (project.id)}
+                <option value={project.id}>{project.name}</option>
+              {/each}
+            </select>
+          </div>
+
+          <div class="chip">
+            <span class="chip-label">{$tStore('repoDetail.labelRole' as any)}:</span>
+            <select class="chip-select" value={repo.role ?? 'other'} onchange={handleRoleChange} title={$tStore('repoDetail.setRole')}>
+              {#each roles as [key, label] (key)}
+                <option value={key}>{label}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
+
+        {#if !isContributor}
+          <div class="chip">
+            <span class="chip-label">{$tStore('repo.deployTarget' as any)}:</span>
+            <select class="chip-select" value={repo.deploy_target ?? ''} onchange={handleDeployTargetChange}>
+              <option value="">{$tStore('repo.deployTargetNone' as any)}</option>
+              {#each deployTargetOptions as lang (lang)}
+                <option value={lang}>{lang}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
 
         <div class="chip">
-          <span class="chip-label">{$tStore('repoDetail.labelRole' as any)}:</span>
-          <select class="chip-select" value={repo.role ?? 'other'} onchange={handleRoleChange} title={$tStore('repoDetail.setRole')}>
-            {#each roles as [key, label] (key)}
-              <option value={key}>{label}</option>
-            {/each}
-          </select>
-        </div>
-
-        <div class="chip">
-          <span class="chip-label">{$tStore('repo.deployTarget' as any)}:</span>
-          <select class="chip-select" value={repo.deploy_target ?? ''} onchange={handleDeployTargetChange}>
-            <option value="">{$tStore('repo.deployTargetNone' as any)}</option>
-            {#each deployTargetOptions as lang (lang)}
-              <option value={lang}>{lang}</option>
-            {/each}
-          </select>
-        </div>
-
-        <div class="chip">
-          <span class="chip-label">{$tStore('repoDetail.labelAutocommit' as any)}:</span>
+          <span class="chip-label">{isContributor ? $tStore('shared.myBranchLabel' as any) : $tStore('repoDetail.labelAutocommit' as any)}:</span>
           <input
             class="chip-input"
             type="text"
@@ -471,7 +599,7 @@
             value={autocommitBranch}
             onchange={handleAutocommitBranchChange}
             placeholder={$tStore('repoDetail.autocommitPlaceholder' as any)}
-            title={$tStore('repoDetail.autocommitHint' as any)}
+            title={isContributor ? $tStore('shared.myBranchHint' as any) : $tStore('repoDetail.autocommitHint' as any)}
           />
           {#if branches.length > 0}
             <datalist id="autocommit-branch-list">
@@ -481,6 +609,29 @@
             </datalist>
           {/if}
         </div>
+
+        {#if showSharedToggle}
+          <!-- One instance per repo: an in-flight check of the previous repo
+               cannot open its dialog on this one. -->
+          {#key repo.id}
+            <SharedModeChip
+              repoId={repo.id}
+              repoName={getDisplayName(repo)}
+              githubName={repo.github_name}
+              devBranch={autocommitBranch}
+              checked={sharedState?.shared_mode ?? false}
+              onPreflightErrors={(m) => (preflightErrors = m)}
+              onChanged={handleSharedChanged}
+            />
+          {/key}
+        {/if}
+
+        {#if myBand}
+          <div class="chip ro" title={$tStore('shared.myBandsHint' as any)}>
+            <span class="chip-label">{$tStore('shared.myBandsLabel' as any)}:</span>
+            <span class="chip-value mono">{myBand}</span>
+          </div>
+        {/if}
 
         <button class="delete-repo-btn row-action" onclick={openDeleteDialog} type="button" disabled={deleting} title={$tStore('repo.deleteButton' as any)}>
           <span class="btn-icon">🗑</span>
@@ -495,6 +646,35 @@
             {#if part === '{0}'}<code>{currentBranch}</code>{:else if part === '{1}'}<code>{autocommitBranch}</code>{:else}{part}{/if}
           {/each}
         </div>
+      {/if}
+
+      {#each preflightErrors as msg (msg)}
+        <div class="shared-note error">
+          <span aria-hidden="true">✕</span>
+          <span>{msg}</span>
+        </div>
+      {/each}
+
+      {#if sharedState && isShared}
+        <SharedStatusLine
+          repoId={repo.id}
+          shared={sharedState}
+          ownerLogin={structure?.main.login ?? null}
+          onRefresh={handleSharedChanged}
+        />
+        {#if isContributor && !sharedStatusLine && structure && autocommitBranch}
+          <div class="shared-note muted">
+            {$tStore('shared.contributorInfo' as any)
+              .replace('{0}', structure.main.login)
+              .replace('{1}', autocommitBranch)
+              .replace('{2}', structure.main.dev_branch)}
+          </div>
+        {/if}
+        {#if isOwnerInstall && requestCount > 0}
+          <button type="button" class="shared-note requests" onclick={() => (activeTab = 'participants')} title={$tStore('shared.requestsWaitingHint' as any)}>
+            {$tStore(requestsWaitingKey(requestCount, $locale) as any).replace('{0}', String(requestCount))}
+          </button>
+        {/if}
       {/if}
     </div>
 
@@ -524,18 +704,28 @@
         onclick={() => (activeTab = 'changelog')}
         type="button"
       >{$tStore('repo.tabChangelog' as any)}</button>
-      <button
-        class="tab-btn"
-        class:active={activeTab === 'deploy'}
-        onclick={() => (activeTab = 'deploy')}
-        type="button"
-      >{$tStore('repo.tabDeploy' as any)}</button>
-      <button
-        class="tab-btn"
-        class:active={activeTab === 'secrets'}
-        onclick={() => (activeTab = 'secrets')}
-        type="button"
-      >{$tStore('repo.tabSecrets' as any)}</button>
+      {#if isShared}
+        <button
+          class="tab-btn"
+          class:active={activeTab === 'participants'}
+          onclick={() => (activeTab = 'participants')}
+          type="button"
+        >{$tStore('shared.tabParticipants' as any).replace('{0}', String(participantRows.length))}</button>
+      {/if}
+      {#if !isContributor}
+        <button
+          class="tab-btn"
+          class:active={activeTab === 'deploy'}
+          onclick={() => (activeTab = 'deploy')}
+          type="button"
+        >{$tStore('repo.tabDeploy' as any)}</button>
+        <button
+          class="tab-btn"
+          class:active={activeTab === 'secrets'}
+          onclick={() => (activeTab = 'secrets')}
+          type="button"
+        >{$tStore('repo.tabSecrets' as any)}</button>
+      {/if}
       <button
         class="tab-btn"
         class:active={activeTab === 'stats'}
@@ -586,6 +776,13 @@
           <p>{$tStore('repo.bugsBlocked' as any)}</p>
         </div>
       {/if}
+    {:else if activeTab === 'participants'}
+      <ParticipantsTab
+        rows={participantRows}
+        {isOwnerInstall}
+        {approving}
+        onApprove={handleApprove}
+      />
     {:else if activeTab === 'deploy'}
       {#if repo.github_name && repo.deploy_target}
         <div class="deploy-wrapper">
@@ -849,6 +1046,23 @@
     font-weight: 400;
   }
 
+  /* F-000044 frame 5: contributor's read-only chips (dashed border, no arrow). */
+  .chip.ro,
+  .chip.ro:hover {
+    border-style: dashed;
+    background: var(--surface);
+    border-color: var(--border);
+    cursor: default;
+  }
+  .chip-value {
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .chip-value.mono {
+    font-family: monospace;
+  }
+
   .row-action {
     margin-left: auto;
     flex-shrink: 0;
@@ -897,6 +1111,27 @@
   .autocommit-status code {
     font-family: monospace;
   }
+
+  /* F-000044: extra header lines of a shared repo (same rhythm as the status line). */
+  .shared-note {
+    font-size: 12px;
+    padding-top: 4px;
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    line-height: 1.4;
+  }
+  .shared-note.error { color: var(--danger); }
+  .shared-note.muted { color: var(--text-muted); }
+  .shared-note.requests {
+    background: none;
+    border: none;
+    padding: 4px 0 0;
+    color: var(--toast-warning);
+    cursor: pointer;
+    text-align: left;
+  }
+  .shared-note.requests:hover { text-decoration: underline; }
 
   .mini {
     font-size: 10px;

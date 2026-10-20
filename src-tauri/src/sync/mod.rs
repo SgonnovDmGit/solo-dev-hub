@@ -11,10 +11,16 @@ pub mod fs;
 pub mod gitattributes;
 pub mod gitignore;
 pub mod managed_block;
+pub mod merge_by_id;
 pub mod peer_channels;
 pub mod project_md;
 pub mod project_sync;
 pub mod requirements;
+pub mod shared;
+pub mod shared_canon;
+#[cfg(test)]
+mod shared_e2e_tests;
+pub mod shared_structure;
 pub mod skills;
 pub mod tasks;
 

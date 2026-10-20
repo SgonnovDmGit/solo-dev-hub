@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Repository, UntrackReport, GitignoredListing, PeerLink } from '$lib/types';
+import type { Repository, UntrackReport, GitignoredListing, PeerLink, RepoSharedState } from '$lib/types';
 
 
 // ── Repository commands ───────────────────────────────────────────────────────
@@ -179,4 +179,14 @@ export async function listPeerLinks(): Promise<PeerLink[]> {
 
 export async function listRepoPeers(repoId: number): Promise<Repository[]> {
   return invoke<Repository[]>('list_repo_peers', { repoId });
+}
+
+// ── Contributor mode (F-000044) ───────────────────────────────────────────────
+
+export async function getRepoSharedState(repoId: number): Promise<RepoSharedState> {
+  return invoke<RepoSharedState>('get_repo_shared_state', { repoId });
+}
+
+export async function listRepoSharedStates(): Promise<RepoSharedState[]> {
+  return invoke<RepoSharedState[]>('list_repo_shared_states');
 }

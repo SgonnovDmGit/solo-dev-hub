@@ -41,6 +41,8 @@
   let showResetConfirm = $state(false);
 
   const isGlobal = $derived(rule.file_name === GLOBAL_SECTION_FILE);
+  // T-000224: the text comes from the owner's repo; Save and Reset are off.
+  const followed = $derived(rule.follows_main !== null && rule.follows_main !== undefined);
   const title = $derived(isGlobal ? $tStore('rules.globalName') : rule.rule);
 
   // The diff compares the canon with the SAVED text, never the unsaved textarea.
@@ -76,6 +78,7 @@
     <span class="title" class:mono={!isGlobal}>{title}</span>
     {#if rule.changed}<span class="chip changed">{$tStore('rules.chipChanged')}</span>{/if}
     {#if rule.conflict}<span class="chip conflict">{$tStore('rules.chipConflict')}</span>{/if}
+    {#if rule.follows_main}<span class="chip main">{$tStore('rules.chipFollowsMain')}</span>{/if}
     {#if version}<span class="canon">{tf('rules.canonOf', version)}</span>{/if}
   </div>
 
@@ -103,15 +106,19 @@
     </div>
 
     {#if tab === 'text'}
-      <textarea class="editor" bind:value={edited} spellcheck="false"></textarea>
-      <div class="warn">
-        {isGlobal ? $tStore('rules.warnGlobal') : tf('rules.warnSkill', repos)}
-      </div>
+      <textarea class="editor" bind:value={edited} spellcheck="false" readonly={followed}></textarea>
+      {#if followed}
+        <div class="follows">{tf('rules.followsMain', rule.follows_main ?? '')}</div>
+      {:else}
+        <div class="warn">
+          {isGlobal ? $tStore('rules.warnGlobal') : tf('rules.warnSkill', repos)}
+        </div>
+      {/if}
       <div class="actions">
-        <button type="button" class="ghost reset-btn" disabled={!rule.changed || busy} onclick={() => (showResetConfirm = true)}>
+        <button type="button" class="ghost reset-btn" disabled={followed || !rule.changed || busy} onclick={() => (showResetConfirm = true)}>
           {$tStore('rules.resetCanon')}
         </button>
-        <button type="button" class="primary" disabled={!dirty || busy} onclick={onSave}>
+        <button type="button" class="primary" disabled={followed || !dirty || busy} onclick={onSave}>
           {isGlobal ? $tStore('rules.save') : $tStore('rules.saveAndSend')}
         </button>
       </div>
@@ -147,6 +154,8 @@
   .chip.changed { background: rgba(234, 179, 8, 0.15); color: rgb(234, 179, 8); }
   /* Red tint of --danger (#ef4444). */
   .chip.conflict { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
+  .chip.main { border: 1px solid var(--accent); color: var(--accent); padding: 0 6px; }
+  .follows { flex-shrink: 0; font-size: 11px; line-height: 1.4; color: var(--text-muted); }
   .origin { flex-shrink: 0; display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding: 8px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
   .origin-note { color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
   .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); flex-shrink: 0; }

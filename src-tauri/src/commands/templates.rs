@@ -80,6 +80,8 @@ fn save_template_file_in(
     // needs no lock. `after_rule_write` runs the unlocked delivery
     // (`refresh_rules_locked`); the lock is not re-entrant.
     let _guard = rule_of(language_key, file_name).map(|_| sync::rules_guard());
+    // T-000224: a rule that follows an owner's canon is changed in his repo.
+    refuse_followed(db, language_key, file_name)?;
     // T-000206: a save of the very text already stored changes nothing, so it
     // is no event of the rule's history. Compared before the write, which is
     // what replaces the old text. An unreadable old row counts as a change:
@@ -113,6 +115,15 @@ fn rule_of<'a>(language_key: &str, file_name: &'a str) -> Option<&'a str> {
     match sync::rule_name_of(file_name) {
         Some(rule) if language_key == "_global" => Some(rule),
         _ => None,
+    }
+}
+
+/// T-000224: a rule this install takes from an owner (`sync::shared_canon`) is
+/// read-only here; the error is `rule_follows_main: <login>`.
+fn refuse_followed(db: &AppDb, language_key: &str, file_name: &str) -> Result<(), String> {
+    match rule_of(language_key, file_name) {
+        Some(rule) => sync::shared_canon::refuse_if_followed(db, rule),
+        None => Ok(()),
     }
 }
 
@@ -212,6 +223,7 @@ fn list_rules_in(db: &AppDb) -> Result<RulesOverview, String> {
         .list_template_files("_global")
         .map_err(|e| e.to_string())?;
     let conflicts = db.open_rule_conflicts().map_err(|e| e.to_string())?;
+    let followed = sync::shared_canon::followed_rules(db);
     let mut rules = Vec::new();
     for file in files {
         let Some(rule) = sync::rule_name_of(&file.file_name).map(str::to_string) else {
@@ -223,6 +235,7 @@ fn list_rules_in(db: &AppDb) -> Result<RulesOverview, String> {
             // the bundle leaves the flag set but changes nothing.
             changed: canon.as_deref().is_some_and(|canon| canon != file.content),
             conflict: conflicts.contains(&rule),
+            follows_main: followed.get(&rule).map(|f| f.login.clone()),
             origin: db.latest_origin_event(&rule).map_err(|e| e.to_string())?,
             canon,
             file_name: file.file_name,
@@ -318,6 +331,7 @@ fn reset_template_file_in(
         .ok_or_else(|| format!("No bundled default for {}/{}", language_key, file_name))?;
     // T-000174: same hold as a save — see `save_template_file_in`.
     let _guard = rule_of(language_key, file_name).map(|_| sync::rules_guard());
+    refuse_followed(db, language_key, file_name)?;
     db.upsert_template_file(language_key, file_name, &bundled, false)
         .map_err(|e| e.to_string())?;
     Ok(after_rule_write(
@@ -1285,5 +1299,95 @@ mod tests {
             .collect();
         assert_eq!(flagged, vec![SKILL]);
         assert_eq!(listed.repos, 2, "the missing checkout is not counted");
+    }
+
+    // ── T-000224: a rule that follows an owner's canon is read-only ──────────────
+
+    /// A rule taken from `owner` through a contributor repo of this install.
+    fn follow(db: &AppDb, rule: &str, owner: &str) -> i64 {
+        let repo = db
+            .insert_local_repository("/nonexistent/shared", "owner/app", None, None)
+            .unwrap();
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        db.set_setting(
+            sync::shared_canon::RULES_FROM_MAIN_KEY,
+            &format!(
+                r#"{{"{}":{{"login":"{}","repo_id":{},"committed_at":1}}}}"#,
+                rule, owner, repo.id
+            ),
+        )
+        .unwrap();
+        repo.id
+    }
+
+    #[test]
+    fn test_a_followed_rule_is_flagged_and_refuses_save_and_reset() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let repo_id = follow(&db, "sdh-debugging", "owner");
+
+        let listed = list_rules_in(&db).unwrap();
+        for rule in &listed.rules {
+            let want = (rule.rule == "sdh-debugging").then(|| "owner".to_string());
+            assert_eq!(rule.follows_main, want, "{}", rule.rule);
+        }
+
+        let file = "skill.sdh-debugging.md.tmpl";
+        let before = db
+            .get_template_file("_global", file)
+            .unwrap()
+            .unwrap()
+            .content;
+        let save = save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            file,
+            "MY EDIT",
+        );
+        assert_eq!(
+            save.unwrap_err(),
+            format!("{}: owner", sync::shared_canon::ERR_FOLLOWS_MAIN)
+        );
+        let reset = reset_template_file_in(&db, Some(home.path().to_path_buf()), "_global", file);
+        assert!(reset
+            .unwrap_err()
+            .starts_with(sync::shared_canon::ERR_FOLLOWS_MAIN));
+        assert_eq!(
+            db.get_template_file("_global", file)
+                .unwrap()
+                .unwrap()
+                .content,
+            before
+        );
+        assert!(
+            !home.path().join(".claude/skills").exists(),
+            "nothing rendered"
+        );
+        // Another rule is not affected.
+        save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "skill.sdh-retro.md.tmpl",
+            "MINE",
+        )
+        .unwrap();
+
+        // The repo stops being shared: the rule is editable again, text kept.
+        db.set_shared_role(repo_id, None).unwrap();
+        assert!(list_rules_in(&db)
+            .unwrap()
+            .rules
+            .iter()
+            .all(|r| r.follows_main.is_none()));
+        save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            file,
+            "MY EDIT",
+        )
+        .unwrap();
     }
 }

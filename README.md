@@ -28,6 +28,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 - **Markdown bugs** — every bug lives in `docs/bug-reports.md` of the affected repo. SQLite is the source-of-truth, the MD file is a 2-way-synced LLM-readable view. Severity, category, append-only event log per bug.
 - **Cross-repo requirements** — `REQ-NNN.md` exchange between client ↔ server ↔ microservice. Sender writes the ask, recipient writes the receipt, the app handles file movement between repos. No GitHub Issues, no email threads.
 - **Peer channels** — two repos at the *same* level (client ↔ client, server ↔ server, or servers in two different products) exchange through `docs/InOutBox/`: an outbox you write, an inbox the app fills, and a shared folder for two-sided agreements. Requirements only work downhill, where one side owes the other an answer; between equals nobody does, so `declined` is a normal answer and the channel carries agreements, handovers and notes instead of demands. Peers are connected deliberately — a shared role opens nothing.
+- **Contributor mode** — a helper works in your repositories with their own install on their own machine. You switch a repository to shared mode, approve the helper's join request, and from then on tasks, done items and bugs travel through git, merge by id, and carry their author. Each install issues ids from its own number band, the helper takes your rules as they are, and nothing is ever force-pushed or pushed to `master` / `main`.
 - **Project graph** — visualize a project as a 1-hop graph: server in the center, repos and connected microservices around it. Click any node to navigate. Built on Cytoscape.
 - **Multi-environment deploy** — generate Docker + GitHub Actions deploy pipelines per environment (prod / staging / test / any custom name) with native GitHub Environments integration and per-secret role/scope flags.
 - **Deploy report** — portfolio-wide view of every deploy environment across all repos in one screen (domains, branches, image tags, secret counts), grouped by project. Click any row to jump straight to that environment's setup.
@@ -68,7 +69,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 
 **Windows**
 
-1. Download `solo-dev-hub_<version>_x64-setup.exe` from the [Releases page](https://github.com/SgonnovDmGit/solo-dev-hub/releases)
+1. Download `Solo.Dev.Hub_<version>_x64-setup.exe` from the [Releases page](https://github.com/SgonnovDmGit/solo-dev-hub/releases)
 2. Run the installer.
 3. **First launch may show a Windows SmartScreen warning** ("Unrecognized publisher"). Authenticode code-signing is on the v2.0.0 roadmap. Until then: click "More info" → "Run anyway".
 
@@ -118,8 +119,8 @@ npm run tauri dev          # local dev with hot reload
 ### Tests
 
 ```bash
-cd src-tauri && cargo test --lib   # ~622 Rust tests
-npm test                            # vitest frontend (~124 tests)
+cd src-tauri && cargo test --lib   # ~901 Rust tests
+npm test                            # vitest frontend (~177 tests)
 npm run check                       # svelte-check
 ```
 
@@ -146,7 +147,8 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Shipped**
 
-- **v1.19.0** *(current — 2026-10-19)* — a Rules screen: which rules were changed, where an edit came from, settling two repos that handed one rule back differently; Linux builds (AppImage and .deb).
+- **v1.20.0** *(current — 2026-10-20)* — contributor mode: a helper with their own install works in the same repositories; tasks, done items and bugs travel through git and merge by id.
+- **v1.19.0** — a Rules screen: which rules were changed, where an edit came from, settling two repos that handed one rule back differently; Linux builds (AppImage and .deb).
 - **v1.18.0** — an approved rule edit is never lost silently; sync problems in the interface language; the rules compressed to less than half (19 skills, a new one for starting a project).
 - **v1.17.0** — rules deliver themselves: an applied rule reaches every agent on save and on startup, and an agent's edit travels back from its own copy; peers can be linked only to equals.
 - **v1.16.0** — the second half of the help screen: cross-repo links, deploy, and the AI agent contract; a revision of the working rules (18 role-scoped skills, a new one on debugging); the task-event leak stopped.
@@ -169,7 +171,6 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Next**
 
-- **v1.20.0** — contributor mode: a second developer with their own install working in the same repositories.
 - **v1.21.0** — macOS build.
 - **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix.
 

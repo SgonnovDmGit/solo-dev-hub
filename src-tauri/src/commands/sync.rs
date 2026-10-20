@@ -100,6 +100,11 @@ fn init_docs_for_repo_in(
     if sync::copy_doc_skeleton_if_missing(&bug_reports_template, base, "bug-reports.md")? {
         updated.push("docs/bug-reports.md".to_string());
     }
+    // F-000044: a shared repo renders both blocks for sharing (same as the sync).
+    let shared = sync::shared::is_shared_repo(db, repo_id);
+    let gitignore_template = sync::shared::gitignore_template_for(&gitignore_template, shared);
+    let gitattributes_template =
+        sync::shared::gitattributes_template_for(&gitattributes_template, shared);
     if sync::sync_gitignore_section(&gitignore_template, base)? {
         updated.push(".gitignore (section)".to_string());
     }
@@ -123,10 +128,12 @@ fn init_docs_for_repo_in(
     if let Some(pid) = repo.project_id {
         sync::generate_project_md(db, pid, base)?;
         updated.push("docs/project.md".to_string());
+        let shared_block = sync::shared_block_for(db, &repo, None);
         sync::update_claude_md_section(
             db,
             Some(pid),
             repo.role.as_deref(),
+            &shared_block,
             &base.join("CLAUDE.md"),
         )?;
         updated.push("CLAUDE.md (section)".to_string());
@@ -151,6 +158,13 @@ fn init_docs_for_repo_in(
 #[tauri::command(async)]
 pub fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String> {
     sync::run_project_sync(&db, project_id)
+}
+
+/// Contributor mode: probe the role-less repos for a shared structure and run
+/// the sync of every project they land in. Git + network, so off the UI thread.
+#[tauri::command(async)]
+pub fn probe_shared_repos(db: State<AppDb>) -> Result<SyncResult, String> {
+    sync::probe_shared_repos(&db)
 }
 
 #[tauri::command]

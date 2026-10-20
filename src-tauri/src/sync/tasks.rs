@@ -35,6 +35,21 @@ pub struct SyncTasksReport {
     pub events_emitted: u32,
 }
 
+/// Who an event belongs to: given the id of a task, the GitHub login of the
+/// participant whose commit caused it (`None` = this install).
+type AuthorOf<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+struct CoreOpts<'a> {
+    author: AuthorOf<'a>,
+    /// Only these task ids are looked at (incoming-delta runs); `None` = all.
+    only_ids: Option<&'a std::collections::HashSet<String>>,
+    /// Drop DB rows that are absent from the MD (B-000004) and resolve the
+    /// todo/done split state (H6). A full run does it; an incoming-delta run
+    /// over the committed files must not: it would delete rows that exist only
+    /// in the work tree, and the next full run would re-create them.
+    cleanup: bool,
+}
+
 /// Sync todo.md + done.md from disk into the `tasks` DB table for the given repo.
 ///
 /// Algorithm:
@@ -44,8 +59,163 @@ pub struct SyncTasksReport {
 /// 4. First-sync semantics: if `tasks_migrated_at IS NULL` for this repo, suppress all
 ///    "created" events (silent backfill of legacy data). Mark migrated after.
 ///
-/// Returns `SyncTasksReport` with counts of imported rows and emitted events.
+/// Events carry no author (they are this install's). Returns `SyncTasksReport`
+/// with counts of imported rows and emitted events.
 pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, String> {
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+
+    let local_path = match repo.local_path.clone() {
+        Some(p) => p,
+        None => {
+            db.mark_tasks_migrated(repo_id, &chrono::Utc::now().to_rfc3339())
+                .map_err(|e| e.to_string())?;
+            return Ok(SyncTasksReport {
+                imported: 0,
+                events_emitted: 0,
+            });
+        }
+    };
+
+    let todo_path = Path::new(&local_path).join("docs").join("todo.md");
+    let done_path = Path::new(&local_path).join("docs").join("done.md");
+    let (todo_text, todo_mtime) = read_with_mtime(&todo_path, "todo.md")?;
+    let (done_text, done_mtime) = read_with_mtime(&done_path, "done.md")?;
+
+    let none = |_: &str| None;
+    sync_tasks_core(
+        db,
+        repo_id,
+        todo_text.as_deref(),
+        &todo_mtime,
+        done_text.as_deref(),
+        &done_mtime,
+        &CoreOpts {
+            author: &none,
+            only_ids: None,
+            cleanup: true,
+        },
+    )
+}
+
+/// Text of `path` and its modification day (`YYYY-MM-DD`); `(None, "")` when the
+/// file is absent.
+fn read_with_mtime(path: &Path, what: &str) -> Result<(Option<String>, String), String> {
+    if !path.exists() {
+        return Ok((None, String::new()));
+    }
+    let content =
+        crate::export::read_to_string_lossy(path).map_err(|e| format!("read {}: {}", what, e))?;
+    let mtime = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            chrono::DateTime::<chrono::Utc>::from(t)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+    Ok((Some(content), mtime))
+}
+
+/// The same mirror over the given file CONTENTS instead of the disk (`None` =
+/// the file does not exist), with every emitted event attributed to `author`
+/// (`None` = this install). Semantics are those of `sync_tasks_for_repo`.
+#[cfg_attr(not(test), allow(dead_code))] // the contents-taking core; production callers use the disk wrapper / the incoming delta
+pub fn sync_tasks_from_contents(
+    db: &AppDb,
+    repo_id: i64,
+    todo: Option<&str>,
+    done: Option<&str>,
+    author: Option<&str>,
+) -> Result<SyncTasksReport, String> {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let fixed = |_: &str| author.map(String::from);
+    sync_tasks_core(
+        db,
+        repo_id,
+        todo,
+        &today,
+        done,
+        &today,
+        &CoreOpts {
+            author: &fixed,
+            only_ids: None,
+            cleanup: true,
+        },
+    )
+}
+
+/// F-000044 / T-000221 (spec R11 step 1): apply what arrived BY COMMIT to the
+/// mirror. `prev_*` is what this install last imported / committed, `head_*`
+/// what HEAD holds now; only the tasks whose entry differs between the two are
+/// touched, so local edits that are not committed yet stay as they are for the
+/// ordinary disk run that follows. No orphan cleanup. `author_of` names the
+/// author of each task's events.
+pub fn sync_tasks_incoming(
+    db: &AppDb,
+    repo_id: i64,
+    prev: (&str, &str),
+    head: (Option<&str>, Option<&str>),
+    author_of: AuthorOf,
+) -> Result<SyncTasksReport, String> {
+    let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(text) = head.0 {
+        let (now, _) = export::parse_todo_tasks(text);
+        let (before, _) = export::parse_todo_tasks(prev.0);
+        let before: std::collections::HashMap<String, String> = before
+            .into_iter()
+            .map(|t| (t.id.clone(), format!("{:?}", t)))
+            .collect();
+        for t in now {
+            if before.get(&t.id) != Some(&format!("{:?}", t)) {
+                changed.insert(t.id);
+            }
+        }
+    }
+    if let Some(text) = head.1 {
+        let (now, _) = export::parse_done_tasks(text);
+        let (before, _) = export::parse_done_tasks(prev.1);
+        let before: std::collections::HashMap<String, String> = before
+            .into_iter()
+            .map(|t| (t.id.clone(), format!("{:?}", t)))
+            .collect();
+        for t in now {
+            if before.get(&t.id) != Some(&format!("{:?}", t)) {
+                changed.insert(t.id);
+            }
+        }
+    }
+    if changed.is_empty() {
+        return Ok(SyncTasksReport {
+            imported: 0,
+            events_emitted: 0,
+        });
+    }
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    sync_tasks_core(
+        db,
+        repo_id,
+        head.0,
+        &today,
+        head.1,
+        &today,
+        &CoreOpts {
+            author: author_of,
+            only_ids: Some(&changed),
+            cleanup: false,
+        },
+    )
+}
+
+fn sync_tasks_core(
+    db: &AppDb,
+    repo_id: i64,
+    todo: Option<&str>,
+    todo_mtime: &str,
+    done: Option<&str>,
+    done_mtime: &str,
+    opts: &CoreOpts,
+) -> Result<SyncTasksReport, String> {
     use std::collections::{HashMap, HashSet};
 
     /// Drop repeated ids within one MD file, keeping the LAST occurrence.
@@ -90,23 +260,6 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
             .collect()
     }
 
-    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
-
-    let local_path = match repo.local_path.clone() {
-        Some(p) => p,
-        None => {
-            db.mark_tasks_migrated(repo_id, &chrono::Utc::now().to_rfc3339())
-                .map_err(|e| e.to_string())?;
-            return Ok(SyncTasksReport {
-                imported: 0,
-                events_emitted: 0,
-            });
-        }
-    };
-
-    let todo_path = Path::new(&local_path).join("docs").join("todo.md");
-    let done_path = Path::new(&local_path).join("docs").join("done.md");
-
     // Determine whether this is a first sync (suppress created events for legacy backfill)
     let was_migrated = db
         .get_tasks_migrated_at(repo_id)
@@ -114,46 +267,20 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
         .is_some();
     let suppress_created_events = !was_migrated;
 
-    // Read and parse todo.md
-    let (todo_tasks, todo_mtime) = if todo_path.exists() {
-        let content = crate::export::read_to_string_lossy(&todo_path)
-            .map_err(|e| format!("read todo.md: {}", e))?;
-        let mtime = std::fs::metadata(&todo_path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .map(|t| {
-                chrono::DateTime::<chrono::Utc>::from(t)
-                    .format("%Y-%m-%d")
-                    .to_string()
-            })
-            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
-        let (tasks, _warnings) = export::parse_todo_tasks(&content);
-        (tasks, mtime)
-    } else {
-        (Vec::new(), String::new())
+    // Parse todo.md. `todo_mtime` / `done_mtime` are the fallback dates for
+    // entries without one; `done_mtime` is used for historical done entries
+    // whose `## YYYY-MM-DD` section header is missing - `todo_mtime` was wrong
+    // here because the entry came from done.md, not todo.md (review H5).
+    let todo_tasks = match todo {
+        Some(content) => export::parse_todo_tasks(content).0,
+        None => Vec::new(),
     };
-
-    // Read and parse done.md. `done_mtime` is used as the fallback date for
-    // historical done entries whose `## YYYY-MM-DD` section header is
-    // missing — `todo_mtime` was wrong here because the entry came from
-    // done.md, not todo.md (review H5).
-    let (done_tasks, done_mtime) = if done_path.exists() {
-        let content = crate::export::read_to_string_lossy(&done_path)
-            .map_err(|e| format!("read done.md: {}", e))?;
-        let mtime = std::fs::metadata(&done_path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .map(|t| {
-                chrono::DateTime::<chrono::Utc>::from(t)
-                    .format("%Y-%m-%d")
-                    .to_string()
-            })
-            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
-        let (tasks, _warnings) = export::parse_done_tasks(&content);
-        (tasks, mtime)
-    } else {
-        (Vec::new(), String::new())
+    let done_tasks = match done {
+        Some(content) => export::parse_done_tasks(content).0,
+        None => Vec::new(),
     };
+    let todo_mtime = todo_mtime.to_string();
+    let done_mtime = done_mtime.to_string();
 
     // T-000157: collapse duplicate ids before diffing against the DB.
     let todo_tasks = dedupe_by_id(todo_tasks, |t| t.id.as_str(), "todo.md", repo_id);
@@ -181,6 +308,21 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
             !in_done
         })
         .collect();
+
+    // Incoming-delta runs look at the changed tasks only.
+    let (todo_tasks, done_tasks) = match opts.only_ids {
+        Some(only) => (
+            todo_tasks
+                .into_iter()
+                .filter(|t| only.contains(&t.id))
+                .collect::<Vec<_>>(),
+            done_tasks
+                .into_iter()
+                .filter(|t| only.contains(&t.id))
+                .collect::<Vec<_>>(),
+        ),
+        None => (todo_tasks, done_tasks),
+    };
 
     // Load existing DB rows keyed by task_id string
     let db_todos = db
@@ -236,6 +378,20 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
                 db.update_task_version(existing.id, new_version_opt)
                     .map_err(|e| e.to_string())?;
             }
+            // BUG-2: description, effort and priority follow the file too.
+            let new_effort = tt.effort.parse::<f64>().ok();
+            let new_priority = if tt.priority.is_empty() {
+                None
+            } else {
+                Some(tt.priority.as_str())
+            };
+            if tt.description != existing.description
+                || new_effort != existing.effort
+                || new_priority != existing.priority.as_deref()
+            {
+                db.update_task_fields(existing.id, &tt.description, new_effort, new_priority)
+                    .map_err(|e| e.to_string())?;
+            }
             // Row exists in DB as todo — check for status change
             let new_status = if tt.status.is_empty() {
                 None
@@ -262,12 +418,13 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
                 db.update_task_status(existing.id, new_status)
                     .map_err(|e| e.to_string())?;
                 if !event_type.is_empty() {
-                    db.insert_task_event(
+                    db.insert_task_event_by(
                         existing.id,
                         event_type,
                         &chrono::Utc::now().to_rfc3339(),
                         old_status,
                         new_status,
+                        (opts.author)(&tt.id).as_deref(),
                     )
                     .map_err(|e| e.to_string())?;
                     events_emitted += 1;
@@ -279,12 +436,13 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
                 .map_err(|e| e.to_string())?;
             db.update_task_status(existing_done.id, Some(tt.status.as_str()))
                 .map_err(|e| e.to_string())?;
-            db.insert_task_event(
+            db.insert_task_event_by(
                 existing_done.id,
                 "reopened",
                 &chrono::Utc::now().to_rfc3339(),
                 None,
                 Some(tt.status.as_str()),
+                (opts.author)(&tt.id).as_deref(),
             )
             .map_err(|e| e.to_string())?;
             events_emitted += 1;
@@ -327,12 +485,13 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
                 } else {
                     Some(tt.status.as_str())
                 };
-                db.insert_task_event(
+                db.insert_task_event_by(
                     row.id,
                     "created",
                     &chrono::Utc::now().to_rfc3339(),
                     None,
                     to_status,
+                    (opts.author)(&tt.id).as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
                 events_emitted += 1;
@@ -368,12 +527,13 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
                 .map_err(|e| e.to_string())?;
             db.update_task_status(was_in_todo.id, None)
                 .map_err(|e| e.to_string())?;
-            db.insert_task_event(
+            db.insert_task_event_by(
                 was_in_todo.id,
                 "done",
                 &done_event_ts(&dt.date, chrono::Utc::now()),
                 was_in_todo.status.as_deref(),
                 None,
+                (opts.author)(&dt.id).as_deref(),
             )
             .map_err(|e| e.to_string())?;
             events_emitted += 1;
@@ -407,12 +567,13 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
             imported += 1;
 
             if !suppress_created_events {
-                db.insert_task_event(
+                db.insert_task_event_by(
                     row.id,
                     "done",
                     &done_event_ts(&dt.date, chrono::Utc::now()),
                     None,
                     None,
+                    (opts.author)(&dt.id).as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
                 events_emitted += 1;
@@ -426,38 +587,40 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
     // around as a duplicate forever. todo.md is canonical for tasks, so any DB
     // row whose task_id is no longer in MD is an orphan and gets dropped here.
     // task_events cascade via FK. Done rows are append-only and untouched.
-    let md_todo_ids: HashSet<&str> = todo_tasks.iter().map(|t| t.id.as_str()).collect();
-    let db_todos_now = db
-        .list_tasks_by_repo(repo_id, "todo")
-        .map_err(|e| e.to_string())?;
-    for t in &db_todos_now {
-        if !md_todo_ids.contains(t.task_id.as_str()) {
-            db.delete_task(t.id).map_err(|e| e.to_string())?;
+    if opts.cleanup {
+        let md_todo_ids: HashSet<&str> = todo_tasks.iter().map(|t| t.id.as_str()).collect();
+        let db_todos_now = db
+            .list_tasks_by_repo(repo_id, "todo")
+            .map_err(|e| e.to_string())?;
+        for t in &db_todos_now {
+            if !md_todo_ids.contains(t.task_id.as_str()) {
+                db.delete_task(t.id).map_err(|e| e.to_string())?;
+            }
         }
-    }
 
-    // H6 review-fix: resolve split-state where the same task_id exists in
-    // both `todo` and `done` source for the same repo. The UNIQUE constraint
-    // is `(repository_id, task_id, source)` (not `task_id` alone), so this
-    // state is reachable after a crash mid-transition or a manual MD edit
-    // listing the same id in both files. Done is the more recent intent —
-    // drop the todo duplicate. Without this the user would see the task
-    // simultaneously in both Tasks and Done tabs.
-    let db_todos_now = db
-        .list_tasks_by_repo(repo_id, "todo")
-        .map_err(|e| e.to_string())?;
-    let db_dones_now = db
-        .list_tasks_by_repo(repo_id, "done")
-        .map_err(|e| e.to_string())?;
-    let done_ids: HashSet<&str> = db_dones_now.iter().map(|t| t.task_id.as_str()).collect();
-    for t in &db_todos_now {
-        if done_ids.contains(t.task_id.as_str()) {
-            db.delete_task(t.id).map_err(|e| e.to_string())?;
+        // H6 review-fix: resolve split-state where the same task_id exists in
+        // both `todo` and `done` source for the same repo. The UNIQUE constraint
+        // is `(repository_id, task_id, source)` (not `task_id` alone), so this
+        // state is reachable after a crash mid-transition or a manual MD edit
+        // listing the same id in both files. Done is the more recent intent —
+        // drop the todo duplicate. Without this the user would see the task
+        // simultaneously in both Tasks and Done tabs.
+        let db_todos_now = db
+            .list_tasks_by_repo(repo_id, "todo")
+            .map_err(|e| e.to_string())?;
+        let db_dones_now = db
+            .list_tasks_by_repo(repo_id, "done")
+            .map_err(|e| e.to_string())?;
+        let done_ids: HashSet<&str> = db_dones_now.iter().map(|t| t.task_id.as_str()).collect();
+        for t in &db_todos_now {
+            if done_ids.contains(t.task_id.as_str()) {
+                db.delete_task(t.id).map_err(|e| e.to_string())?;
+            }
         }
-    }
 
-    db.mark_tasks_migrated(repo_id, &chrono::Utc::now().to_rfc3339())
-        .map_err(|e| e.to_string())?;
+        db.mark_tasks_migrated(repo_id, &chrono::Utc::now().to_rfc3339())
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok(SyncTasksReport {
         imported,
@@ -589,6 +752,44 @@ mod tests {
 
         let r = sync_tasks_for_repo(&db, repo.id).unwrap();
         assert_eq!(r.events_emitted, 0, "a re-sync must stay quiet");
+        std::mem::forget(tmp);
+    }
+
+    /// BUG-2: the file is canonical for description, effort and priority of a
+    /// task that is already mirrored; no event is written for those edits.
+    #[test]
+    fn test_sync_tasks_takes_description_effort_priority_from_the_file() {
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_path.join("docs")).unwrap();
+        let todo = repo_path.join("docs/todo.md");
+        std::fs::write(
+            &todo,
+            "- [ ] T-001 | Task A | 2 | high | open | 2026-10-01\n",
+        )
+        .unwrap();
+        let repo = db
+            .insert_local_repository(repo_path.to_str().unwrap(), "test_repo", None, None)
+            .unwrap();
+        sync_tasks_for_repo(&db, repo.id).unwrap();
+
+        std::fs::write(
+            &todo,
+            "- [ ] T-001 | Task A, reworded | 5 | low | open | 2026-10-01\n",
+        )
+        .unwrap();
+        let r = sync_tasks_for_repo(&db, repo.id).unwrap();
+        assert_eq!(r.events_emitted, 0);
+        let row = db
+            .list_tasks_by_repo(repo.id, "todo")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(row.description, "Task A, reworded");
+        assert_eq!(row.effort, Some(5.0));
+        assert_eq!(row.priority.as_deref(), Some("low"));
+        assert_eq!(row.status.as_deref(), Some("open"));
         std::mem::forget(tmp);
     }
 
@@ -1062,5 +1263,97 @@ mod tests {
             "today's event keeps the exact sync time, not the midday placeholder"
         );
         std::mem::forget(tmp);
+    }
+
+    // ----- T-000221: contents-taking core, authors, incoming delta ---------------
+
+    fn repo_without_files(db: &AppDb, name: &str) -> i64 {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        db.insert_local_repository(p.to_str().unwrap(), name, None, None)
+            .unwrap()
+            .id
+    }
+
+    fn task_event_authors(
+        db: &AppDb,
+        repo_id: i64,
+        task_id: &str,
+    ) -> Vec<(String, Option<String>)> {
+        let filter = crate::models::TimelineFilter {
+            start_date: "1970-01-01".into(),
+            end_date: "2100-01-01".into(),
+            event_kinds: None,
+            project_ids: None,
+            repo_ids: Some(vec![repo_id]),
+            search: None,
+            author: None,
+            author_is_me: false,
+        };
+        let mut evs: Vec<_> = db
+            .read_timeline_filtered(&filter, 0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "task_event" && e.task_display_id.as_deref() == Some(task_id))
+            .collect();
+        evs.sort_by(|a, b| a.ts.cmp(&b.ts));
+        evs.into_iter().map(|e| (e.event_type, e.author)).collect()
+    }
+
+    #[test]
+    fn contents_core_attributes_its_events_to_the_given_author() {
+        let db = make_db_for_sync_tests();
+        let rid = repo_without_files(&db, "authored");
+        let v0 = "- [ ] T-000001 | Task A | 2 | high | open | 2026-10-01\n";
+        sync_tasks_from_contents(&db, rid, Some(v0), None, None).unwrap();
+        let v1 = "- [ ] T-000001 | Task A | 2 | high | in-progress | 2026-10-01\n";
+        let rep = sync_tasks_from_contents(&db, rid, Some(v1), None, Some("helper")).unwrap();
+        assert_eq!(rep.events_emitted, 1);
+        let evs = task_event_authors(&db, rid, "T-000001");
+        assert_eq!(evs, vec![("taken".to_string(), Some("helper".to_string()))]);
+    }
+
+    #[test]
+    fn incoming_delta_touches_only_changed_tasks_and_never_cleans_up() {
+        let db = make_db_for_sync_tests();
+        let rid = repo_without_files(&db, "delta");
+        let prev = "- [ ] T-000001 | A | 1 | low | open | 2026-10-01\n- [ ] T-000002 | B | 1 | low | open | 2026-10-01\n";
+        sync_tasks_from_contents(&db, rid, Some(prev), None, None).unwrap();
+        // A local, uncommitted task that only the DB mirror knows about.
+        let local = format!("{}- [ ] T-000003 | C | 1 | low | open | 2026-10-02\n", prev);
+        sync_tasks_from_contents(&db, rid, Some(&local), None, None).unwrap();
+        // The local edit also moved T-000002 to in-progress (uncommitted).
+        let local2 = local.replace(
+            "T-000002 | B | 1 | low | open",
+            "T-000002 | B | 1 | low | in-progress",
+        );
+        sync_tasks_from_contents(&db, rid, Some(&local2), None, None).unwrap();
+
+        // HEAD: T-000001 started by the other install.
+        let head = prev.replace(
+            "T-000001 | A | 1 | low | open",
+            "T-000001 | A | 1 | low | in-progress",
+        );
+        let by_helper = |_: &str| Some("helper".to_string());
+        sync_tasks_incoming(&db, rid, (prev, ""), (Some(&head), None), &by_helper).unwrap();
+
+        let todos = db.list_tasks_by_repo(rid, "todo").unwrap();
+        let status = |id: &str| {
+            todos
+                .iter()
+                .find(|t| t.task_id == id)
+                .map(|t| t.status.clone())
+        };
+        assert_eq!(status("T-000001"), Some(Some("in-progress".to_string())));
+        // untouched: the local rows keep their state
+        assert_eq!(status("T-000002"), Some(Some("in-progress".to_string())));
+        assert!(status("T-000003").is_some(), "no orphan cleanup");
+        let evs = task_event_authors(&db, rid, "T-000001");
+        assert_eq!(evs, vec![("taken".to_string(), Some("helper".to_string()))]);
+        // nothing changed -> nothing done
+        let again =
+            sync_tasks_incoming(&db, rid, (&head, ""), (Some(&head), None), &by_helper).unwrap();
+        assert_eq!(again.events_emitted, 0);
     }
 }

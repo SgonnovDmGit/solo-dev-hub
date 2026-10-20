@@ -60,6 +60,8 @@ export interface RuleInfo {
   changed: boolean;
   /** An open hand-back conflict. */
   conflict: boolean;
+  /** T-000224: login of the owner whose repo this rule's text is taken from; the rule is read-only here. */
+  follows_main: string | null;
   /** Where the current text came from; null when it predates the history. */
   origin: RuleEvent | null;
 }

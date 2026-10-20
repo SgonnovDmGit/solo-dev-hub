@@ -3,6 +3,23 @@
 
 use super::*;
 
+/// Every id of a participant's number band is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandFull {
+    pub lo: i64,
+    pub hi: i64,
+}
+
+impl std::fmt::Display for BandFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the bug number range B-{:06}..B-{:06} of this install is full",
+            self.lo, self.hi
+        )
+    }
+}
+
 impl AppDb {
     // ── Bugs (v0.16.0, SQLite = SoT) ──────────────────────────────────────────
 
@@ -16,6 +33,31 @@ impl AppDb {
             |row| row.get(0),
         )?;
         Ok(next)
+    }
+
+    /// Next numeric_id for a new bug inside the inclusive band `lo..=hi` (F-000044:
+    /// each participant of a shared repo owns its own id band). Only ids inside
+    /// the band count, so an imported bug from another band never moves the
+    /// counter. An empty band starts at `lo`; `Err(BandFull)` when the next id
+    /// would pass `hi`.
+    pub fn next_numeric_id_in_band(
+        &self,
+        repo_id: i64,
+        lo: i64,
+        hi: i64,
+    ) -> SqlResult<Result<i64, BandFull>> {
+        let conn = self.conn.lock().unwrap();
+        let next: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(numeric_id), ?2 - 1) + 1 FROM bugs
+             WHERE repository_id = ?1 AND numeric_id BETWEEN ?2 AND ?3",
+            rusqlite::params![repo_id, lo, hi],
+            |row| row.get(0),
+        )?;
+        Ok(if next > hi {
+            Err(BandFull { lo, hi })
+        } else {
+            Ok(next)
+        })
     }
 
     /// Insert a new bug row. `numeric_id` is pre-computed by caller via `next_numeric_id`
@@ -445,13 +487,109 @@ impl AppDb {
         to_status: Option<&str>,
         ts: &str,
     ) -> SqlResult<()> {
+        self.insert_bug_event_by(bug_id, event_type, from_status, to_status, ts, None)
+    }
+
+    /// Same as `insert_bug_event`, with the author of the event (F-000044: the
+    /// GitHub login of the participant whose commit caused it; `None` = this
+    /// install).
+    pub fn insert_bug_event_by(
+        &self,
+        bug_id: i64,
+        event_type: &str,
+        from_status: Option<&str>,
+        to_status: Option<&str>,
+        ts: &str,
+        author: Option<&str>,
+    ) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![bug_id, event_type, ts, from_status, to_status],
+            "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status, author)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![bug_id, event_type, ts, from_status, to_status, author],
         )?;
         Ok(())
+    }
+
+    /// F-000044 / T-000221: overwrite every mutable column of a bug with what a
+    /// commit brought (the committed file is truth, protected fields included),
+    /// and log `events` (`(event_type, from, to)`, stamped `ts`, by `author`) -
+    /// all in one transaction. `created_at` is touched only when it is `Some`.
+    /// A status other than `confirmed` clears `confirmed_at` and
+    /// `archived_from_md_at`; for `confirmed`, `confirmed_at` is set when it is
+    /// `Some`. When `fix_attempts` goes DOWN, the newest `old - new`
+    /// `entered_testing` events are deleted, so `COUNT(entered_testing) ==
+    /// fix_attempts` keeps holding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn overwrite_bug_from_commit(
+        &self,
+        bug_id: i64,
+        created_at: Option<&str>,
+        description: &str,
+        severity: &str,
+        category: &str,
+        status: &str,
+        fix_attempts: i32,
+        comment: Option<&str>,
+        confirmed_at: Option<&str>,
+        events: &[(&str, &str, &str)],
+        ts: &str,
+        author: Option<&str>,
+    ) -> SqlResult<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let old_attempts: i32 = tx.query_row(
+            "SELECT fix_attempts FROM bugs WHERE id = ?1",
+            rusqlite::params![bug_id],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "UPDATE bugs SET description = ?1, severity = ?2, category = ?3, status = ?4,
+                    fix_attempts = ?5, comment = ?6 WHERE id = ?7",
+            rusqlite::params![
+                description,
+                severity,
+                category,
+                status,
+                fix_attempts,
+                comment,
+                bug_id
+            ],
+        )?;
+        if let Some(c) = created_at {
+            tx.execute(
+                "UPDATE bugs SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![c, bug_id],
+            )?;
+        }
+        if status != "confirmed" {
+            tx.execute(
+                "UPDATE bugs SET confirmed_at = NULL, archived_from_md_at = NULL WHERE id = ?1",
+                rusqlite::params![bug_id],
+            )?;
+        } else if let Some(c) = confirmed_at {
+            tx.execute(
+                "UPDATE bugs SET confirmed_at = ?1 WHERE id = ?2",
+                rusqlite::params![c, bug_id],
+            )?;
+        }
+        if fix_attempts < old_attempts {
+            tx.execute(
+                "DELETE FROM bug_events WHERE id IN (
+                     SELECT id FROM bug_events
+                     WHERE bug_id = ?1 AND event_type = 'entered_testing'
+                     ORDER BY ts DESC, id DESC LIMIT ?2)",
+                rusqlite::params![bug_id, old_attempts - fix_attempts],
+            )?;
+        }
+        for (event_type, from, to) in events {
+            tx.execute(
+                "INSERT INTO bug_events (bug_id, event_type, ts, from_status, to_status, author)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![bug_id, event_type, ts, from, to, author],
+            )?;
+        }
+        tx.commit()
     }
 
     /// Back-fill bug_events for bugs inserted BEFORE migration v19.
@@ -613,6 +751,89 @@ mod tests {
         seed_bug(&db, r1, "2026-03-29", "minor", "ui_ux", 0, "created");
         assert_eq!(db.next_numeric_id(r2).unwrap(), 1);
         assert_eq!(db.next_numeric_id(r1).unwrap(), 3);
+    }
+
+    fn seed_numeric(db: &AppDb, repo_id: i64, nid: i64) {
+        db.insert_bug(
+            repo_id,
+            nid,
+            "2026-03-29T00:00:00Z",
+            "seed",
+            "minor",
+            "other",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_next_numeric_id_in_band_empty_starts_at_lo() {
+        let db = make_db();
+        let rid = make_repo(&db);
+        assert_eq!(db.next_numeric_id_in_band(rid, 1, 499_999).unwrap(), Ok(1));
+        assert_eq!(
+            db.next_numeric_id_in_band(rid, 500_000, 599_999).unwrap(),
+            Ok(500_000)
+        );
+    }
+
+    #[test]
+    fn test_next_numeric_id_in_band_ignores_ids_of_other_bands() {
+        let db = make_db();
+        let rid = make_repo(&db);
+        seed_numeric(&db, rid, 35);
+        seed_numeric(&db, rid, 500_001); // imported from a helper
+                                         // main keeps counting below its ceiling even though MAX is 500_001
+        assert_eq!(db.next_numeric_id_in_band(rid, 1, 499_999).unwrap(), Ok(36));
+        // the plain counter would have jumped to the helper's band
+        assert_eq!(db.next_numeric_id(rid).unwrap(), 500_002);
+        // a helper band with nothing in it starts at its lo; with one id, +1
+        assert_eq!(
+            db.next_numeric_id_in_band(rid, 600_000, 699_999).unwrap(),
+            Ok(600_000)
+        );
+        assert_eq!(
+            db.next_numeric_id_in_band(rid, 500_000, 599_999).unwrap(),
+            Ok(500_002)
+        );
+    }
+
+    #[test]
+    fn test_next_numeric_id_in_band_is_per_repo() {
+        let db = make_db();
+        let r1 = make_repo(&db);
+        let r2 = db
+            .upsert_repository("owner/other-repo", None, None, None, None, None)
+            .unwrap()
+            .id;
+        seed_numeric(&db, r1, 7);
+        assert_eq!(db.next_numeric_id_in_band(r2, 1, 499_999).unwrap(), Ok(1));
+    }
+
+    #[test]
+    fn test_next_numeric_id_in_band_full_is_an_error() {
+        let db = make_db();
+        let rid = make_repo(&db);
+        seed_numeric(&db, rid, 499_999);
+        let full = db
+            .next_numeric_id_in_band(rid, 1, 499_999)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(full, BandFull { lo: 1, hi: 499_999 });
+        assert!(full.to_string().contains("B-000001..B-499999"));
+        // the last free id is still handed out
+        let r2 = db
+            .upsert_repository("owner/other-repo", None, None, None, None, None)
+            .unwrap()
+            .id;
+        seed_numeric(&db, r2, 499_998);
+        assert_eq!(
+            db.next_numeric_id_in_band(r2, 1, 499_999).unwrap(),
+            Ok(499_999)
+        );
     }
 
     #[test]

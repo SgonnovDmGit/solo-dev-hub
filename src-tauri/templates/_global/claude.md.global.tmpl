@@ -65,6 +65,7 @@ Escape rules for every pipe-separated format below: a literal `|` in a free-form
 `- [ ] <id> | <description> | <effort> | <priority> | <status> | <created_at>`
 
 - `id` — required: `T-NNNNNN` (task), `F-NNNNNN` (feature), `O-NNNNNN` (technical operations), `M-NNNNNN` (marketing operations). Each prefix has its own counter: max within the prefix + 1, 6 digits. Legacy 3-digit ids still parse.
+- **Shared repo** (its `CLAUDE.md` names your number band): new ids of every prefix come from your band only — max within the prefix and the band + 1. Ids outside your band belong to other participants; never renumber or reuse them.
 - `effort` — hours (`0` if unknown). `priority` — `critical` / `high` / `medium` / `low`. `status` — `open` / `in-progress` / `review`.
 - `created_at` — `YYYY-MM-DD`, today when you add the line; never edit it afterwards.
 - Release grouping: tasks sit under `## vX.Y.Z — <description>` headers (a version is `v` + digit, or a bare number with a dot or dash). Word headers (`## Операционка`) set no version.
@@ -87,6 +88,8 @@ Under `## YYYY-MM-DD` (completion day), append at the bottom: `- <id> | <descrip
 # Solo Dev Hub auto-commits
 
 Synced cross-repo files (REQ, API contracts, announcements) land in the working tree. If the repo has an auto-commit branch set and is on it, the app commits them itself — pathspec-scoped to the cross-repo doc folders plus `.gitignore` / `.gitattributes`, tracked paths only (a gitignored inbox is never force-added). Author `Solo Dev Hub <noreply@solodevhub.app>`, subject prefix `chore(sdh-sync):`.
+
+In a shared repo (`.sdh/project.json` exists) the app also commits `docs/todo.md`, `docs/done.md`, `docs/bug-reports.md`, `docs/InOutBox/` and `docs/sdh_skills/` into every participant's branch, and merges the three task files by id. A pull request whose shared files show a conflict on GitHub is merged after both sides have synced, or locally with `git pull` (the merge driver resolves them) — never by hand in the web editor.
 
 Such a commit is a legitimate sync: never revert it, build on top. Synced files that are gitignored or uncommitted are equally real. If auto-commit is off and a tracked synced file blocks your work (a dirty-tree gate), commit it yourself as `chore(sdh-sync): …` without waiting to be asked.
 
