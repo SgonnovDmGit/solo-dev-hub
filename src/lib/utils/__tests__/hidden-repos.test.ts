@@ -15,11 +15,20 @@ const db = (
   local_path: string | null = null,
 ): HiddenRepoInput => ({ id, github_name, github_id, local_path });
 
+// The token sees some other repo: an empty list offers nothing by design.
+const SEEN = [fetched(99, 'me/visible')];
+
 describe('computeHiddenRepos', () => {
   it('lists a repo whose github id is absent from the fetched list', () => {
     const r = computeHiddenRepos([fetched(1, 'me/a')], [db(10, 'me/a', 1), db(11, 'boss/x', 2)], new Set());
     expect(r.candidates.map((c) => c.repo.id)).toEqual([11]);
     expect(r.show).toBe(true);
+  });
+
+  it('offers nothing when the token sees no repo at all', () => {
+    const r = computeHiddenRepos([], [db(10, 'me/a', 1), db(11, 'boss/x', 2)], new Set());
+    expect(r.candidates).toEqual([]);
+    expect(r.show).toBe(false);
   });
 
   it('does not list a renamed repo: the id still matches', () => {
@@ -29,7 +38,7 @@ describe('computeHiddenRepos', () => {
   });
 
   it('never lists a local-only repo without a github name', () => {
-    const r = computeHiddenRepos([], [db(10, null, null, 'C:/x')], new Set());
+    const r = computeHiddenRepos(SEEN, [db(10, null, null, 'C:/x')], new Set());
     expect(r.candidates).toEqual([]);
   });
 
@@ -39,7 +48,7 @@ describe('computeHiddenRepos', () => {
   });
 
   it('preselects repos without a local folder only', () => {
-    const r = computeHiddenRepos([], [db(10, 'a/x', 1), db(11, 'a/y', 2, 'C:/y')], new Set());
+    const r = computeHiddenRepos(SEEN, [db(10, 'a/x', 1), db(11, 'a/y', 2, 'C:/y')], new Set());
     expect(r.candidates.map((c) => [c.repo.id, c.preselected])).toEqual([
       [10, true],
       [11, false],
@@ -49,14 +58,14 @@ describe('computeHiddenRepos', () => {
   it('stays quiet while every candidate was dismissed', () => {
     const rows = [db(10, 'a/x', 1), db(11, 'a/y', 2)];
     const dismissed = new Set(rows.map(dismissKey));
-    const r = computeHiddenRepos([], rows, dismissed);
+    const r = computeHiddenRepos(SEEN, rows, dismissed);
     expect(r.show).toBe(false);
   });
 
   it('shows again when a new one appears, listing all with dismissed unchecked', () => {
     const rows = [db(10, 'a/x', 1), db(11, 'a/y', 2), db(12, 'a/z', 3)];
     const dismissed = new Set([dismissKey(rows[0]), dismissKey(rows[1])]);
-    const r = computeHiddenRepos([], rows, dismissed);
+    const r = computeHiddenRepos(SEEN, rows, dismissed);
     expect(r.show).toBe(true);
     expect(r.candidates.map((c) => [c.repo.id, c.preselected])).toEqual([
       [10, false],
@@ -67,7 +76,7 @@ describe('computeHiddenRepos', () => {
 
   it('a removed repo drops out of the dismissed comparison', () => {
     const dismissed = new Set([dismissKey(db(10, 'a/x', 1))]);
-    const r = computeHiddenRepos([], [db(11, 'a/y', 2)], dismissed);
+    const r = computeHiddenRepos(SEEN, [db(11, 'a/y', 2)], dismissed);
     expect(r.show).toBe(true);
   });
 });

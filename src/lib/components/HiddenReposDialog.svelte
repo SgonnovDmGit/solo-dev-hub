@@ -27,6 +27,12 @@
     selected = next;
   }
 
+  // Focus inside the dialog on open, so Escape works without a click first.
+  let notNowButton: HTMLButtonElement | undefined = $state();
+  $effect(() => {
+    notNowButton?.focus();
+  });
+
   function setAll(on: boolean) {
     selected = on ? new Set(candidates.map((c) => c.repo.id)) : new Set();
   }
@@ -75,7 +81,7 @@
     </div>
 
     <div class="actions">
-      <button type="button" onclick={onDismiss} disabled={busy}>
+      <button type="button" bind:this={notNowButton} onclick={onDismiss} disabled={busy}>
         {$tStore('hiddenRepos.notNow' as any)}
       </button>
       <button

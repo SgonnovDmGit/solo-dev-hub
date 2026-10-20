@@ -45,12 +45,16 @@ export function parseDismissed(raw: string | null | undefined): Set<string> {
  * `fetched` must be the complete list the token sees; call only after a fully
  * successful fetch. A repo is hidden when it has a github_name and its
  * github_id (no id: its name, case-insensitive) is absent from `fetched`.
+ * An empty `fetched` offers nothing: a token that sees no repo at all (a
+ * fine-grained token with none selected, SSO not authorised) says more about
+ * the token than about the repos.
  */
 export function computeHiddenRepos<T extends HiddenRepoInput>(
   fetched: FetchedRepo[],
   dbRepos: T[],
   dismissed: Set<string>,
 ): HiddenRepos<T> {
+  if (fetched.length === 0) return { candidates: [], show: false };
   const ids = new Set(fetched.map((f) => f.id));
   const names = new Set(fetched.map((f) => f.full_name.toLowerCase()));
   const candidates: HiddenCandidate<T>[] = [];
