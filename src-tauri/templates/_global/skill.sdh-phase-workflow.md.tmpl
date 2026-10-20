@@ -78,6 +78,7 @@ Every spec carries `## Verification`: hands-on checks, distinct from unit tests.
 - An item needing expensive or server-driven state names how it is produced: a fixture, a controlled trigger, or `NOT_TESTED` up front (which is not `PASS`).
 - An item naming an endpoint is grepped against `docs/my_api/` first.
 - A test proving a fix is shown red on data of the live shape — encoding, language, length, structure.
+- An end-to-end test of a user flow starts from the state the user is in at that step — an existing checkout, a branch already switched, an empty list — taken from the Verification steps, not from the state the code expects.
 - Length scales with complexity: 3–5 items for a small fix, 10+ for a multi-screen phase.
 
 ## An instrument checks its own premise

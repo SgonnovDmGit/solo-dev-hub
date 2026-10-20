@@ -4,6 +4,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+### Changed
+- **`sdh-phase-workflow`: an end-to-end test starts from the user's real state.** A test of a user flow begins where the user is at that step (an existing checkout, a branch already switched, an empty list), taken from the Verification steps. Retro of v1.20.0 + v1.21.0: two defects of contributor mode slipped past end-to-end tests that started from the state the code expected.
+
 ## [1.21.0] — 2026-10-20
 
 Tail of contributor mode: a helper's install can drop the owner's repositories it no longer sees, shared merges pick a better base, and the Linux window keeps its close button.
