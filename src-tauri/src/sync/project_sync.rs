@@ -95,6 +95,41 @@ fn no_local_path(repo: &Repository) -> SyncIssue {
     SyncIssue::new(Code::NoLocalPath, repo.display_name())
 }
 
+/// T-000231: a repo that is another account's and sits in a shared project this
+/// install only takes part in (contributor / pending). Such a repo stays in the
+/// project so the project context is complete, but this install never cloned
+/// it, so its missing local path is expected and not worth reporting. Never
+/// true for the install's own repos, for ordinary projects, or while the
+/// install's GitHub login is unknown.
+fn is_uncloned_foreign_shared_repo(db: &AppDb, repo: &Repository) -> bool {
+    let (Some(login), Some(gh), Some(project_id)) = (
+        db.github_login(),
+        repo.github_name.as_deref(),
+        repo.project_id,
+    ) else {
+        return false;
+    };
+    if sync::shared_structure::repo_owner_is(gh, &login) {
+        return false;
+    }
+    let Ok(peers) = db.list_repos_by_project(Some(project_id)) else {
+        return false;
+    };
+    peers.iter().any(|p| {
+        db.get_shared_state(p.id).is_ok_and(|s| {
+            !s.shared_mode && matches!(s.shared_role.as_deref(), Some("contributor" | "pending"))
+        })
+    })
+}
+
+/// Push `NoLocalPath` for `repo` unless it is expected (see
+/// [`is_uncloned_foreign_shared_repo`]).
+fn report_no_local_path(db: &AppDb, c: &mut SyncCounters, repo: &Repository) {
+    if !is_uncloned_foreign_shared_repo(db, repo) {
+        c.push(no_local_path(repo));
+    }
+}
+
 /// `ensure_root_exists` failed. The detail is the path, not its English message.
 fn root_missing(repo: &Repository) -> SyncIssue {
     let issue = SyncIssue::new(Code::RootMissing, repo.display_name());
@@ -403,7 +438,7 @@ fn sync_server_to_microservice(
         let ms_path = match ms_server_repo.local_path.as_deref() {
             Some(p) => p,
             None => {
-                c.push(no_local_path(&ms_server_repo));
+                report_no_local_path(db, c, &ms_server_repo);
                 continue;
             }
         };
@@ -697,7 +732,7 @@ fn sync_microservice_to_parents(
                     continue;
                 };
                 let Some(ref parent_local) = parent_server.local_path else {
-                    c.push(no_local_path(parent_server));
+                    report_no_local_path(db, c, parent_server);
                     continue;
                 };
                 let parent_base = Path::new(parent_local);
@@ -941,7 +976,7 @@ fn run_codex_req_channels(db: &AppDb, project_id: i64, project_type: &str, c: &m
     // Returns None (after pushing an error) otherwise.
     let guard = |repo: &Repository, c: &mut SyncCounters| -> bool {
         let Some(ref lp) = repo.local_path else {
-            c.push(no_local_path(repo));
+            report_no_local_path(db, c, repo);
             return false;
         };
         let base = Path::new(lp);
@@ -1156,7 +1191,7 @@ pub(crate) fn run_project_sync_in(
         let Some(path) = repo.local_path.as_deref() else {
             // B-000002: surface silently-skipped repos so user sees why project.md /
             // CLAUDE.md / .gitignore weren't written for this repo.
-            c.push(no_local_path(repo));
+            report_no_local_path(db, &mut c, repo);
             continue;
         };
         let base = Path::new(path);
@@ -1181,7 +1216,7 @@ pub(crate) fn run_project_sync_in(
             continue;
         };
         let Some(path) = ms_server.local_path.as_deref() else {
-            c.push(no_local_path(&ms_server));
+            report_no_local_path(db, &mut c, &ms_server);
             continue;
         };
         let base = Path::new(path);
@@ -1216,7 +1251,7 @@ pub(crate) fn run_project_sync_in(
 
     if let Some(srv) = server {
         if srv.local_path.is_none() {
-            c.push(no_local_path(srv));
+            report_no_local_path(db, &mut c, srv);
         }
         if let Some(ref srv_path) = srv.local_path {
             let srv_base = Path::new(srv_path);
@@ -1424,6 +1459,72 @@ mod tests {
             repo_dir.path().join("docs").join("sdh_skills").is_dir(),
             "the rest of the pass still ran for the repo that exists"
         );
+    }
+
+    // ── T-000231: an un-cloned foreign repo is not reported ─────────────────
+
+    fn contributor_project(db: &AppDb, dir: &Path, others: &[(&str, &str)]) -> i64 {
+        db.set_setting("github_login", "helper").unwrap();
+        let p = db.create_project("Shared", None, "standard").unwrap();
+        let mine = db
+            .insert_local_repository(&dir.to_string_lossy(), "tool", Some(p.id), Some("tool"))
+            .unwrap();
+        db.set_shared_role(mine.id, Some("contributor")).unwrap();
+        for (gh, role) in others {
+            let r = db
+                .upsert_repository(gh, None, None, None, None, None)
+                .unwrap();
+            db.assign_repository(r.id, Some(p.id), Some(role)).unwrap();
+        }
+        p.id
+    }
+
+    fn no_path_subjects(r: &SyncResult) -> Vec<String> {
+        r.errors
+            .iter()
+            .filter(|e| e.code == Code::NoLocalPath)
+            .map(|e| e.subject.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_contributor_project_does_not_report_an_uncloned_foreign_repo() {
+        let (db, _db_dir, home) = seeded_db();
+        let dir = TempDir::new().unwrap();
+        let pid = contributor_project(&db, dir.path(), &[("owner/web", "server")]);
+        let r = run_project_sync_in(&db, pid, Some(home.path().to_path_buf())).unwrap();
+        assert!(no_path_subjects(&r).is_empty(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn test_contributor_project_still_reports_its_own_repo_without_a_path() {
+        let (db, _db_dir, home) = seeded_db();
+        let dir = TempDir::new().unwrap();
+        let pid = contributor_project(&db, dir.path(), &[("helper/api", "server")]);
+        let r = run_project_sync_in(&db, pid, Some(home.path().to_path_buf())).unwrap();
+        assert_eq!(no_path_subjects(&r).len(), 1, "{:?}", r.errors);
+    }
+
+    #[test]
+    fn test_ordinary_project_still_reports_a_foreign_repo_without_a_path() {
+        let (db, _db_dir, home) = seeded_db();
+        let dir = TempDir::new().unwrap();
+        db.set_setting("github_login", "helper").unwrap();
+        let p = db.create_project("Plain", None, "standard").unwrap();
+        db.insert_local_repository(
+            &dir.path().to_string_lossy(),
+            "tool",
+            Some(p.id),
+            Some("tool"),
+        )
+        .unwrap();
+        let r = db
+            .upsert_repository("owner/web", None, None, None, None, None)
+            .unwrap();
+        db.assign_repository(r.id, Some(p.id), Some("server"))
+            .unwrap();
+        let res = run_project_sync_in(&db, p.id, Some(home.path().to_path_buf())).unwrap();
+        assert_eq!(no_path_subjects(&res).len(), 1, "{:?}", res.errors);
     }
 
     // ── T-000207: hand-backs are collected across the whole portfolio ───────
