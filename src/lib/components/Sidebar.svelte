@@ -870,9 +870,11 @@ ${formatSyncIssues(result.errors)}`, 'warning');
           {/if}
         </div>
       {/each}
+    {/if}
 
-      <!-- Unassigned group -->
-      {#if unassignedRepos.length > 0}
+    <!-- Unassigned group: also shown with no project at all (T-000215: a
+         fresh install with repos but no projects showed none of them). -->
+    {#if unassignedRepos.length > 0}
         <div
           class="project-group unassigned"
           class:drag-over={dragOverProjectId === -1}
@@ -885,7 +887,7 @@ ${formatSyncIssues(result.errors)}`, 'warning');
               onclick={toggleUnassigned}
               title={unassignedCollapsed ? $tStore('sidebar.expand') : $tStore('sidebar.collapse')}
             >
-              <span class="chevron" class:rotated={unassignedCollapsed}>▾</span>
+              <span class="chevron" class:rotated={unassignedCollapsed && $projects.length > 0}>▾</span>
             </button>
             <span class="project-name muted">
               {$tStore('sidebar.unassigned')}
@@ -893,7 +895,7 @@ ${formatSyncIssues(result.errors)}`, 'warning');
             </span>
           </div>
 
-          {#if !unassignedCollapsed}
+          {#if !unassignedCollapsed || $projects.length === 0}
             <ul class="repo-list">
               {#each unassignedRepos as repo (repo.id)}
                 {@const badge = sharedBadgeOf(repo.id)}
@@ -923,7 +925,6 @@ ${formatSyncIssues(result.errors)}`, 'warning');
             </ul>
           {/if}
         </div>
-      {/if}
     {/if}
   </div>
   {#if isDragging}
