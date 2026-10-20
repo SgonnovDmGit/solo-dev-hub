@@ -492,6 +492,7 @@ fn tracked(dir: &Path, rev: &str) -> Vec<String> {
 /// is removed, and after one sync origin/dev carries `.sdh/project.json`, the
 /// `merge=sdh` attributes and the tracked task files; the driver is registered
 /// in `.git/config`.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn v1_owner_enables_shared_mode_and_the_sync_publishes_the_structure() {
     let w = World::new();
@@ -573,6 +574,7 @@ fn v1_owner_enables_shared_mode_and_the_sync_publishes_the_structure() {
 /// owner's next sync shows the request; the owner approves; after both sync the
 /// helper is a contributor with the band 500000, and the helper's project was
 /// created locally with the role of the repo read from the structure.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn v2_helper_joins_the_owner_approves_and_the_helper_becomes_a_contributor() {
     let w = World::new();
@@ -647,6 +649,7 @@ fn v2_helper_joins_the_owner_approves_and_the_helper_becomes_a_contributor() {
 /// structure without participants. After the owner approves, that stale copy
 /// must not beat the owner's newer one on origin/dev: the helper becomes a
 /// contributor and the request does not come back to origin/dev.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn v2_a_stale_worktree_structure_does_not_keep_the_helper_pending() {
     let w = World::new();
@@ -694,6 +697,7 @@ fn v2_a_stale_worktree_structure_does_not_keep_the_helper_pending() {
 /// the sidebar "Sync" probe must start the join by itself -- the project is
 /// created from the structure, the repo is assigned with its role, the role is
 /// pending and the request is on the owner's dev branch.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn the_probe_alone_starts_the_join_of_a_helper_without_a_project() {
     let w = World::new();
@@ -820,6 +824,7 @@ impl World {
 /// button (`B-500000`); after the helper's sync and the owner's, the owner has
 /// both, with the helper as the author in the timeline, and the owner's next
 /// bug from the button is the owner's next number, not `B-500001`.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn v3_helpers_task_and_bug_reach_the_owner_with_their_author_and_the_bands_hold() {
     let w = World::new();
@@ -895,6 +900,7 @@ fn v3_helpers_task_and_bug_reach_the_owner_with_their_author_and_the_bands_hold(
 /// `todo.md` between two syncs. After the syncs (and the Merge button wherever
 /// a repo asks for it) both work trees and both branches on the remote hold
 /// both edits, and no conflict marker is anywhere.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn v4_different_tasks_of_one_todo_are_both_kept_everywhere() {
     let w = World::new();
@@ -960,6 +966,7 @@ fn v4_different_tasks_of_one_todo_are_both_kept_everywhere() {
 /// Verification 5: both change the status of the same task between syncs (the
 /// owner to `in-progress`, the helper to `review`). Both sides end with the same
 /// result: the status that is further along, `review`; and the other way round.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn v5_the_same_task_changed_on_both_sides_ends_with_the_further_status() {
     let w = World::new();
@@ -1032,6 +1039,7 @@ fn v5_the_same_task_changed_on_both_sides_ends_with_the_further_status() {
 /// committed. The helper edits the description of `T-500000` in their `todo.md`
 /// and syncs: the owner's next sync takes the new description in, in the
 /// database and in the file.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn v6_a_local_ai_edit_of_a_bug_is_undone_and_a_committed_task_edit_is_taken() {
     let w = World::new();
@@ -1117,6 +1125,7 @@ fn v6_a_local_ai_edit_of_a_bug_is_undone_and_a_committed_task_edit_is_taken() {
 /// runs inside the test harness, which is not the app; see `arm_driver` for how
 /// the very same driver code runs inside a real `git merge` here. The real
 /// binary in a real `git merge` is covered by `tests/merge_driver_git.rs`.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
     let w = World::new();
@@ -1224,6 +1233,7 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
 /// helper's next syncs raise no status and leave every row of the helper's
 /// database intact; the repo is ordinary for the helper (no role) and its branch
 /// no longer carries `.sdh/` (BUG-3, below).
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn v11_switching_off_removes_sdh_and_the_helpers_repo_is_ordinary_again() {
     let w = World::new();
@@ -1303,6 +1313,7 @@ fn v11_switching_off_removes_sdh_and_the_helpers_repo_is_ordinary_again() {
 /// one except forward. The remote's own `update` hook refuses and records any
 /// such update (checked after every sync by `World::check_origin`); this test
 /// also compares the end state with the start.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn guard_nothing_ever_writes_master_or_main_or_forces_the_remote() {
     let w = World::new();
@@ -1370,6 +1381,7 @@ fn guard_nothing_ever_writes_master_or_main_or_forces_the_remote() {
 /// `needs_manual_merge` and the helper never got the owner's files again. Now a
 /// contributor's / pending helper's install renders nothing there, and copies an
 /// earlier run left untracked are removed.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn bug1_a_contributors_rendered_skills_do_not_block_the_fast_forward() {
     let w = World::new();
@@ -1396,6 +1408,7 @@ fn bug1_a_contributors_rendered_skills_do_not_block_the_fast_forward() {
 /// with a `taken` event naming the owner -- and is rendered to `~/.claude`, the
 /// rule is locked in the app while the repo is shared, and switching sharing off
 /// unlocks it, the text staying.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn the_owners_rule_canon_reaches_a_contributor_and_is_released_on_switch_off() {
     const FILE: &str = "skill.sdh-debugging.md.tmpl";
@@ -1493,6 +1506,7 @@ fn the_owners_rule_canon_reaches_a_contributor_and_is_released_on_switch_off() {
 /// `todo.md` -- by a local AI in an ordinary repo, or by a helper's commit in a
 /// shared one (items 4 and 6 of the spec) -- shows the OLD text there while the
 /// file has the new one.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn bug2_a_reworded_task_description_reaches_the_tasks_table() {
     let fx = two_installs();
@@ -1541,6 +1555,7 @@ fn assert_no_sdh_anywhere(w: &World) {
 /// contributor for good. Now the owner removes it from every participant branch
 /// too, the contributor reads the switch-off from origin's dev, and the branch
 /// no longer carries the file after a round.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn bug3_switching_off_makes_the_helpers_repo_ordinary_again() {
     let w = World::new();
@@ -1570,6 +1585,7 @@ fn bug3_switching_off_makes_the_helpers_repo_ordinary_again() {
 /// switch-off from origin's dev, clears the role and deletes the stale file from
 /// its own branch -- committed on the current branch and pushed -- so a later
 /// pull request from it cannot switch sharing back on in dev.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
 fn bug3_the_contributor_drops_a_stale_structure_the_owner_could_not_remove() {
     let w = World::new();

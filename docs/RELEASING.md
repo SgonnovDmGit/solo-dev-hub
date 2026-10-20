@@ -44,7 +44,7 @@ git checkout dev && git rebase master   # подтягиваем хотфикс 
 
 Все шаги 1-5 выполняются на ветке `dev`. Шаг 6 переводит готовое в `master` и тегирует.
 
-1. Убедиться что `dev` в чистом состоянии, тесты зелёные (`cargo test --lib`, `npm test`, `npm run check`). На `master` нет коммитов после последнего тега, иначе сначала `git rebase master` на `dev`.
+1. Убедиться что `dev` в чистом состоянии, тесты зелёные (`cargo test --lib` — быстрый набор; полный с `--include-ignored` гоняет CI на push в `dev`, см. README «Tests»; `npm test`, `npm run check`). На `master` нет коммитов после последнего тега, иначе сначала `git rebase master` на `dev`.
 2. **Bump версии** в 3 файлах:
    - `package.json` (`"version": "..."`)
    - `src-tauri/Cargo.toml` (`version = "..."`)
@@ -83,7 +83,7 @@ git checkout dev && git rebase master   # подтягиваем хотфикс 
 - Linux-цели задаются аргументом `--bundles appimage,deb` у `tauri-action` (не в `tauri.conf.json`, чтобы локальная Windows-сборка не менялась). Подписанный AppImage даёт запись `linux-x86_64` в `latest.json`.
 - Автообновление работает только у AppImage. `.deb` ставится вручную и сам не обновляется.
 - Хранилище секретов на Linux — Secret Service по D-Bus (GNOME Keyring / KWallet), фича `sync-secret-service` в `Cargo.toml` (target-specific). Без запущенного демона PAT и ключ шифрования секретов сохранить нельзя: UI получит строку ошибки от keyring.
-- `.github/workflows/linux-build.yml` (push в `dev` и ручной запуск): `cargo test --lib` и сборка AppImage + deb **без публикации**; артефакты `solo-dev-hub-linux-<sha>` хранятся 14 дней. Используется для проверки Linux-сборки до тега.
+- `.github/workflows/linux-build.yml` (push в `dev` и ручной запуск): `cargo test --lib -- --include-ignored --skip db::migrations::tests::export_fresh_schema_db` (полный набор, включая тесты с git, проигнорированные локально) и сборка AppImage + deb **без публикации**; артефакты `solo-dev-hub-linux-<sha>` хранятся 14 дней. Используется для проверки Linux-сборки до тега.
 
 ## GitHub Actions secrets (один раз настраиваются)
 

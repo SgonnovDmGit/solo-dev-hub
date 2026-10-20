@@ -1119,7 +1119,7 @@ mod tests {
     /// Lives here rather than in `examples/` because `mod db` is private —
     /// generating docs shouldn't widen the crate's public surface.
     #[test]
-    #[ignore]
+    #[ignore = "generator, not a test: run by scripts/schema-docs.sh, needs SDH_SCHEMA_DB_PATH"]
     fn export_fresh_schema_db() {
         let path = std::env::var("SDH_SCHEMA_DB_PATH")
             .expect("set SDH_SCHEMA_DB_PATH to the file the schema should be written to");

@@ -3761,6 +3761,7 @@ mod tests {
 
     // ----- owner side ---------------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn main_commits_the_current_branch_and_pushes() {
         let fx = two_installs();
@@ -3796,6 +3797,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn main_plumbs_a_merged_todo_into_a_participant_branch() {
         let fx = two_installs();
@@ -3858,6 +3860,7 @@ mod tests {
 
     // ----- contributor side -----------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn contributor_commits_own_branch_and_mains_dev_never_master() {
         let fx = two_installs();
@@ -3904,6 +3907,7 @@ mod tests {
         assert!(g(&fx.helper_dir, &["status", "--porcelain"]).contains("src/"));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn contributor_without_an_own_branch_commits_nothing() {
         let fx = two_installs();
@@ -3920,6 +3924,7 @@ mod tests {
         assert!(codes(&out).contains(&Code::SharedNoOwnBranch));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn pending_helper_sends_only_its_request_to_mains_dev() {
         let fx = two_installs();
@@ -3951,6 +3956,7 @@ mod tests {
         assert!(repo.project_id.is_some());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn approval_makes_the_pending_helper_a_contributor() {
         let fx = two_installs();
@@ -3974,6 +3980,7 @@ mod tests {
 
     // ----- statuses ---------------------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn protected_branch_push_is_reported_once() {
         let fx = two_installs();
@@ -4027,6 +4034,7 @@ mod tests {
         assert_eq!(fx.helper_status().as_deref(), Some("push_rejected"));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn diverged_current_branch_needs_a_manual_merge_and_the_button_merges() {
         let fx = two_installs();
@@ -4071,6 +4079,7 @@ mod tests {
         assert!(fx.remote_file("dev", ".sdh/requests/helper.json").is_some());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn untrusted_structure_sets_a_status_and_commits_nothing() {
         let fx = two_installs();
@@ -4112,6 +4121,7 @@ mod tests {
             .is_none());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn no_login_marks_a_shared_repo_and_skips_it() {
         let fx = two_installs();
@@ -4123,6 +4133,7 @@ mod tests {
         assert!(fx.sync_main().issues.is_empty());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_repo_that_stops_being_shared_becomes_ordinary_again() {
         let fx = two_installs();
@@ -4138,6 +4149,7 @@ mod tests {
         assert!(!is_shared_repo(&fx.helper_db, fx.helper_repo));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn phase_a_leaves_ordinary_repos_alone() {
         let fx = two_installs();
@@ -4150,6 +4162,7 @@ mod tests {
 
     // ----- switching on and off ----------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn preflight_finds_a_user_section_line_and_enable_removes_exactly_it() {
         let fx = two_installs();
@@ -4192,6 +4205,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn preflight_flags_a_missing_project_and_dev_branch_and_enable_refuses() {
         let fx = two_installs();
@@ -4212,6 +4226,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn enable_refuses_a_repo_owned_by_somebody_else() {
         let fx = two_installs();
@@ -4224,6 +4239,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn disable_deletes_the_structure_and_commits_and_pushes_it() {
         let fx = two_installs();
@@ -4245,6 +4261,7 @@ mod tests {
             .is_empty());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn disable_from_another_branch_plumbs_the_deletion_into_dev() {
         let fx = two_installs();
@@ -4256,6 +4273,7 @@ mod tests {
         assert_eq!(g(&fx.main_dir, &["branch", "--show-current"]), "feature");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn accept_new_main_branch_clears_the_pin_and_status() {
         let fx = two_installs();
@@ -4296,6 +4314,7 @@ mod tests {
         assert_eq!(fx.helper_status(), None);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn join_requests_are_listed_for_the_owner() {
         let fx = two_installs();
@@ -4323,6 +4342,7 @@ mod tests {
 
     // ----- plumbing rules --------------------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn plumbing_is_a_three_way_copy_for_other_shared_files() {
         let fx = two_installs();
@@ -4359,6 +4379,7 @@ mod tests {
         assert_eq!(fx.remote_file("helper-dev", "docs/server-api/api.md"), None);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn rule_marker_files_never_travel_with_the_skills_folder() {
         let fx = two_installs();
@@ -4378,6 +4399,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn contributors_never_commit_the_skills_folder() {
         let fx = two_installs();
@@ -4436,6 +4458,7 @@ mod tests {
         assert_eq!(fresh_issues(7, dir.path(), vec![issue("other")]).len(), 1);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn head_history_lookups_for_plumbing() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4466,6 +4489,7 @@ mod tests {
         assert_eq!(last_version_sha(&git, d, "never.md"), None);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_repo_in_the_middle_of_a_merge_or_detached_is_left_alone() {
         let fx = two_installs();
@@ -4492,6 +4516,7 @@ mod tests {
         assert_eq!(fx.sync_helper().committed, vec!["api".to_string()]);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn the_old_autocommit_never_touches_a_repo_the_shared_pass_took_over() {
         let fx = two_installs();
@@ -4517,6 +4542,7 @@ mod tests {
         assert_eq!(g(&fx.main_dir, &["rev-parse", "HEAD"]), head);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn non_sync_commits_on_a_non_current_branch_block_plumbing_and_push() {
         let fx = two_installs();
@@ -4564,6 +4590,7 @@ mod tests {
             .contains("T-500001"));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_diverged_branch_holding_only_our_commits_is_reset_with_a_backup() {
         let fx = two_installs();
@@ -4593,6 +4620,7 @@ mod tests {
         assert_eq!(fx.helper_status(), None, "{:?}", out.issues);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_newer_foreign_version_is_not_clobbered_by_plumbing() {
         let fx = two_installs();
@@ -4609,6 +4637,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn managed_root_files_are_committed_on_the_current_branch_only() {
         let fx = two_installs();
@@ -4625,6 +4654,7 @@ mod tests {
         assert_eq!(fx.remote_file("helper-dev", ".gitignore"), None);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn owner_off_the_dev_branch_still_sees_and_prunes_join_requests() {
         let fx = two_installs();
@@ -4650,6 +4680,7 @@ mod tests {
 
     // ----- project scope and probes ---------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn phase_a_only_reaches_the_shared_repos_of_the_synced_project() {
         let fx = two_installs();
@@ -4664,6 +4695,7 @@ mod tests {
         assert!(some.handled.contains(&fx.main_repo));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_role_less_repo_is_probed_at_most_every_ten_minutes_across_restarts() {
         let fx = two_installs();
@@ -4696,6 +4728,7 @@ mod tests {
         assert!(fx.remote_file("dev", ".sdh/requests/helper.json").is_some());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_manual_probe_ignores_the_ten_minute_throttle() {
         let fx = two_installs();
@@ -4720,6 +4753,7 @@ mod tests {
 
     // ----- switching off, review round -------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn disable_before_any_sync_just_removes_the_files() {
         let fx = two_installs();
@@ -4734,6 +4768,7 @@ mod tests {
         assert!(!st.shared_mode && st.shared_role.is_none());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn only_the_owner_can_disable_and_nothing_flips_on_a_refusal() {
         let fx = two_installs();
@@ -4746,6 +4781,7 @@ mod tests {
         assert!(disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).is_err());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_refused_push_of_the_removal_is_retried_by_the_next_sync() {
         let fx = two_installs();
@@ -4804,6 +4840,7 @@ mod tests {
         !g(dir, &["ls-tree", "-r", "--name-only", rev, "--", ".sdh"]).is_empty()
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_failed_cleanup_push_is_retried_until_the_branch_on_origin_is_clean() {
         let fx = two_installs();
@@ -4849,6 +4886,7 @@ mod tests {
             .shared_role
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn without_the_pinned_dev_ref_nothing_is_deleted() {
         let fx = two_installs();
@@ -4881,6 +4919,7 @@ mod tests {
         g(dir, &["update-ref", branch_ref, &c]);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_diverged_participant_branch_is_skipped_with_a_note() {
         let fx = two_installs();
@@ -4915,6 +4954,7 @@ mod tests {
             .any(|s| s == "foreign"));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_retried_removal_is_made_again_on_top_of_a_branch_origin_moved_past() {
         let fx = two_installs();
@@ -5043,6 +5083,7 @@ mod tests {
             .count()
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_bug_the_helper_committed_arrives_with_its_author_and_events() {
         let fx = two_installs();
@@ -5083,6 +5124,7 @@ mod tests {
             .contains("B-500000"));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_committed_protected_change_is_accepted_and_attributed_by_trailer() {
         let fx = two_installs();
@@ -5139,6 +5181,7 @@ mod tests {
             .contains("helper rewrote it"));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn an_uncommitted_local_edit_of_a_protected_field_is_restored() {
         let fx = two_installs();
@@ -5169,6 +5212,7 @@ mod tests {
             .contains("local AI changed it"));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_row_only_the_work_tree_has_is_not_a_bug() {
         let fx = two_installs();
@@ -5192,6 +5236,7 @@ mod tests {
         assert!(!fs::read_to_string(&path).unwrap().contains("B-000009"));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_confirmed_bug_removed_by_commit_is_archived_a_live_one_is_kept() {
         let fx = two_installs();
@@ -5251,6 +5296,7 @@ mod tests {
         }
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn task_events_carry_the_author_of_the_commit_and_local_edits_carry_none() {
         let fx = two_installs();
@@ -5291,6 +5337,7 @@ mod tests {
         assert!(mine.iter().all(|e| e.author.as_deref() == Some("helper")));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn the_first_sync_is_a_baseline_and_applies_nothing_spurious() {
         let fx = two_installs();
@@ -5376,6 +5423,7 @@ mod tests {
         assert!(imp.blobs["docs/bug-reports.md"].contains('@'));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_file_that_does_not_change_is_not_imported_twice() {
         let fx = two_installs();
@@ -5398,6 +5446,7 @@ mod tests {
         assert_eq!(bug_events_of(&fx.main_db, "B-500000").len(), n);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn authors_follow_the_trailer_or_the_band() {
         let s = ProjectStructure {
@@ -5465,6 +5514,7 @@ mod tests {
         new
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn reset_to_origin_uses_the_judged_tip_and_refuses_a_checked_out_branch() {
         let fx = two_installs();
@@ -5492,6 +5542,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_pending_removal_is_fetched_before_it_is_pushed() {
         let fx = two_installs();
@@ -5516,6 +5567,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn enabling_sharing_again_drops_a_leftover_removal_marker() {
         let fx = two_installs();
@@ -5535,6 +5587,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn last_common_blob_finds_the_shared_version_of_unrelated_lineages() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5688,6 +5741,7 @@ mod tests {
         s
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_task_moved_to_done_stays_moved_and_nothing_resurrects() {
         let fx = two_installs();
@@ -5777,6 +5831,7 @@ mod tests {
         assert!(!mine.contains("T-000001") && mine.contains("T-500001"));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_first_sync_with_a_dirty_bugs_file_keeps_the_local_work() {
         let fx = two_installs();
@@ -5852,6 +5907,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn refused_rows_are_reported_and_hold_the_reconcile_back_for_one_pass() {
         let fx = two_installs();

@@ -182,7 +182,7 @@ Full detail, including the microservice triangle and announcement channels: [`fl
 npm install
 npm run tauri dev                    # dev, hot reload
 
-cd src-tauri && cargo test --lib     # 459 Rust tests
+cd src-tauri && cargo test --lib     # fast set; full: add -- --include-ignored (see README)
 npx vitest run                       # 86 frontend tests (from repo root)
 npm run check                        # svelte-check
 

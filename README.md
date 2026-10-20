@@ -119,7 +119,9 @@ npm run tauri dev          # local dev with hot reload
 ### Tests
 
 ```bash
-cd src-tauri && cargo test --lib   # ~901 Rust tests
+cd src-tauri && cargo test --lib   # fast default: ~786 Rust tests, ~45 s
+cd src-tauri && cargo test --lib -- --include-ignored --skip db::migrations::tests::export_fresh_schema_db
+                                    # full set (~911 tests), what CI runs (~1 min on Linux, ~40 min on Windows: git spawns)
 npm test                            # vitest frontend (~177 tests)
 npm run check                       # svelte-check
 ```

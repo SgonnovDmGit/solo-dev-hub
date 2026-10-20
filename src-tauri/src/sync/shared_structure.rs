@@ -1552,6 +1552,7 @@ mod tests {
 
     // ----- requests ----------------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn requests_write_list_and_filter() {
         let tmp = TempDir::new().unwrap();
@@ -1672,6 +1673,7 @@ mod tests {
         }
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_prefers_working_tree() {
         let fx = fx();
@@ -1681,6 +1683,7 @@ mod tests {
         assert_eq!(s.project.name, "Acme");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_none_without_structure() {
         let fx = fx();
@@ -1692,6 +1695,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_reads_remote_ref_matching_dev_branch() {
         let fx = fx();
@@ -1702,6 +1706,7 @@ mod tests {
         assert_eq!(s.main.dev_branch, "dev");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_ignores_ref_that_is_not_the_published_dev_branch() {
         let fx = fx();
@@ -1714,6 +1719,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_compares_dev_branch_and_ref_name_exactly() {
         let fx = fx();
@@ -1725,6 +1731,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_rejects_a_forged_self_consistent_structure() {
         let fx = fx();
@@ -1751,6 +1758,7 @@ mod tests {
         assert_eq!(s.main.login, "Owner");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_untrusted_worktree_file_still_checks_refs() {
         let fx = fx();
@@ -1768,6 +1776,7 @@ mod tests {
         assert_eq!(src, "origin/dev");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_refuses_an_oversized_blob() {
         let fx = fx();
@@ -2064,6 +2073,7 @@ mod tests {
         assert_eq!(names, vec!["project.json"]);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn oversized_structure_file_is_refused() {
         let tmp = TempDir::new().unwrap();
@@ -2086,6 +2096,7 @@ mod tests {
         r.is_ok()
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn symlinked_sdh_dirs_are_refused() {
         let tmp = TempDir::new().unwrap();
@@ -2162,6 +2173,7 @@ mod tests {
         assert!(db.list_projects().unwrap().is_empty());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn apply_skips_a_microservice_that_cannot_be_connected() {
         let db = make_helper_db();
@@ -2190,6 +2202,7 @@ mod tests {
         publish(fx, "aaa", "aaa", "2026-06-01T00:00:00Z");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_unpinned_with_two_valid_refs_is_ambiguous() {
         let fx = fx();
@@ -2204,6 +2217,7 @@ mod tests {
         }
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_pinned_ignores_other_refs() {
         let fx = fx();
@@ -2219,6 +2233,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_pinned_detects_a_changed_dev_branch() {
         let fx = fx();
@@ -2237,6 +2252,7 @@ mod tests {
         }
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_pinned_worktree_file_must_name_the_pinned_branch() {
         let fx = fx();
@@ -2265,6 +2281,7 @@ mod tests {
         c
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_origin_dev_beats_a_stale_worktree_copy_unpinned() {
         let fx = fx();
@@ -2274,6 +2291,7 @@ mod tests {
         assert_eq!(s.participants.len(), 1);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_origin_dev_beats_a_stale_worktree_copy_pinned() {
         let fx = fx();
@@ -2283,6 +2301,7 @@ mod tests {
         assert_eq!(s.participants.len(), 1);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_worktree_is_the_fallback_without_a_remote_ref() {
         let fx = fx();
@@ -2294,6 +2313,7 @@ mod tests {
         }
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn discover_pinned_origin_change_is_not_hidden_by_a_stale_worktree() {
         let fx = fx();
