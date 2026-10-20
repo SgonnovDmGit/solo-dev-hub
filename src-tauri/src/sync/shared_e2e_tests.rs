@@ -642,6 +642,54 @@ fn v2_helper_joins_the_owner_approves_and_the_helper_becomes_a_contributor() {
     w.check_origin();
 }
 
+/// Verification 2, stale checkout: the helper's own branch is created from
+/// `origin/dev` AFTER the owner shared, so the helper's work tree holds the
+/// structure without participants. After the owner approves, that stale copy
+/// must not beat the owner's newer one on origin/dev: the helper becomes a
+/// contributor and the request does not come back to origin/dev.
+#[test]
+fn v2_a_stale_worktree_structure_does_not_keep_the_helper_pending() {
+    let w = World::new();
+    let fx = &w.fx;
+    w.owner_shares();
+    g(&fx.helper_dir, &["fetch", "-q", "origin"]);
+    g(
+        &fx.helper_dir,
+        &["checkout", "-q", "-B", "helper-dev", "origin/dev"],
+    );
+    assert!(
+        w.helper_file(".sdh/project.json")
+            .contains("\"participants\": []"),
+        "the checkout holds the structure without participants"
+    );
+    fx.helper_db
+        .set_autocommit_branch(fx.helper_repo, Some("helper-dev"))
+        .unwrap();
+
+    w.sync_helper();
+    assert_eq!(
+        shared_role(&fx.helper_db, fx.helper_repo).as_deref(),
+        Some("pending")
+    );
+    w.sync_owner();
+    approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper").unwrap();
+    w.sync_owner(); // approval committed and pushed
+    w.sync_helper();
+    assert_eq!(
+        shared_role(&fx.helper_db, fx.helper_repo).as_deref(),
+        Some("contributor"),
+        "the owner's newer structure on origin/dev wins over the stale copy"
+    );
+    w.sync_owner();
+    w.sync_helper();
+    assert_eq!(fx.remote_file("dev", ".sdh/requests/helper.json"), None);
+    assert_eq!(
+        shared_role(&fx.helper_db, fx.helper_repo).as_deref(),
+        Some("contributor")
+    );
+    w.check_origin();
+}
+
 // ---------------------------------------------------------------------------
 // Scenario helpers
 // ---------------------------------------------------------------------------

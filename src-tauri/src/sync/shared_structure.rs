@@ -1029,20 +1029,6 @@ pub fn discover_structure(
         }
     }
 
-    match read_structure_raw(repo_root) {
-        Ok(Some(s)) => match validate_structure(&s, github_name) {
-            Ok(()) => match pinned {
-                Some(pin) if s.main.dev_branch != pin => {
-                    untrusted = Some(dev_branch_changed_reason(pin, &s.main.dev_branch));
-                }
-                _ => return Ok(DiscoverOutcome::Found(s, SOURCE_WORKTREE.to_string())),
-            },
-            Err(reason) => untrusted = Some(format!("{}: {}", STRUCTURE_REL_PATH, reason)),
-        },
-        Ok(None) => {}
-        Err(reason) => untrusted = Some(reason),
-    }
-
     let read_ref = |full: &str| -> Option<ProjectStructure> {
         match git_sync::show_file_capped(
             git,
@@ -1056,18 +1042,61 @@ pub fn discover_structure(
         }
     };
 
+    // The owner's dev branch on origin is authoritative: a work-tree copy may
+    // be older (a helper branches off `origin/dev` before being approved and
+    // its checkout then never sees the approval), so an origin copy that
+    // validates always wins. The work tree is the fallback (no remote ref yet,
+    // offline, or the origin copy does not validate).
     if let Some(pin) = pinned {
         let full = format!("refs/remotes/origin/{}", pin);
         if let Some(s) = read_ref(&full) {
             if s.main.dev_branch != pin {
-                untrusted = Some(dev_branch_changed_reason(pin, &s.main.dev_branch));
-            } else {
-                match validate_structure(&s, github_name) {
-                    Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", pin))),
-                    Err(reason) => untrusted = Some(format!("origin/{}: {}", pin, reason)),
-                }
+                // Never hidden by a work-tree copy that still names the pin.
+                return Ok(DiscoverOutcome::Untrusted(dev_branch_changed_reason(
+                    pin,
+                    &s.main.dev_branch,
+                )));
+            }
+            match validate_structure(&s, github_name) {
+                Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", pin))),
+                Err(reason) => untrusted = Some(format!("origin/{}: {}", pin, reason)),
             }
         }
+    }
+
+    match read_structure_raw(repo_root) {
+        Ok(Some(s)) => match validate_structure(&s, github_name) {
+            Ok(()) => match pinned {
+                Some(pin) if s.main.dev_branch != pin => {
+                    untrusted = Some(dev_branch_changed_reason(pin, &s.main.dev_branch));
+                }
+                Some(_) => return Ok(DiscoverOutcome::Found(s, SOURCE_WORKTREE.to_string())),
+                None => {
+                    // The work-tree file names the dev branch; its origin copy,
+                    // if it validates and names itself, is the newer truth.
+                    let branch = s.main.dev_branch.clone();
+                    let full = format!("refs/remotes/origin/{}", branch);
+                    if let Some(o) = read_ref(&full) {
+                        if o.main.dev_branch == branch
+                            && validate_structure(&o, github_name).is_ok()
+                        {
+                            return Ok(DiscoverOutcome::Found(o, format!("origin/{}", branch)));
+                        }
+                    }
+                    return Ok(DiscoverOutcome::Found(s, SOURCE_WORKTREE.to_string()));
+                }
+            },
+            Err(reason) => {
+                untrusted.get_or_insert(format!("{}: {}", STRUCTURE_REL_PATH, reason));
+            }
+        },
+        Ok(None) => {}
+        Err(reason) => {
+            untrusted.get_or_insert(reason);
+        }
+    }
+
+    if pinned.is_some() {
         return Ok(match untrusted {
             Some(reason) => DiscoverOutcome::Untrusted(reason),
             None => DiscoverOutcome::NotFound,
@@ -2222,6 +2251,62 @@ mod tests {
             discover_structure(&gb(), &fx.a, REPO, Some("other")).unwrap(),
             DiscoverOutcome::Found(_, _)
         ));
+    }
+
+    /// The owner's newer structure (with a participant) on origin/dev, and a
+    /// contributor whose work tree holds the older one (no participants) -
+    /// the copy a helper gets by branching off origin/dev before it is approved.
+    fn owner_approved_stale_worktree(fx: &Fx) -> PathBuf {
+        let mut approved = sample();
+        approved.participants.push(participant("helper", 500_000));
+        publish_struct(fx, "dev", &approved, "2026-01-01T00:00:00Z");
+        let c = contributor(fx);
+        write_structure_if_changed(&c, &sample()).unwrap();
+        c
+    }
+
+    #[test]
+    fn discover_origin_dev_beats_a_stale_worktree_copy_unpinned() {
+        let fx = fx();
+        let c = owner_approved_stale_worktree(&fx);
+        let (s, src) = found(discover_structure(&gb(), &c, REPO, None).unwrap());
+        assert_eq!(src, "origin/dev");
+        assert_eq!(s.participants.len(), 1);
+    }
+
+    #[test]
+    fn discover_origin_dev_beats_a_stale_worktree_copy_pinned() {
+        let fx = fx();
+        let c = owner_approved_stale_worktree(&fx);
+        let (s, src) = found(discover_structure(&gb(), &c, REPO, Some("dev")).unwrap());
+        assert_eq!(src, "origin/dev");
+        assert_eq!(s.participants.len(), 1);
+    }
+
+    #[test]
+    fn discover_worktree_is_the_fallback_without_a_remote_ref() {
+        let fx = fx();
+        let c = contributor(&fx);
+        write_structure_if_changed(&c, &sample()).unwrap();
+        for pin in [None, Some("dev")] {
+            let (_, src) = found(discover_structure(&gb(), &c, REPO, pin).unwrap());
+            assert_eq!(src, SOURCE_WORKTREE);
+        }
+    }
+
+    #[test]
+    fn discover_pinned_origin_change_is_not_hidden_by_a_stale_worktree() {
+        let fx = fx();
+        // origin/dev now names another dev branch; the work tree still says dev
+        publish(&fx, "dev", "other", "2026-01-01T00:00:00Z");
+        let c = contributor(&fx);
+        write_structure_if_changed(&c, &sample()).unwrap();
+        match discover_structure(&gb(), &c, REPO, Some("dev")).unwrap() {
+            DiscoverOutcome::Untrusted(reason) => {
+                assert_eq!(reason, "dev_branch_changed:dev\u{2192}other")
+            }
+            other => panic!("expected Untrusted, got {:?}", other),
+        }
     }
 
     #[test]
