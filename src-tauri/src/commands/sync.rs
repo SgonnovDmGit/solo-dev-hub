@@ -160,6 +160,13 @@ pub fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, Str
     sync::run_project_sync(&db, project_id)
 }
 
+/// Contributor mode: probe the role-less repos for a shared structure and run
+/// the sync of every project they land in. Git + network, so off the UI thread.
+#[tauri::command(async)]
+pub fn probe_shared_repos(db: State<AppDb>) -> Result<SyncResult, String> {
+    sync::probe_shared_repos(&db)
+}
+
 #[tauri::command]
 pub fn list_project_requirements(
     db: State<AppDb>,

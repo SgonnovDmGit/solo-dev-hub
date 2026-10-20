@@ -220,6 +220,7 @@ pub fn run() {
             // Requirements sync
             commands::sync::sync_global_claude_md,
             commands::sync::sync_project,
+            commands::sync::probe_shared_repos,
             commands::sync::init_docs_for_repo,
             commands::sync::list_project_requirements,
             commands::sync::list_codex_edges,

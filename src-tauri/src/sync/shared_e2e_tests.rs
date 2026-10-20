@@ -690,6 +690,48 @@ fn v2_a_stale_worktree_structure_does_not_keep_the_helper_pending() {
     w.check_origin();
 }
 
+/// A contributor with no project at all has nothing to run a project sync on:
+/// the sidebar "Sync" probe must start the join by itself -- the project is
+/// created from the structure, the repo is assigned with its role, the role is
+/// pending and the request is on the owner's dev branch.
+#[test]
+fn the_probe_alone_starts_the_join_of_a_helper_without_a_project() {
+    let w = World::new();
+    let fx = &w.fx;
+    w.owner_shares();
+    fx.helper_db
+        .set_autocommit_branch(fx.helper_repo, Some("helper-dev"))
+        .unwrap();
+    let before = fx.helper_db.get_repository(fx.helper_repo).unwrap();
+    assert!(before.project_id.is_none(), "the repo is in no project");
+
+    let r = crate::sync::project_sync::probe_shared_repos_in(
+        &fx.helper_db,
+        Some(w.helper_home.path().to_path_buf()),
+    )
+    .unwrap();
+    // The only remark is the pending-approval notice, once.
+    assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+    assert_eq!(
+        r.errors[0].code,
+        crate::models::SyncIssueCode::SharedPendingApproval
+    );
+
+    let repo = fx.helper_db.get_repository(fx.helper_repo).unwrap();
+    let project = fx.helper_db.get_project(repo.project_id.unwrap()).unwrap();
+    assert_eq!(project.name, "Acme");
+    assert_eq!(repo.role.as_deref(), Some("server"));
+    assert_eq!(
+        shared_role(&fx.helper_db, fx.helper_repo).as_deref(),
+        Some("pending")
+    );
+    assert!(fx
+        .remote_file("dev", ".sdh/requests/helper.json")
+        .unwrap()
+        .contains("helper-dev"));
+    w.check_origin();
+}
+
 // ---------------------------------------------------------------------------
 // Scenario helpers
 // ---------------------------------------------------------------------------

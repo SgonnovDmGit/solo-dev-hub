@@ -16,6 +16,13 @@ export async function syncProject(projectId: number): Promise<SyncResult> {
   return invoke<SyncResult>('sync_project', { projectId });
 }
 
+/** F-000044: probe the repos that are in no shared project yet for the owner's
+ *  shared structure and sync every project they land in (the contributor's
+ *  join: project created, role assigned, join request sent). */
+export async function probeSharedRepos(): Promise<SyncResult> {
+  return invoke<SyncResult>('probe_shared_repos');
+}
+
 /** T-000198: the branch the repo's checkout is on now (live, not stored);
  *  null when there is no local git checkout or HEAD is detached / unborn. */
 export async function getRepoCurrentBranch(repoId: number): Promise<string | null> {

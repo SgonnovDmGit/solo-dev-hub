@@ -1009,6 +1009,66 @@ fn finish_shared(
     }
 }
 
+/// Entry point of the sidebar "Sync" button for contributor mode: probe the
+/// role-less foreign repos of the portfolio for a shared structure and, for
+/// every project a probed repo ends up in, run that project's sync -- so the
+/// join really starts (the project is created from the structure, the repo is
+/// assigned with its role, a pending helper's request is committed and pushed
+/// into the owner's dev branch). A contributor who has no project yet has
+/// nothing else to press. The probe bypasses the 10-minute throttle (the user
+/// asked for it); repos owned by this install's login are never touched.
+pub fn probe_shared_repos(db: &AppDb) -> Result<SyncResult, String> {
+    probe_shared_repos_in(db, dirs::home_dir())
+}
+
+pub(crate) fn probe_shared_repos_in(
+    db: &AppDb,
+    home: Option<PathBuf>,
+) -> Result<SyncResult, String> {
+    let git = crate::git_ops::check_git_available();
+    let shared = sync::shared::probe_role_less(db, git.as_ref());
+    // Projects of the repos the probe took over (a repo that was found shared
+    // is in a project by now; one refused as untrusted is not).
+    let mut projects: Vec<i64> = Vec::new();
+    for repo_id in &shared.handled {
+        if let Ok(repo) = db.get_repository(*repo_id) {
+            if let Some(pid) = repo.project_id {
+                if !projects.contains(&pid) {
+                    projects.push(pid);
+                }
+            }
+        }
+    }
+    projects.sort_unstable();
+    let mut c = SyncCounters::new();
+    finish_shared(db, git.as_ref(), shared, &mut c);
+    let mut merged = c.into_result();
+    for pid in projects {
+        let r = run_project_sync_in(db, pid, home.clone())?;
+        merged.copied += r.copied;
+        merged.responses += r.responses;
+        merged.migrated += r.migrated;
+        for issue in r.errors {
+            if !merged.errors.contains(&issue) {
+                merged.errors.push(issue);
+            }
+        }
+        for (dst, src) in [
+            (&mut merged.auto_closed, r.auto_closed),
+            (&mut merged.committed, r.committed),
+            (&mut merged.rules_taken, r.rules_taken),
+            (&mut merged.rules_lost, r.rules_lost),
+        ] {
+            for x in src {
+                if !dst.contains(&x) {
+                    dst.push(x);
+                }
+            }
+        }
+    }
+    Ok(merged)
+}
+
 /// Orchestrator for a full project sync — the body of the former
 /// `sync_project` Tauri command. Writes Phase-0 skeletons to every repo, then
 /// runs the directional REQ / api / handlers copies based on project topology.

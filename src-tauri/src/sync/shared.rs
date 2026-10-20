@@ -1500,6 +1500,23 @@ enum FetchMode {
 /// role-less foreign repos of the portfolio. `git` `None` (no git on this
 /// machine) yields an empty pass.
 pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>, project_id: Option<i64>) -> SharedSync {
+    run_phase_a_with(db, git, project_id, false)
+}
+
+/// Phase A for the role-less foreign repos only (no project in scope), the probe
+/// of the sidebar "Sync" button. The user pressed the button on purpose, so the
+/// 10-minute probe throttle is bypassed (the slot is still taken, so the
+/// automatic probe of a project sync does not repeat it right away).
+pub fn probe_role_less(db: &AppDb, git: Option<&GitBinary>) -> SharedSync {
+    run_phase_a_with(db, git, None, true)
+}
+
+fn run_phase_a_with(
+    db: &AppDb,
+    git: Option<&GitBinary>,
+    project_id: Option<i64>,
+    force_probe: bool,
+) -> SharedSync {
     let mut sync = SharedSync::empty();
     let Some(git) = git else {
         return sync;
@@ -1581,8 +1598,11 @@ pub fn run_phase_a(db: &AppDb, git: Option<&GitBinary>, project_id: Option<i64>)
         }
         // A role-less repo is probed at most every 10 minutes (persisted); one
         // that was refused as untrusted is looked at again on every sync.
-        if !known && state.shared_status.is_none() && !probe_due(db, repo.id, now) {
-            continue;
+        if !known && state.shared_status.is_none() {
+            let due = probe_due(db, repo.id, now);
+            if !due && !force_probe {
+                continue;
+            }
         }
         let mode = if known {
             FetchMode::Always
@@ -4551,6 +4571,28 @@ mod tests {
             Some("pending")
         );
         assert!(fx.remote_file("dev", ".sdh/requests/helper.json").is_some());
+    }
+
+    #[test]
+    fn a_manual_probe_ignores_the_ten_minute_throttle() {
+        let fx = two_installs();
+        fx.enable_main();
+        let mut imp = ss::read_shared_import(&fx.helper_db, fx.helper_repo);
+        imp.last_probe_unix = Some(unix_now());
+        ss::write_shared_import(&fx.helper_db, fx.helper_repo, &imp).unwrap();
+        let sync = probe_role_less(&fx.helper_db, Some(&gb()));
+        assert!(
+            sync.handled.contains(&fx.helper_repo),
+            "probed a minute ago, but the user pressed the button"
+        );
+        assert_eq!(
+            fx.helper_db
+                .get_shared_state(fx.helper_repo)
+                .unwrap()
+                .shared_role
+                .as_deref(),
+            Some("pending")
+        );
     }
 
     // ----- switching off, review round -------------------------------------------------
