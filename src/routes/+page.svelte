@@ -194,7 +194,7 @@
         onclick={() => $currentScreen.name === 'dashboard' ? goBack() : navigateTo('dashboard')}
         title={$tStore('dashboard.tooltip')}
       >
-        📊 {$tStore('dashboard.title')}
+        📊 <span class="tb-label">{$tStore('dashboard.title')}</span>
       </button>
       <button
         class="ghost titlebar-btn"
@@ -202,7 +202,7 @@
         onclick={() => $currentScreen.name === 'timeline' ? goBack() : navigateTo('timeline')}
         title={$tStore('timeline.title' as any)}
       >
-        📅 {$tStore('timeline.title' as any)}
+        📅 <span class="tb-label">{$tStore('timeline.title' as any)}</span>
       </button>
       <button
         class="ghost titlebar-btn"
@@ -210,7 +210,7 @@
         onclick={() => $currentScreen.name === 'reports' ? goBack() : navigateTo('reports')}
         title={$tStore('reports.tooltip' as any)}
       >
-        📋 {$tStore('reports.title' as any)}
+        📋 <span class="tb-label">{$tStore('reports.title' as any)}</span>
       </button>
       <button
         class="ghost titlebar-btn"
@@ -218,7 +218,7 @@
         onclick={() => $currentScreen.name === 'secret_bundles' ? goBack() : navigateTo('secret_bundles')}
         title={$tStore('bundles.title' as any)}
       >
-        🔐 {$tStore('bundles.title' as any)}
+        🔐 <span class="tb-label">{$tStore('bundles.title' as any)}</span>
       </button>
       <button
         class="ghost titlebar-btn"
@@ -226,7 +226,7 @@
         onclick={() => $currentScreen.name === 'settings' ? goBack() : navigateTo('settings')}
         title={$tStore('app.openSettings')}
       >
-        ⚙ {$tStore('app.settings')}
+        ⚙ <span class="tb-label">{$tStore('app.settings')}</span>
       </button>
       <button
         class="ghost titlebar-btn"
@@ -234,7 +234,7 @@
         onclick={() => $currentScreen.name === 'help' ? goBack() : navigateTo('help')}
         title={$tStore('help.tooltip' as any)}
       >
-        ❓ {$tStore('help.title' as any)}
+        ❓ <span class="tb-label">{$tStore('help.title' as any)}</span>
       </button>
       <button
         class="ghost titlebar-btn"
@@ -242,7 +242,7 @@
         onclick={() => $currentScreen.name === 'about' ? goBack() : navigateTo('about')}
         title={$tStore('about.tooltip' as any)}
       >
-        ℹ {$tStore('about.title' as any)}
+        ℹ <span class="tb-label">{$tStore('about.title' as any)}</span>
       </button>
 
       <div class="window-controls">
@@ -390,6 +390,8 @@
     align-items: center;
     gap: 8px;
     flex: 1;
+    min-width: 0;
+    overflow: hidden;
   }
 
   .app-logo {
@@ -401,6 +403,9 @@
   }
 
   .titlebar-title {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     font-size: 12px;
     font-weight: 600;
     color: var(--text);
@@ -412,9 +417,11 @@
     align-items: center;
     gap: 4px;
     height: 100%;
+    flex-shrink: 0;
   }
 
   .titlebar-btn {
+    white-space: nowrap;
     font-size: 12px;
     padding: 2px 8px;
     height: 100%;
@@ -446,6 +453,16 @@
   .window-controls {
     display: flex;
     height: 100%;
+    flex-shrink: 0;
+  }
+
+  /* T-000215: on a narrower window the labels go and the icons stay (each
+     button keeps its tooltip), so the window controls are never pushed out
+     of the titlebar. Wider fonts on Linux made this happen at ~1100 px. */
+  @media (max-width: 1240px) {
+    .tb-label {
+      display: none;
+    }
   }
 
   .win-btn {
