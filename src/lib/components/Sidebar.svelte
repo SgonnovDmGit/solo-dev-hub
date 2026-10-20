@@ -6,16 +6,19 @@
   import { currentScreen, selectedRepoId, selectedProjectId, addToast } from '$lib/stores/ui';
   import { ROLE_ICONS, getDisplayName } from '$lib/types';
   import type { Role, Repository } from '$lib/types';
-  import { tStore } from '$lib/i18n';
+  import { tStore, tf } from '$lib/i18n';
   import {
     createLocalRepository, getSetting, setSetting,
-    reorderProject, reorderRepo, rebalanceRepoGroup, autoSortAll, probeSharedRepos,
+    reorderProject, reorderRepo, rebalanceRepoGroup, autoSortAll, probeSharedRepos, deleteRepository,
   } from '$lib/api/tauri-commands';
   import { sharedStates, refreshAfterSync } from '$lib/stores/shared';
   import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { sidebarBadge, describeSharedStatus, fillParams } from '$lib/utils/shared-mode';
   import EmptyState from './EmptyState.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
+  import HiddenReposDialog from './HiddenReposDialog.svelte';
+  import { computeHiddenRepos, parseDismissed, dismissKey, type HiddenCandidate } from '$lib/utils/hidden-repos';
+  import type { GitHubRepo } from '$lib/api/github';
   import SidebarResizer from './SidebarResizer.svelte';
 
   // F-000044: ⇄ after the name of a shared repo, ⚠ (title = the status text) when it needs attention.
@@ -162,8 +165,77 @@
   async function handleSync() {
     if ($isSyncing) return;
     if (!$pat) return;
-    await syncFromGitHub($pat);
+    const fetched = await syncFromGitHub($pat);
     await probeSharedAfterSync();
+    // Only a fully successful fetch may drive the cleanup offer.
+    if (fetched) await offerHiddenRepos(fetched);
+  }
+
+  // T-000233: repos the current token no longer sees. DB-only removal; a
+  // declined set is remembered so the dialog returns only for a new one.
+  const HIDDEN_DISMISSED_KEY = 'hidden_repos_dismissed';
+  let hiddenCandidates = $state<HiddenCandidate<Repository>[] | null>(null);
+  let hiddenBusy = $state(false);
+
+  async function offerHiddenRepos(fetched: GitHubRepo[]) {
+    try {
+      const dismissed = parseDismissed(await getSetting(HIDDEN_DISMISSED_KEY));
+      const res = computeHiddenRepos(fetched, $allRepos, dismissed);
+      if (res.show) hiddenCandidates = res.candidates;
+    } catch {
+      // A failed settings read must not read as a failed sync.
+    }
+  }
+
+  async function rememberDismissed(keys: string[]) {
+    try {
+      await setSetting(HIDDEN_DISMISSED_KEY, JSON.stringify(keys));
+    } catch {
+      // Worst case the dialog shows again on the next sync.
+    }
+  }
+
+  async function dismissHidden() {
+    const list = hiddenCandidates ?? [];
+    hiddenCandidates = null;
+    await rememberDismissed(list.map((c) => dismissKey(c.repo)));
+  }
+
+  async function removeHidden(ids: number[]) {
+    const list = hiddenCandidates ?? [];
+    if (hiddenBusy) return;
+    hiddenBusy = true;
+    const removed: number[] = [];
+    let failed = 0;
+    try {
+      for (const c of list.filter((x) => ids.includes(x.repo.id))) {
+        try {
+          // clearGitLocal=false: nothing on disk is touched, nothing on GitHub.
+          await deleteRepository(c.repo.id, false, c.repo.local_path);
+          removed.push(c.repo.id);
+        } catch {
+          failed++;
+        }
+      }
+      // Whatever the user left unchecked counts as declined.
+      await rememberDismissed(
+        list.filter((c) => !removed.includes(c.repo.id)).map((c) => dismissKey(c.repo)),
+      );
+      await loadAllRepos();
+      if ($selectedRepoId !== null && removed.includes($selectedRepoId)) {
+        selectedRepoId.set(null);
+        if ($currentScreen.name === 'repo-detail') currentScreen.set({ name: 'dashboard' });
+      }
+      addToast(
+        failed === 0
+          ? tf('toast.hiddenReposRemoved' as any, removed.length)
+          : tf('toast.hiddenReposPartial' as any, removed.length, failed),
+        failed === 0 ? 'success' : 'error',
+      );
+    } finally {
+      hiddenBusy = false;
+      hiddenCandidates = null;
+    }
   }
 
   // F-000044: a contributor who has no project yet has nothing to press a
@@ -869,6 +941,15 @@ ${formatSyncIssues(result.errors)}`, 'warning');
     onCommit={handleResizeCommit}
   />
 </aside>
+
+{#if hiddenCandidates}
+  <HiddenReposDialog
+    candidates={hiddenCandidates}
+    busy={hiddenBusy}
+    onRemove={removeHidden}
+    onDismiss={dismissHidden}
+  />
+{/if}
 
 {#if showAutoSortConfirm}
   <ConfirmDialog

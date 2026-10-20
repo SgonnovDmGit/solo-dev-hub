@@ -37,6 +37,7 @@ import * as secrets from './strings/secrets';
 import * as templates from './strings/templates';
 import * as deploy from './strings/deploy';
 import * as untrack from './strings/untrack';
+import * as hiddenRepos from './strings/hiddenRepos';
 import * as bundles from './strings/bundles';
 import * as reports from './strings/reports';
 import * as secretAudit from './strings/secretAudit';
@@ -82,6 +83,7 @@ const ru = {
   ...templates.ru,
   ...deploy.ru,
   ...untrack.ru,
+  ...hiddenRepos.ru,
   ...bundles.ru,
   ...reports.ru,
   ...secretAudit.ru,
@@ -128,6 +130,7 @@ const en: Record<keyof typeof ru, string> = {
   ...templates.en,
   ...deploy.en,
   ...untrack.en,
+  ...hiddenRepos.en,
   ...bundles.en,
   ...reports.en,
   ...secretAudit.en,
