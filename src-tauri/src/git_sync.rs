@@ -1519,6 +1519,7 @@ mod tests {
         assert!(git_path(Path::new("/x")).is_err());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn branch_name_validation() {
         assert!(validate_branch("dev").is_ok());
@@ -1634,6 +1635,7 @@ mod tests {
 
     // ----- runner -------------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn run_git_kills_on_timeout() {
         let tmp = TempDir::new().unwrap();
@@ -1670,6 +1672,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn run_git_handles_large_output_and_stdin() {
         let fx = fixture();
@@ -1682,6 +1685,7 @@ mod tests {
 
     // ----- fetch ---------------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn fetch_ok_and_unreachable() {
         let fx = fixture();
@@ -1708,6 +1712,7 @@ mod tests {
         assert!(!e.message.is_empty());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn fetch_does_not_leak_token_from_remote_url() {
         let fx = fixture();
@@ -1735,6 +1740,7 @@ mod tests {
 
     // ----- queries -------------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn rev_parse_merge_base_is_ancestor() {
         let fx = fixture();
@@ -1754,6 +1760,7 @@ mod tests {
         assert_eq!(merge_base(&gb(), &fx.a, &second, &island).unwrap(), None);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn show_file_and_blob_sha() {
         let fx = fixture();
@@ -1784,6 +1791,7 @@ mod tests {
 
     // ----- update_ref_cas / fast_forward_ref ------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn update_ref_cas_match_and_mismatch() {
         let fx = fixture();
@@ -1803,6 +1811,7 @@ mod tests {
         assert!(e.contains("protected"), "{e}");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn fast_forward_ref_outcomes() {
         let fx = fixture();
@@ -1853,6 +1862,7 @@ mod tests {
         assert_eq!(g(&b, &["rev-parse", "shared"]), before);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn fast_forward_ref_refuses_current_protected_and_bad_target() {
         let fx = fixture();
@@ -1875,6 +1885,7 @@ mod tests {
         assert!(fast_forward_ref(&gb(), &fx.a, "shared", "no-such-rev").is_err());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn merge_ff_only_outcomes() {
         let fx = fixture();
@@ -1910,6 +1921,7 @@ mod tests {
         assert_eq!(g(&b, &["rev-parse", "HEAD"]), head);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn merge_fns_refuse_protected_current_branch() {
         let fx = fixture();
@@ -1962,6 +1974,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn commit_to_branch_add_modify_delete() {
         let fx = fixture();
@@ -2041,6 +2054,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn commit_to_branch_nothing_to_commit() {
         let fx = fixture();
@@ -2076,6 +2090,7 @@ mod tests {
         assert_eq!(g(&fx.a, &["rev-parse", "shared"]), before);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn commit_to_branch_ref_moved() {
         let fx = fixture();
@@ -2115,6 +2130,7 @@ mod tests {
         assert_untouched(&snap, &fx.a);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn commit_to_branch_identity_and_message() {
         let fx = fixture();
@@ -2141,6 +2157,7 @@ mod tests {
         assert_eq!(g(&fx.a, &["config", "user.name"]), "Repo User");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn commit_to_branch_refusals() {
         let fx = fixture();
@@ -2182,6 +2199,7 @@ mod tests {
         assert_untouched(&snap, &fx.a);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn commit_to_branch_removes_temp_index_on_error() {
         let fx = fixture();
@@ -2207,6 +2225,7 @@ mod tests {
         assert_eq!(leftovers, 0);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn hash_object_applies_path_filters() {
         let fx = fixture();
@@ -2221,6 +2240,7 @@ mod tests {
 
     // ----- push -----------------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn push_branches_outcomes() {
         let fx = fixture();
@@ -2258,6 +2278,7 @@ mod tests {
         assert_eq!(r[1].1, PushOutcome::Pushed);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn push_branches_refuses_protected_before_spawning() {
         let fx = fixture();
@@ -2281,6 +2302,7 @@ mod tests {
         assert!(g(&fx.remote, &["branch", "--list", "main", "master"]).is_empty());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn push_to_unreachable_remote_is_net_error() {
         let fx = fixture();
@@ -2299,6 +2321,7 @@ mod tests {
 
     // ----- config ---------------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn config_get_set_local() {
         let fx = fixture();
@@ -2322,6 +2345,7 @@ mod tests {
 
     // ----- merge_or_abort ---------------------------------------------------
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn merge_or_abort_merged_and_up_to_date() {
         let fx = fixture();
@@ -2348,6 +2372,7 @@ mod tests {
         );
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn merge_or_abort_conflict_restores_head() {
         let fx = fixture();
@@ -2373,6 +2398,7 @@ mod tests {
         assert_eq!(g(&b, &["status", "--porcelain"]), "");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn merge_or_abort_refuses_mid_merge() {
         let fx = fixture();
@@ -2402,6 +2428,7 @@ mod tests {
         assert_eq!(subcommand::<&str>(&[]), "");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn timeout_kills_the_whole_process_tree() {
         let tmp = TempDir::new().unwrap();
@@ -2428,12 +2455,14 @@ mod tests {
         assert_eq!(first, second, "a process of the tree is still running");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn relative_repo_path_is_refused() {
         let e = rev_parse(&gb(), Path::new("some/relative/dir"), "HEAD").unwrap_err();
         assert!(e.contains("absolute"), "{e}");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn update_ref_cas_does_not_follow_symbolic_refs() {
         let fx = fixture();
@@ -2449,6 +2478,7 @@ mod tests {
         assert_eq!(g(&fx.a, &["rev-parse", "refs/heads/shared"]), first);
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn branch_checked_out_in_another_worktree_is_refused() {
         let fx = fixture();
@@ -2474,6 +2504,7 @@ mod tests {
         assert!(matches!(r, BranchCommit::Committed { .. }));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn mid_merge_guard_works_in_a_linked_worktree() {
         let fx = fixture();
@@ -2498,6 +2529,7 @@ mod tests {
         assert!(e.contains("middle of a merge"), "{e}");
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn merge_or_abort_aborts_even_when_listing_conflicts_fails() {
         let fx = fixture();
@@ -2520,6 +2552,7 @@ mod tests {
         assert!(!b.join(".git/MERGE_HEAD").exists());
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn commit_to_branch_normalises_crlf_like_git_add() {
         let fx = fixture();

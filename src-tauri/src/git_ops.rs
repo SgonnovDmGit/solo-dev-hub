@@ -244,16 +244,12 @@ pub fn commit_paths(
     })
 }
 
-/// True if `rel_path` (repo-relative) is excluded by the repo's ignore rules.
-/// Auto-commit uses this to skip cross-repo folders the dev deliberately
-/// gitignored (their local "inbox"): `git add` refuses an explicitly-named
-/// ignored path with exit 1, which would otherwise abort the whole scoped
-/// commit for every folder in the batch.
-pub fn is_gitignored(git: &GitBinary, local_path: &Path, rel_path: &Path) -> Result<bool, String> {
-    check_ignore(git, local_path, rel_path, false)
-}
-
-/// Like [`is_gitignored`], but answers the question `git add -- <path>` asks.
+/// True if `git add -- <path>` would refuse `rel_path` (repo-relative) as
+/// gitignored. Auto-commit uses this to skip cross-repo folders the dev
+/// deliberately gitignored (their local "inbox"): `git add` refuses an
+/// explicitly-named ignored path with exit 1, which would otherwise abort the
+/// whole scoped commit for every folder in the batch.
+///
 /// For a directory that holds tracked files plain `check-ignore` says "not
 /// ignored" (the index wins), yet `git add -- <dir>` still refuses it. So a
 /// directory is checked with `--no-index`; a single file keeps index
@@ -480,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_gitignored_true_for_ignored_false_for_tracked() {
+    fn test_is_ignored_for_add_true_for_ignored_false_for_tracked() {
         let tmp = TempDir::new().unwrap();
         init_test_repo(tmp.path());
         fs::write(
@@ -498,7 +494,7 @@ mod tests {
 
         let git = check_git_available().expect("git available");
         assert!(
-            is_gitignored(
+            is_ignored_for_add(
                 &git,
                 tmp.path(),
                 &PathBuf::from("docs/backend-requirements")
@@ -507,7 +503,7 @@ mod tests {
             "gitignored folder must report true"
         );
         assert!(
-            !is_gitignored(&git, tmp.path(), &PathBuf::from("docs/server-api")).unwrap(),
+            !is_ignored_for_add(&git, tmp.path(), &PathBuf::from("docs/server-api")).unwrap(),
             "non-ignored folder must report false"
         );
     }

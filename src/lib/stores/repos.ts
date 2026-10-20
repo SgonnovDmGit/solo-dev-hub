@@ -9,7 +9,7 @@ import {
   listRepoSharedStates,
   getSetting,
 } from '$lib/api/tauri-commands';
-import { fetchAllRepos, listBranches, splitRepoFullName } from '$lib/api/github';
+import { fetchAllRepos, listBranches, splitRepoFullName, type GitHubRepo } from '$lib/api/github';
 import { shouldBackfillAutocommit } from '$lib/utils/autocommit-backfill';
 import { addToast } from './ui';
 import { t, tf } from '$lib/i18n';
@@ -78,7 +78,11 @@ export async function backfillAutocommitDevBranch(token: string): Promise<void> 
   );
 }
 
-export async function syncFromGitHub(token: string): Promise<void> {
+/**
+ * Returns the complete list the token sees when the sync succeeded, or null
+ * when it failed (a partial list must never drive a cleanup).
+ */
+export async function syncFromGitHub(token: string): Promise<GitHubRepo[] | null> {
   isSyncing.set(true);
   try {
     const githubRepos = await fetchAllRepos(token);
@@ -118,6 +122,7 @@ export async function syncFromGitHub(token: string): Promise<void> {
     }
 
     addToast(tf('toast.syncedRepos', upsertedCount), 'success');
+    return githubRepos;
   } catch (err) {
     const message = String(err);
     if (message.includes('401') || message.includes('Unauthorized')) {
@@ -127,6 +132,7 @@ export async function syncFromGitHub(token: string): Promise<void> {
     } else {
       addToast(tf('toast.syncFailed', String(err)), 'error');
     }
+    return null;
   } finally {
     isSyncing.set(false);
   }

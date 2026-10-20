@@ -48,7 +48,10 @@ jobs:
 
       - name: Rust tests
         working-directory: src-tauri
-        run: cargo test --lib
+        # The full set: --include-ignored also runs the git-spawning contributor
+        # tests that are ignored locally (slow on Windows). The schema generator
+        # is an ignored non-test and needs an env var, so it is skipped.
+        run: cargo test --lib -- --include-ignored --skip db::migrations::tests::export_fresh_schema_db
 
       - name: Build bundles
         # createUpdaterArtifacts needs the signing key; its password is empty.

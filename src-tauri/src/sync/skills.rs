@@ -308,6 +308,10 @@ struct Collected {
     taken: Vec<String>,
     lost: Vec<String>,
     superseded: Vec<String>,
+    /// T-000214: rules whose stale hand-back was set aside this pass because the
+    /// owner had edited them since; only the wording of a closed conflict reads
+    /// it.
+    owner_superseded: HashSet<String>,
     errors: Vec<SyncIssue>,
     /// T-000206: see `RulesRefresh::quiet_conflicts`.
     quiet_conflicts: Vec<String>,
@@ -408,6 +412,31 @@ fn read_open_conflicts(db: &AppDb, out: &mut Collected) -> HashMap<String, OpenC
     }
 }
 
+/// T-000214: is the marker older than the owner's last save or reset of
+/// `name` (`rule_events`)?
+///
+/// The marker's time is its file mtime: it is when the agent dropped it, which
+/// is when the hand-back was approved, and unlike the copy beside it nothing
+/// rewrites it. Both sides are absolute instants, so the local time zone does
+/// not enter; what does is clock skew between machines (a checkout written on
+/// another machine whose clock runs ahead can look newer than an edit it
+/// predates) and a copy of the checkout that resets mtimes (a fresh copy looks
+/// newer than it is). In both cases the hand-back is taken as before this check
+/// existed. Anything unreadable or unparsable counts as "not older". Equal
+/// instants are not older.
+fn marker_predates_owner_edit(db: &AppDb, name: &str, marker: &Path) -> bool {
+    let Ok(Some(edit)) = db.last_owner_edit_at(name) else {
+        return false;
+    };
+    let Ok(edit) = chrono::DateTime::parse_from_rfc3339(&edit) else {
+        return false;
+    };
+    let Ok(modified) = fs::metadata(marker).and_then(|m| m.modified()) else {
+        return false;
+    };
+    chrono::DateTime::<chrono::Utc>::from(modified) < edit.with_timezone(&chrono::Utc)
+}
+
 /// Sort the markers of a pass into its outcomes. Unknown, superseded and lost
 /// markers are settled (and recorded) right here; everything else is returned
 /// as a hand-back for the decisions that follow.
@@ -447,7 +476,16 @@ fn classify(
             };
             // A rule that follows an owner (shared_canon) has its text from his
             // repo; a hand-back of it is set aside like the owner's own edit.
-            if settings_edit == Some(name) || followed.contains(name) {
+            // T-000214: the same for a marker older than the owner's last save or
+            // reset of the rule, which the owner made while this checkout could
+            // not be read (so no pass superseded it then).
+            let stale = settings_edit != Some(name)
+                && !followed.contains(name)
+                && marker_predates_owner_edit(db, name, &marker.path);
+            if stale {
+                out.owner_superseded.insert(name.to_string());
+            }
+            if settings_edit == Some(name) || followed.contains(name) || stale {
                 match remove_if_present(&marker.path) {
                     Ok(()) => {
                         out.superseded.push(format!("{} ({})", name, label));
@@ -526,6 +564,7 @@ fn settle_open_conflicts(
     settings_edit: Option<&str>,
     out: &mut Collected,
 ) -> HashSet<String> {
+    let superseded_rules = out.owner_superseded.clone();
     let live: HashSet<&str> = found
         .handed
         .iter()
@@ -552,7 +591,7 @@ fn settle_open_conflicts(
                 false
             }
         };
-        let note = if settings_edit == Some(rule.as_str()) {
+        let note = if settings_edit == Some(rule.as_str()) || superseded_rules.contains(rule) {
             // The owner's own save or reset set the markers aside this pass.
             conflict_note::SUPERSEDED_BY_OWNER
         } else {
@@ -1810,6 +1849,90 @@ mod tests {
             ),
             ("superseded", Some(label.as_str()), None)
         );
+    }
+
+    // ── T-000214: a hand-back older than the owner's edit is not taken ───────
+
+    fn set_mtime(path: &Path, t: std::time::SystemTime) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    /// The owner saves `sdh-alpha` in the app: new text plus a `saved` event.
+    fn owner_saves(db: &AppDb, text: &str) {
+        db.upsert_template_file("_global", "skill.sdh-alpha.md.tmpl", text, true)
+            .unwrap();
+        db.insert_rule_event("sdh-alpha", rule_event::SAVED, None, None)
+            .unwrap();
+    }
+
+    fn rule_text_of(db: &AppDb) -> String {
+        list_skill_templates(db)
+            .unwrap()
+            .into_iter()
+            .find(|(n, _)| n == "sdh-alpha")
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn test_a_handback_from_a_checkout_unreadable_during_the_owners_save_is_superseded() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        let label = rule_copy_label(&repo);
+        hand_back(&skills, "sdh-alpha", "AGENT TEXT", "approved");
+        let hour = std::time::Duration::from_secs(3600);
+        set_mtime(
+            &skills.join("sdh-alpha.md.approved"),
+            std::time::SystemTime::now() - hour,
+        );
+
+        // The checkout is away (another machine, unmounted) while the owner saves.
+        let away = tmp.path().join("docs/sdh_skills_away");
+        fs::rename(&skills, &away).unwrap();
+        owner_saves(&db, "OWNER TEXT");
+        let during =
+            collect_approved_skill_edits(&db, std::slice::from_ref(&repo), Some("sdh-alpha"));
+        assert!(during.superseded.is_empty() && during.taken.is_empty());
+
+        // It comes back: the hand-back predates the save and must not win.
+        fs::rename(&away, &skills).unwrap();
+        let after = collect_approved_skill_edits(&db, std::slice::from_ref(&repo), None);
+
+        assert!(after.errors.is_empty(), "{:?}", after.errors);
+        assert!(after.taken.is_empty(), "taken: {:?}", after.taken);
+        assert_eq!(after.superseded, vec![format!("sdh-alpha ({})", label)]);
+        assert_eq!(rule_text_of(&db), "OWNER TEXT");
+        assert!(!skills.join("sdh-alpha.md.approved").exists());
+        let kinds: Vec<String> = rule_history(&db, "sdh-alpha")
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec!["saved", "superseded"]);
+    }
+
+    #[test]
+    fn test_a_handback_made_after_the_owners_save_is_still_taken() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        owner_saves(&db, "OWNER TEXT");
+        hand_back(&skills, "sdh-alpha", "AGENT TEXT", "approved");
+        set_mtime(
+            &skills.join("sdh-alpha.md.approved"),
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+        );
+
+        let c = collect_approved_skill_edits(&db, &[repo], None);
+
+        assert!(c.superseded.is_empty());
+        assert_eq!(c.taken, vec!["sdh-alpha".to_string()]);
+        assert_eq!(rule_text_of(&db), "AGENT TEXT");
     }
 
     // ── T-000206: a conflict is reported once and explained to the agent ─────
