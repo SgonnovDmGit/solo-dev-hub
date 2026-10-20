@@ -65,7 +65,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 
 ### Install
 
-> Builds are **Windows x64 and Linux x64** for now; macOS is planned for v1.21.0.
+> Builds are **Windows x64 and Linux x64** for now; macOS is planned for v1.22.0.
 
 **Windows**
 
@@ -149,7 +149,8 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Shipped**
 
-- **v1.20.0** *(current — 2026-10-20)* — contributor mode: a helper with their own install works in the same repositories; tasks, done items and bugs travel through git and merge by id.
+- **v1.21.0** *(current — 2026-10-20)* — removing repositories the current token cannot see; a better merge base for shared task files; the close button stays in a narrow window on Linux.
+- **v1.20.0** — contributor mode: a helper with their own install works in the same repositories; tasks, done items and bugs travel through git and merge by id.
 - **v1.19.0** — a Rules screen: which rules were changed, where an edit came from, settling two repos that handed one rule back differently; Linux builds (AppImage and .deb).
 - **v1.18.0** — an approved rule edit is never lost silently; sync problems in the interface language; the rules compressed to less than half (19 skills, a new one for starting a project).
 - **v1.17.0** — rules deliver themselves: an applied rule reaches every agent on save and on startup, and an agent's edit travels back from its own copy; peers can be linked only to equals.
@@ -173,7 +174,7 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Next**
 
-- **v1.21.0** — macOS build.
+- **v1.22.0** — macOS build.
 - **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix.
 
 Per-release detail lives in the [Changelog](Changelog.md); the day-to-day task list is kept locally and is not part of the repository.

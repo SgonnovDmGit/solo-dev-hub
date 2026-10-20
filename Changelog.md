@@ -4,6 +4,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.21.0] — 2026-10-20
+
+Tail of contributor mode: a helper's install can drop the owner's repositories it no longer sees, shared merges pick a better base, and the Linux window keeps its close button.
+
+### Added
+- **Remove repositories the current token cannot see (T-000233).** An install that once used another person's token kept all of that person's repositories, and they could only be deleted one by one, typing each name. After the sidebar **Sync** the app now lists the repositories the current token does not see and offers to remove them. Repositories without a local folder are pre-selected; those with a folder show the path and are not. Removal deletes only the app's record: files on disk and the repository on GitHub are not touched. "Not now" remembers the list, and the dialog comes back only when a new repository joins it. An empty list from GitHub offers nothing.
+
+### Changed
+- **A contributor is not told about the owner's repositories it never cloned (T-000231).** The project a helper's install builds from the owner's structure lists every repository of the project, and each sync warned "no local path" for the ones the helper does not work in. Those warnings are gone; the owner's own repositories and ordinary projects still get them.
+
+### Fixed
+- **The close button stays in a narrow window (T-000215).** On a window narrower than 1240 px the titlebar buttons show icons only, with their tooltips, and the window controls never shrink. On Linux, with its wider fonts, the close and minimize buttons fell off the edge at about 1100 px.
+- **Repositories without a project are listed when there is no project yet (T-000215).** A fresh install with repositories and no projects showed only "No projects yet": the no-project group was drawn only next to a project. It is now always drawn, open while there is no project.
+- **Shared task files merge against the right base (T-000226).** A commit into another participant's branch merged `todo.md`, `done.md` and `bug-reports.md` against one guessed version of the whole file. When the same file content recurred three times in both histories, a deleted row could come back or a re-added row could be lost. Each differing row now gets its own base, the last state of that row both histories held.
+- **A hand-back from a checkout that was away does not overwrite a later owner edit (T-000214).** A rule edit handed back from a repository folder that could not be read while the owner saved or reset the rule was taken up later and replaced the owner's newer text. A hand-back marker older than the owner's last save or reset is now set aside, like any superseded hand-back.
+
+### Notes
+- Checked live on Linux: the token survives a restart, and a `.deb` updates itself (a candidate install updated to the published 1.20.0). The repository-removal dialog has not yet been seen on a real install with another person's repositories (O-000005).
+
+### Tests
+- 911 Rust (+10 over the 901 of v1.20.0: per-row merge base, stale hand-back, quiet foreign repositories). 125 of them spawn `git` and are now ignored by default (T-000234): a git process costs about 0.2 s on the owner's Windows machine and one end-to-end test starts about 650, so the full set took 20–40 minutes there. `cargo test --lib` runs the other 786 in about 45 s; CI runs all of them on every push to `dev` (910 on Linux in 38 s, one test is Windows-only). 187 vitest (+10 in 19 files: the removal candidates), svelte-check clean. Numbers from `fc15d29`.
+
 ## [1.20.0] — 2026-10-20
 
 A helper can now work in your repositories with their own copy of Solo Dev Hub on their own machine. Tasks, done items and bugs travel through git and merge by id. The helper takes your rules as they are.
