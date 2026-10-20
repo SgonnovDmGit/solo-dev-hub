@@ -604,7 +604,10 @@ fn oldest_positions(blobs: &[String]) -> HashMap<&str, usize> {
 /// older version), so a blob is judged by where it FIRST appeared on each side,
 /// not by its latest occurrence: the shared blob whose first appearances are
 /// the most recent on both sides wins (smallest sum of ages, ours first on a
-/// tie). `None` when they never held the same version.
+/// tie). `None` when they never held the same version. Production code calls
+/// `blobs_in_history` + `common_of` directly (T-000226); this wrapper is kept
+/// for the tests of the heuristic.
+#[cfg(test)]
 fn last_common_blob(
     git: &GitBinary,
     root: &Path,
