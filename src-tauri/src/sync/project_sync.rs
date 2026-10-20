@@ -1044,7 +1044,17 @@ pub(crate) fn probe_shared_repos_in(
     finish_shared(db, git.as_ref(), shared, &mut c);
     let mut merged = c.into_result();
     for pid in projects {
-        let r = run_project_sync_in(db, pid, home.clone())?;
+        // One project failing must not drop the probe's outcome or the others.
+        let r = match run_project_sync_in(db, pid, home.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                let name = db.get_project(pid).map(|p| p.name).unwrap_or_default();
+                merged
+                    .errors
+                    .push(SyncIssue::new(Code::LookupFailed, name).detail(e));
+                continue;
+            }
+        };
         merged.copied += r.copied;
         merged.responses += r.responses;
         merged.migrated += r.migrated;
