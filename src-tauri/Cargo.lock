@@ -4150,7 +4150,7 @@ dependencies = [
 
 [[package]]
 name = "solo-dev-hub"
-version = "1.21.0"
+version = "1.22.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",

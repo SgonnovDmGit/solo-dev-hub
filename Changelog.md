@@ -4,6 +4,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+## [1.22.0] — 2026-10-25
+
+macOS builds, and contributor mode after its first days of real use: a sync button on the repository screen, a visible sign that a participant stopped syncing, organization repositories, and a mark on rules whose canon moved.
+
 ### Added
 - **macOS builds (T-000125).** Releases now ship `.dmg` for Apple Silicon and Intel, and both update themselves like the Windows and Linux builds. The token is kept in the macOS Keychain. An app opened from Finder finds Homebrew's git before the system one, so a Mac without the Command Line Tools no longer gets the "install developer tools" dialog on start. The build is ad-hoc signed, not notarized: the first launch goes through System Settings → Privacy & Security → "Open Anyway" (README). A "macOS build" workflow tests and builds an Intel `.dmg` on every push to `dev`.
 - **Sync button on the repository screen (T-000235).** A repository in a project syncs its project; a repository without one is checked for shared mode, as the sidebar does, which may link it to a project. Before, a helper who opened a shared repository had no way to sync it from there.
@@ -14,6 +18,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 ### Changed
 - **Repository folder row (T-000236).** The path fills the free space up to the action buttons instead of stopping at 40 characters, and the folder button is a highlighted "…" attached to the path field.
 - **`sdh-phase-workflow`: an end-to-end test starts from the user's real state.** A test of a user flow begins where the user is at that step (an existing checkout, a branch already switched, an empty list), taken from the Verification steps. Retro of v1.20.0 + v1.21.0: two defects of contributor mode slipped past end-to-end tests that started from the state the code expected.
+
+### Fixed
+- **The window froze for seconds when switching repositories.** Opening a repository asked whether git is available, and that check spawned git on the UI thread; on Windows one spawn measured 0.7–7.8 s. The check and the two untrack commands now run off the UI thread and reuse the git found at start. Found at this release's smoke.
+
+### Notes
+- The macOS and new Linux builds are checked after the release, by the owner's decision: the Intel `.dmg` in a macOS VM and the Linux update on the helper's install (O-000006). CI builds both and runs the fast test set on macOS. Organization repositories are covered by an end-to-end test on a local remote; no real organization was tried.
+
+### Tests
+- 952 Rust (+41 over the 911 of v1.21.0: participants' last push, admin trust, canon records, git candidates per OS); 127 of them spawn `git` and run in CI only. CI runs 951 on Linux in 33 s (one test is Windows-only) and the fast 825 on macOS in 19 s. 205 vitest (+18 in 21 files: sync target, auto-sync hint, admin re-run, switch visibility), svelte-check clean. Numbers from `7d9918d`; the later freeze fix adds no tests.
 
 ## [1.21.0] — 2026-10-20
 
