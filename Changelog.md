@@ -4,7 +4,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+### Added
+- **macOS builds (T-000125).** Releases now ship `.dmg` for Apple Silicon and Intel, and both update themselves like the Windows and Linux builds. The token is kept in the macOS Keychain. An app opened from Finder finds Homebrew's git before the system one, so a Mac without the Command Line Tools no longer gets the "install developer tools" dialog on start. The build is ad-hoc signed, not notarized: the first launch goes through System Settings → Privacy & Security → "Open Anyway" (README). A "macOS build" workflow tests and builds an Intel `.dmg` on every push to `dev`.
+- **Sync button on the repository screen (T-000235).** A repository in a project syncs its project; a repository without one is checked for shared mode, as the sidebar does, which may link it to a project. Before, a helper who opened a shared repository had no way to sync it from there.
+- **See whether a participant still syncs (T-000237).** The owner's **Participants** tab shows each participant's last push — the newest sync commit of that install on their branch or on the owner's dev branch. On the helper's side a shared repository says so when auto-sync will not run for it (the global switch or the project's flag is off, or the repository has no project), with an **Enable** button. Found dogfooding: a helper went three days without syncing and nobody saw it.
+- **Shared mode in an organization's repository (T-000227).** The structure file is trusted when its main is the repository owner or, now, an administrator of the repository by the GitHub API. The app checks the rights from the JavaScript side on every sync of such a repository, so a revoked admin stops being trusted on the next sync. The shared-mode switch shows to the owner and to administrators only.
+- **"Canon updated" mark on the Rules screen (T-000213).** A rule you edited keeps your text when a new build brings a new canon; the rule now says so and leads to the diff against the new canon. Saving the rule again clears the mark. Edits made before this version count from its first launch.
+
 ### Changed
+- **Repository folder row (T-000236).** The path fills the free space up to the action buttons instead of stopping at 40 characters, and the folder button is a highlighted "…" attached to the path field.
 - **`sdh-phase-workflow`: an end-to-end test starts from the user's real state.** A test of a user flow begins where the user is at that step (an existing checkout, a branch already switched, an empty list), taken from the Verification steps. Retro of v1.20.0 + v1.21.0: two defects of contributor mode slipped past end-to-end tests that started from the state the code expected.
 
 ## [1.21.0] — 2026-10-20
