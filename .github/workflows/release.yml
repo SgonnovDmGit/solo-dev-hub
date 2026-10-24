@@ -21,6 +21,13 @@ jobs:
             # Oldest runner with webkit2gtk-4.1 = widest glibc compatibility.
             # The signed AppImage feeds the linux-x86_64 entry in latest.json.
             args: '--bundles appimage,deb'
+          # macOS: two native builds on the Apple Silicon runner; each signed
+          # .app.tar.gz feeds its own darwin-* entry in latest.json. Ad-hoc
+          # signature (signingIdentity "-" in tauri.conf.json), not notarized.
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin --bundles app,dmg'
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin --bundles app,dmg'
 
     runs-on: ${{ matrix.platform }}
 
@@ -45,11 +52,15 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
+          # The two macOS rows share a platform; keep their caches apart.
+          key: ${{ matrix.args }}
 
       - name: Extract release notes from Changelog.md
         id: notes

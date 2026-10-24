@@ -29,8 +29,8 @@ use crate::git_ops::{
 use crate::git_sync::{self, BranchCommit, FfOutcome, FileChange, MergeOutcome, PushOutcome};
 use crate::merge_driver::register_merge_driver;
 use crate::models::{
-    IgnoreLine, RepoSharedState, Repository, SharedDisableResult, SharedMergeResult,
-    SharedPreflight, SyncIssue, SyncIssueCode as Code,
+    AdminCheck, IgnoreLine, ParticipantActivity, RepoSharedState, Repository, SharedDisableResult,
+    SharedMergeResult, SharedPreflight, SyncIssue, SyncIssueCode as Code,
 };
 use crate::sync::autocommit::{
     CROSS_REPO_DIRS, MANAGED_ROOT_FILES, SDH_COMMIT_EMAIL, SDH_COMMIT_NAME,
@@ -604,7 +604,10 @@ fn oldest_positions(blobs: &[String]) -> HashMap<&str, usize> {
 /// older version), so a blob is judged by where it FIRST appeared on each side,
 /// not by its latest occurrence: the shared blob whose first appearances are
 /// the most recent on both sides wins (smallest sum of ages, ours first on a
-/// tie). `None` when they never held the same version.
+/// tie). `None` when they never held the same version. Production code calls
+/// `blobs_in_history` + `common_of` directly (T-000226); this wrapper is kept
+/// for the tests of the heuristic.
+#[cfg(test)]
 fn last_common_blob(
     git: &GitBinary,
     root: &Path,
@@ -1039,10 +1042,11 @@ pub fn import_incoming(
     let imp = ss::read_shared_import(db, repo_id);
     let authors = Authors {
         me: db.github_login().unwrap_or_default(),
-        structure: repo
-            .github_name
-            .as_deref()
-            .and_then(|gh| ss::read_structure_file(root, gh).ok().flatten()),
+        structure: repo.github_name.as_deref().and_then(|gh| {
+            ss::read_structure_file(root, gh, &ss::AdminVerified::load(db))
+                .ok()
+                .flatten()
+        }),
     };
     let mut head_blob: BTreeMap<&str, Option<String>> = BTreeMap::new();
     for p in IMPORT_FILES {
@@ -1302,9 +1306,29 @@ struct RepoPass {
     committed: bool,
     /// Rules whose canon this pass took from the owner (T-000224).
     canon_changed: Vec<String>,
+    /// (repo, login) pairs whose trust rests on a GitHub administrator check the
+    /// frontend has to make (T-000227).
+    admin_checks: Vec<AdminCheck>,
 }
 
 impl RepoPass {
+    /// Ask the frontend to verify `login` as an administrator of `gh`, unless
+    /// `login` is the owner segment of the repo (then nothing rests on the API).
+    fn ask_admin_check(&mut self, gh: &str, login: &str) {
+        if !ss::needs_admin_check(gh, login) {
+            return;
+        }
+        let check = AdminCheck {
+            repo: gh.to_string(),
+            login: login.to_string(),
+        };
+        if !self.admin_checks.iter().any(|c| {
+            c.repo.eq_ignore_ascii_case(&check.repo) && ss::logins_equal(&c.login, &check.login)
+        }) {
+            self.admin_checks.push(check);
+        }
+    }
+
     fn note(&mut self, status: SharedStatus, detail: impl Into<String>) {
         self.notes.push(StatusNote {
             status,
@@ -1367,6 +1391,11 @@ pub struct SharedSync {
     /// Rules whose canon changed because an owner's committed copy differs
     /// (T-000224): the project sync renders everywhere when this is not empty.
     pub canon_changed: Vec<String>,
+    /// Every shared repo of this run whose structure names a main that is not
+    /// the repo owner, with that main: the frontend verifies (or re-verifies)
+    /// them against GitHub (T-000227). Covers both the structures refused for
+    /// lack of a verification and those currently trusted through one.
+    pub admin_checks: Vec<AdminCheck>,
 }
 
 impl SharedSync {
@@ -1375,6 +1404,7 @@ impl SharedSync {
             passes: Vec::new(),
             handled: HashSet::new(),
             canon_changed: Vec::new(),
+            admin_checks: Vec::new(),
         }
     }
 
@@ -1740,6 +1770,13 @@ fn run_phase_a_with(
             sync.passes.push(pass);
         }
     }
+    for pass in &sync.passes {
+        for c in &pass.admin_checks {
+            if !sync.admin_checks.contains(c) {
+                sync.admin_checks.push(c.clone());
+            }
+        }
+    }
     sync
 }
 
@@ -1759,6 +1796,7 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         blocked: HashSet::new(),
         committed: false,
         canon_changed: Vec::new(),
+        admin_checks: Vec::new(),
     }
 }
 
@@ -1799,7 +1837,12 @@ fn phase_a_main(
     let _ = db.set_shared_role(repo.id, Some("main"));
     register_driver(git, &mut pass);
     fetch_into(git, &mut pass, FetchMode::Always);
-    match ss::read_structure_file(root, &gh) {
+    let admins = ss::AdminVerified::load(db);
+    // The main's own trust may rest on an administrator verification (an
+    // organization's repo): ask the frontend to (re)verify this login on every
+    // sync, so a revoked admin is noticed.
+    pass.ask_admin_check(&gh, login);
+    match ss::read_structure_file(root, &gh, &admins) {
         Ok(s) => pass.structure = s,
         Err(reason) => {
             pass.note_untrusted(reason);
@@ -1834,7 +1877,8 @@ fn phase_a_foreign(
     let mut pass = new_pass(repo, root, login);
     fetch_into(git, &mut pass, mode);
     let pinned = ss::read_shared_import(db, repo.id).pinned_dev_branch;
-    let found = match ss::discover_structure(git, root, gh, pinned.as_deref()) {
+    let admins = ss::AdminVerified::load(db);
+    let found = match ss::discover_structure(git, root, gh, pinned.as_deref(), &admins) {
         Ok(f) => f,
         Err(e) => {
             if mode == FetchMode::Always {
@@ -1862,10 +1906,23 @@ fn phase_a_foreign(
             None
         }
         DiscoverOutcome::Untrusted(reason) => {
+            // Refused for lack of a verification? Ask about every non-owner
+            // main the files name.
+            for l in ss::candidate_admin_logins(git, root, gh, pinned.as_deref()) {
+                pass.ask_admin_check(gh, &l);
+            }
             pass.note_untrusted(reason);
             Some(pass)
         }
         DiscoverOutcome::Found(s, _source) => {
+            // Trusted through a verification? Re-verify it on every sync.
+            pass.ask_admin_check(gh, &s.main.login);
+            // A structure whose main is this very install while shared mode is
+            // off here: this install switched it off. (The owner's repos never
+            // get here -- `owned_by_me` skips them -- but a verified admin's do.)
+            if ss::derive_role(Some(&s), Some(login)) == Some(Role::Main) {
+                return None;
+            }
             if let Err(e) = ss::apply_structure_locally(db, repo.id, &s) {
                 pass.issue(
                     repo_issue(Code::ManagedFileFailed, repo)
@@ -2805,6 +2862,13 @@ pub fn shared_mode_preflight(
     repo_id: i64,
 ) -> Result<SharedPreflight, String> {
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    // T-000227: the owner or a verified administrator only (the frontend
+    // verifies the install's own login against GitHub before it asks).
+    if let (Some(gh), Some(login)) = (repo.github_name.as_deref(), db.github_login()) {
+        if !ss::can_enable_shared(gh, &login, &ss::AdminVerified::load(db)) {
+            return Err(ss::refusal_not_owner_or_admin(&login, gh));
+        }
+    }
     let root = repo_root(&repo)?;
     let branch = db
         .get_autocommit_branch(repo_id)
@@ -2852,8 +2916,8 @@ pub fn enable_shared_mode(
         .github_name
         .clone()
         .ok_or_else(|| "shared mode needs a GitHub repository".to_string())?;
-    let existing = ss::read_structure_file(&root, &gh)?;
-    // Validates: owner, project, dev branch.
+    let existing = ss::read_structure_file(&root, &gh, &ss::AdminVerified::load(db))?;
+    // Validates: owner or administrator, project, dev branch.
     let built = ss::build_structure(db, repo_id, &login, existing.as_ref())?;
     let blocking = blocking_ignore_lines(git, &root)?;
     if !blocking.is_empty() {
@@ -2933,7 +2997,11 @@ pub fn disable_shared_mode(
     let participant_branches: Vec<String> = repo
         .github_name
         .as_deref()
-        .and_then(|gh| ss::read_structure_file(&root, gh).ok().flatten())
+        .and_then(|gh| {
+            ss::read_structure_file(&root, gh, &ss::AdminVerified::load(db))
+                .ok()
+                .flatten()
+        })
         .map(|s| s.participants.iter().map(|p| p.branch.clone()).collect())
         .unwrap_or_default();
     let dev = own_branch_of(db, repo_id);
@@ -3151,13 +3219,15 @@ fn remove_sdh_from_branch(
 /// Join requests in the work tree plus, when the owner's current branch is not
 /// the dev branch, those published on `origin/<dev>`.
 fn all_join_requests(
+    db: &AppDb,
     git: Option<&GitBinary>,
     root: &Path,
     gh: &str,
     dev: Option<&str>,
 ) -> Vec<JoinRequest> {
-    let structure = ss::read_structure_file(root, gh).ok().flatten();
-    let mut out = ss::list_requests(root, gh);
+    let admins = ss::AdminVerified::load(db);
+    let structure = ss::read_structure_file(root, gh, &admins).ok().flatten();
+    let mut out = ss::list_requests(root, gh, &admins);
     let (Some(git), Some(dev)) = (git, dev) else {
         return out;
     };
@@ -3217,9 +3287,9 @@ pub fn approve_join_request(
     let me = db
         .github_login()
         .ok_or_else(|| "the GitHub login of this install is unknown".to_string())?;
-    let existing = ss::read_structure_file(&root, &gh)?;
+    let existing = ss::read_structure_file(&root, &gh, &ss::AdminVerified::load(db))?;
     let base = ss::build_structure(db, repo_id, &me, existing.as_ref())?;
-    let req = all_join_requests(git, &root, &gh, Some(&base.main.dev_branch))
+    let req = all_join_requests(db, git, &root, &gh, Some(&base.main.dev_branch))
         .into_iter()
         .find(|r| ss::logins_equal(&r.login, login))
         .ok_or_else(|| format!("no join request from {}", login))?;
@@ -3312,7 +3382,13 @@ pub fn list_join_requests(
         return Ok(Vec::new());
     };
     let dev = own_branch_of(db, repo_id);
-    Ok(all_join_requests(git, Path::new(lp), gh, dev.as_deref()))
+    Ok(all_join_requests(
+        db,
+        git,
+        Path::new(lp),
+        gh,
+        dev.as_deref(),
+    ))
 }
 
 /// The trusted structure of a shared repo for the UI: the work-tree file, or
@@ -3327,7 +3403,8 @@ pub fn get_repo_structure(
         return Ok(None);
     };
     let root = PathBuf::from(lp);
-    if let Some(s) = ss::read_structure_file(&root, &gh)? {
+    let admins = ss::AdminVerified::load(db);
+    if let Some(s) = ss::read_structure_file(&root, &gh, &admins)? {
         return Ok(Some(s));
     }
     let (Some(git), true) = (git, is_git_repo(&root)) else {
@@ -3341,11 +3418,94 @@ pub fn get_repo_structure(
         return Ok(None);
     }
     Ok(
-        match ss::discover_structure(git, &root, &gh, pinned.as_deref())? {
+        match ss::discover_structure(git, &root, &gh, pinned.as_deref(), &admins)? {
             DiscoverOutcome::Found(s, _) => Some(s),
             _ => None,
         },
     )
+}
+
+/// Unit separator between the commit time and the trailer values in the log
+/// format of `participants_activity`.
+const ACTIVITY_SEP: char = '\u{1f}';
+
+/// The newest commit time among the lines of `git log --format=%cI%x1f<trailers>`
+/// whose `SDH-Participant` trailer names `login` (case-insensitive). Several
+/// trailer values on one line are comma-separated. Malformed lines and
+/// unparsable times are skipped.
+fn latest_participant_commit(log: &str, login: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    log.lines()
+        .filter_map(|line| {
+            let (time, trailers) = line.split_once(ACTIVITY_SEP)?;
+            if !trailers
+                .split(',')
+                .any(|t| !t.trim().is_empty() && ss::logins_equal(t.trim(), login))
+            {
+                return None;
+            }
+            chrono::DateTime::parse_from_rfc3339(time.trim())
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc))
+        })
+        .max()
+}
+
+/// The last `HISTORY_CAP` commits of `origin/<branch>` as `time<US>trailers`
+/// lines; empty when the ref is missing or git fails.
+fn activity_log(git: &GitBinary, root: &Path, branch: &str) -> String {
+    let cap = format!("-n{}", HISTORY_CAP);
+    let rev = format!("{}/{}", REMOTE, branch);
+    let Ok(out) = spawn_cmd(&git.0)
+        .args([
+            "log",
+            cap.as_str(),
+            "--format=%cI%x1f%(trailers:key=SDH-Participant,valueonly,separator=%x2C)",
+            rev.as_str(),
+            "--",
+        ])
+        .current_dir(root)
+        .output()
+    else {
+        return String::new();
+    };
+    if !out.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Owner's view (T-000237): per participant, the time of the newest commit with
+/// their `SDH-Participant` trailer on their own branch or on the owner's dev
+/// branch. Does not fetch: the sync does.
+pub fn participants_activity(
+    db: &AppDb,
+    git: &GitBinary,
+    repo_id: i64,
+) -> Result<Vec<ParticipantActivity>, String> {
+    let Some(structure) = get_repo_structure(db, Some(git), repo_id)? else {
+        return Ok(Vec::new());
+    };
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let Some(lp) = repo.local_path.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let root = Path::new(lp);
+    let dev_log = activity_log(git, root, &structure.main.dev_branch);
+    Ok(structure
+        .participants
+        .iter()
+        .map(|p| {
+            let own_log = activity_log(git, root, &p.branch);
+            let last = latest_participant_commit(&own_log, &p.login)
+                .into_iter()
+                .chain(latest_participant_commit(&dev_log, &p.login))
+                .max();
+            ParticipantActivity {
+                login: p.login.clone(),
+                last_at: last.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            }
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -3616,6 +3776,206 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::fs;
+
+    // ----- T-000227: administrator checks and eligibility ---------------------
+
+    fn org_db(login: &str) -> (AppDb, Repository) {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", login).unwrap();
+        let repo = db
+            .upsert_repository("Acme-Org/web", None, None, None, None, None)
+            .unwrap();
+        (db, repo)
+    }
+
+    #[test]
+    fn a_pass_asks_for_admin_checks_only_when_main_is_not_the_owner() {
+        let (_db, repo) = org_db("boss");
+        let root = PathBuf::from("unused");
+        let mut pass = new_pass(&repo, &root, "boss");
+        // trusted by ownership: nothing rests on the API
+        pass.ask_admin_check("Owner/web", "owner");
+        assert!(pass.admin_checks.is_empty());
+        // not the owner: asked once, however often and in whatever case
+        pass.ask_admin_check("Acme-Org/web", "boss");
+        pass.ask_admin_check("acme-org/WEB", "BOSS");
+        pass.ask_admin_check("Acme-Org/web", "second-admin");
+        let asked: Vec<_> = pass
+            .admin_checks
+            .iter()
+            .map(|c| (c.repo.as_str(), c.login.as_str()))
+            .collect();
+        assert_eq!(
+            asked,
+            vec![("Acme-Org/web", "boss"), ("Acme-Org/web", "second-admin")]
+        );
+    }
+
+    #[test]
+    fn preflight_refuses_a_non_owner_without_a_verification() {
+        let (db, repo) = org_db("boss");
+        let err = shared_mode_preflight(&db, &gb(), repo.id).unwrap_err();
+        assert!(err.contains("repo owner or an administrator"), "{}", err);
+        // a non-admin answer changes nothing
+        ss::record_admin_verification(&db, "Acme-Org/web", "boss", false).unwrap();
+        assert!(shared_mode_preflight(&db, &gb(), repo.id)
+            .unwrap_err()
+            .contains("repo owner or an administrator"));
+        // a verified admin gets past the eligibility check (and meets the next
+        // requirement, the missing local checkout)
+        ss::record_admin_verification(&db, "Acme-Org/web", "boss", true).unwrap();
+        let err = shared_mode_preflight(&db, &gb(), repo.id).unwrap_err();
+        assert!(!err.contains("administrator"), "{}", err);
+    }
+
+    #[test]
+    fn preflight_does_not_ask_the_owner_for_a_verification() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "Owner").unwrap();
+        let repo = db
+            .upsert_repository("owner/api", None, None, None, None, None)
+            .unwrap();
+        let err = shared_mode_preflight(&db, &gb(), repo.id).unwrap_err();
+        assert!(!err.contains("administrator"), "{}", err);
+    }
+
+    // ----- T-000227: an organization's repo (git, ignored) -------------------
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_org_repo_is_shared_only_through_the_admin_verification() {
+        let fx = two_installs();
+        fx.main_db.set_setting("github_login", "boss").unwrap();
+        for (db, id) in [(&fx.main_db, fx.main_repo), (&fx.helper_db, fx.helper_repo)] {
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE repositories SET github_name = 'Acme-Org/api' WHERE id = ?1",
+                    [id],
+                )
+                .unwrap();
+        }
+        let boss = AdminCheck {
+            repo: "Acme-Org/api".into(),
+            login: "boss".into(),
+        };
+
+        // The main cannot switch sharing on until GitHub says he is an admin.
+        let err = enable_shared_mode(&fx.main_db, &gb(), fx.main_repo, false).unwrap_err();
+        assert!(err.contains("administrator"), "{}", err);
+        ss::record_admin_verification(&fx.main_db, "Acme-Org/api", "boss", true).unwrap();
+        enable_shared_mode(&fx.main_db, &gb(), fx.main_repo, false).unwrap();
+        // His sync asks to re-verify him, and pushes the structure.
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        assert_eq!(shared.admin_checks, vec![boss.clone()]);
+        shared.finish(&fx.main_db, Some(&gb()));
+        assert!(fx.remote_file("dev", ".sdh/project.json").is_some());
+
+        // The helper's install does not trust the file yet, and names whom to ask.
+        let probe = probe_role_less(&fx.helper_db, Some(&gb()));
+        assert_eq!(probe.admin_checks, vec![boss.clone()]);
+        probe.finish(&fx.helper_db, Some(&gb()));
+        assert_eq!(fx.helper_status().as_deref(), Some("shared_untrusted"));
+        let st = fx.helper_db.get_shared_state(fx.helper_repo).unwrap();
+        assert_eq!(st.shared_role, None);
+
+        // A non-admin answer changes nothing.
+        ss::record_admin_verification(&fx.helper_db, "Acme-Org/api", "boss", false).unwrap();
+        let probe = probe_role_less(&fx.helper_db, Some(&gb()));
+        probe.finish(&fx.helper_db, Some(&gb()));
+        assert_eq!(fx.helper_status().as_deref(), Some("shared_untrusted"));
+
+        // Verified: the structure is trusted, the helper is a pending joiner,
+        // and the check is still asked for on every sync.
+        ss::record_admin_verification(&fx.helper_db, "Acme-Org/api", "boss", true).unwrap();
+        let probe = probe_role_less(&fx.helper_db, Some(&gb()));
+        assert_eq!(probe.admin_checks, vec![boss.clone()]);
+        probe.finish(&fx.helper_db, Some(&gb()));
+        let st = fx.helper_db.get_shared_state(fx.helper_repo).unwrap();
+        assert_eq!(st.shared_role.as_deref(), Some("pending"));
+
+        // Revoked: the next sync does not trust the file any more.
+        ss::record_admin_verification(&fx.helper_db, "Acme-Org/api", "boss", false).unwrap();
+        let out = fx.sync_helper();
+        assert_eq!(fx.helper_status().as_deref(), Some("shared_untrusted"));
+        drop(out);
+    }
+
+    // ----- participants activity (T-000237) --------------------------------
+
+    fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn activity_takes_the_newest_commit_of_the_login() {
+        let log = "2026-10-20T10:00:00+00:00\u{1f}helper\n\
+                   2026-10-22T10:00:00+00:00\u{1f}helper\n\
+                   2026-10-21T10:00:00+00:00\u{1f}helper\n";
+        assert_eq!(
+            latest_participant_commit(log, "helper"),
+            Some(ts("2026-10-22T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn activity_ignores_commits_of_another_login_and_empty_trailers() {
+        let log = "2026-10-25T10:00:00+00:00\u{1f}someone-else\n\
+                   2026-10-24T10:00:00+00:00\u{1f}\n\
+                   2026-10-20T10:00:00+00:00\u{1f}helper\n";
+        assert_eq!(
+            latest_participant_commit(log, "helper"),
+            Some(ts("2026-10-20T10:00:00Z"))
+        );
+        assert_eq!(latest_participant_commit(log, "nobody"), None);
+    }
+
+    #[test]
+    fn activity_login_is_case_insensitive_and_handles_several_trailers() {
+        let log = "2026-10-20T10:00:00+00:00\u{1f}Other,HeLPer\n";
+        assert_eq!(
+            latest_participant_commit(log, "helper"),
+            Some(ts("2026-10-20T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn activity_converts_offsets_before_comparing() {
+        // 12:00+05:00 is 07:00Z, earlier than 10:00Z.
+        let log = "2026-10-20T12:00:00+05:00\u{1f}helper\n\
+                   2026-10-20T10:00:00+00:00\u{1f}helper\n";
+        assert_eq!(
+            latest_participant_commit(log, "helper"),
+            Some(ts("2026-10-20T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn activity_skips_malformed_lines_and_empty_output() {
+        let log = "garbage without separator\n\
+                   not-a-time\u{1f}helper\n\
+                   \n\
+                   2026-10-20T10:00:00+00:00\u{1f}helper\n";
+        assert_eq!(
+            latest_participant_commit(log, "helper"),
+            Some(ts("2026-10-20T10:00:00Z"))
+        );
+        assert_eq!(latest_participant_commit("", "helper"), None);
+    }
+
+    #[test]
+    fn activity_over_two_refs_is_the_maximum() {
+        let own = "2026-10-20T10:00:00+00:00\u{1f}helper\n";
+        let dev = "2026-10-23T10:00:00+00:00\u{1f}helper\n";
+        let last = latest_participant_commit(own, "helper")
+            .into_iter()
+            .chain(latest_participant_commit(dev, "helper"))
+            .max();
+        assert_eq!(last, Some(ts("2026-10-23T10:00:00Z")));
+    }
 
     // ----- managed blocks -------------------------------------------------
 

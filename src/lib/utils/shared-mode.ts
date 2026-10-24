@@ -29,17 +29,22 @@ export function isContributorRole(state: Pick<RepoSharedState, 'shared_role'> | 
 }
 
 /**
- * Is the "Общий режим" switch offered here? Only when this install may be the
- * main one: the repo owner is this install's GitHub login, and the install is
- * not somebody's contributor.
+ * Is the "Общий режим" switch offered here? When this install may be the main
+ * one: it is not somebody's contributor, its GitHub login is known, and it owns
+ * the repo or administers it by the last repo-list fetch (`adminRepos`, lower-
+ * cased full names — an organization's repo, T-000227). The admin is checked
+ * against GitHub again on press. Once main, the switch stays (to switch off).
  */
 export function canToggleSharedMode(
   githubName: string | null | undefined,
   login: string | null | undefined,
   state: Pick<RepoSharedState, 'shared_role'> | null | undefined,
+  adminRepos: ReadonlySet<string> = new Set(),
 ): boolean {
   if (isContributorRole(state)) return false;
-  return sameLogin(repoOwner(githubName), login);
+  if (repoOwner(githubName) === '' || (login ?? '').trim() === '') return false;
+  if (state?.shared_role === 'main') return true;
+  return sameLogin(repoOwner(githubName), login) || adminRepos.has((githubName ?? '').toLowerCase());
 }
 
 /** A repo that takes part in shared mode in any way (any role, or a status). */
@@ -322,4 +327,37 @@ export function requestsWaitingKey(n: number, locale: 'ru' | 'en'): TranslationK
     : form === 'few'
       ? 'shared.requestsWaitingFew'
       : 'shared.requestsWaitingMany';
+}
+
+// ── Auto-sync hint of a contributor (T-000237) ──────────────────────────────
+
+export interface AutoSyncOffHint {
+  /** The project to switch auto-sync on for; null when the repo has no project. */
+  projectId: number | null;
+}
+
+/**
+ * The contributor's install will not sync this repo by itself: the global
+ * switch is off, or the repo has no project, or its project has auto-sync off.
+ * Null when the line is not due (not a contributor / pending, auto-sync runs,
+ * or the repo's project is not in the list yet).
+ */
+export function autoSyncOffHint(
+  state: Pick<RepoSharedState, 'shared_role'> | null | undefined,
+  globalEnabled: boolean,
+  projectId: number | null | undefined,
+  projects: { id: number; auto_sync_enabled: boolean }[],
+): AutoSyncOffHint | null {
+  if (!isContributorRole(state)) return null;
+  if (projectId === null || projectId === undefined) return { projectId: null };
+  const project = projects.find((p) => p.id === projectId);
+  if (!project) return null;
+  return !globalEnabled || !project.auto_sync_enabled ? { projectId } : null;
+}
+
+/** `login (any case) -> last push time` from the activity list; keys are lower-cased. */
+export function activityByLogin(
+  list: { login: string; last_at: string | null }[],
+): Map<string, string | null> {
+  return new Map(list.map((a) => [a.login.trim().toLowerCase(), a.last_at]));
 }

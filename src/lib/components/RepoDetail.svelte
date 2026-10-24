@@ -1,18 +1,18 @@
 <script lang="ts">
   import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { open } from '@tauri-apps/plugin-dialog';
-  import { allRepos, assignRepo, loadAllRepos } from '$lib/stores/repos';
-  import { projects } from '$lib/stores/projects';
+  import { allRepos, assignRepo, loadAllRepos, isSyncing, adminRepos } from '$lib/stores/repos';
+  import { projects, loadProjects } from '$lib/stores/projects';
   import { currentScreen, selectedRepoId, deployDrillTarget } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
-  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch, getRepoStructure, listJoinRequests, approveJoinRequest } from '$lib/api/tauri-commands';
-  import type { RepoRename, ProjectStructure, JoinRequest } from '$lib/types';
+  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch, getRepoStructure, listJoinRequests, approveJoinRequest, sharedParticipantsActivity, setProjectAutoSync } from '$lib/api/tauri-commands';
+  import type { RepoRename, ProjectStructure, JoinRequest, ParticipantActivity } from '$lib/types';
   import { deleteRepoOnGitHub, splitRepoFullName, listBranches, type BranchInfo } from '$lib/api/github';
   import { addToast } from '$lib/stores/ui';
   import { getRoleLabel, getDisplayName, type Role } from '$lib/types';
   import type { StatsSummary as StatsSummaryData } from '$lib/types';
   import { tStore, locale } from '$lib/i18n';
-  import { pat } from '$lib/stores/settings';
+  import { pat, autoSyncEnabled, saveAutoSyncEnabled } from '$lib/stores/settings';
   import BugNotes from './BugNotes.svelte';
   import EmptyState from './EmptyState.svelte';
   import StatsSummary from './StatsSummary.svelte';
@@ -26,13 +26,15 @@
   import DeployScreen from './DeployScreen.svelte';
   import UntrackGitignoredDialog from './UntrackGitignoredDialog.svelte';
   import { toastRulesFindings } from '$lib/utils/rules-report';
+  import { runProjectSync, runSharedProbe } from '$lib/sync-run';
+  import { chooseSyncAction } from '$lib/utils/sync-target';
   import { sharedStates, githubLogin, refreshShared } from '$lib/stores/shared';
   import SharedModeChip from './SharedModeChip.svelte';
   import SharedStatusLine from './SharedStatusLine.svelte';
   import ParticipantsTab from './ParticipantsTab.svelte';
   import {
     canToggleSharedMode, isContributorRole, isSharedRepo, buildParticipantRows, pendingRequestCount,
-    myBandLabel, describeSharedStatus, requestsWaitingKey,
+    myBandLabel, describeSharedStatus, requestsWaitingKey, autoSyncOffHint, activityByLogin,
   } from '$lib/utils/shared-mode';
 
   const roleKeys: Role[] = ['server', 'admin_client', 'client', 'test_client', 'landing', 'tool', 'other'];
@@ -72,7 +74,7 @@
   // This install is the owner's: the repo is shared and it is not a contributor.
   const isOwnerInstall = $derived(isShared && !isContributor);
   const showSharedToggle = $derived(
-    repo ? canToggleSharedMode(repo.github_name, $githubLogin, sharedState) : false,
+    repo ? canToggleSharedMode(repo.github_name, $githubLogin, sharedState, $adminRepos) : false,
   );
   let structure = $state<ProjectStructure | null>(null);
   let joinRequests = $state<JoinRequest[]>([]);
@@ -94,6 +96,46 @@
     sharedState?.shared_role === 'contributor' ? myBandLabel(structure, $githubLogin) : null,
   );
   const sharedStatusLine = $derived(describeSharedStatus(sharedState, structure?.main.login ?? null));
+
+  // T-000237: the owner's view of when each participant last pushed.
+  let participantActivity = $state<ParticipantActivity[]>([]);
+  const activityMap = $derived(activityByLogin(participantActivity));
+
+  async function loadParticipantActivity() {
+    const id = repo?.id;
+    if (id === undefined || !isOwnerInstall || activeTab !== 'participants') {
+      participantActivity = [];
+      return;
+    }
+    try {
+      const list = await sharedParticipantsActivity(id);
+      if (repo?.id === id) participantActivity = list;
+    } catch {
+      // Silent: the column stays "—".
+      if (repo?.id === id) participantActivity = [];
+    }
+  }
+
+  // T-000237: a contributor whose install will not sync this repo by itself.
+  const autoSyncHint = $derived(
+    repo ? autoSyncOffHint(sharedState, $autoSyncEnabled, repo.project_id, $projects) : null,
+  );
+  let enablingAutoSync = $state(false);
+
+  async function handleEnableAutoSync() {
+    const projectId = autoSyncHint?.projectId;
+    if (projectId === null || projectId === undefined || enablingAutoSync) return;
+    enablingAutoSync = true;
+    try {
+      await saveAutoSyncEnabled(true);
+      await setProjectAutoSync(projectId, true);
+      await loadProjects();
+    } catch (err) {
+      addToast(String(err), 'error');
+    } finally {
+      enablingAutoSync = false;
+    }
+  }
 
   async function loadSharedDetails() {
     const id = repo?.id;
@@ -138,6 +180,16 @@
     void $selectedRepoId;
     void sharedSignature;
     void loadSharedDetails();
+  });
+
+  // Reload the last-push column when the tab is shown, the repo changes, or the
+  // shared state is refreshed (after every sync the store holds new objects).
+  $effect(() => {
+    void $selectedRepoId;
+    void sharedState;
+    void activeTab;
+    void isOwnerInstall;
+    void loadParticipantActivity();
   });
 
   // The shared state changed under an action of this screen: reload everything.
@@ -403,6 +455,27 @@
     await loadAllRepos();
   }
 
+  // T-000235: the repo's own Sync button. A repo in a project syncs that project;
+  // a repo without one (a contributor's, not linked yet) is probed for the
+  // owner's structure, which links it to a project.
+  let syncingProject = $state(false);
+  const syncBusy = $derived(syncingProject || $isSyncing);
+
+  async function handleSyncRepo() {
+    if (!repo || syncBusy) return;
+    const action = chooseSyncAction(repo.project_id);
+    if (action.kind === 'project') {
+      syncingProject = true;
+      try {
+        await runProjectSync(action.projectId);
+      } finally {
+        syncingProject = false;
+      }
+    } else {
+      await runSharedProbe();
+    }
+  }
+
   async function handleInitDocs() {
     if (!repo) return;
     try {
@@ -527,11 +600,19 @@
         <span class="meta-text">{$tStore('repoDetail.labelLastPushed')}: {formatDate(repo.last_pushed_at)}</span>
         <span class="meta-dot">·</span>
         {#if repo.local_path}
-          <span class="local-path ok" title={repo.local_path}>📁 {repo.local_path}</span>
+          <!-- T-000236: read-only path field with the folder button flush against it. -->
+          <div class="path-group">
+            <input type="text" class="path-field" readonly value={repo.local_path} title={repo.local_path} />
+            <button class="path-pick" onclick={handleSetLocalPath} type="button" title={$tStore('repo.localPathSet' as any)}>…</button>
+          </div>
         {:else}
           <span class="local-path warn">⚠ {$tStore('repo.localPathNotFound' as any)}</span>
+          <button class="ghost mini" onclick={handleSetLocalPath} type="button">{$tStore('repo.localPathSet' as any)}</button>
         {/if}
-        <button class="ghost mini" onclick={handleSetLocalPath} type="button">{$tStore('repo.localPathSet' as any)}</button>
+        <button class="sync-btn row-action" onclick={handleSyncRepo} type="button" disabled={syncBusy} title={$tStore('repo.syncButton' as any)}>
+          <span class="btn-icon">🔄</span>
+          <span class="btn-label">{$tStore('repo.syncButton' as any)}</span>
+        </button>
         <button class="init-docs-btn row-action" onclick={handleInitDocs} type="button" title={$tStore('repo.initDocsButton' as any)}>
           <span class="btn-icon">📚</span>
           <span class="btn-label">{$tStore('repo.initDocsButton' as any)}</span>
@@ -670,6 +751,16 @@
               .replace('{2}', structure.main.dev_branch)}
           </div>
         {/if}
+        {#if autoSyncHint}
+          <div class="shared-note muted">
+            <span>{$tStore('shared.autoSyncOff' as any)}</span>
+            {#if autoSyncHint.projectId !== null}
+              <button type="button" class="shared-note-btn" onclick={handleEnableAutoSync} disabled={enablingAutoSync}>
+                {$tStore('shared.autoSyncEnable' as any)}
+              </button>
+            {/if}
+          </div>
+        {/if}
         {#if isOwnerInstall && requestCount > 0}
           <button type="button" class="shared-note requests" onclick={() => (activeTab = 'participants')} title={$tStore('shared.requestsWaitingHint' as any)}>
             {$tStore(requestsWaitingKey(requestCount, $locale) as any).replace('{0}', String(requestCount))}
@@ -782,6 +873,7 @@
         {isOwnerInstall}
         {approving}
         onApprove={handleApprove}
+        activity={activityMap}
       />
     {:else if activeTab === 'deploy'}
       {#if repo.github_name && repo.deploy_target}
@@ -1083,18 +1175,44 @@
   .local-path {
     font-size: 11px;
     font-family: monospace;
-    /* B-000015: cap visible width so a deeply nested path doesn't push the
-       row-action buttons (init-docs / untrack-gitignored) onto the next line.
-       Full path is available on hover via the `title` attribute. */
-    max-width: 40ch;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
     min-width: 0;
   }
 
-  .local-path.ok {
-    color: var(--text);
+  /* T-000236: path field + folder button as one input-group. B-000015: the group
+     takes a zero flex-basis so a deeply nested path shrinks (ellipsis) instead of
+     pushing the row-action buttons onto the next line; flex-grow stretches it
+     over all the free space up to them. Full path is in the `title`. */
+  .path-group {
+    display: flex;
+    align-items: stretch;
+    flex: 1 1 0;
+    min-width: 8rem;
+  }
+  .path-field {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
+    font-size: 11px;
+    font-family: monospace;
+    padding: 2px 8px;
+    text-overflow: ellipsis;
+    border-radius: var(--radius) 0 0 var(--radius);
+    cursor: default;
+  }
+  .path-pick {
+    flex-shrink: 0;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 10px;
+    margin-left: -1px;
+    border-radius: 0 var(--radius) var(--radius) 0;
+    background-color: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .path-pick:hover:not(:disabled) {
+    background-color: var(--accent-hover);
+    border-color: var(--accent-hover);
   }
 
   .local-path.warn {
@@ -1132,6 +1250,17 @@
     text-align: left;
   }
   .shared-note.requests:hover { text-decoration: underline; }
+  .shared-note-btn {
+    font-size: 11px;
+    padding: 0 8px;
+    border-radius: 4px;
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+  }
+  .shared-note-btn:hover:not(:disabled) { background: var(--accent); color: white; }
+  .shared-note-btn:disabled { opacity: 0.5; cursor: wait; }
 
   .mini {
     font-size: 10px;
@@ -1191,6 +1320,7 @@
     color: var(--text);
   }
 
+  .sync-btn,
   .init-docs-btn {
     font-size: 11px;
     padding: 2px 10px;
@@ -1201,7 +1331,10 @@
     cursor: pointer;
     white-space: nowrap;
   }
+  .sync-btn:hover:not(:disabled),
   .init-docs-btn:hover { background: var(--surface); border-color: var(--accent); }
+
+  .init-docs-btn { margin-left: 4px; }
 
   .untrack-gitignored-btn {
     /* Sits immediately to the right of init-docs in meta-row. Init-docs has the

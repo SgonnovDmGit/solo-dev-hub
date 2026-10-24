@@ -7,8 +7,16 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { writable } from 'svelte/store';
 
 const syncProject = vi.fn();
+const setSharedAdminVerified = vi.fn();
 vi.mock('$lib/api/tauri-commands', () => ({
   syncProject: (id: number) => syncProject(id),
+  probeSharedRepos: vi.fn(),
+  setSharedAdminVerified: (...args: unknown[]) => setSharedAdminVerified(...args),
+}));
+
+const isRepoAdmin = vi.fn();
+vi.mock('$lib/api/github', () => ({
+  isRepoAdmin: (...args: unknown[]) => isRepoAdmin(...args),
 }));
 
 vi.mock('../settings', () => ({
@@ -16,6 +24,7 @@ vi.mock('../settings', () => ({
   autoSyncIntervalMin: writable(15),
   autoSyncLastAt: writable(null),
   saveAutoSyncLastAt: vi.fn(async () => undefined),
+  pat: writable('token'),
 }));
 
 vi.mock('../projects', () => ({
@@ -46,6 +55,7 @@ function result(extra: Record<string, unknown>) {
     committed: [],
     rules_taken: [],
     rules_lost: [],
+    admin_checks: [],
     ...extra,
   };
 }
@@ -89,5 +99,59 @@ describe('auto-sync rule findings', () => {
     await runOneTick();
     expect(syncProject).toHaveBeenCalledWith(7);
     expect(addToast).not.toHaveBeenCalled();
+  });
+});
+
+// T-000227: the background timer goes through the same administrator
+// verification as a manual sync.
+describe('auto-sync administrator checks', () => {
+  const check = { repo: 'Acme-Org/web', login: 'boss' };
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    syncProject.mockReset();
+    setSharedAdminVerified.mockReset();
+    isRepoAdmin.mockReset();
+    addToast.mockReset();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function runOneTick() {
+    const { startAutoSyncTimer } = await import('../autosync');
+    startAutoSyncTimer();
+    await vi.advanceTimersByTimeAsync(60_000);
+  }
+
+  it('verifies the asked logins and syncs once more when one just became an admin', async () => {
+    syncProject
+      .mockResolvedValueOnce(result({ admin_checks: [check], copied: 1 }))
+      .mockResolvedValueOnce(result({ admin_checks: [check], copied: 2 }));
+    isRepoAdmin.mockResolvedValue(true);
+    setSharedAdminVerified.mockResolvedValue(true);
+    await runOneTick();
+    expect(isRepoAdmin).toHaveBeenCalledWith('token', 'Acme-Org', 'web', 'boss');
+    expect(setSharedAdminVerified).toHaveBeenCalledWith('Acme-Org/web', 'boss', true);
+    // exactly one re-run, even though the second result asks again
+    expect(syncProject).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not sync again when nobody newly became an admin', async () => {
+    syncProject.mockResolvedValue(result({ admin_checks: [check] }));
+    isRepoAdmin.mockResolvedValue(true);
+    setSharedAdminVerified.mockResolvedValue(false);
+    await runOneTick();
+    expect(setSharedAdminVerified).toHaveBeenCalledTimes(1);
+    expect(syncProject).toHaveBeenCalledTimes(1);
+  });
+
+  it('writes nothing when the GitHub call fails', async () => {
+    syncProject.mockResolvedValue(result({ admin_checks: [check] }));
+    isRepoAdmin.mockRejectedValue(new Error('403'));
+    await runOneTick();
+    expect(setSharedAdminVerified).not.toHaveBeenCalled();
+    expect(syncProject).toHaveBeenCalledTimes(1);
   });
 });

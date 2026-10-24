@@ -798,6 +798,11 @@ fn take_up(db: &AppDb, name: String, copies: &[HandedCopy], out: &mut Collected)
         out.rule_failed(&name, file_name, e);
         return;
     }
+    // T-000213: taking a hand-back up is an explicit acceptance of the rule as
+    // it stands against the current canon.
+    if let Err(e) = crate::sync::rule_canon::acknowledge(db, &name) {
+        out.rule_failed(&name, crate::sync::rule_canon::RULE_FORK_CANON_KEY, e);
+    }
     for copy in copies {
         // Recorded before the marker is cleared, and whether or not that
         // succeeds: the text is already the rule at this point.
@@ -1009,6 +1014,13 @@ pub fn resolve_conflict(
             .map_err(|e| e.to_string())?;
     }
     let mut out = Collected::default();
+    if accepted.is_some() {
+        // T-000213: the owner chose a text on the Rules screen — an acceptance
+        // like a save.
+        if let Err(e) = crate::sync::rule_canon::acknowledge(db, rule) {
+            out.rule_failed(rule, crate::sync::rule_canon::RULE_FORK_CANON_KEY, e);
+        }
+    }
     for marker in &live.markers {
         if let Err(e) = remove_if_present(marker) {
             out.rule_failed(rule, marker.display().to_string(), e);
@@ -1084,7 +1096,23 @@ pub(crate) fn refresh_rules_locked(
     report.absorb(collected);
     let everywhere = !report.taken.is_empty();
     render_scope(db, claude_dir, scope, everywhere, &repos, &mut report);
+    reconcile_fork_canon(db, &mut report);
     report
+}
+
+/// T-000213: bring the fork-canon records in line with the stored rules; a
+/// failure is reported, never fatal. Every rule write ends in a pass that calls
+/// this (or is followed by one), and startup calls it after seeding.
+fn reconcile_fork_canon(db: &AppDb, report: &mut RulesRefresh) {
+    if let Err(e) = crate::sync::rule_canon::reconcile(db) {
+        report.errors.push(
+            SyncIssue::new(
+                SyncIssueCode::RuleFailed,
+                crate::sync::rule_canon::RULE_FORK_CANON_KEY,
+            )
+            .detail(e),
+        );
+    }
 }
 
 /// T-000174: the checkout of `repo` on THIS machine — `None` without a local
@@ -1278,6 +1306,7 @@ pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option
             0
         }
     };
+    reconcile_fork_canon(db, &mut report);
     let render = seeded > 0 || !report.taken.is_empty() || !report.lost.is_empty();
     if render {
         render_scope(
@@ -2657,6 +2686,45 @@ mod tests {
     }
 
     // ── T-000207: every render collects across the portfolio first ───────────
+
+    /// T-000213: taking a hand-back up accepts the current canon for the rule —
+    /// a record left by an older build is brought up to date, so no "canon
+    /// updated" mark survives the owner's approved edit.
+    #[test]
+    fn test_taking_a_handback_up_acknowledges_the_current_canon() {
+        use crate::sync::rule_canon;
+        let tmp = TempDir::new().unwrap();
+        let db = AppDb::new(tmp.path().join("test.db")).unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        rendered_repo(&db, &repo_dir, "pending");
+        hand_back_edit(repo_dir.path(), "sdh-debugging");
+        db.set_setting(
+            rule_canon::RULE_FORK_CANON_KEY,
+            &format!(
+                "{{\"sdh-debugging\":\"{}\"}}",
+                rule_canon::canon_hash("older canon")
+            ),
+        )
+        .unwrap();
+
+        let report = refresh_rules(
+            &db,
+            Some(&home.path().join(".claude")),
+            RenderScope::UptakeOnly,
+            None,
+        );
+
+        assert_eq!(report.taken, vec!["sdh-debugging"]);
+        let canon =
+            crate::template_seeder::bundled_file_content("_global", "skill.sdh-debugging.md.tmpl")
+                .unwrap();
+        assert_eq!(
+            rule_canon::read_records(&db).unwrap().get("sdh-debugging"),
+            Some(&rule_canon::canon_hash(&canon))
+        );
+    }
 
     /// Startup re-renders the whole portfolio after a seed that changed
     /// something. A hand-back waiting in any repo must be taken up first.

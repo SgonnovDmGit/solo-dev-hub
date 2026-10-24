@@ -161,6 +161,16 @@ fn after_rule_write(
                 .detail(e),
         );
     }
+    // T-000213: a save or a reset (also an unchanged save) accepts the rule
+    // against the current canon. Here rather than in the refresh pass, which a
+    // global-section write never reaches.
+    if let Err(e) = sync::rule_canon::acknowledge(db, rule) {
+        errors.push(
+            SyncIssue::new(SyncIssueCode::RuleFailed, rule)
+                .target(sync::rule_canon::RULE_FORK_CANON_KEY)
+                .detail(e),
+        );
+    }
     let Some(skill_name) = sync::skill_name_of(file_name) else {
         return TemplateSaveOutcome {
             errors,
@@ -224,6 +234,7 @@ fn list_rules_in(db: &AppDb) -> Result<RulesOverview, String> {
         .map_err(|e| e.to_string())?;
     let conflicts = db.open_rule_conflicts().map_err(|e| e.to_string())?;
     let followed = sync::shared_canon::followed_rules(db);
+    let fork_canon = sync::rule_canon::read_records(db)?;
     let mut rules = Vec::new();
     for file in files {
         let Some(rule) = sync::rule_name_of(&file.file_name).map(str::to_string) else {
@@ -234,6 +245,12 @@ fn list_rules_in(db: &AppDb) -> Result<RulesOverview, String> {
             // Text against the bundle, not `is_custom`: a save of text equal to
             // the bundle leaves the flag set but changes nothing.
             changed: canon.as_deref().is_some_and(|canon| canon != file.content),
+            canon_moved: sync::rule_canon::is_moved(
+                &fork_canon,
+                &rule,
+                canon.as_deref(),
+                &file.content,
+            ),
             conflict: conflicts.contains(&rule),
             follows_main: followed.get(&rule).map(|f| f.login.clone()),
             origin: db.latest_origin_event(&rule).map_err(|e| e.to_string())?,
@@ -1389,5 +1406,138 @@ mod tests {
             "MY EDIT",
         )
         .unwrap();
+    }
+
+    // ── T-000213: a fork whose canon moved after the edit ──────────────────
+
+    const RETRO: &str = "skill.sdh-retro.md.tmpl";
+
+    fn moved_rules(db: &AppDb) -> Vec<String> {
+        list_rules_in(db)
+            .unwrap()
+            .rules
+            .into_iter()
+            .filter(|r| r.canon_moved)
+            .map(|r| r.rule)
+            .collect()
+    }
+
+    /// Simulate a build that moved the canon: the record is the hash of an
+    /// older canon text.
+    fn age_record(db: &AppDb, rule: &str) {
+        let mut records = sync::rule_canon::read_records(db).unwrap();
+        records.insert(
+            rule.to_string(),
+            sync::rule_canon::canon_hash("older canon"),
+        );
+        db.set_setting(
+            sync::rule_canon::RULE_FORK_CANON_KEY,
+            &serde_json::to_string(&records).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_a_save_records_the_canon_and_a_later_save_after_it_moved_clears_the_flag() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        let save = |text: &str| {
+            save_template_file_in(&db, Some(home.path().to_path_buf()), "_global", RETRO, text)
+                .unwrap()
+        };
+
+        save("OWNER TEXT");
+        assert_eq!(
+            sync::rule_canon::read_records(&db).unwrap().len(),
+            1,
+            "the save made a fork and accepted the canon"
+        );
+        assert!(moved_rules(&db).is_empty());
+
+        age_record(&db, "sdh-retro");
+        assert_eq!(moved_rules(&db), vec!["sdh-retro".to_string()]);
+
+        // Pressing Save again, with the same text, is the acknowledgement.
+        save("OWNER TEXT");
+        assert!(moved_rules(&db).is_empty());
+    }
+
+    #[test]
+    fn test_a_reset_drops_the_record_and_the_flag() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            RETRO,
+            "OWNER TEXT",
+        )
+        .unwrap();
+        age_record(&db, "sdh-retro");
+        assert_eq!(moved_rules(&db).len(), 1);
+
+        reset_template_file_in(&db, Some(home.path().to_path_buf()), "_global", RETRO).unwrap();
+
+        assert!(moved_rules(&db).is_empty());
+        assert!(sync::rule_canon::read_records(&db).unwrap().is_empty());
+    }
+
+    /// The global section does not go through the refresh pass, but a save of it
+    /// is an acknowledgement all the same.
+    #[test]
+    fn test_saving_the_global_section_acknowledges_the_canon() {
+        let (db, _db_dir) = seeded();
+        let home = TempDir::new().unwrap();
+        save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "claude.md.global.tmpl",
+            "MY SECTION",
+        )
+        .unwrap();
+        age_record(&db, "claude.md.global");
+        assert_eq!(moved_rules(&db), vec!["claude.md.global".to_string()]);
+
+        save_template_file_in(
+            &db,
+            Some(home.path().to_path_buf()),
+            "_global",
+            "claude.md.global.tmpl",
+            "MY SECTION",
+        )
+        .unwrap();
+        assert!(moved_rules(&db).is_empty());
+    }
+
+    /// A fork from before this feature has no record: the first rules pass takes
+    /// the current canon as its baseline, so it shows no mark.
+    #[test]
+    fn test_an_old_fork_is_baselined_by_the_first_refresh_and_not_flagged() {
+        let (db, _db_dir) = seeded();
+        db.upsert_template_file("_global", RETRO, "OLD FORK", true)
+            .unwrap();
+        assert!(sync::rule_canon::read_records(&db).unwrap().is_empty());
+        assert!(moved_rules(&db).is_empty());
+
+        let home = TempDir::new().unwrap();
+        sync::refresh_rules(
+            &db,
+            Some(&home.path().join(".claude")),
+            sync::RenderScope::UptakeOnly,
+            None,
+        );
+
+        assert_eq!(sync::rule_canon::read_records(&db).unwrap().len(), 1);
+        assert!(moved_rules(&db).is_empty());
+    }
+
+    /// A rule that equals its canon never carries the flag, whatever is recorded.
+    #[test]
+    fn test_a_rule_equal_to_its_canon_is_not_flagged() {
+        let (db, _db_dir) = seeded();
+        age_record(&db, "sdh-retro");
+        assert!(moved_rules(&db).is_empty());
     }
 }

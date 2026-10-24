@@ -5,6 +5,9 @@
   import { onDestroy } from 'svelte';
   import { tStore } from '$lib/i18n';
   import { pat } from '$lib/stores/settings';
+  import { githubLogin } from '$lib/stores/shared';
+  import { verifyAdmin } from '$lib/sync-core';
+  import { needsOwnAdminCheck } from '$lib/utils/shared-admin';
   import { addToast } from '$lib/stores/ui';
   import { sharedModePreflight, enableSharedMode, disableSharedMode } from '$lib/api/tauri-commands';
   import { isRepoPublic, splitRepoFullName } from '$lib/api/github';
@@ -56,6 +59,16 @@
     busy = true;
     onPreflightErrors([]);
     try {
+      // T-000227: the repo's owner may switch sharing on without asking GitHub;
+      // anybody else (an organization's repo) must be one of its administrators.
+      if (githubName && $githubLogin && needsOwnAdminCheck(githubName, $githubLogin)) {
+        const admin = $pat ? (await verifyAdmin($pat, githubName, $githubLogin)).admin : false;
+        if (!alive) return;
+        if (!admin) {
+          onPreflightErrors([$tStore('shared.preflight.notOwnerOrAdmin' as any)]);
+          return;
+        }
+      }
       const pre = await sharedModePreflight(repoId);
       if (!alive) return;
       const problems: string[] = [];

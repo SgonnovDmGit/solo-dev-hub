@@ -3,7 +3,7 @@
 
 use crate::db::AppDb;
 use crate::git_ops::cached_git;
-use crate::models::{SharedDisableResult, SharedMergeResult, SharedPreflight};
+use crate::models::{ParticipantActivity, SharedDisableResult, SharedMergeResult, SharedPreflight};
 use crate::sync::shared;
 use crate::sync::shared_structure::{JoinRequest, ProjectStructure};
 use tauri::State;
@@ -29,6 +29,20 @@ pub fn enable_shared_mode(
     remove_lines: bool,
 ) -> Result<(), String> {
     shared::enable_shared_mode(&db, &need_git()?, repo_id, remove_lines)
+}
+
+/// T-000227: store the outcome of a GitHub administrator check made by the
+/// frontend (`repos.getCollaboratorPermissionLevel`). Returns true when `login`
+/// became an administrator of the repo with this call (it was not one before).
+/// The backend never calls GitHub; a failed check is simply not reported.
+#[tauri::command]
+pub fn set_shared_admin_verified(
+    db: State<AppDb>,
+    repo_full_name: String,
+    login: String,
+    admin: bool,
+) -> Result<bool, String> {
+    crate::sync::shared_structure::record_admin_verification(&db, &repo_full_name, &login, admin)
 }
 
 /// Switch shared mode off; the deletion of `.sdh/` is committed and pushed now.
@@ -70,4 +84,13 @@ pub fn get_repo_structure(
     repo_id: i64,
 ) -> Result<Option<ProjectStructure>, String> {
     shared::get_repo_structure(&db, cached_git().as_ref(), repo_id)
+}
+
+/// Owner's view: when each participant's install last pushed a sync commit.
+#[tauri::command(async)]
+pub fn shared_participants_activity(
+    db: State<AppDb>,
+    repo_id: i64,
+) -> Result<Vec<ParticipantActivity>, String> {
+    shared::participants_activity(&db, &need_git()?, repo_id)
 }

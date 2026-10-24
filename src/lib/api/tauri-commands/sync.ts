@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult, SharedPreflight, SharedMergeResult, SharedDisableResult, JoinRequest, ProjectStructure } from '$lib/types';
+import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult, SharedPreflight, SharedMergeResult, SharedDisableResult, JoinRequest, ProjectStructure, ParticipantActivity } from '$lib/types';
 
 
 // ── Requirements sync commands ──────────────────────────────────────────────
@@ -78,6 +78,13 @@ export async function sharedModePreflight(repoId: number): Promise<SharedPreflig
   return invoke<SharedPreflight>('shared_mode_preflight', { repoId });
 }
 
+/** T-000227: store the outcome of a GitHub administrator check. Resolves to true
+ *  when `login` became an administrator of the repo with this call (it was not
+ *  one before). Only a successful API answer may be reported. */
+export async function setSharedAdminVerified(repoFullName: string, login: string, admin: boolean): Promise<boolean> {
+  return invoke<boolean>('set_shared_admin_verified', { repoFullName, login, admin });
+}
+
 /** Owner: switch shared mode on. Rejects when blocking .gitignore lines remain
  *  and `removeLines` is false; with it, exactly those lines are removed. */
 export async function enableSharedMode(repoId: number, removeLines: boolean): Promise<void> {
@@ -109,4 +116,9 @@ export async function listJoinRequests(repoId: number): Promise<JoinRequest[]> {
 
 export async function getRepoStructure(repoId: number): Promise<ProjectStructure | null> {
   return invoke<ProjectStructure | null>('get_repo_structure', { repoId });
+}
+
+/** Owner: when each participant's install last pushed a sync commit. */
+export async function sharedParticipantsActivity(repoId: number): Promise<ParticipantActivity[]> {
+  return invoke<ParticipantActivity[]>('shared_participants_activity', { repoId });
 }

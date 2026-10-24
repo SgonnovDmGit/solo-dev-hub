@@ -79,11 +79,20 @@ git checkout dev && git rebase master   # подтягиваем хотфикс 
 
 ### Linux
 
-`release.yml` собирает матрицей `windows-latest` + `ubuntu-22.04` (`fail-fast: false`); оба job'а публикуют в один и тот же Release.
+`release.yml` собирает матрицей `windows-latest` + `ubuntu-22.04` + две строки `macos-latest` (`fail-fast: false`); все job'ы публикуют в один и тот же Release.
 - Linux-цели задаются аргументом `--bundles appimage,deb` у `tauri-action` (не в `tauri.conf.json`, чтобы локальная Windows-сборка не менялась). Подписанный AppImage даёт запись `linux-x86_64` в `latest.json`.
 - Автообновление работает только у AppImage. `.deb` ставится вручную и сам не обновляется.
 - Хранилище секретов на Linux — Secret Service по D-Bus (GNOME Keyring / KWallet), фича `sync-secret-service` в `Cargo.toml` (target-specific). Без запущенного демона PAT и ключ шифрования секретов сохранить нельзя: UI получит строку ошибки от keyring.
 - `.github/workflows/linux-build.yml` (push в `dev` и ручной запуск): `cargo test --lib -- --include-ignored --skip db::migrations::tests::export_fresh_schema_db` (полный набор, включая тесты с git, проигнорированные локально) и сборка AppImage + deb **без публикации**; артефакты `solo-dev-hub-linux-<sha>` хранятся 14 дней. Используется для проверки Linux-сборки до тега.
+
+### macOS
+
+Ещё две строки матрицы — `macos-latest` (раннер Apple Silicon) с `--target aarch64-apple-darwin --bundles app,dmg` и `--target x86_64-apple-darwin --bundles app,dmg`: две нативные сборки, каждая даёт свой подписанный updater-ключом `.app.tar.gz` → записи `darwin-aarch64` и `darwin-x86_64` в `latest.json`. Universal-сборку не используем: что tauri-action заполняет ею обе записи, официально не задокументировано.
+- Тулчейн ставит обе цели (`targets` у `dtolnay/rust-toolchain` по условию платформы); кэш двух mac-строк разведён ключом `matrix.args`.
+- Подпись Apple **ad-hoc** (`bundle.macOS.signingIdentity: "-"` в `tauri.conf.json`), без Developer ID и нотаризации: первый запуск у пользователя — через «Конфиденциальность и безопасность → Всё равно открыть» (README). Подпись и нотаризация — T-000238 (v2.0.0): секреты `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` в env шага tauri-action.
+- Хранилище секретов — связка ключей входа, фича `apple-native` у `keyring` (target-specific).
+- git: GUI-процесс из Finder получает PATH без Homebrew, а `/usr/bin/git` без Command Line Tools открывает диалог установки — `git_ops::git_candidates` пробует Homebrew раньше PATH.
+- `.github/workflows/macos-build.yml` (push в `dev` и ручной запуск): быстрый набор `cargo test --lib` на macOS и Intel-`.dmg` **без публикации** (артефакт `solo-dev-hub-macos-x64-<sha>`, 14 дней) — кандидат для проверки в виртуалке с macOS для Intel.
 
 ## GitHub Actions secrets (один раз настраиваются)
 

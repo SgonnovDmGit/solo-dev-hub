@@ -106,6 +106,11 @@ pub struct RuleInfo {
     /// The text differs from `canon` — not the same as `is_custom`, which stays
     /// set after the owner saves text that happens to equal the bundle.
     pub changed: bool,
+    /// T-000213: the rule is a fork whose canon moved since the owner last
+    /// accepted it (`sync::rule_canon`): a new build shipped other text than the
+    /// one the fork was made against.
+    #[serde(default)]
+    pub canon_moved: bool,
     /// The rule has an open hand-back conflict.
     pub conflict: bool,
     /// T-000224: login of the owner whose repo this install takes the rule's

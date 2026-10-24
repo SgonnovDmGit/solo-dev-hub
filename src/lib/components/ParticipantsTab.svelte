@@ -2,8 +2,9 @@
   // F-000044 / T-000223 (frame 2B): the "Участники" tab of a shared repo —
   // owner, participants with their number bands, and join requests. The owner's
   // install can approve a request; a contributor sees the same table read-only.
-  import { tStore } from '$lib/i18n';
+  import { tStore, locale } from '$lib/i18n';
   import type { ParticipantRow } from '$lib/utils/shared-mode';
+  import { formatRelativeTime, nowTick } from '$lib/utils/time-format';
 
   interface Props {
     rows: ParticipantRow[];
@@ -12,9 +13,15 @@
     /** Login of the request being approved right now. */
     approving: string | null;
     onApprove: (login: string) => void;
+    /** Last push per participant, keyed by lower-cased login (owner's install only). */
+    activity?: Map<string, string | null>;
   }
 
-  let { rows, isOwnerInstall, approving, onApprove }: Props = $props();
+  let { rows, isOwnerInstall, approving, onApprove, activity = new Map() }: Props = $props();
+
+  // The column is the owner's view: a contributor's install has no such data.
+  const lastPush = (row: ParticipantRow): string | null =>
+    row.kind === 'participant' ? (activity.get(row.login.trim().toLowerCase()) ?? null) : null;
 
   function roleKey(kind: ParticipantRow['kind']): string {
     return kind === 'owner' ? 'shared.roleOwner' : kind === 'participant' ? 'shared.roleParticipant' : 'shared.roleRequest';
@@ -32,6 +39,9 @@
           <th>{$tStore('shared.colBranch' as any)}</th>
           <th>{$tStore('shared.colNumbers' as any)}</th>
           <th>{$tStore('shared.colRole' as any)}</th>
+          {#if isOwnerInstall}
+            <th title={$tStore('shared.colLastPushHint' as any)}>{$tStore('shared.colLastPush' as any)}</th>
+          {/if}
           <th class="action-col"></th>
         </tr>
       </thead>
@@ -52,6 +62,16 @@
               {/if}
             </td>
             <td><span class="role-badge {row.kind}">{$tStore(roleKey(row.kind) as any)}</span></td>
+            {#if isOwnerInstall}
+              {@const at = lastPush(row)}
+              <td class="last-push" title={at ? new Date(at).toLocaleString() : ''}>
+                {#if at}
+                  {formatRelativeTime(at, $nowTick, $locale === 'en' ? 'en' : 'ru')}
+                {:else}
+                  {$tStore('shared.bandNone' as any)}
+                {/if}
+              </td>
+            {/if}
             <td class="action-col">
               {#if row.canApprove && isOwnerInstall}
                 <button
@@ -118,6 +138,11 @@
   .mono {
     font-family: monospace;
     font-size: 12px;
+  }
+
+  .last-push {
+    white-space: nowrap;
+    color: var(--text-muted);
   }
 
   .action-col {

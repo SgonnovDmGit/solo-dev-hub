@@ -8,6 +8,7 @@ import {
   setAutocommitBranch,
   listRepoSharedStates,
   getSetting,
+  setSetting,
 } from '$lib/api/tauri-commands';
 import { fetchAllRepos, listBranches, splitRepoFullName, type GitHubRepo } from '$lib/api/github';
 import { shouldBackfillAutocommit } from '$lib/utils/autocommit-backfill';
@@ -16,6 +17,33 @@ import { t, tf } from '$lib/i18n';
 
 export const allRepos = writable<Repository[]>([]);
 export const isSyncing = writable<boolean>(false);
+
+// T-000227: repos the token's user administers (lower-cased full names), from
+// the last repo-list fetch. Decides where the shared-mode switch is offered: an
+// organization's repo has no owner login to compare with. Persisted so the
+// switch is there before the first fetch of a session.
+const ADMIN_REPOS_KEY = 'github_admin_repos';
+export const adminRepos = writable<Set<string>>(new Set());
+
+async function loadAdminRepos(): Promise<void> {
+  try {
+    const raw = await getSetting(ADMIN_REPOS_KEY);
+    const list: unknown = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(list)) adminRepos.set(new Set(list.filter((x): x is string => typeof x === 'string')));
+  } catch {
+    // Unreadable: the switch shows for owned repos only until the next fetch.
+  }
+}
+
+async function saveAdminRepos(fetched: GitHubRepo[]): Promise<void> {
+  const list = fetched.filter((r) => r.admin).map((r) => r.full_name.toLowerCase());
+  adminRepos.set(new Set(list));
+  try {
+    await setSetting(ADMIN_REPOS_KEY, JSON.stringify(list));
+  } catch {
+    // Kept in memory for this session.
+  }
+}
 
 // Ambiguous merge cases queued from B-007 sync: 2+ local-only records matched by basename.
 // Consumed by <MergeChoiceDialog> in +page.svelte.
@@ -37,6 +65,7 @@ export async function loadAllRepos(): Promise<void> {
   } catch (err) {
     addToast(tf('toast.failedToLoadRepos', String(err)), 'error');
   }
+  await loadAdminRepos();
 }
 
 // B-000028: portfolio-wide default — right after repos load, sweep every GitHub
@@ -86,6 +115,7 @@ export async function syncFromGitHub(token: string): Promise<GitHubRepo[] | null
   isSyncing.set(true);
   try {
     const githubRepos = await fetchAllRepos(token);
+    await saveAdminRepos(githubRepos);
 
     let upsertedCount = 0;
     const ambiguousCases: AmbiguousMergeCase[] = [];

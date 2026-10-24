@@ -58,6 +58,8 @@ export interface RuleInfo {
   canon: string | null;
   /** Text differs from `canon` (not `is_custom`). */
   changed: boolean;
+  /** T-000213: a fork whose canon moved since the owner last accepted it (a new build changed the bundled text). */
+  canon_moved: boolean;
   /** An open hand-back conflict. */
   conflict: boolean;
   /** T-000224: login of the owner whose repo this rule's text is taken from; the rule is read-only here. */

@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::db::AppDb;
-use crate::models::{lookup, Repository, SyncIssue, SyncIssueCode as Code, SyncResult};
+use crate::models::{lookup, AdminCheck, Repository, SyncIssue, SyncIssueCode as Code, SyncResult};
 use crate::sync;
 
 /// Mutable accumulator for one `run_project_sync` pass. `copied` counts REQ /
@@ -36,6 +36,9 @@ struct SyncCounters {
     /// T-000137: display names of repos that received an SDH auto-commit of
     /// synced cross-repo files this pass.
     committed: Vec<String>,
+    /// T-000227: administrator checks the frontend has to make (see
+    /// `SyncResult::admin_checks`).
+    admin_checks: Vec<AdminCheck>,
 }
 
 impl SyncCounters {
@@ -49,6 +52,7 @@ impl SyncCounters {
             rules_lost: Vec::new(),
             auto_closed: Vec::new(),
             committed: Vec::new(),
+            admin_checks: Vec::new(),
         }
     }
 
@@ -78,6 +82,7 @@ impl SyncCounters {
             rules_lost: self.rules_lost,
             auto_closed: self.auto_closed,
             committed: self.committed,
+            admin_checks: self.admin_checks,
         }
     }
 }
@@ -1035,6 +1040,11 @@ fn finish_shared(
     shared: sync::shared::SharedSync,
     c: &mut SyncCounters,
 ) {
+    for check in &shared.admin_checks {
+        if !c.admin_checks.contains(check) {
+            c.admin_checks.push(check.clone());
+        }
+    }
     let out = shared.finish(db, git);
     c.extend(out.issues);
     for name in out.committed {
@@ -1096,6 +1106,11 @@ pub(crate) fn probe_shared_repos_in(
         for issue in r.errors {
             if !merged.errors.contains(&issue) {
                 merged.errors.push(issue);
+            }
+        }
+        for check in r.admin_checks {
+            if !merged.admin_checks.contains(&check) {
+                merged.admin_checks.push(check);
             }
         }
         for (dst, src) in [

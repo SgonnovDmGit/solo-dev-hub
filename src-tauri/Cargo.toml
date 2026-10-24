@@ -1,6 +1,6 @@
 [package]
 name = "solo-dev-hub"
-version = "1.21.0"
+version = "1.22.0"
 description = "Solo Dev Hub — desktop app for managing GitHub projects"
 authors = ["you"]
 edition = "2021"
@@ -35,12 +35,17 @@ uuid = { version = "1", features = ["v4"] }
 regex = "1"
 include_dir = "0.7"
 aes-gcm = "0.10"
+sha2 = "0.10"
 base64 = "0.22"
 
 # Linux: Secret Service over D-Bus (GNOME Keyring / KWallet). Needs libdbus-1-dev to build.
 # Cargo unifies features per target, so Windows builds still pull only windows-native.
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+# macOS: the login Keychain.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
 
 [dev-dependencies]
 tempfile = "3"

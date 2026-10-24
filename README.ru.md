@@ -36,7 +36,7 @@ Solo Dev Hub — десктопное приложение в одном окн�
 - **Задачи (todo.md / done.md)** — каждый репо ведёт append-only лог завершённых задач с авто-проставленными версиями. Универсальный data-grid: фильтр, сорт, persist preferences по табу.
 - **Хронология активности** — multi-source events (баги, задачи, sync'и, деплои, переименования репо) по всему портфелю. Фильтры по дате / типу события / репо / поиску.
 - **Шаблоны** — per-language seed'ы для `.gitignore`, `.gitattributes`, deploy YAML, CLAUDE.md секций. Настраиваешь один раз в приложении — синхронизирует во все проекты.
-- **PAT в OS keyring** — твой GitHub-токен лежит в системном хранилище ключей (Windows Credential Manager, в Linux — Secret Service), никогда не в SQLite, не в `.env`, не plaintext-файлом.
+- **PAT в OS keyring** — твой GitHub-токен лежит в системном хранилище ключей (Windows Credential Manager, в Linux — Secret Service, в macOS — связка ключей), никогда не в SQLite, не в `.env`, не plaintext-файлом.
 - **Один .exe, ~19 MB** — Tauri v2 + WebView2. Без Electron-bloat'а. Без daemon'а. Без телеметрии. Единственный фоновый сетевой вызов — update-checker ходит в GitHub Releases один раз при старте; всё остальное только по твоему явному действию.
 
 ![Таб Bugs — per-repo список багов с severity, категорией, статусным workflow и счётчиком попыток на каждый баг](docs/screenshots/repo-bugs.png)
@@ -55,7 +55,7 @@ Solo Dev Hub — десктопное приложение в одном окн�
 
 - **Фреймворк** — Tauri v2 (Rust-бекенд + WebView2-фронтенд, single-binary distribution)
 - **Фронтенд** — SvelteKit + Svelte 5 + TypeScript
-- **Бекенд** — Rust: SQLite через `rusqlite`, file I/O для sync, системное хранилище ключей (Windows Credential Manager / Linux Secret Service) через `keyring`
+- **Бекенд** — Rust: SQLite через `rusqlite`, file I/O для sync, системное хранилище ключей (Windows Credential Manager / Linux Secret Service / связка ключей macOS) через `keyring`
 - **GitHub API** — `@octokit/rest` (вызывается напрямую с JS-стороны, не проксируется через Rust)
 - **Граф** — Cytoscape.js, concentric-раскладка, theme-aware
 - **i18n** — Русский (по умолчанию) + Английский, ~850 type-safe ключей, без runtime-зависимостей
@@ -65,7 +65,7 @@ Solo Dev Hub — десктопное приложение в одном окн�
 
 ### Установка
 
-> Сборки пока **Windows x64 и Linux x64**; macOS запланирован в v1.22.0.
+> Сборки: **Windows x64, Linux x64 и macOS** (Apple Silicon и Intel).
 
 **Windows**
 
@@ -78,6 +78,12 @@ Solo Dev Hub — десктопное приложение в одном окн�
 - `.deb`: скачать файл `…_amd64.deb` со страницы [Releases](https://github.com/SgonnovDmGit/solo-dev-hub/releases) и выполнить `sudo apt install ./<файл>.deb` (системные библиотеки apt поставит сам).
 - AppImage: скачать файл `…_amd64.AppImage`, сделать `chmod +x` и запустить (нужен `libfuse2`).
 - Токен хранится в Secret Service (GNOME Keyring или совместимое хранилище), поэтому нужна сессия рабочего стола с разблокированной связкой ключей.
+
+**macOS**
+
+1. Скачать `…_aarch64.dmg` (Apple Silicon) или `…_x64.dmg` (Intel) со страницы [Releases](https://github.com/SgonnovDmGit/solo-dev-hub/releases), открыть и перетащить Solo Dev Hub в «Программы».
+2. **Сборка пока не нотаризована** (подпись Apple — в roadmap'е v2.0.0), поэтому первый запуск блокируется. Открыть один раз через «Системные настройки» → «Конфиденциальность и безопасность» → «Всё равно открыть» или выполнить `xattr -dr com.apple.quarantine "/Applications/Solo Dev Hub.app"`. Обновления ставятся без этого шага.
+3. git: приложение находит git из Homebrew (`/opt/homebrew/bin/git` или `/usr/local/bin/git`) или из Command Line Tools (`xcode-select --install`). Токен хранится в связке ключей входа.
 
 ### Первичная настройка
 
@@ -119,10 +125,10 @@ npm run tauri dev          # локальный dev с hot reload
 ### Тесты
 
 ```bash
-cd src-tauri && cargo test --lib   # быстрый набор по умолчанию: ~786 Rust-тестов, ~45 с
+cd src-tauri && cargo test --lib   # быстрый набор по умолчанию: ~825 Rust-тестов, ~45 с
 cd src-tauri && cargo test --lib -- --include-ignored --skip db::migrations::tests::export_fresh_schema_db
-                                    # полный набор (~911 тестов), его гоняет CI (~1 мин на Linux, ~40 мин на Windows: спавны git)
-npm test                            # vitest на фронтенде (~177 тестов)
+                                    # полный набор (~952 тестов), его гоняет CI (~1 мин на Linux, ~40 мин на Windows: спавны git)
+npm test                            # vitest на фронтенде (~205 тестов)
 npm run check                       # svelte-check
 ```
 
@@ -149,7 +155,8 @@ git push origin master vX.Y.Z
 
 **Выпущено**
 
-- **v1.21.0** *(текущий — 2026-10-20)* — удаление репо, которых не видит текущий токен; верная база слияния общих файлов задач; крестик в узком окне на Linux.
+- **v1.22.0** *(текущий — 2026-10-24)* — сборки под macOS (Apple Silicon и Intel); кнопка синка на экране репо; главный видит, когда участник последний раз отправлял; общий режим в репо организаций; метка у правил, чей канон сдвинулся после вашей правки.
+- **v1.21.0** — удаление репо, которых не видит текущий токен; верная база слияния общих файлов задач; крестик в узком окне на Linux.
 - **v1.20.0** — контрибуторский режим: помощник со своей установкой работает в тех же репозиториях; задачи, сделанное и баги едут через git и сливаются по id.
 - **v1.19.0** — экран «Правила»: какие правила изменены, откуда пришла правка, как развести два репо, вернувших одно правило по-разному; сборки под Linux (AppImage и .deb).
 - **v1.18.0** — одобренная правка правила больше не теряется молча; проблемы синка на языке интерфейса; правила сжаты вдвое (19 скиллов, новый — для старта проекта).
@@ -174,7 +181,6 @@ git push origin master vX.Y.Z
 
 **Дальше**
 
-- **v1.22.0** — сборка под macOS.
 - **v2.0.0** — Windows Authenticode code signing (убирает SmartScreen warning), read-only API viewer + матрица совместимости клиент/сервер.
 
 Детали по релизам — в [Changelog](Changelog.ru.md); повседневный список задач ведётся локально и в репозиторий не входит.

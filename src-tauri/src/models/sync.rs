@@ -188,6 +188,21 @@ pub struct SyncResult {
     /// the marker is cleared and the rule left as it was.
     #[serde(default)]
     pub rules_lost: Vec<String>,
+    /// T-000227: shared repos of this run whose structure names a main that is
+    /// not the repo owner. The frontend asks GitHub whether that login is an
+    /// administrator of the repo and reports the answer through
+    /// `set_shared_admin_verified`; the backend never calls GitHub itself.
+    #[serde(default)]
+    pub admin_checks: Vec<AdminCheck>,
+}
+
+/// T-000227: one administrator check the frontend has to make.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AdminCheck {
+    /// Full name of the repo, `owner/name`.
+    pub repo: String,
+    /// The login the structure names as main.
+    pub login: String,
 }
 
 /// F-000044 / T-000220: one `.gitignore` line (outside the managed block) that
@@ -217,6 +232,14 @@ pub struct SharedPreflight {
 pub struct SharedMergeResult {
     pub outcome: String,
     pub files: Vec<String>,
+}
+
+/// T-000237: when a participant's install last pushed a sync commit. `last_at`
+/// is ISO-8601 (UTC); `None` when no commit with the login's trailer was found.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipantActivity {
+    pub login: String,
+    pub last_at: Option<String>,
 }
 
 /// F-000044 / T-000220: result of switching shared mode off.

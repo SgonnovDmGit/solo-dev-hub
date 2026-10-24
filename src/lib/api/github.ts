@@ -7,6 +7,8 @@ export interface GitHubRepo {
   description: string | null;
   language: string | null;
   pushed_at: string | null;
+  /** T-000227: the token's user may administer the repo (GitHub `permissions.admin`). */
+  admin: boolean;
 }
 
 export async function fetchAllRepos(token: string): Promise<GitHubRepo[]> {
@@ -30,6 +32,7 @@ export async function fetchAllRepos(token: string): Promise<GitHubRepo[]> {
         description: repo.description ?? null,
         language: repo.language ?? null,
         pushed_at: repo.pushed_at ?? null,
+        admin: repo.permissions?.admin ?? false,
       });
     }
 
@@ -126,6 +129,18 @@ export async function isRepoPublic(token: string, owner: string, repo: string): 
   } catch {
     return null;
   }
+}
+
+/**
+ * T-000227: is `username` an administrator of `owner/repo`? GET
+ * /repos/{owner}/{repo}/collaborators/{username}/permission, `permission` is
+ * 'admin' | 'write' | 'read' | 'none'. Throws on any failure (network, 403, 404):
+ * a failed check must not be taken for "not an admin".
+ */
+export async function isRepoAdmin(token: string, owner: string, repo: string, username: string): Promise<boolean> {
+  const octokit = new Octokit({ auth: token });
+  const resp = await octokit.repos.getCollaboratorPermissionLevel({ owner, repo, username });
+  return resp.data.permission === 'admin';
 }
 
 /**

@@ -20,6 +20,8 @@ import {
   pluralForm,
   requestsWaitingKey,
   needsClassicTokenHint,
+  autoSyncOffHint,
+  activityByLogin,
 } from '../shared-mode';
 
 function state(over: Partial<RepoSharedState> = {}): RepoSharedState {
@@ -66,10 +68,18 @@ describe('ownership and roles', () => {
     expect(isContributorRole(null)).toBe(false);
   });
 
-  it('offers the switch only to the repo owner who is not a contributor', () => {
+  it('offers the switch to the owner and to an administrator of the repo', () => {
     expect(canToggleSharedMode('Owner/api', 'owner', null)).toBe(true);
+    expect(canToggleSharedMode('Owner/api', 'OWNER', null)).toBe(true);
     expect(canToggleSharedMode('Owner/api', 'owner', state({ shared_role: 'main' }))).toBe(true);
+    // A collaborator without admin rights never sees it.
     expect(canToggleSharedMode('Owner/api', 'helper', null)).toBe(false);
+    expect(canToggleSharedMode('Owner/api', 'helper', null, new Set(['other/repo']))).toBe(false);
+    // An organization's repo the login administers.
+    expect(canToggleSharedMode('Acme/api', 'helper', null, new Set(['acme/api']))).toBe(true);
+    // Main already: stays, so it can be switched off.
+    expect(canToggleSharedMode('Acme/api', 'helper', state({ shared_role: 'main' }))).toBe(true);
+    expect(canToggleSharedMode('Owner/api', 'helper', state({ shared_role: 'contributor' }))).toBe(false);
     expect(canToggleSharedMode('Owner/api', null, null)).toBe(false);
     expect(canToggleSharedMode('Owner/api', 'owner', state({ shared_role: 'contributor' }))).toBe(false);
     expect(canToggleSharedMode('Owner/api', 'owner', state({ shared_role: 'pending' }))).toBe(false);
@@ -317,5 +327,52 @@ describe('needsClassicTokenHint', () => {
     expect(needsClassicTokenHint(null, ['other/b'])).toBe(false);
     expect(needsClassicTokenHint('', ['other/b'])).toBe(false);
     expect(needsClassicTokenHint('me', [null, undefined, 'local-only'])).toBe(false);
+  });
+});
+
+describe('autoSyncOffHint', () => {
+  const projects = [
+    { id: 1, auto_sync_enabled: true },
+    { id: 2, auto_sync_enabled: false },
+  ];
+
+  it('is null for a main install and for a repo that is not shared', () => {
+    expect(autoSyncOffHint(state({ shared_role: 'main' }), false, 1, projects)).toBeNull();
+    expect(autoSyncOffHint(state({ shared_role: null }), false, 1, projects)).toBeNull();
+    expect(autoSyncOffHint(null, false, 1, projects)).toBeNull();
+  });
+
+  it('is null when auto-sync will run', () => {
+    expect(autoSyncOffHint(state({ shared_role: 'contributor' }), true, 1, projects)).toBeNull();
+    expect(autoSyncOffHint(state({ shared_role: 'pending' }), true, 1, projects)).toBeNull();
+  });
+
+  it('is due when the global switch is off', () => {
+    expect(autoSyncOffHint(state({ shared_role: 'contributor' }), false, 1, projects)).toEqual({ projectId: 1 });
+  });
+
+  it('is due when the project has auto-sync off', () => {
+    expect(autoSyncOffHint(state({ shared_role: 'pending' }), true, 2, projects)).toEqual({ projectId: 2 });
+  });
+
+  it('is due without a project, with no project to switch on', () => {
+    expect(autoSyncOffHint(state({ shared_role: 'contributor' }), true, null, projects)).toEqual({ projectId: null });
+    expect(autoSyncOffHint(state({ shared_role: 'contributor' }), false, undefined, [])).toEqual({ projectId: null });
+  });
+
+  it('waits while the repo project is not in the list yet', () => {
+    expect(autoSyncOffHint(state({ shared_role: 'contributor' }), false, 9, projects)).toBeNull();
+  });
+});
+
+describe('activityByLogin', () => {
+  it('keys by lower-cased login and keeps nulls', () => {
+    const m = activityByLogin([
+      { login: 'Helper', last_at: '2026-10-20T10:00:00Z' },
+      { login: 'other', last_at: null },
+    ]);
+    expect(m.get('helper')).toBe('2026-10-20T10:00:00Z');
+    expect(m.get('other')).toBeNull();
+    expect(m.has('nobody')).toBe(false);
   });
 });

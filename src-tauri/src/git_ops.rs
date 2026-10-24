@@ -34,34 +34,42 @@ pub(crate) fn spawn_cmd(program: impl AsRef<OsStr>) -> Command {
     cmd
 }
 
-/// PATH-first probe; on Windows, fall back to the two standard Git-for-Windows
-/// install locations before giving up. Returns `None` if no usable binary is
-/// found — callers must handle this (UI hides the Untrack button).
-pub fn check_git_available() -> Option<GitBinary> {
-    if let Ok(out) = spawn_cmd("git").arg("--version").output() {
-        if out.status.success() {
-            return Some(GitBinary(PathBuf::from("git")));
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        for candidate in [
+/// The git binaries to probe, in order, for an OS (`std::env::consts::OS`).
+/// `"git"` is the one on PATH.
+///
+/// - Windows: PATH first, then the two standard Git-for-Windows locations.
+/// - macOS (T-000125): Homebrew first. An app opened from Finder gets a PATH
+///   without Homebrew, and its `/usr/bin/git` is the Command Line Tools shim,
+///   which on a Mac without them opens the "install developer tools" dialog on
+///   every probe. Apple Silicon Homebrew, then Intel / older Homebrew, then PATH.
+/// - Elsewhere: PATH only.
+fn git_candidates(os: &str) -> &'static [&'static str] {
+    match os {
+        "windows" => &[
+            "git",
             r"C:\Program Files\Git\cmd\git.exe",
             r"C:\Program Files (x86)\Git\cmd\git.exe",
-        ] {
-            let path = PathBuf::from(candidate);
-            if path.exists() {
-                if let Ok(out) = spawn_cmd(&path).arg("--version").output() {
-                    if out.status.success() {
-                        return Some(GitBinary(path));
-                    }
-                }
-            }
-        }
+        ],
+        "macos" => &["/opt/homebrew/bin/git", "/usr/local/bin/git", "git"],
+        _ => &["git"],
     }
+}
 
-    None
+/// Probes `git_candidates` for this OS; an absolute candidate is tried only if
+/// the file exists. Returns `None` if no usable binary is found — callers must
+/// handle this (UI hides the Untrack button).
+pub fn check_git_available() -> Option<GitBinary> {
+    git_candidates(std::env::consts::OS)
+        .iter()
+        .map(PathBuf::from)
+        .filter(|path| !path.is_absolute() || path.exists())
+        .find(|path| {
+            spawn_cmd(path)
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
+        .map(GitBinary)
 }
 
 /// `check_git_available`, probed once per process: the first successful probe
@@ -406,6 +414,22 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn git_candidates_try_path_first_on_windows_and_homebrew_first_on_macos() {
+        let win = git_candidates("windows");
+        assert_eq!(win[0], "git");
+        assert!(win.contains(&r"C:\Program Files\Git\cmd\git.exe"));
+
+        // From Finder the PATH has no Homebrew and /usr/bin/git may be the
+        // Command Line Tools shim: Homebrew is probed before it.
+        assert_eq!(
+            git_candidates("macos"),
+            &["/opt/homebrew/bin/git", "/usr/local/bin/git", "git"]
+        );
+
+        assert_eq!(git_candidates("linux"), &["git"]);
+    }
 
     /// Init a git repo in `dir` with a sensible identity so commits work
     /// without depending on the host's global git config.

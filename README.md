@@ -36,7 +36,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 - **Tasks (todo.md / done.md)** — each repo has an append-only completion log auto-tagged with versions. Universal data grid: filter, sort, persist preferences per tab.
 - **Activity timeline** — multi-source events (bugs, tasks, syncs, deploys, repo renames) across the entire portfolio. Date-range / kind / repo / search filters.
 - **Templates** — per-language seeds for `.gitignore`, `.gitattributes`, deploy YAML, CLAUDE.md sections. Customize once in the app, sync into every project.
-- **PAT in OS keyring** — your GitHub token goes into the OS keyring (Windows Credential Manager, the Secret Service on Linux), never SQLite, never `.env`, never a plaintext file.
+- **PAT in OS keyring** — your GitHub token goes into the OS keyring (Windows Credential Manager, the Secret Service on Linux, the Keychain on macOS), never SQLite, never `.env`, never a plaintext file.
 - **Single .exe, ~19 MB** — Tauri v2 + WebView2. No Electron bloat. No daemon. No telemetry. The only background network call is the update-checker pinging GitHub Releases once on startup; everything else is on your explicit action.
 
 ![Bugs tab — per-repo bug list with severity, category, status workflow and per-bug attempts counter](docs/screenshots/repo-bugs.png)
@@ -55,7 +55,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 
 - **Framework** — Tauri v2 (Rust backend + WebView2 frontend, single-binary distribution)
 - **Frontend** — SvelteKit + Svelte 5 + TypeScript
-- **Backend** — Rust: SQLite via `rusqlite`, file I/O for sync, the OS keyring (Windows Credential Manager / Linux Secret Service) via `keyring`
+- **Backend** — Rust: SQLite via `rusqlite`, file I/O for sync, the OS keyring (Windows Credential Manager / Linux Secret Service / macOS Keychain) via `keyring`
 - **GitHub API** — `@octokit/rest` (called directly from the JS side, never proxied through Rust)
 - **Graph** — Cytoscape.js with concentric layout, theme-aware
 - **i18n** — Russian (default) + English, ~850 type-safe keys, no runtime dependency
@@ -65,7 +65,7 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 
 ### Install
 
-> Builds are **Windows x64 and Linux x64** for now; macOS is planned for v1.22.0.
+> Builds are **Windows x64, Linux x64 and macOS** (Apple Silicon and Intel).
 
 **Windows**
 
@@ -78,6 +78,12 @@ Built for solo developers, indie hackers, and freelancers running 5+ active GitH
 - `.deb`: download the `…_amd64.deb` asset from the [Releases page](https://github.com/SgonnovDmGit/solo-dev-hub/releases) and run `sudo apt install ./<file>.deb` (apt pulls in the system libraries).
 - AppImage: download the `…_amd64.AppImage` asset, `chmod +x` it and run it (needs `libfuse2`).
 - The token is kept in the Secret Service (GNOME Keyring or a compatible keyring), so a desktop session with an unlocked keyring is expected.
+
+**macOS**
+
+1. Download `…_aarch64.dmg` (Apple Silicon) or `…_x64.dmg` (Intel) from the [Releases page](https://github.com/SgonnovDmGit/solo-dev-hub/releases), open it and drag Solo Dev Hub into Applications.
+2. **The build is not notarized yet** (Apple signing is on the v2.0.0 roadmap), so the first launch is blocked. Open it once through System Settings → Privacy & Security → "Open Anyway", or run `xattr -dr com.apple.quarantine "/Applications/Solo Dev Hub.app"`. Updates install without this step.
+3. git: the app finds Homebrew's git (`/opt/homebrew/bin/git` or `/usr/local/bin/git`) or the Command Line Tools one (`xcode-select --install`). The token is kept in the login Keychain.
 
 ### First-time setup
 
@@ -119,10 +125,10 @@ npm run tauri dev          # local dev with hot reload
 ### Tests
 
 ```bash
-cd src-tauri && cargo test --lib   # fast default: ~786 Rust tests, ~45 s
+cd src-tauri && cargo test --lib   # fast default: ~825 Rust tests, ~45 s
 cd src-tauri && cargo test --lib -- --include-ignored --skip db::migrations::tests::export_fresh_schema_db
-                                    # full set (~911 tests), what CI runs (~1 min on Linux, ~40 min on Windows: git spawns)
-npm test                            # vitest frontend (~177 tests)
+                                    # full set (~952 tests), what CI runs (~1 min on Linux, ~40 min on Windows: git spawns)
+npm test                            # vitest frontend (~205 tests)
 npm run check                       # svelte-check
 ```
 
@@ -149,7 +155,8 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Shipped**
 
-- **v1.21.0** *(current — 2026-10-20)* — removing repositories the current token cannot see; a better merge base for shared task files; the close button stays in a narrow window on Linux.
+- **v1.22.0** *(current — 2026-10-24)* — macOS builds (Apple Silicon and Intel); a sync button on the repository screen; the owner sees when a participant last pushed; shared mode in organization repositories; a mark on rules whose canon moved after your edit.
+- **v1.21.0** — removing repositories the current token cannot see; a better merge base for shared task files; the close button stays in a narrow window on Linux.
 - **v1.20.0** — contributor mode: a helper with their own install works in the same repositories; tasks, done items and bugs travel through git and merge by id.
 - **v1.19.0** — a Rules screen: which rules were changed, where an edit came from, settling two repos that handed one rule back differently; Linux builds (AppImage and .deb).
 - **v1.18.0** — an approved rule edit is never lost silently; sync problems in the interface language; the rules compressed to less than half (19 skills, a new one for starting a project).
@@ -174,7 +181,6 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Next**
 
-- **v1.22.0** — macOS build.
 - **v2.0.0** — Windows Authenticode code signing (removes the SmartScreen warning), read-only API viewer + client/server compatibility matrix.
 
 Per-release detail lives in the [Changelog](Changelog.md); the day-to-day task list is kept locally and is not part of the repository.
