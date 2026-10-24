@@ -76,6 +76,7 @@
     <span class="rule-name">{name}</span>
     <span class="chips">
       {#if r.changed}<span class="chip changed">{$tStore('rules.chipChanged')}</span>{/if}
+      {#if r.canon_moved}<span class="chip moved" title={$tStore('rules.chipCanonMovedHint')}>{$tStore('rules.chipCanonMoved')}</span>{/if}
       {#if r.conflict}<span class="chip conflict">{$tStore('rules.chipConflict')}</span>{/if}
       {#if r.follows_main}<span class="chip main" title={r.follows_main}>{$tStore('rules.chipFollowsMain')}</span>{/if}
     </span>
@@ -97,6 +98,8 @@
   .chips { display: flex; gap: 4px; flex-shrink: 0; }
   .chip { font-size: 9px; padding: 1px 6px; border-radius: 6px; white-space: nowrap; font-family: sans-serif; flex-shrink: 0; }
   .chip.changed { background: rgba(234, 179, 8, 0.15); color: rgb(234, 179, 8); }
+  /* The canon moved under a fork: outlined amber, distinct from the filled "changed". */
+  .chip.moved { border: 1px solid var(--toast-warning); color: var(--toast-warning); padding: 0 6px; }
   /* Red tint of --danger (#ef4444). */
   .chip.conflict { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
   /* The owner's canon: outlined in the accent, like the pill of the shared-repo board. */

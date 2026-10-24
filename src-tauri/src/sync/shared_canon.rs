@@ -193,6 +193,11 @@ pub fn adopt_main_canon(
                 continue;
             }
             out.changed.push(name.to_string());
+            // T-000213: adopting main's canon accepts the rule as it stands
+            // against this build's canon.
+            if let Err(e) = crate::sync::rule_canon::acknowledge(db, name) {
+                out.errors.push(format!("rule_fork_canon: {}", e));
+            }
             let note = format!("canon of main {}", main_login);
             if let Err(e) =
                 db.insert_rule_event(name, rule_event::TAKEN, Some(&label), Some(note.as_str()))

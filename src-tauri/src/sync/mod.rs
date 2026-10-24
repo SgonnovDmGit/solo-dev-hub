@@ -16,6 +16,7 @@ pub mod peer_channels;
 pub mod project_md;
 pub mod project_sync;
 pub mod requirements;
+pub mod rule_canon;
 pub mod shared;
 pub mod shared_canon;
 #[cfg(test)]

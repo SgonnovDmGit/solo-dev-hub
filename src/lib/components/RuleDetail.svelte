@@ -77,6 +77,7 @@
   <div class="head">
     <span class="title" class:mono={!isGlobal}>{title}</span>
     {#if rule.changed}<span class="chip changed">{$tStore('rules.chipChanged')}</span>{/if}
+    {#if rule.canon_moved}<span class="chip moved" title={$tStore('rules.chipCanonMovedHint')}>{$tStore('rules.chipCanonMoved')}</span>{/if}
     {#if rule.conflict}<span class="chip conflict">{$tStore('rules.chipConflict')}</span>{/if}
     {#if rule.follows_main}<span class="chip main">{$tStore('rules.chipFollowsMain')}</span>{/if}
     {#if version}<span class="canon">{tf('rules.canonOf', version)}</span>{/if}
@@ -88,6 +89,13 @@
       <span class="origin-note">{tf('rules.originNote', originNote)}</span>
     {/if}
   </div>
+
+  {#if rule.canon_moved && !rule.conflict}
+    <div class="moved-line">
+      <span title={$tStore('rules.chipCanonMovedHint')}>{$tStore('rules.canonMovedLine')}</span>
+      <button type="button" class="ghost compare-btn" onclick={() => (tab = 'diff')}>{$tStore('rules.canonMovedCompare')}</button>
+    </div>
+  {/if}
 
   {#if rule.conflict}
     <RuleConflict {rule} {busy} generation={conflictGeneration} {onResolve} />
@@ -154,9 +162,12 @@
   .chip.changed { background: rgba(234, 179, 8, 0.15); color: rgb(234, 179, 8); }
   /* Red tint of --danger (#ef4444). */
   .chip.conflict { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
+  .chip.moved { border: 1px solid var(--toast-warning); color: var(--toast-warning); padding: 0 6px; }
   .chip.main { border: 1px solid var(--accent); color: var(--accent); padding: 0 6px; }
   .follows { flex-shrink: 0; font-size: 11px; line-height: 1.4; color: var(--text-muted); }
   .origin { flex-shrink: 0; display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding: 8px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+  .moved-line { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; padding: 6px 10px; border: 1px solid var(--toast-warning); border-radius: var(--radius); background: rgba(217, 119, 6, 0.12); }
+  .compare-btn { font-size: 12px; padding: 3px 10px; flex-shrink: 0; }
   .origin-note { color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
   .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
   .tabs button { font-size: 12px; padding: 5px 12px; background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0; color: var(--text-muted); cursor: pointer; }
