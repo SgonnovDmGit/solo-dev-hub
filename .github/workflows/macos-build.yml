@@ -1,0 +1,63 @@
+name: macOS build
+
+# Pre-release macOS artifact: on every push to dev, runs the fast test set on
+# macOS and builds the Intel .dmg for the owner's macOS VM on an x86 PC. Uploaded
+# as a workflow artifact; nothing is published to a GitHub release. The full
+# test set (git-spawning tests included) runs in "Linux build".
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+concurrency:
+  group: macos-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  macos-build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Rust tests (fast set)
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: Build Intel bundle
+        # createUpdaterArtifacts needs the signing key; its password is empty.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: npm run tauri build -- --target x86_64-apple-darwin --bundles app,dmg
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: solo-dev-hub-macos-x64-${{ github.sha }}
+          path: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14
