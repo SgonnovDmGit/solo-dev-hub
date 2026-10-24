@@ -30,18 +30,21 @@ export function isContributorRole(state: Pick<RepoSharedState, 'shared_role'> | 
 
 /**
  * Is the "Общий режим" switch offered here? When this install may be the main
- * one: it is not somebody's contributor, its GitHub login is known and the repo
- * has an owner. The owner switches on freely; anybody else (an organization's
- * repo) is checked against GitHub when pressing the switch (T-000227) and is
- * refused unless an administrator of the repo.
+ * one: it is not somebody's contributor, its GitHub login is known, and it owns
+ * the repo or administers it by the last repo-list fetch (`adminRepos`, lower-
+ * cased full names — an organization's repo, T-000227). The admin is checked
+ * against GitHub again on press. Once main, the switch stays (to switch off).
  */
 export function canToggleSharedMode(
   githubName: string | null | undefined,
   login: string | null | undefined,
   state: Pick<RepoSharedState, 'shared_role'> | null | undefined,
+  adminRepos: ReadonlySet<string> = new Set(),
 ): boolean {
   if (isContributorRole(state)) return false;
-  return repoOwner(githubName) !== '' && (login ?? '').trim() !== '';
+  if (repoOwner(githubName) === '' || (login ?? '').trim() === '') return false;
+  if (state?.shared_role === 'main') return true;
+  return sameLogin(repoOwner(githubName), login) || adminRepos.has((githubName ?? '').toLowerCase());
 }
 
 /** A repo that takes part in shared mode in any way (any role, or a status). */

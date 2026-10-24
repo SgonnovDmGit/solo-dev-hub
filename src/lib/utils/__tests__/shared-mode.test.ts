@@ -68,10 +68,17 @@ describe('ownership and roles', () => {
     expect(isContributorRole(null)).toBe(false);
   });
 
-  it('offers the switch to everybody who is not a contributor (non-owners are checked on press)', () => {
+  it('offers the switch to the owner and to an administrator of the repo', () => {
     expect(canToggleSharedMode('Owner/api', 'owner', null)).toBe(true);
+    expect(canToggleSharedMode('Owner/api', 'OWNER', null)).toBe(true);
     expect(canToggleSharedMode('Owner/api', 'owner', state({ shared_role: 'main' }))).toBe(true);
-    expect(canToggleSharedMode('Owner/api', 'helper', null)).toBe(true);
+    // A collaborator without admin rights never sees it.
+    expect(canToggleSharedMode('Owner/api', 'helper', null)).toBe(false);
+    expect(canToggleSharedMode('Owner/api', 'helper', null, new Set(['other/repo']))).toBe(false);
+    // An organization's repo the login administers.
+    expect(canToggleSharedMode('Acme/api', 'helper', null, new Set(['acme/api']))).toBe(true);
+    // Main already: stays, so it can be switched off.
+    expect(canToggleSharedMode('Acme/api', 'helper', state({ shared_role: 'main' }))).toBe(true);
     expect(canToggleSharedMode('Owner/api', 'helper', state({ shared_role: 'contributor' }))).toBe(false);
     expect(canToggleSharedMode('Owner/api', null, null)).toBe(false);
     expect(canToggleSharedMode('Owner/api', 'owner', state({ shared_role: 'contributor' }))).toBe(false);

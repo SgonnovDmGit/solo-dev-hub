@@ -1,7 +1,7 @@
 <script lang="ts">
   import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { open } from '@tauri-apps/plugin-dialog';
-  import { allRepos, assignRepo, loadAllRepos, isSyncing } from '$lib/stores/repos';
+  import { allRepos, assignRepo, loadAllRepos, isSyncing, adminRepos } from '$lib/stores/repos';
   import { projects, loadProjects } from '$lib/stores/projects';
   import { currentScreen, selectedRepoId, deployDrillTarget } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
@@ -74,7 +74,7 @@
   // This install is the owner's: the repo is shared and it is not a contributor.
   const isOwnerInstall = $derived(isShared && !isContributor);
   const showSharedToggle = $derived(
-    repo ? canToggleSharedMode(repo.github_name, $githubLogin, sharedState) : false,
+    repo ? canToggleSharedMode(repo.github_name, $githubLogin, sharedState, $adminRepos) : false,
   );
   let structure = $state<ProjectStructure | null>(null);
   let joinRequests = $state<JoinRequest[]>([]);

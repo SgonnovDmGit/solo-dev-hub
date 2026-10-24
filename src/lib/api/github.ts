@@ -7,6 +7,8 @@ export interface GitHubRepo {
   description: string | null;
   language: string | null;
   pushed_at: string | null;
+  /** T-000227: the token's user may administer the repo (GitHub `permissions.admin`). */
+  admin: boolean;
 }
 
 export async function fetchAllRepos(token: string): Promise<GitHubRepo[]> {
@@ -30,6 +32,7 @@ export async function fetchAllRepos(token: string): Promise<GitHubRepo[]> {
         description: repo.description ?? null,
         language: repo.language ?? null,
         pushed_at: repo.pushed_at ?? null,
+        admin: repo.permissions?.admin ?? false,
       });
     }
 
