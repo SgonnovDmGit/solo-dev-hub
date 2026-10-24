@@ -242,6 +242,7 @@ pub fn run() {
             commands::shared::merge_shared_upstream,
             commands::shared::list_join_requests,
             commands::shared::get_repo_structure,
+            commands::shared::shared_participants_activity,
             // Templates (0.6.0)
             commands::templates::list_template_languages,
             commands::templates::list_template_files,

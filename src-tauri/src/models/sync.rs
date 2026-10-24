@@ -219,6 +219,14 @@ pub struct SharedMergeResult {
     pub files: Vec<String>,
 }
 
+/// T-000237: when a participant's install last pushed a sync commit. `last_at`
+/// is ISO-8601 (UTC); `None` when no commit with the login's trailer was found.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipantActivity {
+    pub login: String,
+    pub last_at: Option<String>,
+}
+
 /// F-000044 / T-000220: result of switching shared mode off.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SharedDisableResult {

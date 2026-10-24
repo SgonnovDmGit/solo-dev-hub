@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult, SharedPreflight, SharedMergeResult, SharedDisableResult, JoinRequest, ProjectStructure } from '$lib/types';
+import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult, SharedPreflight, SharedMergeResult, SharedDisableResult, JoinRequest, ProjectStructure, ParticipantActivity } from '$lib/types';
 
 
 // ── Requirements sync commands ──────────────────────────────────────────────
@@ -109,4 +109,9 @@ export async function listJoinRequests(repoId: number): Promise<JoinRequest[]> {
 
 export async function getRepoStructure(repoId: number): Promise<ProjectStructure | null> {
   return invoke<ProjectStructure | null>('get_repo_structure', { repoId });
+}
+
+/** Owner: when each participant's install last pushed a sync commit. */
+export async function sharedParticipantsActivity(repoId: number): Promise<ParticipantActivity[]> {
+  return invoke<ParticipantActivity[]>('shared_participants_activity', { repoId });
 }

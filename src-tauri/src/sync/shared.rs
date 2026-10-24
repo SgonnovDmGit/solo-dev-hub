@@ -29,8 +29,8 @@ use crate::git_ops::{
 use crate::git_sync::{self, BranchCommit, FfOutcome, FileChange, MergeOutcome, PushOutcome};
 use crate::merge_driver::register_merge_driver;
 use crate::models::{
-    IgnoreLine, RepoSharedState, Repository, SharedDisableResult, SharedMergeResult,
-    SharedPreflight, SyncIssue, SyncIssueCode as Code,
+    IgnoreLine, ParticipantActivity, RepoSharedState, Repository, SharedDisableResult,
+    SharedMergeResult, SharedPreflight, SyncIssue, SyncIssueCode as Code,
 };
 use crate::sync::autocommit::{
     CROSS_REPO_DIRS, MANAGED_ROOT_FILES, SDH_COMMIT_EMAIL, SDH_COMMIT_NAME,
@@ -3351,6 +3351,89 @@ pub fn get_repo_structure(
     )
 }
 
+/// Unit separator between the commit time and the trailer values in the log
+/// format of `participants_activity`.
+const ACTIVITY_SEP: char = '\u{1f}';
+
+/// The newest commit time among the lines of `git log --format=%cI%x1f<trailers>`
+/// whose `SDH-Participant` trailer names `login` (case-insensitive). Several
+/// trailer values on one line are comma-separated. Malformed lines and
+/// unparsable times are skipped.
+fn latest_participant_commit(log: &str, login: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    log.lines()
+        .filter_map(|line| {
+            let (time, trailers) = line.split_once(ACTIVITY_SEP)?;
+            if !trailers
+                .split(',')
+                .any(|t| !t.trim().is_empty() && ss::logins_equal(t.trim(), login))
+            {
+                return None;
+            }
+            chrono::DateTime::parse_from_rfc3339(time.trim())
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc))
+        })
+        .max()
+}
+
+/// The last `HISTORY_CAP` commits of `origin/<branch>` as `time<US>trailers`
+/// lines; empty when the ref is missing or git fails.
+fn activity_log(git: &GitBinary, root: &Path, branch: &str) -> String {
+    let cap = format!("-n{}", HISTORY_CAP);
+    let rev = format!("{}/{}", REMOTE, branch);
+    let Ok(out) = spawn_cmd(&git.0)
+        .args([
+            "log",
+            cap.as_str(),
+            "--format=%cI%x1f%(trailers:key=SDH-Participant,valueonly,separator=%x2C)",
+            rev.as_str(),
+            "--",
+        ])
+        .current_dir(root)
+        .output()
+    else {
+        return String::new();
+    };
+    if !out.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Owner's view (T-000237): per participant, the time of the newest commit with
+/// their `SDH-Participant` trailer on their own branch or on the owner's dev
+/// branch. Does not fetch: the sync does.
+pub fn participants_activity(
+    db: &AppDb,
+    git: &GitBinary,
+    repo_id: i64,
+) -> Result<Vec<ParticipantActivity>, String> {
+    let Some(structure) = get_repo_structure(db, Some(git), repo_id)? else {
+        return Ok(Vec::new());
+    };
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let Some(lp) = repo.local_path.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let root = Path::new(lp);
+    let dev_log = activity_log(git, root, &structure.main.dev_branch);
+    Ok(structure
+        .participants
+        .iter()
+        .map(|p| {
+            let own_log = activity_log(git, root, &p.branch);
+            let last = latest_participant_commit(&own_log, &p.login)
+                .into_iter()
+                .chain(latest_participant_commit(&dev_log, &p.login))
+                .max();
+            ParticipantActivity {
+                login: p.login.clone(),
+                last_at: last.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            }
+        })
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3619,6 +3702,81 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::fs;
+
+    // ----- participants activity (T-000237) --------------------------------
+
+    fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn activity_takes_the_newest_commit_of_the_login() {
+        let log = "2026-10-20T10:00:00+00:00\u{1f}helper\n\
+                   2026-10-22T10:00:00+00:00\u{1f}helper\n\
+                   2026-10-21T10:00:00+00:00\u{1f}helper\n";
+        assert_eq!(
+            latest_participant_commit(log, "helper"),
+            Some(ts("2026-10-22T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn activity_ignores_commits_of_another_login_and_empty_trailers() {
+        let log = "2026-10-25T10:00:00+00:00\u{1f}someone-else\n\
+                   2026-10-24T10:00:00+00:00\u{1f}\n\
+                   2026-10-20T10:00:00+00:00\u{1f}helper\n";
+        assert_eq!(
+            latest_participant_commit(log, "helper"),
+            Some(ts("2026-10-20T10:00:00Z"))
+        );
+        assert_eq!(latest_participant_commit(log, "nobody"), None);
+    }
+
+    #[test]
+    fn activity_login_is_case_insensitive_and_handles_several_trailers() {
+        let log = "2026-10-20T10:00:00+00:00\u{1f}Other,HeLPer\n";
+        assert_eq!(
+            latest_participant_commit(log, "helper"),
+            Some(ts("2026-10-20T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn activity_converts_offsets_before_comparing() {
+        // 12:00+05:00 is 07:00Z, earlier than 10:00Z.
+        let log = "2026-10-20T12:00:00+05:00\u{1f}helper\n\
+                   2026-10-20T10:00:00+00:00\u{1f}helper\n";
+        assert_eq!(
+            latest_participant_commit(log, "helper"),
+            Some(ts("2026-10-20T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn activity_skips_malformed_lines_and_empty_output() {
+        let log = "garbage without separator\n\
+                   not-a-time\u{1f}helper\n\
+                   \n\
+                   2026-10-20T10:00:00+00:00\u{1f}helper\n";
+        assert_eq!(
+            latest_participant_commit(log, "helper"),
+            Some(ts("2026-10-20T10:00:00Z"))
+        );
+        assert_eq!(latest_participant_commit("", "helper"), None);
+    }
+
+    #[test]
+    fn activity_over_two_refs_is_the_maximum() {
+        let own = "2026-10-20T10:00:00+00:00\u{1f}helper\n";
+        let dev = "2026-10-23T10:00:00+00:00\u{1f}helper\n";
+        let last = latest_participant_commit(own, "helper")
+            .into_iter()
+            .chain(latest_participant_commit(dev, "helper"))
+            .max();
+        assert_eq!(last, Some(ts("2026-10-23T10:00:00Z")));
+    }
 
     // ----- managed blocks -------------------------------------------------
 

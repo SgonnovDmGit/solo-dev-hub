@@ -2,17 +2,17 @@
   import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { open } from '@tauri-apps/plugin-dialog';
   import { allRepos, assignRepo, loadAllRepos, isSyncing } from '$lib/stores/repos';
-  import { projects } from '$lib/stores/projects';
+  import { projects, loadProjects } from '$lib/stores/projects';
   import { currentScreen, selectedRepoId, deployDrillTarget } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
-  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch, getRepoStructure, listJoinRequests, approveJoinRequest } from '$lib/api/tauri-commands';
-  import type { RepoRename, ProjectStructure, JoinRequest } from '$lib/types';
+  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch, getRepoStructure, listJoinRequests, approveJoinRequest, sharedParticipantsActivity, setProjectAutoSync } from '$lib/api/tauri-commands';
+  import type { RepoRename, ProjectStructure, JoinRequest, ParticipantActivity } from '$lib/types';
   import { deleteRepoOnGitHub, splitRepoFullName, listBranches, type BranchInfo } from '$lib/api/github';
   import { addToast } from '$lib/stores/ui';
   import { getRoleLabel, getDisplayName, type Role } from '$lib/types';
   import type { StatsSummary as StatsSummaryData } from '$lib/types';
   import { tStore, locale } from '$lib/i18n';
-  import { pat } from '$lib/stores/settings';
+  import { pat, autoSyncEnabled, saveAutoSyncEnabled } from '$lib/stores/settings';
   import BugNotes from './BugNotes.svelte';
   import EmptyState from './EmptyState.svelte';
   import StatsSummary from './StatsSummary.svelte';
@@ -34,7 +34,7 @@
   import ParticipantsTab from './ParticipantsTab.svelte';
   import {
     canToggleSharedMode, isContributorRole, isSharedRepo, buildParticipantRows, pendingRequestCount,
-    myBandLabel, describeSharedStatus, requestsWaitingKey,
+    myBandLabel, describeSharedStatus, requestsWaitingKey, autoSyncOffHint, activityByLogin,
   } from '$lib/utils/shared-mode';
 
   const roleKeys: Role[] = ['server', 'admin_client', 'client', 'test_client', 'landing', 'tool', 'other'];
@@ -97,6 +97,46 @@
   );
   const sharedStatusLine = $derived(describeSharedStatus(sharedState, structure?.main.login ?? null));
 
+  // T-000237: the owner's view of when each participant last pushed.
+  let participantActivity = $state<ParticipantActivity[]>([]);
+  const activityMap = $derived(activityByLogin(participantActivity));
+
+  async function loadParticipantActivity() {
+    const id = repo?.id;
+    if (id === undefined || !isOwnerInstall || activeTab !== 'participants') {
+      participantActivity = [];
+      return;
+    }
+    try {
+      const list = await sharedParticipantsActivity(id);
+      if (repo?.id === id) participantActivity = list;
+    } catch {
+      // Silent: the column stays "—".
+      if (repo?.id === id) participantActivity = [];
+    }
+  }
+
+  // T-000237: a contributor whose install will not sync this repo by itself.
+  const autoSyncHint = $derived(
+    repo ? autoSyncOffHint(sharedState, $autoSyncEnabled, repo.project_id, $projects) : null,
+  );
+  let enablingAutoSync = $state(false);
+
+  async function handleEnableAutoSync() {
+    const projectId = autoSyncHint?.projectId;
+    if (projectId === null || projectId === undefined || enablingAutoSync) return;
+    enablingAutoSync = true;
+    try {
+      await saveAutoSyncEnabled(true);
+      await setProjectAutoSync(projectId, true);
+      await loadProjects();
+    } catch (err) {
+      addToast(String(err), 'error');
+    } finally {
+      enablingAutoSync = false;
+    }
+  }
+
   async function loadSharedDetails() {
     const id = repo?.id;
     if (id === undefined || !isShared) {
@@ -140,6 +180,16 @@
     void $selectedRepoId;
     void sharedSignature;
     void loadSharedDetails();
+  });
+
+  // Reload the last-push column when the tab is shown, the repo changes, or the
+  // shared state is refreshed (after every sync the store holds new objects).
+  $effect(() => {
+    void $selectedRepoId;
+    void sharedState;
+    void activeTab;
+    void isOwnerInstall;
+    void loadParticipantActivity();
   });
 
   // The shared state changed under an action of this screen: reload everything.
@@ -701,6 +751,16 @@
               .replace('{2}', structure.main.dev_branch)}
           </div>
         {/if}
+        {#if autoSyncHint}
+          <div class="shared-note muted">
+            <span>{$tStore('shared.autoSyncOff' as any)}</span>
+            {#if autoSyncHint.projectId !== null}
+              <button type="button" class="shared-note-btn" onclick={handleEnableAutoSync} disabled={enablingAutoSync}>
+                {$tStore('shared.autoSyncEnable' as any)}
+              </button>
+            {/if}
+          </div>
+        {/if}
         {#if isOwnerInstall && requestCount > 0}
           <button type="button" class="shared-note requests" onclick={() => (activeTab = 'participants')} title={$tStore('shared.requestsWaitingHint' as any)}>
             {$tStore(requestsWaitingKey(requestCount, $locale) as any).replace('{0}', String(requestCount))}
@@ -813,6 +873,7 @@
         {isOwnerInstall}
         {approving}
         onApprove={handleApprove}
+        activity={activityMap}
       />
     {:else if activeTab === 'deploy'}
       {#if repo.github_name && repo.deploy_target}
@@ -1189,6 +1250,17 @@
     text-align: left;
   }
   .shared-note.requests:hover { text-decoration: underline; }
+  .shared-note-btn {
+    font-size: 11px;
+    padding: 0 8px;
+    border-radius: 4px;
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+  }
+  .shared-note-btn:hover:not(:disabled) { background: var(--accent); color: white; }
+  .shared-note-btn:disabled { opacity: 0.5; cursor: wait; }
 
   .mini {
     font-size: 10px;

@@ -3,7 +3,7 @@
 
 use crate::db::AppDb;
 use crate::git_ops::cached_git;
-use crate::models::{SharedDisableResult, SharedMergeResult, SharedPreflight};
+use crate::models::{ParticipantActivity, SharedDisableResult, SharedMergeResult, SharedPreflight};
 use crate::sync::shared;
 use crate::sync::shared_structure::{JoinRequest, ProjectStructure};
 use tauri::State;
@@ -70,4 +70,13 @@ pub fn get_repo_structure(
     repo_id: i64,
 ) -> Result<Option<ProjectStructure>, String> {
     shared::get_repo_structure(&db, cached_git().as_ref(), repo_id)
+}
+
+/// Owner's view: when each participant's install last pushed a sync commit.
+#[tauri::command(async)]
+pub fn shared_participants_activity(
+    db: State<AppDb>,
+    repo_id: i64,
+) -> Result<Vec<ParticipantActivity>, String> {
+    shared::participants_activity(&db, &need_git()?, repo_id)
 }

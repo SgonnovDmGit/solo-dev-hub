@@ -323,3 +323,36 @@ export function requestsWaitingKey(n: number, locale: 'ru' | 'en'): TranslationK
       ? 'shared.requestsWaitingFew'
       : 'shared.requestsWaitingMany';
 }
+
+// ── Auto-sync hint of a contributor (T-000237) ──────────────────────────────
+
+export interface AutoSyncOffHint {
+  /** The project to switch auto-sync on for; null when the repo has no project. */
+  projectId: number | null;
+}
+
+/**
+ * The contributor's install will not sync this repo by itself: the global
+ * switch is off, or the repo has no project, or its project has auto-sync off.
+ * Null when the line is not due (not a contributor / pending, auto-sync runs,
+ * or the repo's project is not in the list yet).
+ */
+export function autoSyncOffHint(
+  state: Pick<RepoSharedState, 'shared_role'> | null | undefined,
+  globalEnabled: boolean,
+  projectId: number | null | undefined,
+  projects: { id: number; auto_sync_enabled: boolean }[],
+): AutoSyncOffHint | null {
+  if (!isContributorRole(state)) return null;
+  if (projectId === null || projectId === undefined) return { projectId: null };
+  const project = projects.find((p) => p.id === projectId);
+  if (!project) return null;
+  return !globalEnabled || !project.auto_sync_enabled ? { projectId } : null;
+}
+
+/** `login (any case) -> last push time` from the activity list; keys are lower-cased. */
+export function activityByLogin(
+  list: { login: string; last_at: string | null }[],
+): Map<string, string | null> {
+  return new Map(list.map((a) => [a.login.trim().toLowerCase(), a.last_at]));
+}

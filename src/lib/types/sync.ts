@@ -216,6 +216,13 @@ export interface JoinRequest {
   branch: string;
 }
 
+/** When a participant's install last pushed a sync commit (`ParticipantActivity`). */
+export interface ParticipantActivity {
+  login: string;
+  /** ISO-8601; null when no commit with the login's trailer was found. */
+  last_at: string | null;
+}
+
 export interface StructureParticipant {
   login: string;
   branch: string;
