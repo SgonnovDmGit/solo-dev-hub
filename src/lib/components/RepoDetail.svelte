@@ -527,11 +527,15 @@
         <span class="meta-text">{$tStore('repoDetail.labelLastPushed')}: {formatDate(repo.last_pushed_at)}</span>
         <span class="meta-dot">·</span>
         {#if repo.local_path}
-          <span class="local-path ok" title={repo.local_path}>📁 {repo.local_path}</span>
+          <!-- T-000236: read-only path field with the folder button flush against it. -->
+          <div class="path-group">
+            <input type="text" class="path-field" readonly value={repo.local_path} title={repo.local_path} />
+            <button class="path-pick" onclick={handleSetLocalPath} type="button" title={$tStore('repo.localPathSet' as any)}>…</button>
+          </div>
         {:else}
           <span class="local-path warn">⚠ {$tStore('repo.localPathNotFound' as any)}</span>
+          <button class="ghost mini" onclick={handleSetLocalPath} type="button">{$tStore('repo.localPathSet' as any)}</button>
         {/if}
-        <button class="ghost mini" onclick={handleSetLocalPath} type="button">{$tStore('repo.localPathSet' as any)}</button>
         <button class="init-docs-btn row-action" onclick={handleInitDocs} type="button" title={$tStore('repo.initDocsButton' as any)}>
           <span class="btn-icon">📚</span>
           <span class="btn-label">{$tStore('repo.initDocsButton' as any)}</span>
@@ -1083,18 +1087,44 @@
   .local-path {
     font-size: 11px;
     font-family: monospace;
-    /* B-000015: cap visible width so a deeply nested path doesn't push the
-       row-action buttons (init-docs / untrack-gitignored) onto the next line.
-       Full path is available on hover via the `title` attribute. */
-    max-width: 40ch;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
     min-width: 0;
   }
 
-  .local-path.ok {
-    color: var(--text);
+  /* T-000236: path field + folder button as one input-group. B-000015: the group
+     takes a zero flex-basis so a deeply nested path shrinks (ellipsis) instead of
+     pushing the row-action buttons onto the next line; flex-grow stretches it
+     over all the free space up to them. Full path is in the `title`. */
+  .path-group {
+    display: flex;
+    align-items: stretch;
+    flex: 1 1 0;
+    min-width: 8rem;
+  }
+  .path-field {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
+    font-size: 11px;
+    font-family: monospace;
+    padding: 2px 8px;
+    text-overflow: ellipsis;
+    border-radius: var(--radius) 0 0 var(--radius);
+    cursor: default;
+  }
+  .path-pick {
+    flex-shrink: 0;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 10px;
+    margin-left: -1px;
+    border-radius: 0 var(--radius) var(--radius) 0;
+    background-color: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .path-pick:hover:not(:disabled) {
+    background-color: var(--accent-hover);
+    border-color: var(--accent-hover);
   }
 
   .local-path.warn {
