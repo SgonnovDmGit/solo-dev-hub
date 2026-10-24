@@ -31,6 +31,20 @@ pub fn enable_shared_mode(
     shared::enable_shared_mode(&db, &need_git()?, repo_id, remove_lines)
 }
 
+/// T-000227: store the outcome of a GitHub administrator check made by the
+/// frontend (`repos.getCollaboratorPermissionLevel`). Returns true when `login`
+/// became an administrator of the repo with this call (it was not one before).
+/// The backend never calls GitHub; a failed check is simply not reported.
+#[tauri::command]
+pub fn set_shared_admin_verified(
+    db: State<AppDb>,
+    repo_full_name: String,
+    login: String,
+    admin: bool,
+) -> Result<bool, String> {
+    crate::sync::shared_structure::record_admin_verification(&db, &repo_full_name, &login, admin)
+}
+
 /// Switch shared mode off; the deletion of `.sdh/` is committed and pushed now.
 #[tauri::command(async)]
 pub fn disable_shared_mode(db: State<AppDb>, repo_id: i64) -> Result<SharedDisableResult, String> {

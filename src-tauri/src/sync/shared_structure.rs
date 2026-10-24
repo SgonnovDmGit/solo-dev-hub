@@ -145,6 +145,137 @@ pub fn repo_owner_is(github_name: &str, login: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Second trust rule: administrator rights verified through the GitHub API
+// ---------------------------------------------------------------------------
+
+/// Setting that holds the verified-admin records (JSON, see `AdminRecord`).
+/// Written only by the `set_shared_admin_verified` command, i.e. by the
+/// frontend after a GitHub API call; no file of a repo can reach it.
+pub const ADMIN_VERIFIED_SETTING: &str = "shared_admin_verified";
+
+/// One verification: `login` was found to be (or not to be) an administrator of
+/// the repo the record is keyed by, at `checked_at` (RFC 3339).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminRecord {
+    pub login: String,
+    pub admin: bool,
+    pub checked_at: String,
+}
+
+/// The records of the `shared_admin_verified` setting, keyed by the lowercased
+/// `owner/repo`. Rust never calls GitHub: it only reads what the frontend
+/// verified. Parsing is tolerant (garbage -> no records -> nobody is trusted).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdminVerified(BTreeMap<String, AdminRecord>);
+
+/// Key of a repo in the records: its full name, lowercased.
+fn admin_key(github_name: &str) -> String {
+    github_name.trim().to_ascii_lowercase()
+}
+
+impl AdminVerified {
+    pub fn parse(json: Option<&str>) -> Self {
+        let map = json
+            .and_then(|j| serde_json::from_str::<BTreeMap<String, AdminRecord>>(j).ok())
+            .unwrap_or_default();
+        // Keys are normalised so a hand-edited value cannot dodge the lookup.
+        AdminVerified(map.into_iter().map(|(k, v)| (admin_key(&k), v)).collect())
+    }
+
+    pub fn load(db: &AppDb) -> Self {
+        Self::parse(
+            db.get_setting(ADMIN_VERIFIED_SETTING)
+                .ok()
+                .flatten()
+                .as_deref(),
+        )
+    }
+
+    /// True only when the stored record of `github_name` names `login`
+    /// (case-insensitively) and says admin.
+    pub fn is_admin(&self, github_name: &str, login: &str) -> bool {
+        self.0
+            .get(&admin_key(github_name))
+            .is_some_and(|r| r.admin && logins_equal(&r.login, login))
+    }
+
+    /// Store a verification result; returns true when it made `login` an admin
+    /// of the repo while the previous record did not (no record, another login,
+    /// or admin:false).
+    pub fn set(&mut self, github_name: &str, login: &str, admin: bool, checked_at: &str) -> bool {
+        let newly = admin && !self.is_admin(github_name, login);
+        self.0.insert(
+            admin_key(github_name),
+            AdminRecord {
+                login: login.to_string(),
+                admin,
+                checked_at: checked_at.to_string(),
+            },
+        );
+        newly
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&self.0).expect("admin records serialize")
+    }
+}
+
+/// Is a structure whose `main.login` is `main_login` trusted for the repo
+/// `github_name`? Yes when `main_login` is the owner segment of the repo (no
+/// API call needed) or when an admin verification exists for the pair.
+pub fn main_is_trusted(github_name: &str, main_login: &str, admins: &AdminVerified) -> bool {
+    repo_owner_is(github_name, main_login) || admins.is_admin(github_name, main_login)
+}
+
+/// May the install whose GitHub login is `my_login` switch shared mode on for
+/// `github_name`? The owner may; so may a verified administrator.
+pub fn can_enable_shared(github_name: &str, my_login: &str, admins: &AdminVerified) -> bool {
+    is_valid_login(my_login) && main_is_trusted(github_name, my_login, admins)
+}
+
+/// The refusal text of switching shared mode on without being the owner or a
+/// verified administrator.
+pub fn refusal_not_owner_or_admin(login: &str, github_name: &str) -> String {
+    format!(
+        "shared mode can only be switched on by the repo owner or an administrator of the repo ({} is neither for {})",
+        login, github_name
+    )
+}
+
+/// Does a trust decision about `main_login` in `github_name` rest on an API
+/// verification (the login is not the owner segment)? Those pairs are handed to
+/// the frontend to verify (or re-verify) on every sync.
+pub fn needs_admin_check(github_name: &str, main_login: &str) -> bool {
+    is_valid_login(main_login)
+        && github_name
+            .split_once('/')
+            .is_some_and(|(o, _)| !o.is_empty())
+        && !repo_owner_is(github_name, main_login)
+}
+
+/// Record the outcome of a GitHub administrator check (the
+/// `set_shared_admin_verified` command). Returns true when the login became an
+/// admin of the repo with this call.
+pub fn record_admin_verification(
+    db: &AppDb,
+    github_name: &str,
+    login: &str,
+    admin: bool,
+) -> Result<bool, String> {
+    if !is_valid_repo_full_name(github_name) {
+        return Err(format!("'{}' is not an owner/name repo", github_name));
+    }
+    if !is_valid_login(login) {
+        return Err(format!("invalid GitHub login '{}'", login));
+    }
+    let mut all = AdminVerified::load(db);
+    let newly = all.set(github_name, login, admin, &chrono::Utc::now().to_rfc3339());
+    db.set_setting(ADMIN_VERIFIED_SETTING, &all.to_json())
+        .map_err(|e| e.to_string())?;
+    Ok(newly)
+}
+
+// ---------------------------------------------------------------------------
 // Validation of untrusted input
 // ---------------------------------------------------------------------------
 
@@ -230,15 +361,20 @@ fn is_valid_band_start(b: u32) -> bool {
 
 /// Trust check for a structure read from a working tree or a ref. The
 /// structure is accepted only if its `main.login` is the owner of the repo it
-/// was found in, and every field is well-formed and in range.
-pub fn validate_structure(s: &ProjectStructure, github_name: &str) -> Result<(), String> {
+/// was found in or a GitHub administrator of it verified by the frontend
+/// (`admins`), and every field is well-formed and in range.
+pub fn validate_structure(
+    s: &ProjectStructure,
+    github_name: &str,
+    admins: &AdminVerified,
+) -> Result<(), String> {
     if s.format != STRUCTURE_FORMAT {
         return Err(format!("unsupported format {}", s.format));
     }
     if !is_valid_login(&s.main.login) {
         return Err("main.login is not a valid GitHub login".to_string());
     }
-    if !repo_owner_is(github_name, &s.main.login) {
+    if !main_is_trusted(github_name, &s.main.login, admins) {
         return Err(format!(
             "main is not the repo owner (main.login '{}', repo '{}')",
             s.main.login, github_name
@@ -354,10 +490,11 @@ fn read_structure_raw(repo_root: &Path) -> Result<Option<ProjectStructure>, Stri
 pub fn read_structure_file(
     repo_root: &Path,
     github_name: &str,
+    admins: &AdminVerified,
 ) -> Result<Option<ProjectStructure>, String> {
     match read_structure_raw(repo_root)? {
         Some(s) => {
-            validate_structure(&s, github_name)?;
+            validate_structure(&s, github_name, admins)?;
             Ok(Some(s))
         }
         None => Ok(None),
@@ -469,11 +606,9 @@ pub fn build_structure(
         .github_name
         .clone()
         .ok_or_else(|| "shared mode needs a GitHub repository".to_string())?;
-    if !repo_owner_is(&github_name, main_login) {
-        return Err(format!(
-            "shared mode can only be switched on by the repo owner ({} is not {})",
-            main_login, github_name
-        ));
+    let admins = AdminVerified::load(db);
+    if !can_enable_shared(&github_name, main_login, &admins) {
+        return Err(refusal_not_owner_or_admin(main_login, &github_name));
     }
     let project_id = repo
         .project_id
@@ -525,7 +660,7 @@ pub fn build_structure(
         microservices,
         participants: existing.map(|e| e.participants.clone()).unwrap_or_default(),
     };
-    validate_structure(&built, &github_name)?;
+    validate_structure(&built, &github_name, &admins)?;
     Ok(built)
 }
 
@@ -664,7 +799,7 @@ pub fn bug_band_for_repo(db: &AppDb, repo_id: i64) -> BandDecision {
     };
     let structure = match (repo.local_path.as_deref(), repo.github_name.as_deref()) {
         (Some(path), Some(name)) if !path.trim().is_empty() => {
-            read_structure_file(Path::new(path), name)
+            read_structure_file(Path::new(path), name, &AdminVerified::load(db))
         }
         _ => Ok(None),
     };
@@ -747,7 +882,11 @@ pub fn request_from_bytes(
 /// logins, a name that does not match the login inside, an unusable branch,
 /// later duplicates of a login (case-insensitive), and requests of the main
 /// owner or of an existing participant (when the structure file is valid).
-pub fn list_requests(repo_root: &Path, github_name: &str) -> Vec<JoinRequest> {
+pub fn list_requests(
+    repo_root: &Path,
+    github_name: &str,
+    admins: &AdminVerified,
+) -> Vec<JoinRequest> {
     if ensure_sdh_dir_safe(repo_root).is_err() {
         return Vec::new();
     }
@@ -755,7 +894,9 @@ pub fn list_requests(repo_root: &Path, github_name: &str) -> Vec<JoinRequest> {
     if ensure_not_symlink(&dir).is_err() {
         return Vec::new();
     }
-    let structure = read_structure_file(repo_root, github_name).ok().flatten();
+    let structure = read_structure_file(repo_root, github_name, admins)
+        .ok()
+        .flatten();
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -991,7 +1132,8 @@ pub fn pin_after_accept(db: &AppDb, repo_id: i64, s: &ProjectStructure) -> Resul
 /// the remote-tracking refs.
 ///
 /// Trust anchor: a structure is accepted only if `validate_structure` passes,
-/// i.e. its `main.login` is the repo's owner.
+/// i.e. its `main.login` is the repo's owner or a verified administrator of it
+/// (`admins`).
 ///
 /// * `pinned` is `Some(dev_branch)` once a structure was accepted before (see
 ///   `pin_after_accept`). Then ONLY `origin/<pinned>` is consulted (and the
@@ -1008,6 +1150,7 @@ pub fn discover_structure(
     repo_root: &Path,
     github_name: &str,
     pinned: Option<&str>,
+    admins: &AdminVerified,
 ) -> Result<DiscoverOutcome, String> {
     let pinned = pinned.map(str::trim).filter(|p| !p.is_empty());
     let mut untrusted: Option<String> = None;
@@ -1057,7 +1200,7 @@ pub fn discover_structure(
                     &s.main.dev_branch,
                 )));
             }
-            match validate_structure(&s, github_name) {
+            match validate_structure(&s, github_name, admins) {
                 Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", pin))),
                 Err(reason) => untrusted = Some(format!("origin/{}: {}", pin, reason)),
             }
@@ -1065,7 +1208,7 @@ pub fn discover_structure(
     }
 
     match read_structure_raw(repo_root) {
-        Ok(Some(s)) => match validate_structure(&s, github_name) {
+        Ok(Some(s)) => match validate_structure(&s, github_name, admins) {
             Ok(()) => match pinned {
                 Some(pin) if s.main.dev_branch != pin => {
                     untrusted = Some(dev_branch_changed_reason(pin, &s.main.dev_branch));
@@ -1078,7 +1221,7 @@ pub fn discover_structure(
                     let full = format!("refs/remotes/origin/{}", branch);
                     if let Some(o) = read_ref(&full) {
                         if o.main.dev_branch == branch
-                            && validate_structure(&o, github_name).is_ok()
+                            && validate_structure(&o, github_name, admins).is_ok()
                         {
                             return Ok(DiscoverOutcome::Found(o, format!("origin/{}", branch)));
                         }
@@ -1112,7 +1255,7 @@ pub fn discover_structure(
         if s.main.dev_branch != branch {
             continue;
         }
-        match validate_structure(&s, github_name) {
+        match validate_structure(&s, github_name, admins) {
             Ok(()) => candidates.push((s, format!("origin/{}", branch))),
             Err(reason) => {
                 untrusted.get_or_insert(format!("origin/{}: {}", branch, reason));
@@ -1133,6 +1276,68 @@ pub fn discover_structure(
         Some(reason) => DiscoverOutcome::Untrusted(reason),
         None => DiscoverOutcome::NotFound,
     })
+}
+
+/// At most this many distinct logins are handed to the frontend to verify per
+/// repo and sync; a forged file naming many logins cannot trigger many API calls.
+pub const MAX_ADMIN_CHECKS_PER_REPO: usize = 3;
+
+/// The `main.login` values of the structure files of `github_name` (work tree,
+/// the pinned remote ref, or - unpinned - every remote ref that sits on its own
+/// dev branch) whose trust would rest on an administrator verification: valid
+/// logins that are not the owner segment of the repo. Nothing here trusts the
+/// files; the list only says whom the frontend should ask GitHub about.
+/// Distinct, in first-seen order, at most `MAX_ADMIN_CHECKS_PER_REPO`.
+pub fn candidate_admin_logins(
+    git: &GitBinary,
+    repo_root: &Path,
+    github_name: &str,
+    pinned: Option<&str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |s: &ProjectStructure| {
+        let login = s.main.login.trim();
+        if needs_admin_check(github_name, login)
+            && out.len() < MAX_ADMIN_CHECKS_PER_REPO
+            && !out.iter().any(|l| logins_equal(l, login))
+        {
+            out.push(login.to_string());
+        }
+    };
+    let read_ref = |full: &str| -> Option<ProjectStructure> {
+        match git_sync::show_file_capped(
+            git,
+            repo_root,
+            full,
+            STRUCTURE_REL_PATH,
+            MAX_STRUCTURE_BYTES,
+        ) {
+            Ok(Some(b)) => parse_structure(&b).ok(),
+            _ => None,
+        }
+    };
+    let pinned = pinned.map(str::trim).filter(|p| !p.is_empty());
+    if let Some(pin) = pinned {
+        if let Some(s) = read_ref(&format!("refs/remotes/origin/{}", pin)) {
+            add(&s);
+        }
+    }
+    if let Ok(Some(s)) = read_structure_raw(repo_root) {
+        add(&s);
+    }
+    if pinned.is_none() {
+        for full in list_origin_refs(git, repo_root).unwrap_or_default() {
+            let Some(branch) = full.strip_prefix("refs/remotes/origin/") else {
+                continue;
+            };
+            if let Some(s) = read_ref(&full) {
+                if s.main.dev_branch == branch {
+                    add(&s);
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,7 +1363,8 @@ pub fn apply_structure_locally(
         .github_name
         .clone()
         .ok_or_else(|| "the repository has no GitHub name".to_string())?;
-    validate_structure(s, &called_name)?;
+    let admins = AdminVerified::load(db);
+    validate_structure(s, &called_name, &admins)?;
     // Fail closed: without a known login this install cannot tell its own
     // repos from the owner's, so it must not move anything.
     let my_login = db
@@ -1184,7 +1390,13 @@ pub fn apply_structure_locally(
         let Some(github) = repo.github_name.as_deref() else {
             continue;
         };
-        if !repo_owner_is(github, &s.main.login) || mine(github) {
+        // The called repo carries the validated file, so it is always in; any
+        // other repo only if the main owns it or is a verified admin of it
+        // (an organization's repos are not owned by a person).
+        let eligible = repo.id == repo_id
+            || repo_owner_is(github, &s.main.login)
+            || admins.is_admin(github, &s.main.login);
+        if !eligible || mine(github) {
             continue;
         }
         let listed_role = s
@@ -1366,7 +1578,7 @@ mod tests {
         assert_eq!(text, serialize_structure(&shuffled));
 
         assert!(write_structure_if_changed(tmp.path(), &s).unwrap());
-        let back = read_structure_file(tmp.path(), "Owner/web")
+        let back = read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default())
             .unwrap()
             .unwrap();
         assert_eq!(serialize_structure(&back), text);
@@ -1391,10 +1603,13 @@ mod tests {
     #[test]
     fn read_structure_file_absent_garbage_and_wrong_format() {
         let tmp = TempDir::new().unwrap();
-        assert_eq!(read_structure_file(tmp.path(), "Owner/web").unwrap(), None);
+        assert_eq!(
+            read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default()).unwrap(),
+            None
+        );
         fs::create_dir_all(tmp.path().join(".sdh")).unwrap();
         fs::write(tmp.path().join(".sdh/project.json"), "not json").unwrap();
-        assert!(read_structure_file(tmp.path(), "Owner/web").is_err());
+        assert!(read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default()).is_err());
         let mut s = sample();
         s.format = 2;
         fs::write(
@@ -1402,9 +1617,11 @@ mod tests {
             serde_json::to_string(&s).unwrap(),
         )
         .unwrap();
-        assert!(read_structure_file(tmp.path(), "Owner/web")
-            .unwrap_err()
-            .contains("unsupported format"));
+        assert!(
+            read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default())
+                .unwrap_err()
+                .contains("unsupported format")
+        );
     }
 
     // ----- build_structure -------------------------------------------------
@@ -1557,7 +1774,7 @@ mod tests {
     fn requests_write_list_and_filter() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        assert!(list_requests(root, "Owner/web").is_empty());
+        assert!(list_requests(root, "Owner/web", &AdminVerified::default()).is_empty());
 
         assert!(write_request_if_changed(root, &req("zed")).unwrap());
         assert!(!write_request_if_changed(root, &req("zed")).unwrap());
@@ -1587,7 +1804,7 @@ mod tests {
         )
         .unwrap();
 
-        let logins: Vec<_> = list_requests(root, "Owner/web")
+        let logins: Vec<_> = list_requests(root, "Owner/web", &AdminVerified::default())
             .into_iter()
             .map(|r| r.login)
             .collect();
@@ -1598,7 +1815,7 @@ mod tests {
         s.participants.push(participant("AMY", 500_000));
         write_structure_if_changed(root, &s).unwrap();
         write_request_if_changed(root, &req("owner")).unwrap();
-        let logins: Vec<_> = list_requests(root, "Owner/web")
+        let logins: Vec<_> = list_requests(root, "Owner/web", &AdminVerified::default())
             .into_iter()
             .map(|r| r.login)
             .collect();
@@ -1678,7 +1895,8 @@ mod tests {
     fn discover_prefers_working_tree() {
         let fx = fx();
         write_structure_if_changed(&fx.a, &sample()).unwrap();
-        let (s, src) = found(discover_structure(&gb(), &fx.a, REPO, None).unwrap());
+        let (s, src) =
+            found(discover_structure(&gb(), &fx.a, REPO, None, &AdminVerified::default()).unwrap());
         assert_eq!(src, SOURCE_WORKTREE);
         assert_eq!(s.project.name, "Acme");
     }
@@ -1690,7 +1908,7 @@ mod tests {
         g(&fx.a, &["push", "-q", "origin", "dev"]);
         let c = contributor(&fx);
         assert_eq!(
-            discover_structure(&gb(), &c, REPO, None).unwrap(),
+            discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap(),
             DiscoverOutcome::NotFound
         );
     }
@@ -1701,7 +1919,8 @@ mod tests {
         let fx = fx();
         publish(&fx, "dev", "dev", "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
-        let (s, src) = found(discover_structure(&gb(), &c, REPO, None).unwrap());
+        let (s, src) =
+            found(discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap());
         assert_eq!(src, "origin/dev");
         assert_eq!(s.main.dev_branch, "dev");
     }
@@ -1714,7 +1933,7 @@ mod tests {
         publish(&fx, "helper-branch", "dev", "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
         assert_eq!(
-            discover_structure(&gb(), &c, REPO, None).unwrap(),
+            discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap(),
             DiscoverOutcome::NotFound
         );
     }
@@ -1726,7 +1945,7 @@ mod tests {
         publish(&fx, "dev", "DEV", "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
         assert_eq!(
-            discover_structure(&gb(), &c, REPO, None).unwrap(),
+            discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap(),
             DiscoverOutcome::NotFound
         );
     }
@@ -1743,7 +1962,7 @@ mod tests {
         };
         publish_struct(&fx, "helper", &forged, "2026-06-01T00:00:00Z");
         let c = contributor(&fx);
-        match discover_structure(&gb(), &c, REPO, None).unwrap() {
+        match discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap() {
             DiscoverOutcome::Untrusted(reason) => {
                 assert!(reason.contains("main is not the repo owner"), "{}", reason)
             }
@@ -1753,7 +1972,8 @@ mod tests {
         // the legitimate copy is still found, however old
         publish(&fx, "dev", "dev", "2020-01-01T00:00:00Z");
         g(&c, &["fetch", "-q", "origin"]);
-        let (s, src) = found(discover_structure(&gb(), &c, REPO, None).unwrap());
+        let (s, src) =
+            found(discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap());
         assert_eq!(src, "origin/dev");
         assert_eq!(s.main.login, "Owner");
     }
@@ -1767,12 +1987,13 @@ mod tests {
         forged.main.login = "helper".into();
         write_structure_if_changed(&c, &forged).unwrap();
         assert!(matches!(
-            discover_structure(&gb(), &c, REPO, None).unwrap(),
+            discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap(),
             DiscoverOutcome::Untrusted(_)
         ));
         publish(&fx, "dev", "dev", "2026-01-01T00:00:00Z");
         g(&c, &["fetch", "-q", "origin"]);
-        let (_, src) = found(discover_structure(&gb(), &c, REPO, None).unwrap());
+        let (_, src) =
+            found(discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap());
         assert_eq!(src, "origin/dev");
     }
 
@@ -1794,7 +2015,7 @@ mod tests {
         publish_struct(&fx, "dev", &big, "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
         assert_eq!(
-            discover_structure(&gb(), &c, REPO, None).unwrap(),
+            discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap(),
             DiscoverOutcome::NotFound
         );
     }
@@ -1863,11 +2084,12 @@ mod tests {
 
     #[test]
     fn validate_accepts_the_sample_and_rejects_foreign_main() {
-        assert!(validate_structure(&sample(), "Owner/web").is_ok());
-        assert!(validate_structure(&sample(), "owner/web").is_ok());
-        let err = validate_structure(&sample(), "Other/web").unwrap_err();
+        assert!(validate_structure(&sample(), "Owner/web", &AdminVerified::default()).is_ok());
+        assert!(validate_structure(&sample(), "owner/web", &AdminVerified::default()).is_ok());
+        let err =
+            validate_structure(&sample(), "Other/web", &AdminVerified::default()).unwrap_err();
         assert!(err.contains("main is not the repo owner"), "{}", err);
-        assert!(validate_structure(&sample(), "web").is_err());
+        assert!(validate_structure(&sample(), "web", &AdminVerified::default()).is_err());
     }
 
     #[test]
@@ -1875,7 +2097,7 @@ mod tests {
         let check = |f: &dyn Fn(&mut ProjectStructure)| {
             let mut s = sample();
             f(&mut s);
-            validate_structure(&s, "Owner/web")
+            validate_structure(&s, "Owner/web", &AdminVerified::default())
         };
         assert!(check(&|s| s.format = 2).is_err());
         assert!(check(&|s| s.main.login = "a/b".into()).is_err());
@@ -1926,12 +2148,16 @@ mod tests {
     fn read_structure_file_validates_ownership() {
         let tmp = TempDir::new().unwrap();
         write_structure_if_changed(tmp.path(), &sample()).unwrap();
-        assert!(read_structure_file(tmp.path(), "Owner/web")
-            .unwrap()
-            .is_some());
-        assert!(read_structure_file(tmp.path(), "Other/web")
-            .unwrap_err()
-            .contains("main is not the repo owner"));
+        assert!(
+            read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            read_structure_file(tmp.path(), "Other/web", &AdminVerified::default())
+                .unwrap_err()
+                .contains("main is not the repo owner")
+        );
     }
 
     #[test]
@@ -2007,7 +2233,10 @@ mod tests {
     fn request_branch_is_trimmed_and_validated() {
         let tmp = TempDir::new().unwrap();
         assert!(write_request_if_changed(tmp.path(), &req_branch("amy", "  amy-dev ")).unwrap());
-        assert_eq!(list_requests(tmp.path(), REPO)[0].branch, "amy-dev");
+        assert_eq!(
+            list_requests(tmp.path(), REPO, &AdminVerified::default())[0].branch,
+            "amy-dev"
+        );
         for bad in ["main", "-x", "a b", "HEAD", ""] {
             let r = req_branch("amy", bad);
             assert!(write_request_if_changed(tmp.path(), &r).is_err(), "{}", bad);
@@ -2024,7 +2253,10 @@ mod tests {
         for i in 10..70 {
             write_request_if_changed(root, &req(&format!("u{}", i))).unwrap();
         }
-        assert_eq!(list_requests(root, REPO).len(), MAX_REQUEST_FILES);
+        assert_eq!(
+            list_requests(root, REPO, &AdminVerified::default()).len(),
+            MAX_REQUEST_FILES
+        );
         let dir = root.join(".sdh/requests");
         // u10 becomes unusable (protected branch), u11 oversized
         fs::write(dir.join("u10.json"), r#"{"login":"u10","branch":"main"}"#).unwrap();
@@ -2033,7 +2265,7 @@ mod tests {
             format!(r#"{{"login":"u11","branch":"{}"}}"#, "a".repeat(20_000)),
         )
         .unwrap();
-        let logins: Vec<_> = list_requests(root, REPO)
+        let logins: Vec<_> = list_requests(root, REPO, &AdminVerified::default())
             .into_iter()
             .map(|r| r.login)
             .collect();
@@ -2050,7 +2282,10 @@ mod tests {
         fs::write(dir.join("Amy.json"), r#"{"login":"Amy","branch":"a1"}"#).unwrap();
         fs::write(dir.join("amy.json"), r#"{"login":"amy","branch":"a2"}"#).unwrap();
         // on a case-insensitive filesystem the second write replaced the first
-        assert_eq!(list_requests(tmp.path(), REPO).len(), 1);
+        assert_eq!(
+            list_requests(tmp.path(), REPO, &AdminVerified::default()).len(),
+            1
+        );
     }
 
     #[test]
@@ -2083,9 +2318,11 @@ mod tests {
             vec![b' '; MAX_STRUCTURE_BYTES as usize + 1],
         )
         .unwrap();
-        assert!(read_structure_file(tmp.path(), REPO)
-            .unwrap_err()
-            .contains("too large"));
+        assert!(
+            read_structure_file(tmp.path(), REPO, &AdminVerified::default())
+                .unwrap_err()
+                .contains("too large")
+        );
     }
 
     fn try_symlink_dir(target: &Path, link: &Path) -> bool {
@@ -2108,9 +2345,9 @@ mod tests {
             return; // no symlink privilege on this machine
         }
         assert!(write_structure_if_changed(&root, &sample()).is_err());
-        assert!(read_structure_file(&root, REPO).is_err());
+        assert!(read_structure_file(&root, REPO, &AdminVerified::default()).is_err());
         assert!(write_request_if_changed(&root, &req("amy")).is_err());
-        assert!(list_requests(&root, REPO).is_empty());
+        assert!(list_requests(&root, REPO, &AdminVerified::default()).is_empty());
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
 
         let root2 = tmp.path().join("repo2");
@@ -2119,7 +2356,7 @@ mod tests {
             return;
         }
         assert!(write_request_if_changed(&root2, &req("amy")).is_err());
-        assert!(list_requests(&root2, REPO).is_empty());
+        assert!(list_requests(&root2, REPO, &AdminVerified::default()).is_empty());
     }
 
     #[test]
@@ -2130,6 +2367,221 @@ mod tests {
         let err = build_structure(&db, api_id, "someone-else", None).unwrap_err();
         assert!(err.contains("repo owner"), "{}", err);
         assert!(build_structure(&db, api_id, "owner", None).is_ok());
+    }
+
+    // ----- T-000227: second trust rule (administrator by GitHub API) --------
+
+    const ORG_REPO: &str = "Acme-Org/web";
+
+    fn org_structure(main: &str) -> ProjectStructure {
+        let mut s = sample();
+        s.main.login = main.into();
+        s.repos = vec![StructRepo {
+            github: ORG_REPO.into(),
+            role: "client".into(),
+        }];
+        s
+    }
+
+    fn verified(repo: &str, login: &str, admin: bool) -> AdminVerified {
+        let mut a = AdminVerified::default();
+        a.set(repo, login, admin, "2026-10-24T00:00:00Z");
+        a
+    }
+
+    #[test]
+    fn validate_trusts_the_owner_without_any_record() {
+        assert!(validate_structure(&sample(), "Owner/web", &AdminVerified::default()).is_ok());
+    }
+
+    #[test]
+    fn validate_refuses_a_non_owner_main_without_a_record() {
+        let err = validate_structure(&org_structure("boss"), ORG_REPO, &AdminVerified::default())
+            .unwrap_err();
+        assert!(err.contains("main is not the repo owner"), "{}", err);
+    }
+
+    #[test]
+    fn validate_trusts_a_non_owner_main_with_an_admin_record_for_the_same_login() {
+        let s = org_structure("boss");
+        assert!(validate_structure(&s, ORG_REPO, &verified(ORG_REPO, "boss", true)).is_ok());
+    }
+
+    #[test]
+    fn validate_refuses_a_record_of_another_login_or_a_non_admin_one() {
+        let s = org_structure("boss");
+        // a record of somebody else does not carry over to this main.login
+        assert!(validate_structure(&s, ORG_REPO, &verified(ORG_REPO, "other", true)).is_err());
+        assert!(validate_structure(&s, ORG_REPO, &verified(ORG_REPO, "boss", false)).is_err());
+        // a helper forging main.login = himself while only the boss is verified
+        let forged = org_structure("helper");
+        assert!(validate_structure(&forged, ORG_REPO, &verified(ORG_REPO, "boss", true)).is_err());
+        // a record of another repo does not count either
+        assert!(validate_structure(&s, ORG_REPO, &verified("Acme-Org/api", "boss", true)).is_err());
+    }
+
+    #[test]
+    fn admin_records_compare_logins_and_repos_case_insensitively() {
+        let s = org_structure("Boss");
+        assert!(validate_structure(&s, ORG_REPO, &verified("acme-org/WEB", "bOSS", true)).is_ok());
+        assert!(validate_structure(&s, "ACME-ORG/web", &verified(ORG_REPO, "boss", true)).is_ok());
+    }
+
+    #[test]
+    fn admin_records_survive_a_round_trip_and_garbage_trusts_nobody() {
+        let a = verified(ORG_REPO, "boss", true);
+        let back = AdminVerified::parse(Some(&a.to_json()));
+        assert!(back.is_admin(ORG_REPO, "boss"));
+        assert!(!AdminVerified::parse(Some("not json")).is_admin(ORG_REPO, "boss"));
+        assert!(!AdminVerified::parse(Some("[]")).is_admin(ORG_REPO, "boss"));
+        assert!(!AdminVerified::parse(None).is_admin(ORG_REPO, "boss"));
+        // a hand-edited key with other casing still resolves, nothing wider
+        let raw = r#"{"ACME-ORG/Web":{"login":"boss","admin":true,"checked_at":"x"}}"#;
+        assert!(AdminVerified::parse(Some(raw)).is_admin(ORG_REPO, "boss"));
+        assert!(!AdminVerified::parse(Some(raw)).is_admin("Acme-Org/web2", "boss"));
+    }
+
+    #[test]
+    fn setting_a_record_reports_only_a_new_admin() {
+        let mut a = AdminVerified::default();
+        assert!(a.set(ORG_REPO, "boss", true, "t1"));
+        assert!(!a.set(ORG_REPO, "boss", true, "t2"));
+        assert!(!a.set(ORG_REPO, "boss", false, "t3"));
+        assert!(!a.is_admin(ORG_REPO, "boss"));
+        assert!(a.set(ORG_REPO, "boss", true, "t4"));
+        // another login replaces the record: admin again counts as new
+        assert!(a.set(ORG_REPO, "second", true, "t5"));
+        assert!(!a.is_admin(ORG_REPO, "boss"));
+    }
+
+    #[test]
+    fn needs_admin_check_is_false_for_the_owner_and_for_junk() {
+        assert!(!needs_admin_check("Owner/web", "owner"));
+        assert!(needs_admin_check(ORG_REPO, "boss"));
+        assert!(!needs_admin_check(ORG_REPO, "not a login"));
+        assert!(!needs_admin_check("web", "boss"));
+        assert!(!needs_admin_check("/web", "boss"));
+    }
+
+    #[test]
+    fn enabling_is_for_the_owner_or_a_verified_admin() {
+        let none = AdminVerified::default();
+        assert!(can_enable_shared("Owner/web", "owner", &none));
+        assert!(!can_enable_shared(ORG_REPO, "boss", &none));
+        assert!(can_enable_shared(
+            ORG_REPO,
+            "boss",
+            &verified(ORG_REPO, "boss", true)
+        ));
+        assert!(!can_enable_shared(
+            ORG_REPO,
+            "boss",
+            &verified(ORG_REPO, "boss", false)
+        ));
+        assert!(!can_enable_shared(
+            ORG_REPO,
+            "boss",
+            &verified(ORG_REPO, "other", true)
+        ));
+        assert!(!can_enable_shared(ORG_REPO, "", &none));
+    }
+
+    #[test]
+    fn recording_a_verification_persists_it_and_validates_its_input() {
+        let db = make_db();
+        assert!(record_admin_verification(&db, ORG_REPO, "boss", true).unwrap());
+        assert!(AdminVerified::load(&db).is_admin(ORG_REPO, "BOSS"));
+        // the same answer again is not news
+        assert!(!record_admin_verification(&db, ORG_REPO, "boss", true).unwrap());
+        // a revocation is stored, not dropped
+        assert!(!record_admin_verification(&db, ORG_REPO, "boss", false).unwrap());
+        assert!(!AdminVerified::load(&db).is_admin(ORG_REPO, "boss"));
+        assert!(record_admin_verification(&db, "no-slash", "boss", true).is_err());
+        assert!(record_admin_verification(&db, ORG_REPO, "bad login", true).is_err());
+    }
+
+    #[test]
+    fn build_structure_lets_a_verified_admin_of_an_org_repo_be_main() {
+        let db = make_db();
+        let project = db.create_project("Acme", None, "standard").unwrap();
+        let web = local_repo(&db, ORG_REPO);
+        db.assign_repository(web, Some(project.id), Some("client"))
+            .unwrap();
+        db.set_autocommit_branch(web, Some("dev")).unwrap();
+        // not the owner, no record: refused
+        let err = build_structure(&db, web, "boss", None).unwrap_err();
+        assert!(err.contains("repo owner or an administrator"), "{}", err);
+        // a non-admin answer does not help
+        record_admin_verification(&db, ORG_REPO, "boss", false).unwrap();
+        assert!(build_structure(&db, web, "boss", None).is_err());
+        // an admin does, and the result validates under that record
+        record_admin_verification(&db, ORG_REPO, "boss", true).unwrap();
+        let s = build_structure(&db, web, "boss", None).unwrap();
+        assert_eq!(s.main.login, "boss");
+        // and only for him
+        assert!(build_structure(&db, web, "someone-else", None).is_err());
+    }
+
+    #[test]
+    fn read_structure_file_trusts_an_org_structure_only_through_the_record() {
+        let tmp = TempDir::new().unwrap();
+        write_structure_if_changed(tmp.path(), &org_structure("boss")).unwrap();
+        assert!(read_structure_file(tmp.path(), ORG_REPO, &AdminVerified::default()).is_err());
+        let ok = read_structure_file(tmp.path(), ORG_REPO, &verified(ORG_REPO, "boss", true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok.main.login, "boss");
+        assert!(
+            read_structure_file(tmp.path(), ORG_REPO, &verified(ORG_REPO, "boss", false)).is_err()
+        );
+    }
+
+    #[test]
+    fn candidate_admin_logins_names_only_non_owner_mains_of_the_work_tree() {
+        // A git that cannot start: only the work-tree file is looked at.
+        let no_git = GitBinary(PathBuf::from("definitely-not-a-git-binary"));
+        let tmp = TempDir::new().unwrap();
+        write_structure_if_changed(tmp.path(), &org_structure("boss")).unwrap();
+        assert_eq!(
+            candidate_admin_logins(&no_git, tmp.path(), ORG_REPO, None),
+            vec!["boss".to_string()]
+        );
+        // the owner as main needs no API check
+        let owner = TempDir::new().unwrap();
+        write_structure_if_changed(owner.path(), &sample()).unwrap();
+        assert!(candidate_admin_logins(&no_git, owner.path(), "Owner/web", None).is_empty());
+        // no file: nothing to verify
+        let empty = TempDir::new().unwrap();
+        assert!(candidate_admin_logins(&no_git, empty.path(), ORG_REPO, None).is_empty());
+    }
+
+    #[test]
+    fn apply_assigns_the_called_org_repo_but_not_unverified_org_siblings() {
+        let db = make_helper_db();
+        let web = local_repo(&db, ORG_REPO);
+        let api = local_repo(&db, "Acme-Org/api");
+        let mut s = org_structure("boss");
+        s.repos.push(StructRepo {
+            github: "Acme-Org/api".into(),
+            role: "server".into(),
+        });
+        // without a verification the structure is refused outright
+        assert!(apply_structure_locally(&db, web, &s).is_err());
+        record_admin_verification(&db, ORG_REPO, "boss", true).unwrap();
+        apply_structure_locally(&db, web, &s).unwrap();
+        let p = db
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "Acme")
+            .unwrap();
+        assert_eq!(db.get_repository(web).unwrap().project_id, Some(p.id));
+        assert_eq!(
+            db.get_repository(web).unwrap().role.as_deref(),
+            Some("client")
+        );
+        // the sibling was verified for nobody: it joins by its own sync
+        assert_eq!(db.get_repository(api).unwrap().project_id, None);
     }
 
     #[test]
@@ -2208,7 +2660,7 @@ mod tests {
         let fx = fx();
         publish_dev_and_aaa(&fx);
         let c = contributor(&fx);
-        match discover_structure(&gb(), &c, REPO, None).unwrap() {
+        match discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap() {
             DiscoverOutcome::Untrusted(reason) => {
                 assert!(reason.starts_with("ambiguous structure: "), "{}", reason);
                 assert!(reason.contains("origin/aaa") && reason.contains("origin/dev"));
@@ -2223,12 +2675,14 @@ mod tests {
         let fx = fx();
         publish_dev_and_aaa(&fx);
         let c = contributor(&fx);
-        let (s, src) = found(discover_structure(&gb(), &c, REPO, Some("dev")).unwrap());
+        let (s, src) = found(
+            discover_structure(&gb(), &c, REPO, Some("dev"), &AdminVerified::default()).unwrap(),
+        );
         assert_eq!(src, "origin/dev");
         assert_eq!(s.main.dev_branch, "dev");
         // an absent pinned ref is simply not found
         assert_eq!(
-            discover_structure(&gb(), &c, REPO, Some("gone")).unwrap(),
+            discover_structure(&gb(), &c, REPO, Some("gone"), &AdminVerified::default()).unwrap(),
             DiscoverOutcome::NotFound
         );
     }
@@ -2240,7 +2694,7 @@ mod tests {
         // origin/dev now claims another dev branch
         publish(&fx, "dev", "other", "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
-        match discover_structure(&gb(), &c, REPO, Some("dev")).unwrap() {
+        match discover_structure(&gb(), &c, REPO, Some("dev"), &AdminVerified::default()).unwrap() {
             DiscoverOutcome::Untrusted(reason) => {
                 assert_eq!(reason, "dev_branch_changed:dev\u{2192}other");
                 assert_eq!(
@@ -2260,11 +2714,12 @@ mod tests {
         st.main.dev_branch = "other".into();
         write_structure_if_changed(&fx.a, &st).unwrap();
         assert!(matches!(
-            discover_structure(&gb(), &fx.a, REPO, Some("dev")).unwrap(),
+            discover_structure(&gb(), &fx.a, REPO, Some("dev"), &AdminVerified::default()).unwrap(),
             DiscoverOutcome::Untrusted(_)
         ));
         assert!(matches!(
-            discover_structure(&gb(), &fx.a, REPO, Some("other")).unwrap(),
+            discover_structure(&gb(), &fx.a, REPO, Some("other"), &AdminVerified::default())
+                .unwrap(),
             DiscoverOutcome::Found(_, _)
         ));
     }
@@ -2286,7 +2741,8 @@ mod tests {
     fn discover_origin_dev_beats_a_stale_worktree_copy_unpinned() {
         let fx = fx();
         let c = owner_approved_stale_worktree(&fx);
-        let (s, src) = found(discover_structure(&gb(), &c, REPO, None).unwrap());
+        let (s, src) =
+            found(discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap());
         assert_eq!(src, "origin/dev");
         assert_eq!(s.participants.len(), 1);
     }
@@ -2296,7 +2752,9 @@ mod tests {
     fn discover_origin_dev_beats_a_stale_worktree_copy_pinned() {
         let fx = fx();
         let c = owner_approved_stale_worktree(&fx);
-        let (s, src) = found(discover_structure(&gb(), &c, REPO, Some("dev")).unwrap());
+        let (s, src) = found(
+            discover_structure(&gb(), &c, REPO, Some("dev"), &AdminVerified::default()).unwrap(),
+        );
         assert_eq!(src, "origin/dev");
         assert_eq!(s.participants.len(), 1);
     }
@@ -2308,7 +2766,8 @@ mod tests {
         let c = contributor(&fx);
         write_structure_if_changed(&c, &sample()).unwrap();
         for pin in [None, Some("dev")] {
-            let (_, src) = found(discover_structure(&gb(), &c, REPO, pin).unwrap());
+            let (_, src) =
+                found(discover_structure(&gb(), &c, REPO, pin, &AdminVerified::default()).unwrap());
             assert_eq!(src, SOURCE_WORKTREE);
         }
     }
@@ -2321,7 +2780,7 @@ mod tests {
         publish(&fx, "dev", "other", "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
         write_structure_if_changed(&c, &sample()).unwrap();
-        match discover_structure(&gb(), &c, REPO, Some("dev")).unwrap() {
+        match discover_structure(&gb(), &c, REPO, Some("dev"), &AdminVerified::default()).unwrap() {
             DiscoverOutcome::Untrusted(reason) => {
                 assert_eq!(reason, "dev_branch_changed:dev\u{2192}other")
             }
@@ -2395,7 +2854,7 @@ mod tests {
             fs::write(dir.join(format!("bad name {}.json", i)), "x").unwrap();
         }
         write_request_if_changed(root, &req("zed")).unwrap();
-        let logins: Vec<_> = list_requests(root, REPO)
+        let logins: Vec<_> = list_requests(root, REPO, &AdminVerified::default())
             .into_iter()
             .map(|r| r.login)
             .collect();

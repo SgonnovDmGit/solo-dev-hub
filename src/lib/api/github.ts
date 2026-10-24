@@ -129,6 +129,18 @@ export async function isRepoPublic(token: string, owner: string, repo: string): 
 }
 
 /**
+ * T-000227: is `username` an administrator of `owner/repo`? GET
+ * /repos/{owner}/{repo}/collaborators/{username}/permission, `permission` is
+ * 'admin' | 'write' | 'read' | 'none'. Throws on any failure (network, 403, 404):
+ * a failed check must not be taken for "not an admin".
+ */
+export async function isRepoAdmin(token: string, owner: string, repo: string, username: string): Promise<boolean> {
+  const octokit = new Octokit({ auth: token });
+  const resp = await octokit.repos.getCollaboratorPermissionLevel({ owner, repo, username });
+  return resp.data.permission === 'admin';
+}
+
+/**
  * Login of the account the token belongs to, or null when the token is not
  * accepted. T-000216: contributor mode identifies this install by that login.
  */

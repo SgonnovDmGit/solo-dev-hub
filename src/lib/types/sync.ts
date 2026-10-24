@@ -74,6 +74,17 @@ export interface SyncResult {
   rules_taken: string[];
   /** T-000207: `<skill> (<repo>)` — marker beside a copy already equal to the rule; the edit was lost. */
   rules_lost: string[];
+  /** T-000227: shared repos whose structure names a main that is not the repo owner;
+   *  the frontend verifies each one against GitHub (see `sync-core.ts`). */
+  admin_checks: AdminCheck[];
+}
+
+/** T-000227: one administrator check the frontend has to make (`AdminCheck`). */
+export interface AdminCheck {
+  /** Full name of the repo, `owner/name`. */
+  repo: string;
+  /** The login the structure names as main. */
+  login: string;
 }
 
 /** Result of `sync_global_claude_md` (the global-rules button). Mirrors

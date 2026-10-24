@@ -5,11 +5,14 @@ import { addToast } from '$lib/stores/ui';
 import { isSyncing } from '$lib/stores/repos';
 import { refreshAfterSync } from '$lib/stores/shared';
 import { noteManualSync } from '$lib/stores/autosync';
-import { syncProject, probeSharedRepos } from '$lib/api/tauri-commands';
+import { syncProjectCore, probeSharedCore } from '$lib/sync-core';
 import { toastRulesFindings } from '$lib/utils/rules-report';
 import { formatSyncIssues } from '$lib/utils/sync-issues';
 import { tf } from '$lib/i18n';
 import type { SyncResult } from '$lib/types';
+
+// T-000227: the toast-free core (sync + administrator checks + at most one re-run).
+export { syncProjectCore, probeSharedCore } from '$lib/sync-core';
 
 /**
  * Sync one project and report the outcome in toasts. Resolves to the result,
@@ -20,7 +23,7 @@ export async function runProjectSync(projectId: number): Promise<SyncResult | nu
   // full interval after this manual sync.
   noteManualSync();
   try {
-    const result = await syncProject(projectId);
+    const result = await syncProjectCore(projectId);
     const msgKey = result.migrated > 0 ? 'sync.syncCompleteFull' : 'sync.syncComplete';
     const msg =
       result.migrated > 0
@@ -65,7 +68,7 @@ export async function runProjectSync(projectId: number): Promise<SyncResult | nu
 export async function runSharedProbe(): Promise<void> {
   isSyncing.set(true);
   try {
-    const result = await probeSharedRepos();
+    const result = await probeSharedCore();
     if (result.errors.length > 0) {
       const header = tf('sync.errors', result.errors.length);
       addToast(`${header}\n${formatSyncIssues(result.errors)}`, 'warning');

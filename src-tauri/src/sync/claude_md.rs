@@ -132,7 +132,11 @@ pub fn shared_block_for(
         }
     };
     let from_file = || match (repo.local_path.as_deref(), repo.github_name.as_deref()) {
-        (Some(path), Some(gh)) => ss::read_structure_file(Path::new(path), gh).ok().flatten(),
+        (Some(path), Some(gh)) => {
+            ss::read_structure_file(Path::new(path), gh, &ss::AdminVerified::load(db))
+                .ok()
+                .flatten()
+        }
         _ => None,
     };
     let structure = structure.cloned().or_else(from_file);

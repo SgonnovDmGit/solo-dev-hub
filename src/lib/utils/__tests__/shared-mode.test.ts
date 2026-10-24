@@ -68,10 +68,11 @@ describe('ownership and roles', () => {
     expect(isContributorRole(null)).toBe(false);
   });
 
-  it('offers the switch only to the repo owner who is not a contributor', () => {
+  it('offers the switch to everybody who is not a contributor (non-owners are checked on press)', () => {
     expect(canToggleSharedMode('Owner/api', 'owner', null)).toBe(true);
     expect(canToggleSharedMode('Owner/api', 'owner', state({ shared_role: 'main' }))).toBe(true);
-    expect(canToggleSharedMode('Owner/api', 'helper', null)).toBe(false);
+    expect(canToggleSharedMode('Owner/api', 'helper', null)).toBe(true);
+    expect(canToggleSharedMode('Owner/api', 'helper', state({ shared_role: 'contributor' }))).toBe(false);
     expect(canToggleSharedMode('Owner/api', null, null)).toBe(false);
     expect(canToggleSharedMode('Owner/api', 'owner', state({ shared_role: 'contributor' }))).toBe(false);
     expect(canToggleSharedMode('Owner/api', 'owner', state({ shared_role: 'pending' }))).toBe(false);
