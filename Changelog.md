@@ -4,6 +4,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+### Changed
+- **`sdh-phase-workflow`: a conditionally visible element is counted on live data.** A UI element shown by role, permission or state gets a Verification item saying how many items on the owner's data show it and how many hide it. Retro of v1.22.0: the shared-mode switch showed on every foreign repository, and nobody counted before the owner looked.
+
 ## [1.22.0] — 2026-10-25
 
 macOS builds, and contributor mode after its first days of real use: a sync button on the repository screen, a visible sign that a participant stopped syncing, organization repositories, and a mark on rules whose canon moved.
