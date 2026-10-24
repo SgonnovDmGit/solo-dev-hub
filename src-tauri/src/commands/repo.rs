@@ -212,17 +212,18 @@ pub fn delete_repository(
 }
 
 // ── F-000041: untrack gitignored files ────────────────────────────────────────
-// Sync commands — `git_ops::*` are sync (subprocess output() blocks) and finish
-// in well under 500ms on realistic repos; an async wrapper would not pay for
-// itself. UI gates the Untrack button on `check_git_available_for_repo` so the
-// two listing/untracking commands are only called when both binary and `.git/`
-// are known to exist.
+// Async commands: each spawns git, and a git spawn on the owner's Windows
+// machine measured 0.7–7.8 s, which a sync command spent on the UI thread with
+// the window frozen (2026-10-24, the repo screen asks on every open). The git
+// binary comes from the per-process probe (`cached_git`). UI gates the Untrack
+// button on `check_git_available_for_repo` so the two listing/untracking
+// commands are only called when both binary and `.git/` are known to exist.
 
 /// True iff a git binary is discoverable AND the repo has a `local_path`
 /// pointing at something that looks like a git work tree. Lookup failure
 /// (no such repo, no local_path) returns Ok(false) so the UI quietly hides
 /// the Untrack button — symmetric with the missing-local-path UX elsewhere.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn check_git_available_for_repo(db: State<AppDb>, repository_id: i64) -> Result<bool, String> {
     let repo = match db.get_repository(repository_id) {
         Ok(r) => r,
@@ -233,7 +234,7 @@ pub fn check_git_available_for_repo(db: State<AppDb>, repository_id: i64) -> Res
         _ => return Ok(false),
     };
     let path = Path::new(local_path);
-    Ok(git_ops::check_git_available().is_some() && git_ops::is_git_repo(path))
+    Ok(git_ops::cached_git().is_some() && git_ops::is_git_repo(path))
 }
 
 /// Read `git ls-files -ci --exclude-standard -z` plus repo-state and
@@ -241,7 +242,7 @@ pub fn check_git_available_for_repo(db: State<AppDb>, repository_id: i64) -> Res
 /// open. Callers should have already gated on `check_git_available_for_repo`,
 /// but we re-validate locally (errors here are surfaced to the dialog's error
 /// state — see UntrackGitignoredDialog).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_gitignored_tracked(
     db: State<AppDb>,
     repository_id: i64,
@@ -256,7 +257,7 @@ pub fn list_gitignored_tracked(
         .ok_or_else(|| "Repository has no local_path".to_string())?;
     let path = Path::new(local_path);
 
-    let git = git_ops::check_git_available().ok_or_else(|| "git not available".to_string())?;
+    let git = git_ops::cached_git().ok_or_else(|| "git not available".to_string())?;
 
     let files = git_ops::list_gitignored_tracked(&git, path)?;
     let repo_state = match git_ops::detect_repo_state(path) {
@@ -282,7 +283,7 @@ pub fn list_gitignored_tracked(
 /// Run `git rm --cached <files...>` for the user-selected subset. Errors are
 /// per-chunk rather than per-file (matches the `git_ops` chunking model);
 /// the dialog displays them as a partial-success toast.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn untrack_files(
     db: State<AppDb>,
     repository_id: i64,
@@ -298,7 +299,7 @@ pub fn untrack_files(
         .ok_or_else(|| "Repository has no local_path".to_string())?;
     let path = Path::new(local_path);
 
-    let git = git_ops::check_git_available().ok_or_else(|| "git not available".to_string())?;
+    let git = git_ops::cached_git().ok_or_else(|| "git not available".to_string())?;
 
     let file_bufs: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
     git_ops::untrack_files(&git, path, &file_bufs)
