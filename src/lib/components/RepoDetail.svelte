@@ -1,7 +1,7 @@
 <script lang="ts">
   import { formatSyncIssues } from '$lib/utils/sync-issues';
   import { open } from '@tauri-apps/plugin-dialog';
-  import { allRepos, assignRepo, loadAllRepos } from '$lib/stores/repos';
+  import { allRepos, assignRepo, loadAllRepos, isSyncing } from '$lib/stores/repos';
   import { projects } from '$lib/stores/projects';
   import { currentScreen, selectedRepoId, deployDrillTarget } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
@@ -26,6 +26,8 @@
   import DeployScreen from './DeployScreen.svelte';
   import UntrackGitignoredDialog from './UntrackGitignoredDialog.svelte';
   import { toastRulesFindings } from '$lib/utils/rules-report';
+  import { runProjectSync, runSharedProbe } from '$lib/sync-run';
+  import { chooseSyncAction } from '$lib/utils/sync-target';
   import { sharedStates, githubLogin, refreshShared } from '$lib/stores/shared';
   import SharedModeChip from './SharedModeChip.svelte';
   import SharedStatusLine from './SharedStatusLine.svelte';
@@ -403,6 +405,27 @@
     await loadAllRepos();
   }
 
+  // T-000235: the repo's own Sync button. A repo in a project syncs that project;
+  // a repo without one (a contributor's, not linked yet) is probed for the
+  // owner's structure, which links it to a project.
+  let syncingProject = $state(false);
+  const syncBusy = $derived(syncingProject || $isSyncing);
+
+  async function handleSyncRepo() {
+    if (!repo || syncBusy) return;
+    const action = chooseSyncAction(repo.project_id);
+    if (action.kind === 'project') {
+      syncingProject = true;
+      try {
+        await runProjectSync(action.projectId);
+      } finally {
+        syncingProject = false;
+      }
+    } else {
+      await runSharedProbe();
+    }
+  }
+
   async function handleInitDocs() {
     if (!repo) return;
     try {
@@ -536,6 +559,10 @@
           <span class="local-path warn">⚠ {$tStore('repo.localPathNotFound' as any)}</span>
           <button class="ghost mini" onclick={handleSetLocalPath} type="button">{$tStore('repo.localPathSet' as any)}</button>
         {/if}
+        <button class="sync-btn row-action" onclick={handleSyncRepo} type="button" disabled={syncBusy} title={$tStore('repo.syncButton' as any)}>
+          <span class="btn-icon">🔄</span>
+          <span class="btn-label">{$tStore('repo.syncButton' as any)}</span>
+        </button>
         <button class="init-docs-btn row-action" onclick={handleInitDocs} type="button" title={$tStore('repo.initDocsButton' as any)}>
           <span class="btn-icon">📚</span>
           <span class="btn-label">{$tStore('repo.initDocsButton' as any)}</span>
@@ -1221,6 +1248,7 @@
     color: var(--text);
   }
 
+  .sync-btn,
   .init-docs-btn {
     font-size: 11px;
     padding: 2px 10px;
@@ -1231,7 +1259,10 @@
     cursor: pointer;
     white-space: nowrap;
   }
+  .sync-btn:hover:not(:disabled),
   .init-docs-btn:hover { background: var(--surface); border-color: var(--accent); }
+
+  .init-docs-btn { margin-left: 4px; }
 
   .untrack-gitignored-btn {
     /* Sits immediately to the right of init-docs in meta-row. Init-docs has the

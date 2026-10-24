@@ -9,10 +9,10 @@
   import { tStore, tf } from '$lib/i18n';
   import {
     createLocalRepository, getSetting, setSetting,
-    reorderProject, reorderRepo, rebalanceRepoGroup, autoSortAll, probeSharedRepos, deleteRepository,
+    reorderProject, reorderRepo, rebalanceRepoGroup, autoSortAll, deleteRepository,
   } from '$lib/api/tauri-commands';
-  import { sharedStates, refreshAfterSync } from '$lib/stores/shared';
-  import { formatSyncIssues } from '$lib/utils/sync-issues';
+  import { sharedStates } from '$lib/stores/shared';
+  import { runSharedProbe } from '$lib/sync-run';
   import { sidebarBadge, describeSharedStatus, fillParams } from '$lib/utils/shared-mode';
   import EmptyState from './EmptyState.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
@@ -166,7 +166,7 @@
     if ($isSyncing) return;
     if (!$pat) return;
     const fetched = await syncFromGitHub($pat);
-    await probeSharedAfterSync();
+    await runSharedProbe();
     // Only a fully successful fetch may drive the cleanup offer.
     if (fetched) await offerHiddenRepos(fetched);
   }
@@ -235,28 +235,6 @@
     } finally {
       hiddenBusy = false;
       hiddenCandidates = null;
-    }
-  }
-
-  // F-000044: a contributor who has no project yet has nothing to press a
-  // project sync on. After the repo list is refreshed, probe the repos that are
-  // in no shared project for the owner's structure; the backend runs the sync
-  // of every project they land in, which also sends the join request.
-  async function probeSharedAfterSync() {
-    isSyncing.set(true);
-    try {
-      const result = await probeSharedRepos();
-      if (result.errors.length > 0) {
-        const header = $tStore('sync.errors').replace('{0}', String(result.errors.length));
-        addToast(`${header}
-${formatSyncIssues(result.errors)}`, 'warning');
-      }
-    } catch {
-      // The probe is a side job of the repo-list sync: a failure must not
-      // read as a failed sync.
-    } finally {
-      isSyncing.set(false);
-      await refreshAfterSync();
     }
   }
 
