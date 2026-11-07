@@ -81,6 +81,22 @@ describe('refreshShared', () => {
     await refreshShared();
     expect([...get(sharedStates).keys()]).toEqual([1]);
   });
+
+  // T-000239: RepoDetail reloads the structure and the join requests on every
+  // refresh — it keys on the state OBJECT, because a sync can change the
+  // requests/structure while role/status/mode stay exactly the same. The
+  // backend hands out fresh objects each call (Tauri deserializes), so the
+  // signal must survive identical field values.
+  it('hands out a new state object even when every field is unchanged', async () => {
+    listRepoSharedStates.mockImplementation(async () => [state(1)]);
+    const { refreshShared, sharedStates } = await import('../shared');
+    await refreshShared();
+    const first = get(sharedStates).get(1);
+    await refreshShared();
+    const second = get(sharedStates).get(1);
+    expect(second).toEqual(first);
+    expect(second).not.toBe(first);
+  });
 });
 
 describe('refreshAfterSync', () => {

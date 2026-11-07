@@ -2639,6 +2639,47 @@ mod tests {
         assert!(!skills.join("sdh-alpha.md.approved").exists());
     }
 
+    /// Audit of contributor-mode skill approval: on an install that follows an
+    /// owner's canon, a hand-back of the install's OWN rule (not followed) in
+    /// its own repo is still taken up — only followed rules are set aside.
+    #[test]
+    fn test_a_contributor_approves_own_rules_but_not_followed_ones() {
+        let db = db_with_skill();
+        let shared = TempDir::new().unwrap();
+        let mine = TempDir::new().unwrap();
+        let shared_repo = repo_with_role(&db, &shared, "acme/shared", Some("contributor"));
+        let (_, skills) = rendered_repo(&db, &mine, "mine");
+        db.set_setting(
+            super::super::shared_canon::RULES_FROM_MAIN_KEY,
+            &format!(
+                r#"{{"sdh-alpha":{{"login":"owner","repo_id":{},"committed_at":1}}}}"#,
+                shared_repo.id
+            ),
+        )
+        .unwrap();
+        hand_back(&skills, "sdh-alpha", "ALPHA REVISED", "approved");
+        hand_back(&skills, "sdh-beta", "BETA REVISED", "approved");
+
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+
+        assert_eq!(report.taken, vec!["sdh-beta".to_string()]);
+        assert_eq!(report.superseded.len(), 1, "{:?}", report.superseded);
+        assert_eq!(
+            db.get_template_file("_global", "skill.sdh-beta.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            "BETA REVISED"
+        );
+        assert_eq!(
+            db.get_template_file("_global", "skill.sdh-alpha.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            "ALPHA BODY"
+        );
+    }
+
     #[test]
     fn test_render_everywhere_covers_global_and_every_local_repo() {
         let db = db_with_skill();

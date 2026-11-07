@@ -39,6 +39,10 @@
 
   const appWindow = getCurrentWindow();
 
+  // T-000240: on macOS the window uses the native overlay titlebar — traffic
+  // lights on the left, our own min/max/close buttons are hidden.
+  const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.userAgent);
+
   // B-000006: track maximize state so titlebar can swap maximize→restore icon
   // (and tooltip) instead of static "□" glyph that didn't reflect window state.
   let isMaximized = $state(false);
@@ -171,8 +175,8 @@
   }
 </script>
 
-<div class="app" class:maximized={isMaximized}>
-  <header class="titlebar" data-tauri-drag-region>
+<div class="app" class:maximized={isMaximized && !isMac}>
+  <header class="titlebar" class:is-mac={isMac} data-tauri-drag-region>
     <div class="titlebar-left" data-tauri-drag-region>
       <img src={logo} alt="Solo Dev Hub" class="app-logo" data-tauri-drag-region />
       <span class="titlebar-title" data-tauri-drag-region>{$tStore('app.title')}</span>
@@ -245,6 +249,7 @@
         ℹ <span class="tb-label">{$tStore('about.title' as any)}</span>
       </button>
 
+      {#if !isMac}
       <div class="window-controls">
         <!-- B-000006: SVG glyphs replace Unicode "─ □ ✕" — sharper, properly
              scaled, and the maximize button now swaps to a restore-down icon
@@ -287,6 +292,7 @@
           </svg>
         </button>
       </div>
+      {/if}
     </div>
   </header>
 
@@ -383,6 +389,12 @@
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
     user-select: none;
+  }
+
+  /* T-000240: macOS overlay titlebar — native traffic lights occupy the
+     left ~70px; shift our content right so nothing sits under them. */
+  .titlebar.is-mac {
+    padding-left: 78px;
   }
 
   .titlebar-left {

@@ -79,6 +79,7 @@ Every spec carries `## Verification`: hands-on checks, distinct from unit tests.
 - An item naming an endpoint is grepped against `docs/my_api/` first.
 - A test proving a fix is shown red on data of the live shape — encoding, language, length, structure.
 - An end-to-end test of a user flow starts from the state the user is in at that step — an existing checkout, a branch already switched, an empty list — taken from the Verification steps, not from the state the code expects.
+- A UI element whose visibility depends on a condition (role, permission, state): the Verification names how many items on the owner's live data show it and how many hide it.
 - Length scales with complexity: 3–5 items for a small fix, 10+ for a multi-screen phase.
 
 ## An instrument checks its own premise
