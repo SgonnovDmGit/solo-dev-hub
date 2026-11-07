@@ -140,10 +140,21 @@ fn refuse_protected(name: &str) -> Result<(), String> {
     }
 }
 
-/// Conservative branch-name check (a subset of `git check-ref-format`): we
-/// only accept short names, never `refs/...`, never anything that could be read
-/// as an option or a refspec. F-000045: also used by `clone_repo_to` to reject
-/// a garbage configured branch *before* anything is cloned.
+/// Branch-name check matching `git check-ref-format --branch` for short
+/// names. Review follow-up (F-000045): the previous check only looked at the
+/// name as a whole, so `.hidden`, `dev/.hidden` and `bad.lock/branch` passed
+/// — git rejects them, and after the clone they silently became an "absent
+/// branch" that attached on the default branch. Every rule of git is now
+/// applied per component:
+/// * no component may begin with `.` or end with `.lock`;
+/// * no `..`, no leading/trailing `/`, no `//`, no trailing `.`;
+/// * no ASCII control char, whitespace or one of `~ ^ : ? * [ \`;
+/// * no `@{`, not `@`, not `HEAD` (any case);
+/// * only short names (never `refs/...`) and nothing that could be read as
+///   an option or a refspec.
+/// F-000045: also used by `clone_repo_to` to reject a garbage configured
+/// branch *before* anything is cloned — malformed must stay a `CloneFailed`,
+/// distinct from the ratified "valid but absent → stay on the default branch".
 pub(crate) fn validate_branch(name: &str) -> Result<(), String> {
     let bad = name.is_empty()
         || name.starts_with('-')
@@ -151,7 +162,6 @@ pub(crate) fn validate_branch(name: &str) -> Result<(), String> {
         || name.starts_with("refs/")
         || name.ends_with('/')
         || name.ends_with('.')
-        || name.ends_with(".lock")
         || name.contains("..")
         || name.contains("//")
         || name.contains("@{")
@@ -159,7 +169,10 @@ pub(crate) fn validate_branch(name: &str) -> Result<(), String> {
         || name.eq_ignore_ascii_case("HEAD")
         || name
             .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c));
+            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
+        || name
+            .split('/')
+            .any(|part| part.starts_with('.') || part.ends_with(".lock"));
     if bad {
         Err(format!("invalid branch name '{}'", name))
     } else {
@@ -1368,6 +1381,66 @@ pub fn clone_repo(git: &GitBinary, url: &str, cwd: &Path, target: &Path) -> Resu
     }
 }
 
+// ---------------------------------------------------------------------------
+// F-000045 review: incomplete-clone marker
+// ---------------------------------------------------------------------------
+
+/// FNV-1a 64 — implemented inline because the hash must be stable across
+/// releases: a marker written by an older build has to be found after an
+/// update (`DefaultHasher` guarantees no such thing).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// F-000045 review: path of the "this clone never finished" marker of
+/// `target` — `<parent>/.sdh-clone-incomplete-<hash>`. Design constraints:
+/// * OUTSIDE the clone root — a file inside would dirty the worktree the
+///   clone just produced;
+/// * named deterministically from the target path (separators normalised,
+///   case too on Windows), so a retry naming the same folder finds it and a
+///   different target never collides with it;
+/// * `None` when the target has no parent folder (a filesystem root — the
+///   clone itself is refused there anyway).
+pub(crate) fn clone_incomplete_marker(target: &Path) -> Option<PathBuf> {
+    let parent = target.parent()?;
+    let key = target.to_string_lossy().replace(['/', '\\'], "/");
+    #[cfg(windows)]
+    let key = key.to_lowercase();
+    Some(parent.join(format!(
+        ".sdh-clone-incomplete-{:016x}",
+        fnv1a64(key.as_bytes())
+    )))
+}
+
+/// Write the marker before the first mutation of a fresh clone target. The
+/// content is the target path, so a human stumbling over the file knows what
+/// it was for; only its existence is ever checked.
+pub(crate) fn mark_clone_incomplete(target: &Path) -> Result<(), String> {
+    let marker = clone_incomplete_marker(target).ok_or_else(|| {
+        format!(
+            "{} has no parent folder to hold the clone marker",
+            target.display()
+        )
+    })?;
+    std::fs::write(&marker, format!("{}\n", target.display()))
+        .map_err(|e| format!("could not write {}: {}", marker.display(), e))
+}
+
+/// Remove the marker after a fully successful preparation. A missing marker
+/// is fine; a removal that fails must not block the bind, so errors are
+/// swallowed (the worst case is a spurious refusal on a later retry, never a
+/// wrong attach).
+pub(crate) fn clear_clone_incomplete_marker(target: &Path) {
+    if let Some(marker) = clone_incomplete_marker(target) {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
 /// F-000045: after a fresh clone, switch onto `branch` when the remote has it.
 /// The exact ref `refs/remotes/origin/<branch>` decides — a same-named tag
 /// does not count. `Ok(false)` when the ref is absent: HEAD, the index and the
@@ -1430,11 +1503,20 @@ pub fn origin_url_of_worktree_root(git: &GitBinary, target: &Path) -> Result<Str
 
 /// F-000045: make `target` a clone of `github_name` fetched from `url`, or
 /// verify that it already is one. Target classes:
-/// * missing or an empty folder → `git clone` (+ the branch checkout);
+/// * missing or an empty folder → `git clone` (+ the branch checkout). The
+///   incomplete-clone marker is written to the parent BEFORE the first
+///   mutation and removed only after clone AND checkout both succeeded — a
+///   failure leaves it behind together with the leftovers it names;
 /// * an existing clone of the same repo (origin matches `github_name` via the
 ///   exact GitHub matcher) → `ExistingClone`, nothing touched;
 /// * anything else (a file, an unreadable folder, another repo, a non-empty
-///   non-git folder, a nested folder of another repo) → `Invalid`.
+///   non-git folder, a nested folder of another repo) → `Invalid`;
+/// * a target with a leftover incomplete-clone marker → `Invalid` naming the
+///   marker (review follow-up: a valid `.git` plus a matching origin only
+///   proves a non-bare root of the right repo — a clone whose checkout failed
+///   looks exactly like that, and a blind retry would bind a broken tree).
+///   Nothing is ever deleted for the user: the marker message names what to
+///   remove by hand.
 pub fn prepare_clone_target(
     git: &GitBinary,
     url: &str,
@@ -1443,6 +1525,18 @@ pub fn prepare_clone_target(
     branch: &str,
 ) -> Result<ClonePrep, CloneTargetError> {
     let invalid = CloneTargetError::Invalid;
+    // First, the unfinished-attempt marker: while it exists the folder's state
+    // is unproven, so the target must not be adopted as an ExistingClone.
+    if let Some(marker) = clone_incomplete_marker(target) {
+        if marker.exists() {
+            return Err(invalid(format!(
+                "{} holds the leftovers of an unfinished clone attempt (marker {}); \
+                 nothing was touched - delete the marker and, if unwanted, the folder, then retry",
+                target.display(),
+                marker.display()
+            )));
+        }
+    }
     if target.exists() {
         if !target.is_dir() {
             return Err(invalid(format!("{} is a file", target.display())));
@@ -1477,15 +1571,32 @@ pub fn prepare_clone_target(
             cwd.display()
         )));
     }
-    clone_repo(git, url, cwd, target).map_err(CloneTargetError::Failed)?;
-    checkout_remote_branch_if_present(git, target, branch)
-        .map(|checked_out| ClonePrep::FreshClone { checked_out })
-        .map_err(|e| {
-            CloneTargetError::Failed(NetError {
-                kind: NetErrorKind::Other,
-                message: e,
-            })
-        })
+    // Marker first (F-000045 review): from here on the target is mutated, and
+    // until clone AND checkout both succeed its contents are unproven — a
+    // partial clone looks exactly like a complete one. The marker sits in the
+    // parent, so writing it cannot dirty anything git is about to create; if
+    // the write itself fails, nothing has been cloned yet → `Invalid`.
+    mark_clone_incomplete(target).map_err(invalid)?;
+    let checked_out = match clone_repo(git, url, cwd, target) {
+        // The marker stays after a failure — that is the point: the next
+        // attempt at the same target is refused until the user has removed
+        // the leftovers (and the marker) by hand.
+        Err(e) => return Err(CloneTargetError::Failed(e)),
+        Ok(()) => match checkout_remote_branch_if_present(git, target, branch) {
+            Ok(checked_out) => checked_out,
+            Err(e) => {
+                return Err(CloneTargetError::Failed(NetError {
+                    kind: NetErrorKind::Other,
+                    message: e,
+                }))
+            }
+        },
+    };
+    // Clone and checkout both succeeded (or the checkout was deliberately
+    // skipped): the target is a proven clone, the marker can go. A failed
+    // removal must not un-prove it, so errors are swallowed inside.
+    clear_clone_incomplete_marker(target);
+    Ok(ClonePrep::FreshClone { checked_out })
 }
 
 // ---------------------------------------------------------------------------
@@ -1729,8 +1840,11 @@ mod tests {
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn branch_name_validation() {
-        assert!(validate_branch("dev").is_ok());
-        assert!(validate_branch("sdh/shared-1").is_ok());
+        // Good: plain and hierarchical names, dots/dashes/underscores inside.
+        for good in ["dev", "feature/x", "release-1.2", "a.b-c_d", "sdh/shared-1"] {
+            assert!(validate_branch(good).is_ok(), "{good:?} should be valid");
+        }
+        // Bad: git check-ref-format rules, whole-name and per-component.
         for bad in [
             "",
             "-x",
@@ -1742,8 +1856,17 @@ mod tests {
             "x/",
             "a~1",
             "a@{1}",
+            "@",
             "HEAD",
             "head",
+            // F-000045 review, per-'/'-component rules: a component may not
+            // start with '.' nor end with '.lock' (git rejects these, the old
+            // whole-name check let them through — the clone then silently
+            // attached on the default branch).
+            ".hidden",
+            "dev/.hidden",
+            "bad.lock/branch",
+            "dev/",
         ] {
             assert!(validate_branch(bad).is_err(), "{bad:?} should be invalid");
         }
@@ -2824,6 +2947,69 @@ mod tests {
             CloneTargetError::Failed(net) => assert_eq!(net.kind, NetErrorKind::Network),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_success_and_checkout_skip_clear_the_marker() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+
+        // A full success (clone + checkout) removes the marker.
+        let target = tmp.path().join("t");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap();
+        assert!(!clone_incomplete_marker(&target)
+            .expect("target has a parent")
+            .exists());
+
+        // The justified checkout skip (branch absent on the remote) is also a
+        // fully proven clone — the marker must not survive it either.
+        let other_remote = bare_remote(&tmp, "other.git", "main", &[]);
+        let other_url = other_remote.to_string_lossy().into_owned();
+        let other = tmp.path().join("t2");
+        assert_eq!(
+            prepare_clone_target(&gb(), &other_url, CLONE_GH, &other, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: false }
+        );
+        assert!(!clone_incomplete_marker(&other)
+            .expect("target has a parent")
+            .exists());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_failure_leaves_the_marker_and_a_retry_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+
+        // The clone itself fails: the marker must stay behind.
+        let dead = tmp.path().join("nope.git").to_string_lossy().into_owned();
+        assert!(matches!(
+            prepare_clone_target(&gb(), &dead, CLONE_GH, &target, "dev"),
+            Err(CloneTargetError::Failed(_))
+        ));
+        let marker = clone_incomplete_marker(&target).unwrap();
+        assert!(marker.exists(), "the marker must outlive the failed clone");
+        assert_ne!(marker.parent(), Some(target.as_path()));
+
+        // A retry at the SAME target is refused before anything is touched —
+        // even with a perfectly good remote — and names the leftover.
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap_err();
+        match &e {
+            CloneTargetError::Invalid(m) => assert!(
+                m.contains("unfinished clone") && m.contains(".sdh-clone-incomplete-"),
+                "{m}"
+            ),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert!(marker.exists(), "the refusal deletes nothing");
+
+        // A different target never collides with the leftover marker.
+        let elsewhere = tmp.path().join("elsewhere");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &elsewhere, "dev").unwrap();
     }
 
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]

@@ -565,13 +565,16 @@ impl AppDb {
             "UPDATE repositories SET local_path = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             rusqlite::params![local_path, id],
         )?;
-        tx.commit()?;
-        conn.query_row(
+        // F-000045 review: the final SELECT runs through the transaction and
+        // precedes the commit — with a post-commit read a failing query would
+        // leave the path bound while the caller reports CloneAttachFailed.
+        let repo = tx.query_row(
             "SELECT id, project_id, github_name, github_url, role, description, language, last_pushed_at, added_at, updated_at, local_path, github_id, deploy_target FROM repositories WHERE id = ?1",
             rusqlite::params![id],
             row_to_repo,
-        )
-        .map(Some)
+        )?;
+        tx.commit()?;
+        Ok(Some(repo))
     }
 
     /// Update a repo's `description`. For local-only repos this also drives

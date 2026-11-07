@@ -329,27 +329,47 @@ pub fn clone_repo_to(
     clone_repo_to_impl(&db, id, target_dir)
 }
 
-/// F-000045: `owner/repo` shape for a `github_name` — exactly one `/`, both
-/// halves non-empty, and no URL / userinfo / query noise (a full URL or
-/// `a/b/c` can never name a GitHub repository, so there is nothing to clone).
+/// F-000045 review: one component of an `owner/repo` name. GitHub names are
+/// alphanumerics, `-`, `_` and `.` — the allow-list rejects every URL-ish
+/// character (`: / ? # @ \`, whitespace, control chars) in a single rule, and
+/// the two traversal specials `.` and `..` are refused explicitly
+/// (documented choice: this is the character set GitHub itself accepts when
+/// creating an owner or repository name).
+fn is_github_component(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// F-000045: `owner/repo` shape for a `github_name` — trimmed, exactly one
+/// `/`, and both components valid GitHub names. A full URL, `a/b/c`, a
+/// fragment, a backslash path or an embedded space can never name a GitHub
+/// repository, so there is nothing to clone.
 fn is_github_owner_repo(name: &str) -> bool {
-    let name = name.trim();
-    match name.split_once('/') {
-        Some((owner, repo)) => {
-            !owner.is_empty()
-                && !repo.is_empty()
-                && !repo.contains('/')
-                && !name.contains("://")
-                && !name.contains('@')
-                && !name.contains('?')
-        }
+    match name.trim().split_once('/') {
+        Some((owner, repo)) => is_github_component(owner) && is_github_component(repo),
         None => false,
     }
 }
 
 /// The orchestration behind `clone_repo_to`, on a plain `&AppDb` so the
-/// no-git failure paths are unit-testable without a Tauri runtime.
+/// no-git failure paths are unit-testable without a Tauri runtime. Production
+/// delegates with `url = None` (the GitHub URL built from the validated
+/// `github_name`); tests drive the same orchestration with a local bare-repo
+/// path through `clone_repo_to_impl_with_url`.
 fn clone_repo_to_impl(db: &AppDb, id: i64, target_dir: String) -> Result<Repository, SyncIssue> {
+    clone_repo_to_impl_with_url(db, id, target_dir, None)
+}
+
+fn clone_repo_to_impl_with_url(
+    db: &AppDb,
+    id: i64,
+    target_dir: String,
+    url: Option<&str>,
+) -> Result<Repository, SyncIssue> {
     let repo = db.get_repository(id).map_err(|e| {
         SyncIssue::new(SyncIssueCode::CloneFailed, format!("#{}", id)).detail(e.to_string())
     })?;
@@ -400,7 +420,12 @@ fn clone_repo_to_impl(db: &AppDb, id: i64, target_dir: String) -> Result<Reposit
     let git = git_ops::cached_git().ok_or_else(|| {
         SyncIssue::new(SyncIssueCode::CloneFailed, &subject).detail("git binary not available")
     })?;
-    let url = git_sync::github_clone_url(&github_name);
+    // `None` is production: the GitHub URL of the validated name. Tests pass
+    // a local bare-repo path so the whole orchestration runs offline.
+    let url = match url {
+        Some(url) => url.to_string(),
+        None => git_sync::github_clone_url(&github_name),
+    };
 
     // FreshClone and ExistingClone both end in a bindable clone; for the
     // latter the origin check inside `prepare_clone_target` already proved it
@@ -479,31 +504,117 @@ pub fn scan_workspace_for_repos(
     Ok(found)
 }
 
+/// F-000045 review: the text between the brackets of a section header — a
+/// remote section iff the section name is exactly `remote` (ASCII
+/// case-insensitive, so `[REMOTE "origin"]` counts) AND a quoted subsection
+/// follows (any name). `[remote]` without a subsection keys `remote.url`, not
+/// any remote's `url`; `[remoteExtra "x"]` is a different section name.
+/// Documented simplification: git's dotted `[remote.origin]` form is not
+/// accepted — git itself only ever writes the quoted form.
+fn config_section_is_remote(header: &str) -> bool {
+    let header = header.trim();
+    let name_end = header
+        .find(|c: char| c.is_whitespace() || c == '"')
+        .unwrap_or(header.len());
+    if !header[..name_end].eq_ignore_ascii_case("remote") {
+        return false;
+    }
+    header[name_end..].trim_start().starts_with('"')
+}
+
+/// F-000045 review: the value of `key = value`, git-config syntax for the
+/// subset a `.git/config` needs:
+/// * leading whitespace is ignored; trailing unquoted whitespace is trimmed
+///   (tracked while parsing so a closing quote keeps its content intact);
+/// * an unquoted `;` or `#` starts an inline comment — anywhere, exactly like
+///   git (`url = https://x#y` reads as `https://x`);
+/// * a `"` toggles quoted mode: inside it `\"`, `\\`, `\n`, `\t` and `\b` are
+///   unescaped, any other `\x` keeps both characters, whitespace is
+///   significant; a closing quote may be followed by more unquoted text;
+/// * backslashes OUTSIDE quotes are literal — git has no backslash line
+///   continuation for values (documented choice: keep it simple).
+/// `None` for an unterminated quote, mirroring git's "bad config line".
+fn parse_config_value(raw: &str) -> Option<String> {
+    let raw = raw.trim_start();
+    let mut value = String::new();
+    let mut in_quote = false;
+    // Length of `value` after the last character git would keep (git's trim_len).
+    let mut trim_len = 0usize;
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                trim_len = value.len();
+            }
+            ';' | '#' if !in_quote => break,
+            '\\' if in_quote => {
+                match chars.next() {
+                    Some('n') => value.push('\n'),
+                    Some('t') => value.push('\t'),
+                    Some('b') => value.push('\u{0008}'),
+                    Some('\\') => value.push('\\'),
+                    Some('"') => value.push('"'),
+                    Some(other) => {
+                        value.push('\\');
+                        value.push(other);
+                    }
+                    None => value.push('\\'),
+                }
+                trim_len = value.len();
+            }
+            other => {
+                let significant = in_quote || !other.is_whitespace();
+                value.push(other);
+                if significant {
+                    trim_len = value.len();
+                }
+            }
+        }
+    }
+    if in_quote {
+        return None;
+    }
+    value.truncate(trim_len);
+    Some(value)
+}
+
 /// F-000045: every fetch URL (`url = ...`) of the `[remote "..."]` sections of
 /// a `.git/config`. `pushurl` is skipped — where a clone fetches from is the
 /// proof, not where it may push to — and so are comments and any `url`-like
 /// key (`url-other`) or key outside a remote section. The old scanner
 /// lowercased the whole file and searched substrings, which also matched
-/// commented URLs, `pushurl` lines and prefix repos; this parser hands
-/// `git_ops::remote_matches_github` the real fetch URLs only.
+/// commented URLs, `pushurl` lines, quoted values and prefix sections
+/// (`[remoteExtra "x"]`); this parser implements the git config syntax the
+/// scanner needs (see `config_section_is_remote` / `parse_config_value`) and
+/// hands `git_ops::remote_matches_github` the real fetch URLs only.
 fn remote_fetch_urls(config: &str) -> Vec<String> {
     let mut urls = Vec::new();
     let mut in_remote_section = false;
     for line in config.lines() {
         let line = line.trim();
-        if line.starts_with('#') || line.starts_with(';') {
+        // A bare `#` / `;` line is a comment (git: at line start).
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if let Some(section) = line.strip_prefix('[') {
-            in_remote_section = section.trim_start().starts_with("remote");
+        if let Some(header) = line.strip_prefix('[') {
+            // Up to the closing bracket — the LAST one, so a quoted
+            // subsection containing `]` still parses.
+            let header = match header.rfind(']') {
+                Some(end) => &header[..end],
+                None => header,
+            };
+            in_remote_section = config_section_is_remote(header);
             continue;
         }
         if !in_remote_section {
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
+        if let Some((key, raw)) = line.split_once('=') {
             if key.trim().eq_ignore_ascii_case("url") {
-                urls.push(value.trim().to_string());
+                if let Some(url) = parse_config_value(raw) {
+                    urls.push(url);
+                }
             }
         }
     }
@@ -691,6 +802,83 @@ mod tests {
         assert!(remote_fetch_urls("# url = x\n; [remote]\nurl = y").is_empty());
     }
 
+    /// F-000045 review: the parser must read a `.git/config` the way git
+    /// itself reads it — quoted values, upper-case section names, inline
+    /// comments — and must not accept look-alike sections.
+    #[test]
+    fn test_remote_fetch_urls_git_config_syntax() {
+        // Double-quoted value: quotes are delimiters, not part of the URL.
+        assert_eq!(
+            remote_fetch_urls("[remote \"origin\"]\n\turl = \"https://github.com/o/r.git\"\n"),
+            vec!["https://github.com/o/r.git".to_string()]
+        );
+        // Section and key names are case-insensitive.
+        assert_eq!(
+            remote_fetch_urls("[REMOTE \"origin\"]\n\tURL = \"https://github.com/o/r.git\"\n"),
+            vec!["https://github.com/o/r.git".to_string()]
+        );
+        // Inline comment after an unquoted value (both ; and #, like git).
+        assert_eq!(
+            remote_fetch_urls(
+                "[remote \"origin\"]\n\turl = https://github.com/o/r.git ; local mirror\n"
+            ),
+            vec!["https://github.com/o/r.git".to_string()]
+        );
+        assert_eq!(
+            remote_fetch_urls(
+                "[remote \"origin\"]\n\turl = https://github.com/o/r.git # local mirror\n"
+            ),
+            vec!["https://github.com/o/r.git".to_string()]
+        );
+        // Inline comment after a QUOTED value: the closing quote keeps the URL
+        // intact, the comment is still stripped.
+        assert_eq!(
+            remote_fetch_urls("[remote \"origin\"]\n\turl = \"https://github.com/o/r.git\" ; c\n"),
+            vec!["https://github.com/o/r.git".to_string()]
+        );
+        // Escapes inside quotes: \" stays a quote-worthy char, \n becomes LF.
+        assert_eq!(
+            remote_fetch_urls("[remote \"o\"]\n\turl = \"a\\\"b\"\n"),
+            vec!["a\"b".to_string()]
+        );
+        assert_eq!(
+            remote_fetch_urls("[remote \"o\"]\n\turl = \"a\\tb\"\n"),
+            vec!["a\tb".to_string()]
+        );
+        // A prefix section name is a DIFFERENT section: no match.
+        assert!(
+            remote_fetch_urls("[remoteExtra \"x\"]\n\turl = https://github.com/o/r.git\n")
+                .is_empty()
+        );
+        // `[remote]` without a subsection keys `remote.url`, not a remote's.
+        assert!(remote_fetch_urls("[remote]\n\turl = https://github.com/o/r.git\n").is_empty());
+        // Trailing whitespace of an unquoted value is trimmed.
+        assert_eq!(
+            remote_fetch_urls("[remote \"o\"]\n\turl = https://github.com/o/r.git   \n"),
+            vec!["https://github.com/o/r.git".to_string()]
+        );
+        // An unterminated quote is a bad config line, not a URL.
+        assert!(remote_fetch_urls("[remote \"o\"]\n\turl = \"https://github.com/o/r\n").is_empty());
+        // End-to-end through the scanner: a quoted URL in a `[REMOTE]` section
+        // is found by scan_workspace_for_repos.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("mixed-case");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(
+            dir.join(".git").join("config"),
+            "[core]\n\tbare = false\n\
+             [REMOTE \"origin\"]\n\turl = \"https://github.com/Owner/Repo.git\" ; primary\n",
+        )
+        .unwrap();
+        let found = scan_workspace_for_repos(
+            tmp.path().to_string_lossy().to_string(),
+            vec!["owner/repo".to_string()],
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1, "{:?}", found);
+        assert!(found["owner/repo"].ends_with("mixed-case"));
+    }
+
     // ── F-000045: clone_repo_to — the failure paths that need no git ─────────
 
     fn make_db() -> AppDb {
@@ -761,8 +949,8 @@ mod tests {
         // rejected before git is even looked up, so nothing is created.
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("clone-target");
-        let err = clone_repo_to_impl(&db, repo.id, target.to_string_lossy().into_owned())
-            .unwrap_err();
+        let err =
+            clone_repo_to_impl(&db, repo.id, target.to_string_lossy().into_owned()).unwrap_err();
         assert_eq!(err.code, SyncIssueCode::CloneFailed);
         assert!(err
             .detail
@@ -775,5 +963,276 @@ mod tests {
             Some("a..b".to_string())
         );
         assert_eq!(db.get_repository(repo.id).unwrap().local_path, None);
+    }
+
+    /// F-000045 review: `is_github_owner_repo` with an explicit per-component
+    /// policy — fragments, traversal specials, backslashes and embedded
+    /// whitespace must all be refused before anything is cloned.
+    #[test]
+    fn test_is_github_owner_repo_shape() {
+        for good in [
+            "owner/repo",
+            "Owner/Repo_1.2-x",
+            "o.r/re.po",
+            "  owner/repo  ",
+        ] {
+            assert!(is_github_owner_repo(good), "{good:?} should be valid");
+        }
+        for bad in [
+            "",
+            "repo",
+            "owner/",
+            "/repo",
+            "a/b/c",
+            "owner/repo#fragment",
+            "owner/..",
+            "../repo",
+            ".",
+            "..",
+            "owner/re po",
+            "owner/re\tpo",
+            "owner/re?po",
+            "owner/re@po",
+            "owner/:repo",
+            "owner\\repo",
+            "https://github.com/owner/repo",
+            "git@github.com:owner/repo.git",
+            "owner/\u{1}repo",
+        ] {
+            assert!(!is_github_owner_repo(bad), "{bad:?} should be invalid");
+        }
+    }
+
+    // ── F-000045 review: clone_repo_to against a real git remote ────────────
+    // Minimal local fixtures (git CLI + TempDir + in-memory AppDb). git_sync's
+    // test module is private — its helpers are deliberately replicated here
+    // in the smallest shape the command needs.
+
+    /// Run git, assert success, return trimmed stdout.
+    fn g(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git invocation failed");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A bare remote whose HEAD is `default`, plus one commit on every name in
+    /// `branches`, pushed from a throw-away seed clone.
+    fn bare_remote(
+        tmp: &tempfile::TempDir,
+        name: &str,
+        default: &str,
+        branches: &[&str],
+    ) -> PathBuf {
+        let remote = tmp.path().join(name);
+        fs::create_dir(&remote).unwrap();
+        g(&remote, &["init", "--bare", "-q"]);
+        let head = format!("refs/heads/{default}");
+        g(&remote, &["symbolic-ref", "HEAD", head.as_str()]);
+        let seed = tmp.path().join(format!("{name}-seed"));
+        fs::create_dir(&seed).unwrap();
+        g(&seed, &["init", "-q"]);
+        g(&seed, &["symbolic-ref", "HEAD", head.as_str()]);
+        for (key, val) in [
+            ("user.email", "repo@example.com"),
+            ("user.name", "Repo User"),
+            ("commit.gpgsign", "false"),
+        ] {
+            g(&seed, &["config", key, val]);
+        }
+        g(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        fs::write(seed.join("README.md"), "hello\n").unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "-q", "-m", "init"]);
+        let default_ref = format!("HEAD:refs/heads/{default}");
+        g(&seed, &["push", "-q", "origin", default_ref.as_str()]);
+        for b in branches {
+            let spec = format!("HEAD:refs/heads/{b}");
+            g(&seed, &["push", "-q", "origin", spec.as_str()]);
+        }
+        remote
+    }
+
+    fn untracked_repo(db: &AppDb, github_name: &str) -> i64 {
+        let repo = db
+            .upsert_repository(github_name, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(repo.local_path, None);
+        repo.id
+    }
+
+    /// (a) The happy path: fresh clone → checkout of the default branch
+    /// (nothing configured) → atomic bind, and no marker left behind.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_repo_to_clones_checks_out_and_binds() {
+        let db = make_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &["shared"]);
+        let url = remote.to_string_lossy().into_owned();
+        let id = untracked_repo(&db, "owner/repo");
+        let target = tmp.path().join("t");
+        let target_str = target.to_string_lossy().into_owned();
+
+        let bound = clone_repo_to_impl_with_url(&db, id, target_str.clone(), Some(&url)).unwrap();
+        assert_eq!(bound.local_path.as_deref(), Some(target_str.as_str()));
+        assert_eq!(
+            db.get_repository(id).unwrap().local_path.as_deref(),
+            Some(target_str.as_str()),
+            "the DB row is bound"
+        );
+        assert_eq!(g(&target, &["branch", "--show-current"]), "dev");
+        assert!(
+            !git_sync::clone_incomplete_marker(&target)
+                .expect("target has a parent")
+                .exists(),
+            "a successful preparation leaves no marker"
+        );
+    }
+
+    /// (b) A configured `autocommit_branch` wins over the remote default.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_repo_to_prefers_the_configured_branch_over_dev() {
+        let db = make_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &["shared"]);
+        let url = remote.to_string_lossy().into_owned();
+        let id = untracked_repo(&db, "owner/repo");
+        db.set_autocommit_branch(id, Some("shared")).unwrap();
+        let target = tmp.path().join("t");
+        let target_str = target.to_string_lossy().into_owned();
+
+        let bound = clone_repo_to_impl_with_url(&db, id, target_str, Some(&url)).unwrap();
+        assert_eq!(
+            bound.local_path.as_deref(),
+            Some(target.to_string_lossy().as_ref())
+        );
+        assert_eq!(g(&target, &["branch", "--show-current"]), "shared");
+        assert_eq!(g(&target, &["config", "branch.shared.remote"]), "origin");
+    }
+
+    /// (c) A requested branch that is absent on the remote: the clone is
+    /// bound, HEAD stays on the remote default, and nothing is created.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_repo_to_with_absent_branch_binds_on_the_default() {
+        let db = make_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "main", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let id = untracked_repo(&db, "owner/repo");
+        db.set_autocommit_branch(id, Some("staging")).unwrap();
+        let target = tmp.path().join("t");
+        let target_str = target.to_string_lossy().into_owned();
+
+        let bound = clone_repo_to_impl_with_url(&db, id, target_str.clone(), Some(&url)).unwrap();
+        assert_eq!(bound.local_path.as_deref(), Some(target_str.as_str()));
+        assert_eq!(g(&target, &["branch", "--show-current"]), "main");
+        assert!(
+            g(&target, &["branch", "--list", "staging"]).is_empty(),
+            "the configured branch is never created from nothing"
+        );
+    }
+
+    /// (d) A clone/network failure: nothing is bound, the marker stays in the
+    /// parent folder, and a second attempt at the same target is refused
+    /// naming the leftover — even though the remote is fine by then.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_repo_to_failure_leaves_no_binding_but_a_marker() {
+        let db = make_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let good_url = remote.to_string_lossy().into_owned();
+        let dead_url = tmp.path().join("nope.git").to_string_lossy().into_owned();
+        let id = untracked_repo(&db, "owner/repo");
+        let target = tmp.path().join("t");
+        let target_str = target.to_string_lossy().into_owned();
+
+        let err =
+            clone_repo_to_impl_with_url(&db, id, target_str.clone(), Some(&dead_url)).unwrap_err();
+        assert_eq!(err.code, SyncIssueCode::CloneFailed, "{}", err);
+        assert_eq!(
+            db.get_repository(id).unwrap().local_path,
+            None,
+            "a failed clone is never bound"
+        );
+        let marker = git_sync::clone_incomplete_marker(&target).unwrap();
+        assert!(marker.exists(), "the marker must outlive the failure");
+
+        // Second attempt at the same target: refused naming the leftover.
+        let err =
+            clone_repo_to_impl_with_url(&db, id, target_str.clone(), Some(&good_url)).unwrap_err();
+        assert_eq!(err.code, SyncIssueCode::CloneTargetInvalid, "{}", err);
+        assert_eq!(err.target.as_deref(), Some(target_str.as_str()));
+        let detail = err.detail.unwrap_or_default();
+        assert!(
+            detail.contains("unfinished clone") && detail.contains(".sdh-clone-incomplete-"),
+            "{}",
+            detail
+        );
+        assert!(marker.exists(), "the refusal deletes nothing");
+        assert_eq!(db.get_repository(id).unwrap().local_path, None);
+    }
+
+    /// (e) A folder that already holds a clone of the same repo: bound as-is,
+    /// nothing re-cloned, the worktree (branch, HEAD, local edit) untouched.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_repo_to_attaches_an_existing_clone_without_cloning() {
+        let db = make_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &["shared"]);
+        // A URL that can never be cloned from: any attempt to clone fails, so
+        // success proves the ExistingClone path was taken.
+        let dead_url = tmp.path().join("nope.git").to_string_lossy().into_owned();
+        let id = untracked_repo(&db, "owner/repo");
+        let target = tmp.path().join("t");
+        let target_str = target.to_string_lossy().into_owned();
+
+        g(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ],
+        );
+        g(
+            &target,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/owner/repo.git",
+            ],
+        );
+        g(&target, &["checkout", "-q", "shared"]);
+        fs::write(target.join("README.md"), "local edit\n").unwrap();
+        let head = g(&target, &["rev-parse", "HEAD"]);
+
+        let bound = clone_repo_to_impl_with_url(&db, id, target_str.clone(), Some(&dead_url))
+            .expect("an existing clone is adoptable without any clone attempt");
+        assert_eq!(bound.local_path.as_deref(), Some(target_str.as_str()));
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "shared");
+        assert_eq!(g(&target, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            fs::read_to_string(target.join("README.md")).unwrap(),
+            "local edit\n"
+        );
+        assert!(g(&target, &["status", "--porcelain"]).contains("README.md"));
     }
 }
