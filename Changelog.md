@@ -4,6 +4,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ## [Unreleased]
 
+### Fixed
+- **The Participants tab stayed stale until a repository switch (T-000239).** A join request or a structure update arriving on sync did not reach the screen, because the details loader keyed on a role/status/mode signature that such updates never touch. It now follows every shared-state refresh.
+- **macOS window chrome (T-000240).** On macOS the window uses the native overlay title bar — traffic-light buttons on the left, our own min/max/close buttons hidden, content shifted clear of the buttons. Windows and Linux are unchanged.
+
 ### Changed
 - **`sdh-phase-workflow`: a conditionally visible element is counted on live data.** A UI element shown by role, permission or state gets a Verification item saying how many items on the owner's data show it and how many hide it. Retro of v1.22.0: the shared-mode switch showed on every foreign repository, and nobody counted before the owner looked.
 
