@@ -1401,20 +1401,70 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// `target` — `<parent>/.sdh-clone-incomplete-<hash>`. Design constraints:
 /// * OUTSIDE the clone root — a file inside would dirty the worktree the
 ///   clone just produced;
-/// * named deterministically from the target path (separators normalised,
-///   case too on Windows), so a retry naming the same folder finds it and a
-///   different target never collides with it;
+/// * named deterministically from a NORMALISED FILESYSTEM IDENTITY of the
+///   target, not its spelling (R2: `C:\work\repo`, `C:\work\.\repo`,
+///   `C:\work\repo\`, `C:\work\..\work\repo` and a spelling through a parent
+///   junction/symlink all name the same folder but hashed differently, so a
+///   retry that merely spelled the folder differently missed the marker and
+///   bound an incomplete clone) — see `clone_target_identity`;
+/// * located in `target.parent()` joined with the hash of that identity:
+///   whatever spelling names the target, its parent resolves to the same
+///   physical folder, so the marker file always lands in the very same place;
 /// * `None` when the target has no parent folder (a filesystem root — the
 ///   clone itself is refused there anyway).
+/// Markers left by builds before R2 hashed the raw spelling; they are no
+/// longer found and simply stay behind as inert orphan files.
 pub(crate) fn clone_incomplete_marker(target: &Path) -> Option<PathBuf> {
     let parent = target.parent()?;
-    let key = target.to_string_lossy().replace(['/', '\\'], "/");
+    let key = clone_target_identity(target)
+        .to_string_lossy()
+        .replace(['/', '\\'], "/");
     #[cfg(windows)]
     let key = key.to_lowercase();
     Some(parent.join(format!(
         ".sdh-clone-incomplete-{:016x}",
         fnv1a64(key.as_bytes())
     )))
+}
+
+/// R2: a canonical identity of `target`, stable across equivalent spellings.
+/// The deepest ancestor of `target` that already exists (the target itself
+/// when it does — the filesystem root of an absolute path always does) is
+/// `canonicalize`d, which resolves junctions, symlinks, `.`/`..` and letter
+/// case of the existing part (on Windows the result is a `\\?\` verbatim
+/// path — fine, it only has to be deterministic). The remaining,
+/// not-yet-existing components are appended and normalised LEXICALLY: `.` is
+/// skipped, `..` pops the previous component without ever climbing above the
+/// canonical ancestor. When nothing can be canonicalized (a relative path
+/// whose every component is missing, or an ancestor that raced away), the
+/// base is empty and the whole target is normalised lexically — still
+/// consistent between spellings.
+fn clone_target_identity(target: &Path) -> PathBuf {
+    let comps: Vec<Component<'_>> = target.components().collect();
+    let prefix = |k: usize| comps[..k].iter().collect::<PathBuf>();
+    // Deepest existing ancestor: start at the target itself and walk up.
+    let mut k = comps.len();
+    while k > 0 && !prefix(k).exists() {
+        k -= 1;
+    }
+    // `canonicalize("")` fails, so a missing base degrades to lexical only.
+    let mut identity = prefix(k).canonicalize().unwrap_or_default();
+    let base = identity.components().count();
+    for c in &comps[k..] {
+        match c {
+            Component::Normal(s) => identity.push(s),
+            Component::CurDir => {}
+            // Pops only within the appended part: the ancestor's own
+            // `..`-resolution is already baked into `canonicalize`.
+            Component::ParentDir => {
+                if identity.components().count() > base {
+                    identity.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    identity
 }
 
 /// Write the marker before the first mutation of a fresh clone target. The
@@ -3010,6 +3060,141 @@ mod tests {
         // A different target never collides with the leftover marker.
         let elsewhere = tmp.path().join("elsewhere");
         prepare_clone_target(&gb(), &url, CLONE_GH, &elsewhere, "dev").unwrap();
+    }
+
+    // ----- R2: marker identity vs equivalent target spellings -------------
+
+    #[test]
+    fn clone_marker_identity_is_stable_across_equivalent_spellings() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let target = sub.join("repo"); // the leaf does NOT exist
+
+        mark_clone_incomplete(&target).unwrap();
+        let marker = clone_incomplete_marker(&target).expect("target has a parent");
+        assert!(marker.exists());
+        assert_eq!(
+            marker.parent(),
+            Some(sub.as_path()),
+            "the marker lives in the target's parent folder"
+        );
+
+        // The same folder, spelled differently — every spelling must find
+        // the very same marker file.
+        let dot = PathBuf::from(sub.join(".")).join("repo"); // sub/./repo
+        let trailing_sep = PathBuf::from(format!(
+            "{}{}",
+            target.to_string_lossy(),
+            std::path::MAIN_SEPARATOR
+        ));
+        let detour = sub.join("..").join("sub").join("repo"); // sub/../sub/repo
+        for spelling in [&target, &dot, &trailing_sep, &detour] {
+            let m = clone_incomplete_marker(spelling).expect("spelling has a parent");
+            assert_eq!(
+                m.file_name(),
+                marker.file_name(),
+                "{}: same marker file",
+                spelling.display()
+            );
+            assert!(m.exists(), "{}: must find the marker", spelling.display());
+        }
+
+        // The identity may not depend on the leaf existing either: once it
+        // does, the same marker is still resolved.
+        fs::create_dir(&target).unwrap();
+        assert_eq!(
+            clone_incomplete_marker(&target)
+                .expect("target has a parent")
+                .file_name(),
+            marker.file_name()
+        );
+    }
+
+    #[test]
+    fn clone_marker_identity_distinguishes_different_folders() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        fs::create_dir_all(tmp.path().join("other")).unwrap();
+        let target = tmp.path().join("sub").join("repo");
+        mark_clone_incomplete(&target).unwrap();
+        let marker = clone_incomplete_marker(&target).unwrap();
+
+        let other = tmp.path().join("other").join("repo");
+        let other_marker = clone_incomplete_marker(&other).unwrap();
+        assert_ne!(marker.file_name(), other_marker.file_name());
+        assert!(
+            !other_marker.exists(),
+            "no collision with a different folder"
+        );
+    }
+
+    #[test]
+    fn clone_prep_refuses_a_leftover_marker_under_equivalent_spellings() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let target = sub.join("repo"); // still missing: the leftover scenario
+        mark_clone_incomplete(&target).unwrap();
+
+        // The marker check runs before anything else, so no git is ever
+        // spawned: with a bogus binary any spawn would surface as a
+        // `Failed`, while every refusal below must be the marker's `Invalid`.
+        let nogit = GitBinary(PathBuf::from("/definitely/not/git"));
+        let dot = PathBuf::from(sub.join(".")).join("repo");
+        let trailing_sep = PathBuf::from(format!(
+            "{}{}",
+            target.to_string_lossy(),
+            std::path::MAIN_SEPARATOR
+        ));
+        let detour = sub.join("..").join("sub").join("repo");
+        for spelling in [&target, &dot, &trailing_sep, &detour] {
+            let e = prepare_clone_target(
+                &nogit,
+                "https://github.com/owner/repo.git",
+                CLONE_GH,
+                spelling,
+                "dev",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&e, CloneTargetError::Invalid(m) if m.contains("unfinished clone")),
+                "{}: {e:?}",
+                spelling.display()
+            );
+        }
+        // The refusals deleted nothing and cloned nothing.
+        assert!(clone_incomplete_marker(&target).unwrap().exists());
+        assert!(!target.exists());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_refuses_a_leftover_marker_over_a_valid_clone() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: true }
+        );
+        fake_github_origin(&target, CLONE_GH);
+
+        // Without a marker this exact clone would bind as an ExistingClone;
+        // with one on top (a clone whose checkout failed leaves exactly this
+        // picture) the retry must still be refused — through an equivalent
+        // spelling of the same folder as well.
+        mark_clone_incomplete(&target).unwrap();
+        let dot = PathBuf::from(tmp.path().join(".")).join("t");
+        for spelling in [&target, &dot] {
+            let e = prepare_clone_target(&gb(), &url, CLONE_GH, spelling, "dev").unwrap_err();
+            assert!(
+                matches!(&e, CloneTargetError::Invalid(m) if m.contains("unfinished clone")),
+                "{}: {e:?}",
+                spelling.display()
+            );
+        }
     }
 
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]

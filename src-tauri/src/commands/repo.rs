@@ -439,7 +439,19 @@ fn clone_repo_to_impl_with_url(
                     .detail(msg)
             }
             git_sync::CloneTargetError::Failed(net_err) => {
-                SyncIssue::new(SyncIssueCode::CloneFailed, subject).detail(net_err.message)
+                // R3: the incomplete-clone marker (and the partial clone or
+                // failed-checkout leftovers it names) stays in the target's
+                // parent — recovery is manual by design, so the issue names
+                // both the target and what to delete. `net_err.message` is
+                // already credential-redacted by git_sync.
+                SyncIssue::new(SyncIssueCode::CloneFailed, subject)
+                    .target(&target_dir)
+                    .detail(format!(
+                        "{} — an incomplete-clone marker (.sdh-clone-incomplete-*) was left \
+                         in the target's parent folder together with the clone leftovers; \
+                         delete the marker and the leftovers by hand before retrying",
+                        net_err.message
+                    ))
             }
         });
     }
@@ -498,127 +510,90 @@ pub fn scan_workspace_for_repos(
 
     let mut found: HashMap<String, String> = HashMap::new();
 
+    // R1: the remote URLs are read by git itself (`git config --file ...`),
+    // so the scan needs a git binary. One per-process probe per scan via
+    // `cached_git`. Documented choice: without a git binary the URLs cannot
+    // be read, so NOTHING can match — an empty map, never an error (the
+    // scanner is a matching aid; the UI's git availability is checked
+    // separately, e.g. `check_git_available_for_repo`).
+    let git = git_ops::cached_git();
+
     // Scan 2 levels deep for .git/config
-    scan_dir(root, &github_names, &mut found, 0, 2);
+    scan_dir(root, &github_names, &mut found, 0, 2, git.as_ref());
 
     Ok(found)
 }
 
-/// F-000045 review: the text between the brackets of a section header — a
-/// remote section iff the section name is exactly `remote` (ASCII
-/// case-insensitive, so `[REMOTE "origin"]` counts) AND a quoted subsection
-/// follows (any name). `[remote]` without a subsection keys `remote.url`, not
-/// any remote's `url`; `[remoteExtra "x"]` is a different section name.
-/// Documented simplification: git's dotted `[remote.origin]` form is not
-/// accepted — git itself only ever writes the quoted form.
-fn config_section_is_remote(header: &str) -> bool {
-    let header = header.trim();
-    let name_end = header
-        .find(|c: char| c.is_whitespace() || c == '"')
-        .unwrap_or(header.len());
-    if !header[..name_end].eq_ignore_ascii_case("remote") {
-        return false;
-    }
-    header[name_end..].trim_start().starts_with('"')
+/// F-000045: the fetch-URL keys of every remote, as a `git config
+/// --get-regexp` pattern. Both spellings of a remote subsection — quoted
+/// `[remote "x"]` AND dotted `[remote.x]` — key to `remote.<name>.url`, and
+/// git lowercases section and key names (so `[REMOTE "x"]` / `URL =` key the
+/// same). The pattern matches every remote's `url` and nothing else:
+/// * `remote.<name>.pushurl` ends in `.pushurl`, not `.url`;
+/// * a subsection-less `[remote]` keys `remote.url` — no `.` + name in
+///   between, so no match (it is not any remote's URL);
+/// * `[remoteExtra "x"]` keys `remoteextra.x.url`, which does not start with
+///   `remote.` — a different section, not a remote.
+const REMOTE_URL_KEY_PATTERN: &str = "^remote\\..*\\.url$";
+
+/// F-000045: decode `git config --null --get-regexp` stdout. With `--null`
+/// git emits one `key\nvalue\0` record per match — verified empirically
+/// against git 2.52: a LF separates the lowercased key from the raw value,
+/// a NUL ends the record, and a trailing NUL leaves one final empty
+/// segment. Only the value half is kept — the regexp already selected the
+/// key. A value may itself contain LFs (a quoted `"a\nb"` config value), so
+/// the FIRST LF of a record is the separator; non-UTF-8 bytes (a path
+/// spelling) are kept lossily rather than dropping the URL.
+fn remote_urls_from_config_output(stdout: &[u8]) -> Vec<String> {
+    stdout
+        .split(|b| *b == 0)
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            // First LF separates key from value (`<[u8]>::split_once` is
+            // still unstable, so split by position).
+            record
+                .iter()
+                .position(|b| *b == b'\n')
+                .map(|i| &record[i + 1..])
+        })
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+        .collect()
 }
 
-/// F-000045 review: the value of `key = value`, git-config syntax for the
-/// subset a `.git/config` needs:
-/// * leading whitespace is ignored; trailing unquoted whitespace is trimmed
-///   (tracked while parsing so a closing quote keeps its content intact);
-/// * an unquoted `;` or `#` starts an inline comment — anywhere, exactly like
-///   git (`url = https://x#y` reads as `https://x`);
-/// * a `"` toggles quoted mode: inside it `\"`, `\\`, `\n`, `\t` and `\b` are
-///   unescaped, any other `\x` keeps both characters, whitespace is
-///   significant; a closing quote may be followed by more unquoted text;
-/// * backslashes OUTSIDE quotes are literal — git has no backslash line
-///   continuation for values (documented choice: keep it simple).
-/// `None` for an unterminated quote, mirroring git's "bad config line".
-fn parse_config_value(raw: &str) -> Option<String> {
-    let raw = raw.trim_start();
-    let mut value = String::new();
-    let mut in_quote = false;
-    // Length of `value` after the last character git would keep (git's trim_len).
-    let mut trim_len = 0usize;
-    let mut chars = raw.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                in_quote = !in_quote;
-                trim_len = value.len();
-            }
-            ';' | '#' if !in_quote => break,
-            '\\' if in_quote => {
-                match chars.next() {
-                    Some('n') => value.push('\n'),
-                    Some('t') => value.push('\t'),
-                    Some('b') => value.push('\u{0008}'),
-                    Some('\\') => value.push('\\'),
-                    Some('"') => value.push('"'),
-                    Some(other) => {
-                        value.push('\\');
-                        value.push(other);
-                    }
-                    None => value.push('\\'),
-                }
-                trim_len = value.len();
-            }
-            other => {
-                let significant = in_quote || !other.is_whitespace();
-                value.push(other);
-                if significant {
-                    trim_len = value.len();
-                }
-            }
-        }
+/// F-000045: every fetch URL (`url = ...`) of the remote sections of a
+/// `.git/config`, read by GIT'S OWN config parser — never hand-rolled — so
+/// every spelling git accepts is honored: quoted `[remote "x"]` AND dotted
+/// `[remote.x]` sections, upper-case `[REMOTE]` spellings, a section header
+/// and its key on the same line, backslash line continuation, quoted values
+/// with escapes, and inline `;`/`#` comments. `pushurl` is skipped — where a
+/// clone fetches from is the proof, not where it may push to — and so are
+/// comments and look-alike sections (`[remoteExtra "x"]`, bare `[remote]`),
+/// all excluded by `REMOTE_URL_KEY_PATTERN`.
+///
+/// Spawned through `git_ops::spawn_cmd` (CREATE_NO_WINDOW on Windows) with
+/// the config path as a single argument — no shell, so spaces in the
+/// workspace path are safe. `--null` makes the output NUL-delimited and
+/// therefore parseable without heuristics.
+///
+/// `None` means the listing cannot be trusted — a spawn failure or any exit
+/// code other than 0/1 — and the caller treats the directory as having no
+/// URLs, exactly like an unreadable config file before. `--get-regexp`
+/// exits 1 when nothing matches; that is a plain empty vec, not an error.
+fn remote_fetch_urls(git: &git_ops::GitBinary, config_path: &Path) -> Option<Vec<String>> {
+    let out = git_ops::spawn_cmd(&git.0)
+        .arg("config")
+        .arg("--file")
+        .arg(config_path)
+        .arg("--null")
+        .arg("--get-regexp")
+        .arg(REMOTE_URL_KEY_PATTERN)
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(remote_urls_from_config_output(&out.stdout)),
+        Some(1) => Some(Vec::new()),
+        _ => None,
     }
-    if in_quote {
-        return None;
-    }
-    value.truncate(trim_len);
-    Some(value)
-}
-
-/// F-000045: every fetch URL (`url = ...`) of the `[remote "..."]` sections of
-/// a `.git/config`. `pushurl` is skipped — where a clone fetches from is the
-/// proof, not where it may push to — and so are comments and any `url`-like
-/// key (`url-other`) or key outside a remote section. The old scanner
-/// lowercased the whole file and searched substrings, which also matched
-/// commented URLs, `pushurl` lines, quoted values and prefix sections
-/// (`[remoteExtra "x"]`); this parser implements the git config syntax the
-/// scanner needs (see `config_section_is_remote` / `parse_config_value`) and
-/// hands `git_ops::remote_matches_github` the real fetch URLs only.
-fn remote_fetch_urls(config: &str) -> Vec<String> {
-    let mut urls = Vec::new();
-    let mut in_remote_section = false;
-    for line in config.lines() {
-        let line = line.trim();
-        // A bare `#` / `;` line is a comment (git: at line start).
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        if let Some(header) = line.strip_prefix('[') {
-            // Up to the closing bracket — the LAST one, so a quoted
-            // subsection containing `]` still parses.
-            let header = match header.rfind(']') {
-                Some(end) => &header[..end],
-                None => header,
-            };
-            in_remote_section = config_section_is_remote(header);
-            continue;
-        }
-        if !in_remote_section {
-            continue;
-        }
-        if let Some((key, raw)) = line.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("url") {
-                if let Some(url) = parse_config_value(raw) {
-                    urls.push(url);
-                }
-            }
-        }
-    }
-    urls
 }
 
 fn scan_dir(
@@ -627,19 +602,21 @@ fn scan_dir(
     found: &mut HashMap<String, String>,
     depth: usize,
     max_depth: usize,
+    git: Option<&git_ops::GitBinary>,
 ) {
     if depth > max_depth {
         return;
     }
 
     let git_config = dir.join(".git").join("config");
-    if git_config.exists() {
-        if let Ok(content) = std::fs::read_to_string(&git_config) {
-            // T-000242 / F-000045: the real fetch URLs go through the exact
-            // GitHub matcher, which compares owner/repo case-insensitively
-            // (the clone keeps the case GitHub gave it) but no longer treats
-            // a commented URL, a `pushurl` or a prefix repo as a match.
-            let fetch_urls = remote_fetch_urls(&content);
+    if let (true, Some(git)) = (git_config.exists(), git) {
+        // T-000242 / F-000045: git's own parser reads the config, then the
+        // real fetch URLs go through the exact GitHub matcher, which compares
+        // owner/repo case-insensitively (the clone keeps the case GitHub gave
+        // it) but never treats a commented URL, a `pushurl` or a prefix repo
+        // as a match. An untrustworthy listing (spawn/exit failure → None)
+        // skips the directory, exactly like an unreadable config file before.
+        if let Some(fetch_urls) = remote_fetch_urls(git, &git_config) {
             for name in github_names {
                 if fetch_urls
                     .iter()
@@ -658,7 +635,14 @@ fn scan_dir(
                 let name_str = name.to_string_lossy();
                 if !name_str.starts_with('.') && name_str != "node_modules" && name_str != "target"
                 {
-                    scan_dir(&entry.path(), github_names, found, depth + 1, max_depth);
+                    scan_dir(
+                        &entry.path(),
+                        github_names,
+                        found,
+                        depth + 1,
+                        max_depth,
+                        git,
+                    );
                 }
             }
         }
@@ -681,6 +665,9 @@ mod tests {
         dir
     }
 
+    // R1: the scanner reads each config through `git config` now, so every
+    // scanner test spawns git — ignored like the other git-spawning tests.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn test_scan_matches_remote_url_regardless_of_case() {
         // T-000242: on Linux `Server_Airouter` and `server_airouter` are
@@ -708,6 +695,7 @@ mod tests {
         assert!(found["owner/other_repo"].ends_with("other"));
     }
 
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn test_scan_does_not_match_a_different_repo_name() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -729,6 +717,7 @@ mod tests {
     /// F-000045: a config file as the old substring scanner would have
     /// mis-matched — a commented URL, a `pushurl`, a `url-other` key and a
     /// prefix repo — none of which proves the folder fetches from the repo.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn test_scan_ignores_commented_pushurl_and_prefix_urls() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -762,6 +751,7 @@ mod tests {
 
     /// F-000045: any remote section proves the match (not just `origin`), and
     /// the depth-2 walk of the old scanner is unchanged.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn test_scan_matches_any_remote_and_nested_path() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -785,98 +775,109 @@ mod tests {
         assert!(found["owner/repo"].ends_with("repo"));
     }
 
+    /// R1: `git config --null --get-regexp` emits one `key\nvalue\0` record
+    /// per match (the format was verified empirically against git 2.52).
+    /// Pure parser — no git is spawned, so no `#[ignore]`.
     #[test]
-    fn test_remote_fetch_urls_parses_only_remote_url_keys() {
-        let config = "[core]\n\turl = not-a-remote\n\
-                      [remote \"origin\"]\n\turl = https://github.com/o/r.git\n\tpushurl = ssh://git@github.com/o/r.git\n\
-                      [remote \"second\"]\n\tURL = git@github.com:o/r2.git\n\
-                      [branch \"dev\"]\n\tremote = origin\n";
+    fn test_remote_urls_from_config_output_parses_the_null_format() {
+        // Two records with a trailing NUL: only the value halves survive, in
+        // order, with their original case.
         assert_eq!(
-            remote_fetch_urls(config),
+            remote_urls_from_config_output(
+                b"remote.origin.url\nhttps://github.com/o/r.git\0\
+                  remote.up.url\ngit@github.com:o/U.git\0"
+            ),
             vec![
                 "https://github.com/o/r.git".to_string(),
-                "git@github.com:o/r2.git".to_string(),
+                "git@github.com:o/U.git".to_string(),
             ]
         );
-        assert!(remote_fetch_urls("").is_empty());
-        assert!(remote_fetch_urls("# url = x\n; [remote]\nurl = y").is_empty());
+        // A value may contain LFs, quotes, backslashes and CRs: only the
+        // FIRST LF of a record separates the key from the value.
+        assert_eq!(
+            remote_urls_from_config_output(b"remote.nl.url\nline1\nline\"2\\x\r\n\0"),
+            vec!["line1\nline\"2\\x\r\n".to_string()]
+        );
+        // An empty value is still a record (`url =`).
+        assert_eq!(
+            remote_urls_from_config_output(b"remote.e.url\n\0"),
+            vec![String::new()]
+        );
+        // Empty stdout, a bare trailing NUL and a record without the
+        // key/value LF all yield nothing rather than garbage.
+        assert!(remote_urls_from_config_output(b"").is_empty());
+        assert!(remote_urls_from_config_output(b"\0").is_empty());
+        assert!(remote_urls_from_config_output(b"remote.only-key\0").is_empty());
     }
 
-    /// F-000045 review: the parser must read a `.git/config` the way git
-    /// itself reads it — quoted values, upper-case section names, inline
-    /// comments — and must not accept look-alike sections.
+    /// R1: the scanner reads `.git/config` through git itself, so EVERY
+    /// spelling git accepts is a match — dotted `[remote.origin]`, quoted
+    /// subsections, upper-case sections, quoted values with inline comments,
+    /// a header and its key on one line, backslash line continuation — and
+    /// every look-alike is NOT: a `pushurl` decoy, `[remoteExtra "x"]`, a
+    /// bare `[remote]` and commented `url` lines. One config, one scan: each
+    /// spelling names a different repo, so each must be found on its own.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
-    fn test_remote_fetch_urls_git_config_syntax() {
-        // Double-quoted value: quotes are delimiters, not part of the URL.
-        assert_eq!(
-            remote_fetch_urls("[remote \"origin\"]\n\turl = \"https://github.com/o/r.git\"\n"),
-            vec!["https://github.com/o/r.git".to_string()]
-        );
-        // Section and key names are case-insensitive.
-        assert_eq!(
-            remote_fetch_urls("[REMOTE \"origin\"]\n\tURL = \"https://github.com/o/r.git\"\n"),
-            vec!["https://github.com/o/r.git".to_string()]
-        );
-        // Inline comment after an unquoted value (both ; and #, like git).
-        assert_eq!(
-            remote_fetch_urls(
-                "[remote \"origin\"]\n\turl = https://github.com/o/r.git ; local mirror\n"
-            ),
-            vec!["https://github.com/o/r.git".to_string()]
-        );
-        assert_eq!(
-            remote_fetch_urls(
-                "[remote \"origin\"]\n\turl = https://github.com/o/r.git # local mirror\n"
-            ),
-            vec!["https://github.com/o/r.git".to_string()]
-        );
-        // Inline comment after a QUOTED value: the closing quote keeps the URL
-        // intact, the comment is still stripped.
-        assert_eq!(
-            remote_fetch_urls("[remote \"origin\"]\n\turl = \"https://github.com/o/r.git\" ; c\n"),
-            vec!["https://github.com/o/r.git".to_string()]
-        );
-        // Escapes inside quotes: \" stays a quote-worthy char, \n becomes LF.
-        assert_eq!(
-            remote_fetch_urls("[remote \"o\"]\n\turl = \"a\\\"b\"\n"),
-            vec!["a\"b".to_string()]
-        );
-        assert_eq!(
-            remote_fetch_urls("[remote \"o\"]\n\turl = \"a\\tb\"\n"),
-            vec!["a\tb".to_string()]
-        );
-        // A prefix section name is a DIFFERENT section: no match.
-        assert!(
-            remote_fetch_urls("[remoteExtra \"x\"]\n\turl = https://github.com/o/r.git\n")
-                .is_empty()
-        );
-        // `[remote]` without a subsection keys `remote.url`, not a remote's.
-        assert!(remote_fetch_urls("[remote]\n\turl = https://github.com/o/r.git\n").is_empty());
-        // Trailing whitespace of an unquoted value is trimmed.
-        assert_eq!(
-            remote_fetch_urls("[remote \"o\"]\n\turl = https://github.com/o/r.git   \n"),
-            vec!["https://github.com/o/r.git".to_string()]
-        );
-        // An unterminated quote is a bad config line, not a URL.
-        assert!(remote_fetch_urls("[remote \"o\"]\n\turl = \"https://github.com/o/r\n").is_empty());
-        // End-to-end through the scanner: a quoted URL in a `[REMOTE]` section
-        // is found by scan_workspace_for_repos.
+    fn test_scan_reads_remote_urls_through_gits_own_parser() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path().join("mixed-case");
+        let dir = tmp.path().join("spellings");
         fs::create_dir_all(dir.join(".git")).unwrap();
         fs::write(
             dir.join(".git").join("config"),
-            "[core]\n\tbare = false\n\
-             [REMOTE \"origin\"]\n\turl = \"https://github.com/Owner/Repo.git\" ; primary\n",
+            // Raw string: the continuation line's trailing backslash is a
+            // literal character, exactly as git reads it.
+            r#"[core]
+	repositoryformatversion = 0
+[remote "q"]
+	url = https://github.com/Owner/Quoted.git
+[REMOTE "UP"]
+	url = "https://github.com/owner/Uppercase.git" ; quoted value + inline comment
+[remote.origin]
+	url = git@github.com:owner/Dotted.git
+[remote "same"] url = https://github.com/owner/SameLine.git # header + key on one line
+[remote "cont"]
+	url = https://github.com/owner/Contin\
+uation.git
+[remote "decoy"]
+	pushurl = https://github.com/owner/Decoy.git
+[remoteExtra "x"]
+	url = https://github.com/owner/Decoy.git
+[remote]
+	url = https://github.com/owner/Decoy.git
+# url = https://github.com/owner/Decoy.git
+; url = https://github.com/owner/Decoy.git
+"#,
         )
         .unwrap();
+
         let found = scan_workspace_for_repos(
             tmp.path().to_string_lossy().to_string(),
-            vec!["owner/repo".to_string()],
+            vec![
+                "owner/quoted".to_string(),
+                "owner/uppercase".to_string(),
+                "owner/dotted".to_string(),
+                "owner/sameline".to_string(),
+                "owner/continuation".to_string(),
+                "owner/decoy".to_string(),
+            ],
         )
         .unwrap();
-        assert_eq!(found.len(), 1, "{:?}", found);
-        assert!(found["owner/repo"].ends_with("mixed-case"));
+
+        for name in [
+            "owner/quoted",
+            "owner/uppercase",
+            "owner/dotted",
+            "owner/sameline",
+            "owner/continuation",
+        ] {
+            assert!(found.contains_key(name), "{name} missing: {found:?}");
+            assert!(found[name].ends_with("spellings"), "{name}: {found:?}");
+        }
+        assert!(
+            !found.contains_key("owner/decoy"),
+            "pushurl / remoteExtra / bare [remote] / commented url must not match: {found:?}"
+        );
     }
 
     // ── F-000045: clone_repo_to — the failure paths that need no git ─────────
