@@ -142,8 +142,9 @@ fn refuse_protected(name: &str) -> Result<(), String> {
 
 /// Conservative branch-name check (a subset of `git check-ref-format`): we
 /// only accept short names, never `refs/...`, never anything that could be read
-/// as an option or a refspec.
-fn validate_branch(name: &str) -> Result<(), String> {
+/// as an option or a refspec. F-000045: also used by `clone_repo_to` to reject
+/// a garbage configured branch *before* anything is cloned.
+pub(crate) fn validate_branch(name: &str) -> Result<(), String> {
     let bad = name.is_empty()
         || name.starts_with('-')
         || name.starts_with('/')
@@ -1306,6 +1307,188 @@ fn parse_push_output(
 }
 
 // ---------------------------------------------------------------------------
+// F-000045: clone a repo that has no local folder
+// ---------------------------------------------------------------------------
+
+/// F-000045: production clone URL of a validated `owner/repo` GitHub name.
+/// The PAT never appears here — credentials come from the system git helper,
+/// exactly like `fetch`.
+pub fn github_clone_url(github_name: &str) -> String {
+    format!("https://github.com/{}.git", github_name)
+}
+
+/// F-000045: why preparing a clone target failed. `Invalid` leaves the target
+/// exactly as it was; after `Failed` the target may hold leftovers of a partial
+/// clone, which the caller must name and never bind as a success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloneTargetError {
+    Invalid(String),
+    Failed(NetError),
+}
+
+/// F-000045: what `prepare_clone_target` found / did at the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClonePrep {
+    /// `git clone` ran. `checked_out` is false when the target branch has no
+    /// `refs/remotes/origin/<branch>`: the default branch / HEAD that
+    /// `git clone` picked stays, no branch is created — deliberately not an
+    /// error (owner's decision, 2026-11-08).
+    FreshClone { checked_out: bool },
+    /// The target already held a clone of the same repo: nothing was touched —
+    /// not the branch, the index, the working files or the remotes.
+    ExistingClone,
+}
+
+/// `git clone <url> <target>` — non-interactive, under the same timeout and
+/// credential hygiene as `fetch` (system helper only, nothing in the URL, env
+/// or args, stderr redacted, the whole process tree killed on timeout).
+/// `cwd` must be an existing absolute directory: the target may not exist yet,
+/// so it cannot host the run.
+pub fn clone_repo(git: &GitBinary, url: &str, cwd: &Path, target: &Path) -> Result<(), NetError> {
+    validate_rev(url).map_err(|m| NetError {
+        kind: NetErrorKind::Other,
+        message: m,
+    })?;
+    if !target.is_absolute() {
+        return Err(NetError {
+            kind: NetErrorKind::Other,
+            message: format!("clone target must be absolute: {}", target.display()),
+        });
+    }
+    let mut args: Vec<std::ffi::OsString> = LOW_SPEED_ARGS.iter().map(Into::into).collect();
+    args.push("clone".into());
+    args.push(url.into());
+    args.push(target.as_os_str().to_owned());
+    let env = net_env();
+    let out = run_git(git, cwd, &args, &net_opts(&env, NET_TIMEOUT)).map_err(net_error_from_run)?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(net_error_from_output("clone", &out))
+    }
+}
+
+/// F-000045: after a fresh clone, switch onto `branch` when the remote has it.
+/// The exact ref `refs/remotes/origin/<branch>` decides — a same-named tag
+/// does not count. `Ok(false)` when the ref is absent: HEAD, the index and the
+/// working tree keep what `git clone` left and no branch is created. A failure
+/// of the check or the checkout itself is a real error (nothing is bound).
+pub fn checkout_remote_branch_if_present(
+    git: &GitBinary,
+    target: &Path,
+    branch: &str,
+) -> Result<bool, String> {
+    validate_branch(branch)?;
+    let remote_ref = format!("refs/remotes/origin/{}", branch);
+    if rev_parse(git, target, &remote_ref)?.is_none() {
+        return Ok(false);
+    }
+    let local_ref = format!("refs/heads/{}", branch);
+    if rev_parse(git, target, &local_ref)?.is_none() {
+        // No local branch yet (the clone checked out a different default):
+        // create one tracking the exact remote ref. Unlike `update_ref_cas`
+        // this may name `main`/`master`: it creates a branch exactly at the
+        // remote tip and checks it out — it never moves history.
+        run_ok(
+            git,
+            target,
+            &["branch", "--track", branch, remote_ref.as_str()],
+        )?;
+    }
+    run_ok(git, target, &["checkout", branch]).map(|_| true)
+}
+
+/// F-000045: the origin fetch URL of a valid work-tree root at `target`.
+/// `Err` (naming why) when the folder is not a git repository, is bare, is a
+/// nested folder of another repo's work tree, or has no unambiguous
+/// `remote.origin.url`. Reading the config through git — not by parsing
+/// `.git/config` — also works when `.git` is a file (linked worktree).
+pub fn origin_url_of_worktree_root(git: &GitBinary, target: &Path) -> Result<String, String> {
+    let bare = run_ok(git, target, &["rev-parse", "--is-bare-repository"])?;
+    if stdout_text(&bare) != "false" {
+        return Err("bare repository: no working tree to attach".to_string());
+    }
+    let top = run_ok(git, target, &["rev-parse", "--show-toplevel"])?;
+    let top = PathBuf::from(stdout_text(&top));
+    let same_dir = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if !same_dir(&top, target) {
+        return Err(format!(
+            "not the repository root (the work-tree root is {})",
+            top.display()
+        ));
+    }
+    let urls = config_get_all(git, target, "remote.origin.url")?;
+    match urls.len() {
+        1 => Ok(urls.into_iter().next().expect("len checked")),
+        0 => Err("remote 'origin' is not configured".to_string()),
+        _ => Err("remote 'origin' has several URLs".to_string()),
+    }
+}
+
+/// F-000045: make `target` a clone of `github_name` fetched from `url`, or
+/// verify that it already is one. Target classes:
+/// * missing or an empty folder → `git clone` (+ the branch checkout);
+/// * an existing clone of the same repo (origin matches `github_name` via the
+///   exact GitHub matcher) → `ExistingClone`, nothing touched;
+/// * anything else (a file, an unreadable folder, another repo, a non-empty
+///   non-git folder, a nested folder of another repo) → `Invalid`.
+pub fn prepare_clone_target(
+    git: &GitBinary,
+    url: &str,
+    github_name: &str,
+    target: &Path,
+    branch: &str,
+) -> Result<ClonePrep, CloneTargetError> {
+    let invalid = CloneTargetError::Invalid;
+    if target.exists() {
+        if !target.is_dir() {
+            return Err(invalid(format!("{} is a file", target.display())));
+        }
+        // A folder we cannot list is a refusal, not an "empty folder".
+        let empty = std::fs::read_dir(target)
+            .map_err(|e| invalid(format!("{} cannot be read: {}", target.display(), e)))?
+            .next()
+            .is_none();
+        if !empty {
+            let origin = origin_url_of_worktree_root(git, target).map_err(invalid)?;
+            if !crate::git_ops::remote_matches_github(&origin, github_name) {
+                return Err(invalid(format!(
+                    "{} already holds another repository or foreign files",
+                    target.display()
+                )));
+            }
+            return Ok(ClonePrep::ExistingClone);
+        }
+    }
+    // The picked folder is the clone root itself; git hosts the run from the
+    // parent, which must exist (the target does not yet).
+    let cwd = target.parent().ok_or_else(|| {
+        invalid(format!(
+            "{} has no parent folder to clone from",
+            target.display()
+        ))
+    })?;
+    if !cwd.is_dir() {
+        return Err(invalid(format!(
+            "the parent folder {} does not exist",
+            cwd.display()
+        )));
+    }
+    clone_repo(git, url, cwd, target).map_err(CloneTargetError::Failed)?;
+    checkout_remote_branch_if_present(git, target, branch)
+        .map(|checked_out| ClonePrep::FreshClone { checked_out })
+        .map_err(|e| {
+            CloneTargetError::Failed(NetError {
+                kind: NetErrorKind::Other,
+                message: e,
+            })
+        })
+}
+
+// ---------------------------------------------------------------------------
 // Local repo config
 // ---------------------------------------------------------------------------
 
@@ -1325,6 +1508,30 @@ pub fn config_get(git: &GitBinary, repo: &Path, key: &str) -> Result<Option<Stri
     }
     if out.status.code() == Some(1) {
         return Ok(None);
+    }
+    Err(failure("config", &out))
+}
+
+/// F-000045: every value of a (possibly multi-valued) local config key, via
+/// `--get-all`. An absent key is an empty vec. The clone attach check uses it
+/// so an ambiguous `remote.origin.url` is a refusal, not a silent pick.
+pub fn config_get_all(git: &GitBinary, repo: &Path, key: &str) -> Result<Vec<String>, String> {
+    validate_rev(key)?;
+    let out = run_git(
+        git,
+        repo,
+        &["config", "--local", "--get-all", key],
+        &RunOpts::LOCAL,
+    )
+    .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect());
+    }
+    if out.status.code() == Some(1) {
+        return Ok(Vec::new());
     }
     Err(failure("config", &out))
 }
@@ -2341,6 +2548,396 @@ mod tests {
             Some("-weird")
         );
         assert!(config_get(&gb(), &fx.a, "--list").is_err());
+    }
+
+    // ----- F-000045: clone -------------------------------------------------
+
+    #[test]
+    fn github_clone_url_is_plain_https() {
+        // Production builder — checked separately from the transport, which
+        // tests drive with a local path.
+        assert_eq!(
+            github_clone_url("owner/repo"),
+            "https://github.com/owner/repo.git"
+        );
+    }
+
+    /// A bare remote with `default` as its HEAD plus one commit on every name
+    /// in `branches`, pushed from a throw-away seed clone.
+    fn bare_remote(tmp: &TempDir, name: &str, default: &str, branches: &[&str]) -> PathBuf {
+        let remote = tmp.path().join(name);
+        fs::create_dir(&remote).unwrap();
+        g(&remote, &["init", "--bare", "-q"]);
+        let head = format!("refs/heads/{default}");
+        g(&remote, &["symbolic-ref", "HEAD", head.as_str()]);
+        let seed = tmp.path().join(format!("{name}-seed"));
+        fs::create_dir(&seed).unwrap();
+        g(&seed, &["init", "-q"]);
+        g(&seed, &["symbolic-ref", "HEAD", head.as_str()]);
+        configure(&seed);
+        g(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        fs::write(seed.join("README.md"), "hello\n").unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "-q", "-m", "init"]);
+        let default_ref = format!("HEAD:refs/heads/{default}");
+        g(&seed, &["push", "-q", "origin", default_ref.as_str()]);
+        for b in branches {
+            let spec = format!("HEAD:refs/heads/{b}");
+            g(&seed, &["push", "-q", "origin", spec.as_str()]);
+        }
+        remote
+    }
+
+    const CLONE_GH: &str = "owner/repo";
+
+    /// Point a clone's origin at a fictive GitHub URL (no fetch ever happens —
+    /// the matcher only reads the config), so the local-path origin used for
+    /// cloning looks like the production remote.
+    fn fake_github_origin(dir: &Path, github_name: &str) {
+        let url = github_clone_url(github_name);
+        g(dir, &["remote", "set-url", "origin", url.as_str()]);
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_fresh_into_missing_and_empty_folder() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &["shared"]);
+        let url = remote.to_string_lossy().into_owned();
+
+        // Missing folder.
+        let target = tmp.path().join("missing");
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: true }
+        );
+        assert_eq!(
+            g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "dev",
+            "the default branch is already dev: checkout is a no-op"
+        );
+        assert_eq!(g(&target, &["config", "branch.dev.remote"]), "origin");
+
+        // Empty folder: git clones into it as-is (no extra name appended).
+        let empty = tmp.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &empty, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: true }
+        );
+        assert!(empty.join(".git").exists());
+        assert_eq!(g(&empty, &["rev-parse", "--abbrev-ref", "HEAD"]), "dev");
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_prefers_the_configured_branch_over_dev() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &["shared"]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "shared").unwrap(),
+            ClonePrep::FreshClone { checked_out: true }
+        );
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "shared");
+        // A tracking branch was created from the exact remote ref.
+        assert_eq!(g(&target, &["config", "branch.shared.remote"]), "origin");
+        assert_eq!(
+            g(&target, &["config", "branch.shared.merge"]),
+            "refs/heads/shared"
+        );
+        assert_eq!(
+            g(&target, &["rev-parse", "shared"]),
+            g(&target, &["rev-parse", "origin/shared"])
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_without_dev_keeps_the_default_branch() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "main", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+
+        // Bare remote default `main`, no configured branch → dev is wanted but
+        // missing: attach succeeds on `main`, no `dev` is created.
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: false }
+        );
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(g(&target, &["branch", "--list", "dev"]).is_empty());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_with_missing_configured_branch_never_falls_back_to_dev() {
+        let tmp = TempDir::new().unwrap();
+        // Default `main` and a `dev` branch: the configured `staging` does not
+        // exist — the default branch stays and neither branch is created.
+        let remote = bare_remote(&tmp, "remote.git", "main", &["dev"]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "staging").unwrap(),
+            ClonePrep::FreshClone { checked_out: false }
+        );
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(g(&target, &["branch", "--list", "staging"]).is_empty());
+        assert!(
+            g(&target, &["branch", "--list", "dev"]).is_empty(),
+            "no silent dev fallback"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_a_same_named_tag_is_not_a_branch() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "main", &[]);
+        // A tag named `dev` on the remote, but no `dev` branch.
+        let seed = tmp.path().join("remote.git-seed");
+        g(&seed, &["tag", "dev"]);
+        g(&seed, &["push", "-q", "origin", "refs/tags/dev"]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: false }
+        );
+        // The tag came down with the clone, but HEAD stayed on the default
+        // branch and no local `dev` branch was created from it.
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(
+            !g(&target, &["tag", "--list", "dev"]).is_empty(),
+            "the tag exists locally"
+        );
+        assert!(g(&target, &["branch", "--list", "dev"]).is_empty());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_existing_same_repo_attaches_without_touching_it() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &["shared"]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap();
+        // The local-path origin does not match the GitHub name: swap in a
+        // fictive GitHub origin (never fetched) and re-run as the user would.
+        fake_github_origin(&target, "Owner/Repo");
+        g(&target, &["checkout", "-q", "shared"]);
+        fs::write(target.join("README.md"), "local edit\n").unwrap();
+        let head = g(&target, &["rev-parse", "HEAD"]);
+
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, "owner/repo", &target, "dev").unwrap(),
+            ClonePrep::ExistingClone
+        );
+        // Branch, HEAD, index and working files are untouched until the
+        // normal sync runs.
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "shared");
+        assert_eq!(g(&target, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            fs::read_to_string(target.join("README.md")).unwrap(),
+            "local edit\n"
+        );
+        assert!(g(&target, &["status", "--porcelain"]).contains("README.md"));
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_rejects_a_foreign_clone_and_never_touches_it() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap();
+        fake_github_origin(&target, "owner/elsewhere");
+        let head = g(&target, &["rev-parse", "HEAD"]);
+
+        let e = prepare_clone_target(&gb(), &url, "owner/repo", &target, "dev").unwrap_err();
+        match &e {
+            CloneTargetError::Invalid(m) => {
+                assert!(m.contains("another repository"), "{m}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert_eq!(g(&target, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            g(&target, &["config", "--local", "remote.origin.url"]),
+            "https://github.com/owner/elsewhere.git"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_rejects_file_non_git_and_nested_folders() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+
+        // A file.
+        let file = tmp.path().join("a-file");
+        fs::write(&file, "x").unwrap();
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &file, "dev").unwrap_err();
+        assert!(
+            matches!(&e, CloneTargetError::Invalid(m) if m.contains("is a file")),
+            "{e:?}"
+        );
+
+        // A non-empty non-git folder.
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(plain.join("stuff")).unwrap();
+        fs::write(plain.join("stuff/keep.txt"), "x").unwrap();
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &plain, "dev").unwrap_err();
+        assert!(matches!(&e, CloneTargetError::Invalid(_)), "{e:?}");
+        assert!(plain.join("stuff/keep.txt").exists(), "nothing was deleted");
+
+        // A nested folder inside another repo's work tree.
+        let clone_dir = tmp.path().join("clone");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &clone_dir, "dev").unwrap();
+        fake_github_origin(&clone_dir, CLONE_GH);
+        let nested = clone_dir.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("x.txt"), "x").unwrap();
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &nested, "dev").unwrap_err();
+        assert!(
+            matches!(&e, CloneTargetError::Invalid(m) if m.contains("not the repository root")),
+            "{e:?}"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_from_an_unreachable_remote_is_a_net_failure() {
+        let tmp = TempDir::new().unwrap();
+        let url = tmp.path().join("nope.git").to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap_err();
+        match e {
+            CloneTargetError::Failed(net) => assert_eq!(net.kind, NetErrorKind::Network),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn origin_url_of_worktree_root_bare_plain_and_linked_worktree() {
+        let tmp = TempDir::new().unwrap();
+        // Bare: no working tree at all.
+        let bare = bare_remote(&tmp, "remote.git", "dev", &[]);
+        assert!(origin_url_of_worktree_root(&gb(), &bare).is_err());
+        // Not a git repository.
+        let plain = tmp.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        assert!(origin_url_of_worktree_root(&gb(), &plain).is_err());
+        // A linked worktree carries a `.git` file, not a folder.
+        let clone_dir = tmp.path().join("clone");
+        let url = bare.to_string_lossy().into_owned();
+        prepare_clone_target(&gb(), &url, CLONE_GH, &clone_dir, "dev").unwrap();
+        fake_github_origin(&clone_dir, CLONE_GH);
+        assert_eq!(
+            origin_url_of_worktree_root(&gb(), &clone_dir).unwrap(),
+            "https://github.com/owner/repo.git"
+        );
+        let wt = tmp.path().join("wt");
+        g(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt-branch",
+                wt.to_str().unwrap(),
+            ],
+        );
+        assert!(wt.join(".git").is_file());
+        assert_eq!(
+            origin_url_of_worktree_root(&gb(), &wt).unwrap(),
+            "https://github.com/owner/repo.git"
+        );
+        // A clone with no origin at all is refused, not guessed.
+        let no_origin = tmp.path().join("no-origin");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &no_origin, "dev").unwrap();
+        g(&no_origin, &["remote", "remove", "origin"]);
+        assert!(origin_url_of_worktree_root(&gb(), &no_origin).is_err());
+    }
+
+    #[cfg(unix)]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_an_unreadable_folder_is_a_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("locked");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap_err();
+        assert!(
+            matches!(&e, CloneTargetError::Invalid(m) if m.contains("cannot be read")),
+            "{e:?}"
+        );
+        // Restore so TempDir can clean up.
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_leaves_no_credentials_in_the_error() {
+        let tmp = TempDir::new().unwrap();
+        // Nothing listens on port 9: a connection failure naming the URL.
+        let e = clone_repo(
+            &gb(),
+            "http://user:supersecret@127.0.0.1:9/x.git",
+            tmp.path(),
+            &tmp.path().join("t"),
+        )
+        .unwrap_err();
+        assert!(!e.message.contains("supersecret"), "{}", e.message);
+        assert!(matches!(
+            e.kind,
+            NetErrorKind::Network | NetErrorKind::Timeout
+        ));
+    }
+
+    #[test]
+    fn clone_target_must_be_absolute() {
+        let e = clone_repo(
+            &gb(),
+            "https://github.com/owner/repo.git",
+            Path::new("/definitely/exists"),
+            Path::new("relative/target"),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, NetErrorKind::Other);
+        assert!(e.message.contains("absolute"), "{}", e.message);
+    }
+
+    #[test]
+    fn clone_prep_parent_must_exist() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("no/such/parent/t");
+        let e = prepare_clone_target(
+            &gb(),
+            "https://github.com/owner/repo.git",
+            CLONE_GH,
+            &target,
+            "dev",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, CloneTargetError::Invalid(m) if m.contains("parent folder")),
+            "{e:?}"
+        );
     }
 
     // ----- merge_or_abort ---------------------------------------------------

@@ -89,6 +89,17 @@ pub enum SyncIssueCode {
     SharedPendingApproval,
     /// F-000044: the GitHub login of this install is unknown. subject = repo.
     SharedNoLogin,
+    /// F-000045: the picked clone target cannot be used (a file, an unreadable
+    /// folder, a non-empty non-git folder, another repo's clone, a nested
+    /// folder of one). Nothing was touched. subject = repo, target = path.
+    CloneTargetInvalid,
+    /// F-000045: `git clone` or the target-branch checkout failed (network,
+    /// auth, timeout, git). The folder is NOT bound. subject = repo,
+    /// detail = redacted git text.
+    CloneFailed,
+    /// F-000045: the clone is ready but the path could not be written to the
+    /// repo. subject = repo, detail = the DB error text.
+    CloneAttachFailed,
 }
 
 /// T-000198: one non-fatal issue found by a sync-like pass. Replaces free
@@ -473,6 +484,10 @@ mod tests {
             (SyncIssueCode::RuleUnknownSkill, "rule_unknown_skill"),
             (SyncIssueCode::RuleHeld, "rule_held"),
             (SyncIssueCode::RuleFailed, "rule_failed"),
+            (SyncIssueCode::SharedNoLogin, "shared_no_login"),
+            (SyncIssueCode::CloneTargetInvalid, "clone_target_invalid"),
+            (SyncIssueCode::CloneFailed, "clone_failed"),
+            (SyncIssueCode::CloneAttachFailed, "clone_attach_failed"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), wire);
         }
@@ -510,6 +525,9 @@ mod tests {
             SharedNoOwnBranch,
             SharedPendingApproval,
             SharedNoLogin,
+            CloneTargetInvalid,
+            CloneFailed,
+            CloneAttachFailed,
         ];
         for code in &all {
             match code {
@@ -539,7 +557,10 @@ mod tests {
                 | SharedNeedsManualMerge
                 | SharedNoOwnBranch
                 | SharedPendingApproval
-                | SharedNoLogin => {}
+                | SharedNoLogin
+                | CloneTargetInvalid
+                | CloneFailed
+                | CloneAttachFailed => {}
             }
         }
         all

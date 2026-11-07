@@ -33,6 +33,9 @@ export const SYNC_ISSUE_CODES = [
   'shared_no_own_branch',
   'shared_pending_approval',
   'shared_no_login',
+  'clone_target_invalid',
+  'clone_failed',
+  'clone_attach_failed',
 ] as const;
 export type SyncIssueCode = (typeof SYNC_ISSUE_CODES)[number];
 

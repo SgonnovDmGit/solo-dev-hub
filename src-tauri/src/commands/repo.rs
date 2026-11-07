@@ -1,6 +1,6 @@
 use crate::db::AppDb;
 use crate::models::*;
-use crate::{git_ops, sync};
+use crate::{git_ops, git_sync, sync};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tauri::State;
@@ -305,6 +305,131 @@ pub fn untrack_files(
     git_ops::untrack_files(&git, path, &file_bufs)
 }
 
+// ── F-000045: clone a repo that has no local folder ───────────────────────────
+
+/// F-000045: clone a GitHub-tracked repo into `target_dir` (or adopt an
+/// existing clone of the same repo found there) and bind the folder to the
+/// repo row. Only for a repo whose `local_path` is missing/empty — an existing
+/// binding is never overwritten (`set_repo_local_path` is the explicit path
+/// for that). The branch comes from the repo's auto-commit setting, defaulting
+/// to `dev`; a configured branch that is not a valid branch name is an error
+/// (nothing is cloned), the setting itself is never rewritten. On any failure
+/// the folder is NOT bound: the error is a `SyncIssue` with an F-000045 code
+/// (`clone_target_invalid` / `clone_failed` / `clone_attach_failed`).
+///
+/// Async like the untrack commands above: a clone spends up to a minute on the
+/// network, far too long for the UI thread. The DB mutex is never held across
+/// the git work — every DB touch here is a short locked call.
+#[tauri::command(async)]
+pub fn clone_repo_to(
+    db: State<AppDb>,
+    id: i64,
+    target_dir: String,
+) -> Result<Repository, SyncIssue> {
+    clone_repo_to_impl(&db, id, target_dir)
+}
+
+/// F-000045: `owner/repo` shape for a `github_name` — exactly one `/`, both
+/// halves non-empty, and no URL / userinfo / query noise (a full URL or
+/// `a/b/c` can never name a GitHub repository, so there is nothing to clone).
+fn is_github_owner_repo(name: &str) -> bool {
+    let name = name.trim();
+    match name.split_once('/') {
+        Some((owner, repo)) => {
+            !owner.is_empty()
+                && !repo.is_empty()
+                && !repo.contains('/')
+                && !name.contains("://")
+                && !name.contains('@')
+                && !name.contains('?')
+        }
+        None => false,
+    }
+}
+
+/// The orchestration behind `clone_repo_to`, on a plain `&AppDb` so the
+/// no-git failure paths are unit-testable without a Tauri runtime.
+fn clone_repo_to_impl(db: &AppDb, id: i64, target_dir: String) -> Result<Repository, SyncIssue> {
+    let repo = db.get_repository(id).map_err(|e| {
+        SyncIssue::new(SyncIssueCode::CloneFailed, format!("#{}", id)).detail(e.to_string())
+    })?;
+    let subject = repo.display_name();
+
+    // Local-only / malformed name: nothing GitHub-shaped to clone.
+    let github_name = match repo.github_name.as_deref() {
+        Some(name) if is_github_owner_repo(name) => name.trim().to_string(),
+        _ => {
+            return Err(SyncIssue::new(SyncIssueCode::CloneTargetInvalid, subject)
+                .target(&target_dir)
+                .detail("repository has no github_name of the form owner/repo"))
+        }
+    };
+    // The command is for a repo with no folder: an existing binding is never
+    // overwritten by a clone.
+    if repo.local_path.as_deref().map_or(false, |p| !p.is_empty()) {
+        return Err(SyncIssue::new(SyncIssueCode::CloneTargetInvalid, subject)
+            .target(&target_dir)
+            .detail("repository already has a local folder"));
+    }
+
+    // Fail fast on a target the prep step would refuse anyway.
+    if target_dir.trim().is_empty() {
+        return Err(SyncIssue::new(SyncIssueCode::CloneTargetInvalid, subject)
+            .target(&target_dir)
+            .detail("target folder path is empty"));
+    }
+    let target_path = PathBuf::from(&target_dir);
+    if !target_path.is_absolute() {
+        return Err(SyncIssue::new(SyncIssueCode::CloneTargetInvalid, subject)
+            .target(&target_dir)
+            .detail("target folder must be an absolute path"));
+    }
+
+    // Branch: the repo's auto-commit setting, default `dev`. A garbage name is
+    // refused before anything is cloned; the setting is left as the user set it.
+    let branch = db
+        .get_autocommit_branch(id)
+        .ok()
+        .flatten()
+        .filter(|b| !b.trim().is_empty())
+        .unwrap_or_else(|| "dev".to_string());
+    if let Err(msg) = git_sync::validate_branch(&branch) {
+        return Err(SyncIssue::new(SyncIssueCode::CloneFailed, subject).detail(msg));
+    }
+
+    let git = git_ops::cached_git().ok_or_else(|| {
+        SyncIssue::new(SyncIssueCode::CloneFailed, &subject).detail("git binary not available")
+    })?;
+    let url = git_sync::github_clone_url(&github_name);
+
+    // FreshClone and ExistingClone both end in a bindable clone; for the
+    // latter the origin check inside `prepare_clone_target` already proved it
+    // is the same repo (ambiguous multi-URL origins are refused there).
+    if let Err(e) = git_sync::prepare_clone_target(&git, &url, &github_name, &target_path, &branch)
+    {
+        return Err(match e {
+            git_sync::CloneTargetError::Invalid(msg) => {
+                SyncIssue::new(SyncIssueCode::CloneTargetInvalid, subject)
+                    .target(&target_dir)
+                    .detail(msg)
+            }
+            git_sync::CloneTargetError::Failed(net_err) => {
+                SyncIssue::new(SyncIssueCode::CloneFailed, subject).detail(net_err.message)
+            }
+        });
+    }
+
+    // Bind only if nobody attached a folder meanwhile; a loser never overwrites.
+    match db.bind_repo_local_path_if_unset(id, &target_dir) {
+        Ok(Some(bound)) => Ok(bound),
+        Ok(None) => Err(SyncIssue::new(SyncIssueCode::CloneAttachFailed, subject)
+            .detail("a local folder was bound concurrently")),
+        Err(e) => {
+            Err(SyncIssue::new(SyncIssueCode::CloneAttachFailed, subject).detail(e.to_string()))
+        }
+    }
+}
+
 // ── T-000191: peer links (InOutBox channel between equals) ────────────────────
 
 /// Declare two repositories to be peers. Symmetric and idempotent. Every pair
@@ -354,6 +479,37 @@ pub fn scan_workspace_for_repos(
     Ok(found)
 }
 
+/// F-000045: every fetch URL (`url = ...`) of the `[remote "..."]` sections of
+/// a `.git/config`. `pushurl` is skipped — where a clone fetches from is the
+/// proof, not where it may push to — and so are comments and any `url`-like
+/// key (`url-other`) or key outside a remote section. The old scanner
+/// lowercased the whole file and searched substrings, which also matched
+/// commented URLs, `pushurl` lines and prefix repos; this parser hands
+/// `git_ops::remote_matches_github` the real fetch URLs only.
+fn remote_fetch_urls(config: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut in_remote_section = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(section) = line.strip_prefix('[') {
+            in_remote_section = section.trim_start().starts_with("remote");
+            continue;
+        }
+        if !in_remote_section {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim().eq_ignore_ascii_case("url") {
+                urls.push(value.trim().to_string());
+            }
+        }
+    }
+    urls
+}
+
 fn scan_dir(
     dir: &std::path::Path,
     github_names: &[String],
@@ -368,25 +524,17 @@ fn scan_dir(
     let git_config = dir.join(".git").join("config");
     if git_config.exists() {
         if let Ok(content) = std::fs::read_to_string(&git_config) {
-            // T-000242: GitHub owner/repo paths are case-insensitive, but the
-            // remote URL keeps the case the clone used — on a case-sensitive
-            // filesystem `Server_Airouter` and `server_airouter` are different
-            // folders, so match without regard to case.
-            let content = content.to_lowercase();
+            // T-000242 / F-000045: the real fetch URLs go through the exact
+            // GitHub matcher, which compares owner/repo case-insensitively
+            // (the clone keeps the case GitHub gave it) but no longer treats
+            // a commented URL, a `pushurl` or a prefix repo as a match.
+            let fetch_urls = remote_fetch_urls(&content);
             for name in github_names {
-                // Match against common remote URL patterns
-                let lowered = name.to_lowercase();
-                let patterns = [
-                    format!("github.com/{}.git", lowered),
-                    format!("github.com/{}", lowered),
-                    format!("github.com:{}.git", lowered),
-                    format!("github.com:{}", lowered),
-                ];
-                for pat in &patterns {
-                    if content.contains(pat) {
-                        found.insert(name.clone(), dir.to_string_lossy().to_string());
-                        break;
-                    }
+                if fetch_urls
+                    .iter()
+                    .any(|url| git_ops::remote_matches_github(url, name))
+                {
+                    found.insert(name.clone(), dir.to_string_lossy().to_string());
                 }
             }
         }
@@ -433,11 +581,7 @@ mod tests {
             "server_airouter",
             "git@github.com:owner/Server_Airouter.git",
         );
-        repo_dir(
-            tmp.path(),
-            "other",
-            "https://github.com/Owner/Other_Repo",
-        );
+        repo_dir(tmp.path(), "other", "https://github.com/Owner/Other_Repo");
 
         let found = scan_workspace_for_repos(
             tmp.path().to_string_lossy().to_string(),
@@ -456,7 +600,11 @@ mod tests {
     #[test]
     fn test_scan_does_not_match_a_different_repo_name() {
         let tmp = tempfile::TempDir::new().unwrap();
-        repo_dir(tmp.path(), "airouter", "git@github.com:owner/server_airouter.git");
+        repo_dir(
+            tmp.path(),
+            "airouter",
+            "git@github.com:owner/server_airouter.git",
+        );
 
         let found = scan_workspace_for_repos(
             tmp.path().to_string_lossy().to_string(),
@@ -465,5 +613,167 @@ mod tests {
         .unwrap();
 
         assert!(found.is_empty(), "{:?}", found);
+    }
+
+    /// F-000045: a config file as the old substring scanner would have
+    /// mis-matched — a commented URL, a `pushurl`, a `url-other` key and a
+    /// prefix repo — none of which proves the folder fetches from the repo.
+    #[test]
+    fn test_scan_ignores_commented_pushurl_and_prefix_urls() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("lookalike");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(
+            dir.join(".git").join("config"),
+            concat!(
+                "[core]\n",
+                "\trepositoryformatversion = 0\n",
+                "# url = git@github.com:owner/repo.git\n",
+                "; url = https://github.com/owner/repo.git\n",
+                "[remote \"origin\"]\n",
+                "\turl = git@github.com:owner/repo-other.git\n",
+                "\tpushurl = https://github.com/owner/repo.git\n",
+                "\turl-other = https://github.com/owner/repo.git\n",
+                "[url \"https://github.com/\"]\n",
+                "\tinsteadof = https://example.com/\n",
+            ),
+        )
+        .unwrap();
+
+        let found = scan_workspace_for_repos(
+            tmp.path().to_string_lossy().to_string(),
+            vec!["owner/repo".to_string()],
+        )
+        .unwrap();
+
+        assert!(found.is_empty(), "{:?}", found);
+    }
+
+    /// F-000045: any remote section proves the match (not just `origin`), and
+    /// the depth-2 walk of the old scanner is unchanged.
+    #[test]
+    fn test_scan_matches_any_remote_and_nested_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("work").join("repo"); // depth 2
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(
+            dir.join(".git").join("config"),
+            // The GitHub remote is `upstream`, origin points elsewhere.
+            "[remote \"origin\"]\n\turl = /local/backup.git\n\
+             [remote \"upstream\"]\n\turl = https://github.com/Owner/Repo.git\n",
+        )
+        .unwrap();
+
+        let found = scan_workspace_for_repos(
+            tmp.path().to_string_lossy().to_string(),
+            vec!["owner/repo".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(found.len(), 1, "{:?}", found);
+        assert!(found["owner/repo"].ends_with("repo"));
+    }
+
+    #[test]
+    fn test_remote_fetch_urls_parses_only_remote_url_keys() {
+        let config = "[core]\n\turl = not-a-remote\n\
+                      [remote \"origin\"]\n\turl = https://github.com/o/r.git\n\tpushurl = ssh://git@github.com/o/r.git\n\
+                      [remote \"second\"]\n\tURL = git@github.com:o/r2.git\n\
+                      [branch \"dev\"]\n\tremote = origin\n";
+        assert_eq!(
+            remote_fetch_urls(config),
+            vec![
+                "https://github.com/o/r.git".to_string(),
+                "git@github.com:o/r2.git".to_string(),
+            ]
+        );
+        assert!(remote_fetch_urls("").is_empty());
+        assert!(remote_fetch_urls("# url = x\n; [remote]\nurl = y").is_empty());
+    }
+
+    // ── F-000045: clone_repo_to — the failure paths that need no git ─────────
+
+    fn make_db() -> AppDb {
+        AppDb::new(std::path::PathBuf::from(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn test_clone_repo_to_rejects_early_bad_inputs() {
+        let db = make_db();
+
+        // Unknown repo id: a CloneFailed issue naming the id.
+        let err = clone_repo_to_impl(&db, 99999, "/abs/target".into()).unwrap_err();
+        assert_eq!(err.code, SyncIssueCode::CloneFailed);
+        assert!(err.subject.contains("99999"));
+
+        // Local-only repo (no github_name): nothing to clone.
+        let local = db
+            .insert_local_repository("/tmp/local", "My Folder", None, None)
+            .unwrap();
+        let err = clone_repo_to_impl(&db, local.id, "/abs/target".into()).unwrap_err();
+        assert_eq!(err.code, SyncIssueCode::CloneTargetInvalid);
+        assert_eq!(err.target.as_deref(), Some("/abs/target"));
+        assert!(err.detail.as_deref().unwrap_or("").contains("owner/repo"));
+
+        // A github_name that is not `owner/repo` (URL, 3 segments) is refused.
+        for bad in ["github.com/owner/repo", "owner/repo/extra", "owner/"] {
+            let repo = db
+                .upsert_repository(bad, None, None, None, None, None)
+                .unwrap();
+            let err = clone_repo_to_impl(&db, repo.id, "/abs/target".into()).unwrap_err();
+            assert_eq!(err.code, SyncIssueCode::CloneTargetInvalid, "{}", bad);
+        }
+
+        // Already-bound repo: the clone command never overwrites a binding.
+        let bound = db
+            .upsert_repository("owner/bound", None, None, None, None, None)
+            .unwrap();
+        db.set_repo_local_path(bound.id, Some("/already/here"))
+            .unwrap();
+        let err = clone_repo_to_impl(&db, bound.id, "/abs/target".into()).unwrap_err();
+        assert_eq!(err.code, SyncIssueCode::CloneTargetInvalid);
+        assert!(err
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("already has a local folder"));
+
+        // Relative / empty target folder.
+        let plain = db
+            .upsert_repository("owner/plain", None, None, None, None, None)
+            .unwrap();
+        for target in ["", "relative/path"] {
+            let err = clone_repo_to_impl(&db, plain.id, target.to_string()).unwrap_err();
+            assert_eq!(err.code, SyncIssueCode::CloneTargetInvalid, "{:?}", target);
+            assert_eq!(err.target.as_deref(), Some(target));
+        }
+    }
+
+    #[test]
+    fn test_clone_repo_to_rejects_a_garbage_configured_branch() {
+        let db = make_db();
+        let repo = db
+            .upsert_repository("owner/repo", None, None, None, None, None)
+            .unwrap();
+        db.set_autocommit_branch(repo.id, Some("a..b")).unwrap();
+
+        // An absolute target that does not exist yet: the branch name is
+        // rejected before git is even looked up, so nothing is created.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("clone-target");
+        let err = clone_repo_to_impl(&db, repo.id, target.to_string_lossy().into_owned())
+            .unwrap_err();
+        assert_eq!(err.code, SyncIssueCode::CloneFailed);
+        assert!(err
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("invalid branch name"));
+        // The setting itself is untouched.
+        assert_eq!(
+            db.get_autocommit_branch(repo.id).unwrap(),
+            Some("a..b".to_string())
+        );
+        assert_eq!(db.get_repository(repo.id).unwrap().local_path, None);
     }
 }

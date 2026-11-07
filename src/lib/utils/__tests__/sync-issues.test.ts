@@ -84,6 +84,73 @@ describe('formatSyncIssue', () => {
     expect(formatSyncIssue(issue, 'en')).toBe('Peer channel failed at alpha');
   });
 
+  // F-000045: `clone_repo_to` rejects with these codes — one line per code,
+  // placeholders {subject} / {target} / {detail} as in every other template.
+  it('translates the clone codes in Russian and English', () => {
+    const target: SyncIssue = {
+      code: 'clone_target_invalid',
+      subject: 'owner/repo',
+      target: 'D:\\repos\\target',
+    };
+    expect(formatSyncIssue(target, 'ru')).toBe(
+      'owner/repo: папка D:\\repos\\target не подходит для клонирования — там другой репозиторий или чужие файлы',
+    );
+    expect(formatSyncIssue(target, 'en')).toBe(
+      'owner/repo: folder D:\\repos\\target cannot be used for cloning — it holds another repository or foreign files',
+    );
+
+    const failed: SyncIssue = {
+      code: 'clone_failed',
+      subject: 'owner/repo',
+      detail: 'fatal: Authentication failed for https://github.com/',
+    };
+    expect(formatSyncIssue(failed, 'ru')).toBe(
+      'owner/repo: не удалось клонировать — fatal: Authentication failed for https://github.com/',
+    );
+    expect(formatSyncIssue(failed, 'en')).toBe(
+      'owner/repo: clone failed — fatal: Authentication failed for https://github.com/',
+    );
+
+    const attach: SyncIssue = {
+      code: 'clone_attach_failed',
+      subject: 'owner/repo',
+      detail: 'database is locked',
+    };
+    expect(formatSyncIssue(attach, 'ru')).toBe(
+      'owner/repo: клон готов, но не удалось привязать папку — database is locked',
+    );
+    expect(formatSyncIssue(attach, 'en')).toBe(
+      'owner/repo: the clone is ready, but binding the folder failed — database is locked',
+    );
+  });
+
+  it('appends a target the clone templates do not place, keeping the raw detail', () => {
+    const failed: SyncIssue = {
+      code: 'clone_failed',
+      subject: 'owner/repo',
+      target: 'D:\\repos\\target',
+      detail: 'exit code 128',
+    };
+    expect(formatSyncIssue(failed, 'ru')).toBe(
+      'owner/repo: не удалось клонировать — exit code 128 (D:\\repos\\target)',
+    );
+  });
+
+  it('renders the clone codes through formatSyncIssues, one line per issue', () => {
+    expect(
+      formatSyncIssues(
+        [
+          { code: 'clone_target_invalid', subject: 'a/b', target: 'C:\\t' },
+          { code: 'clone_attach_failed', subject: 'a/b', detail: 'database is locked' },
+        ],
+        'en',
+      ),
+    ).toBe(
+      'a/b: folder C:\\t cannot be used for cloning — it holds another repository or foreign files\n' +
+        'a/b: the clone is ready, but binding the folder failed — database is locked',
+    );
+  });
+
   it('has a ru and en line for every code and lookup token', () => {
     for (const loc of ['ru', 'en'] as const) {
       const table = translations[loc] as Record<string, string>;

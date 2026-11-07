@@ -536,6 +536,44 @@ impl AppDb {
         )
     }
 
+    /// F-000045: bind `local_path` to a repo that has no folder yet, never
+    /// overwriting an existing binding. The read-modify-write runs inside one
+    /// transaction, so a concurrent attach wins and this call returns
+    /// `Ok(None)`. `Ok(None)` also covers a repo id that does not exist.
+    /// An empty-string `local_path` counts as unset and is replaced.
+    pub fn bind_repo_local_path_if_unset(
+        &self,
+        id: i64,
+        local_path: &str,
+    ) -> SqlResult<Option<Repository>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let existing: Option<String> = match tx.query_row(
+            "SELECT local_path FROM repositories WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        ) {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if existing.as_deref().map_or(false, |p| !p.is_empty()) {
+            // A folder is already bound — never overwrite it.
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE repositories SET local_path = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            rusqlite::params![local_path, id],
+        )?;
+        tx.commit()?;
+        conn.query_row(
+            "SELECT id, project_id, github_name, github_url, role, description, language, last_pushed_at, added_at, updated_at, local_path, github_id, deploy_target FROM repositories WHERE id = ?1",
+            rusqlite::params![id],
+            row_to_repo,
+        )
+        .map(Some)
+    }
+
     /// Update a repo's `description`. For local-only repos this also drives
     /// `canonical_folder_name()` (used as cross-repo sync subfolder name), so
     /// changes get logged to `repo_renames` for downstream sync-preamble replay.
@@ -1511,6 +1549,71 @@ mod tests {
         // Clear the path
         let cleared = db.set_repo_local_path(r.id, None).unwrap();
         assert_eq!(cleared.local_path, None);
+    }
+
+    // ── F-000045: bind_repo_local_path_if_unset ──────────────────────────────
+
+    #[test]
+    fn test_bind_repo_local_path_if_unset_binds_when_unset() {
+        let db = make_db();
+        let r = db
+            .upsert_repository("owner/repo", None, None, None, None, None)
+            .unwrap();
+        assert_eq!(r.local_path, None);
+
+        let bound = db
+            .bind_repo_local_path_if_unset(r.id, "/home/user/projects/repo")
+            .unwrap()
+            .expect("unset path must be bound");
+        assert_eq!(bound.id, r.id);
+        assert_eq!(
+            bound.local_path.as_deref(),
+            Some("/home/user/projects/repo")
+        );
+
+        // An empty-string path also counts as unset and gets replaced.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE repositories SET local_path = '' WHERE id = ?1",
+                rusqlite::params![r.id],
+            )
+            .unwrap();
+        }
+        let rebound = db
+            .bind_repo_local_path_if_unset(r.id, "/elsewhere/repo")
+            .unwrap()
+            .expect("empty-string path must be replaced");
+        assert_eq!(rebound.local_path.as_deref(), Some("/elsewhere/repo"));
+    }
+
+    #[test]
+    fn test_bind_repo_local_path_if_unset_refuses_existing_path() {
+        let db = make_db();
+        let r = db
+            .upsert_repository("owner/repo", None, None, None, None, None)
+            .unwrap();
+        db.set_repo_local_path(r.id, Some("/first/choice")).unwrap();
+
+        let res = db
+            .bind_repo_local_path_if_unset(r.id, "/second/choice")
+            .unwrap();
+        assert!(res.is_none(), "an existing binding must never be replaced");
+
+        // The original binding is untouched.
+        assert_eq!(
+            db.get_repository(r.id).unwrap().local_path.as_deref(),
+            Some("/first/choice")
+        );
+    }
+
+    #[test]
+    fn test_bind_repo_local_path_if_unset_missing_repo_is_none() {
+        let db = make_db();
+        assert!(db
+            .bind_repo_local_path_if_unset(99999, "/x/y")
+            .unwrap()
+            .is_none());
     }
 
     // ── update_repo_description tests (rename log for local-only) ─────────────

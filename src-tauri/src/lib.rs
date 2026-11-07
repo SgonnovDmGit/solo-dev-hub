@@ -161,6 +161,8 @@ pub fn run() {
             commands::misc::delete_pat,
             // local_path
             commands::repo::set_repo_local_path,
+            // F-000045: clone a repo that has no local folder
+            commands::repo::clone_repo_to,
             commands::repo::update_repo_description,
             // Repo deletion (B-003)
             commands::repo::delete_repository,

@@ -92,6 +92,85 @@ pub fn is_git_repo(local_path: &Path) -> bool {
     local_path.join(".git").exists()
 }
 
+// ── F-000045: exact GitHub remote matcher ─────────────────────────────────────
+
+/// F-000045: split a git remote URL into `(host, path)` — HTTPS/SSH with a
+/// scheme (`https://github.com/o/r.git`) and the scp-like SSH form without one
+/// (`git@github.com:o/r.git`). Userinfo (`user:token@`) is allowed and ignored;
+/// query/fragment never reach the path. `None` when `url` is not a URL-shaped
+/// remote at all (a comment line, prose).
+fn github_remote_parts(url: &str) -> Option<(&str, &str)> {
+    let url = url.trim();
+    let host_is_github = |authority: &str| -> bool {
+        // Strip `user[:pass]@` userinfo; the host itself must be exactly
+        // github.com — a look-alike host (`github.com.evil`) proves nothing.
+        authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host)
+            .eq_ignore_ascii_case("github.com")
+    };
+    if let Some(idx) = url.find("://") {
+        // A scheme is `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`; anything
+        // else before `://` (a comment, prose) is not a URL.
+        let scheme = &url[..idx];
+        let scheme_ok = !scheme.is_empty()
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.');
+        if !scheme_ok {
+            return None;
+        }
+        let rest = &url[idx + 3..];
+        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if !host_is_github(&rest[..auth_end]) {
+            return None;
+        }
+        let path = rest[auth_end..].split(['?', '#']).next().unwrap_or("");
+        Some(("github.com", path.strip_prefix('/')?))
+    } else {
+        // scp-like: `[user@]host:path`. Anything after the host is the path.
+        let idx = url.find(':')?;
+        if !host_is_github(&url[..idx]) {
+            return None;
+        }
+        let path = &url[idx + 1..];
+        let path = path.split(['?', '#']).next().unwrap_or("");
+        Some(("github.com", path.strip_prefix('/').unwrap_or(path)))
+    }
+}
+
+/// F-000045: true iff `url` is a GitHub remote of exactly `github_name`
+/// (`owner/repo`). Host and full owner/repo path compare case-insensitively
+/// (GitHub ignores case in both); a `.git` suffix and a trailing `/` are
+/// optional. HTTPS and both SSH spellings match:
+/// `https://github.com/owner/repo[.git]`, `ssh://git@github.com/owner/repo.git`
+/// and `git@github.com:owner/repo.git`. A different host, a prefix/suffix repo
+/// (`owner/repo-other`), a nested path, userinfo alone or a `pushurl` value do
+/// NOT prove a match. Replaces the workspace scanner's substring matching,
+/// where `owner/repo` also matched `owner/repo-other` and any commented URL.
+pub fn remote_matches_github(url: &str, github_name: &str) -> bool {
+    let name = github_name.trim();
+    // Exactly `owner/repo`: one separator, both halves non-empty. A name with
+    // more segments or with URL noise can never name a GitHub repository.
+    let (owner, repo) = match name.split_once('/') {
+        Some((o, r)) if !o.is_empty() && !r.is_empty() && !r.contains('/') => (o, r),
+        _ => return false,
+    };
+    let Some((_, path)) = github_remote_parts(url) else {
+        return false;
+    };
+    let mut path = path.trim_end_matches('/').to_ascii_lowercase();
+    if let Some(stripped) = path.strip_suffix(".git") {
+        path = stripped.to_string();
+    }
+    path == format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        repo.to_ascii_lowercase()
+    )
+}
+
 /// Three-state classification of the repo's working state. Untrack is only
 /// safe in `Clean` — `git rm --cached` during a merge or rebase would corrupt
 /// the in-flight operation's metadata.
@@ -429,6 +508,106 @@ mod tests {
         );
 
         assert_eq!(git_candidates("linux"), &["git"]);
+    }
+
+    // ── F-000045: remote_matches_github ─────────────────────────────────────
+
+    #[test]
+    fn test_remote_matches_github_https_and_ssh_forms() {
+        for url in [
+            "https://github.com/owner/repo.git",
+            "https://github.com/owner/repo",
+            "https://github.com/owner/repo/",
+            "git@github.com:owner/repo.git",
+            "git@github.com:owner/repo",
+            "ssh://git@github.com/owner/repo.git",
+            "ssh://git@github.com/owner/repo",
+            // userinfo does not change what the URL points at
+            "https://user:tok3n@github.com/owner/repo.git",
+        ] {
+            assert!(remote_matches_github(url, "owner/repo"), "{url}");
+        }
+    }
+
+    #[test]
+    fn test_remote_matches_github_ignores_case_on_host_and_path() {
+        // T-000242 keeps working: the clone's folder case differs from the
+        // GitHub name on a case-sensitive filesystem.
+        assert!(remote_matches_github(
+            "git@github.com:Owner/Repo_With_Case.git",
+            "owner/repo_with_case"
+        ));
+        assert!(remote_matches_github(
+            "https://GITHUB.COM/owner/repo.git",
+            "Owner/Repo"
+        ));
+    }
+
+    #[test]
+    fn test_remote_matches_github_rejects_prefix_suffix_and_nested_paths() {
+        // The old scanner's substring match accepted all of these.
+        for url in [
+            "https://github.com/owner/repo-other.git",
+            "https://github.com/owner/repo.git.bak",
+            "https://github.com/other-owner/repo.git",
+            "https://github.com/x/owner/repo.git",
+            "https://github.com/owner/repo/extra.git",
+            "git@github.com:owner/repo-other.git",
+        ] {
+            assert!(!remote_matches_github(url, "owner/repo"), "{url}");
+        }
+    }
+
+    #[test]
+    fn test_remote_matches_github_rejects_foreign_hosts_and_noise() {
+        for url in [
+            "https://github.com.evil.example/owner/repo.git",
+            "https://gitlab.com/owner/repo.git",
+            "ssh://git@bitbucket.org/owner/repo.git",
+            "git@gitlab.com:owner/repo.git",
+            "/srv/git/owner/repo.git",
+            "https://github.com/owner",
+            "https://github.com",
+        ] {
+            assert!(!remote_matches_github(url, "owner/repo"), "{url}");
+        }
+        // A commented URL or prose is not a remote value.
+        assert!(!remote_matches_github(
+            "# clone from https://github.com/owner/repo.git",
+            "owner/repo"
+        ));
+        assert!(!remote_matches_github("", "owner/repo"));
+        // A github_name that is not a plain owner/repo never matches.
+        assert!(!remote_matches_github(
+            "https://github.com/owner/repo.git",
+            "https://github.com/owner/repo.git"
+        ));
+        assert!(!remote_matches_github(
+            "https://github.com/owner/repo.git",
+            "repo"
+        ));
+        assert!(!remote_matches_github(
+            "https://github.com/a/b/c.git",
+            "a/b"
+        ));
+        // A pushurl value of another repo is not what the fetch URL says.
+        assert!(!remote_matches_github(
+            "https://github.com/owner/elsewhere.git",
+            "owner/repo"
+        ));
+    }
+
+    #[test]
+    fn test_remote_matches_github_accepts_dotted_repo_names() {
+        // GitHub allows dots in repo names (but never a trailing `.git`).
+        assert!(remote_matches_github(
+            "https://github.com/owner/repo.js.git",
+            "owner/repo.js"
+        ));
+        assert!(remote_matches_github(
+            "https://github.com/owner/repo.js",
+            "owner/repo.js"
+        ));
     }
 
     /// Init a git repo in `dir` with a sensible identity so commits work

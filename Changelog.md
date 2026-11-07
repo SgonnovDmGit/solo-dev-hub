@@ -2,6 +2,11 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Changelog.ru.md](Changelog.ru.md).
 
+## [Unreleased]
+
+### Added
+- **A repo without a local folder can be cloned on demand (F-000045).** The repository screen's sync button offers to clone the repo into a user-picked folder (new Tauri command `clone_repo_to`), binds the folder to the repo and then runs the usual sync.
+
 ## [1.22.1] — 2026-11-08
 
 Contributor-mode dogfood patch: the owner's Participants tab sees a new join request without a repo switch, macOS gets its native traffic lights, and a Linux clone whose folder case differs from the GitHub name is found again.
