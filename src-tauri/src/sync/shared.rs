@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use crate::db::AppDb;
 use crate::git_ops::{
-    commit_paths, current_branch, is_git_repo, spawn_cmd, CommitOutcome, GitBinary,
+    commit_paths, commit_paths_index_only, current_branch, is_git_repo, list_markers_in_rev,
+    spawn_cmd, CommitOutcome, GitBinary,
 };
 use crate::git_sync::{self, BranchCommit, FfOutcome, FileChange, MergeOutcome, PushOutcome};
 use crate::merge_driver::register_merge_driver;
@@ -880,6 +881,21 @@ fn plumb_into_branch(
                 content: None,
             }),
         }
+    }
+    // T-000244: rule hand-back markers this branch still tracks leave it as
+    // deletions. The content exclusions above keep a marker out of every other
+    // plan; here the branch's own markers are enumerated directly, because a
+    // contributor's / pending helper's pathspec does not name `docs/sdh_skills/`
+    // at all. This is the narrow exception shared by every role, and it only
+    // ever deletes — a marker is never written into a branch by this pass.
+    for path in ls_tree(git, root, &refname, &[SKILLS_DIR.to_string()])?
+        .keys()
+        .filter(|p| is_excluded_file(p))
+    {
+        changes.push(FileChange {
+            rel_path: PathBuf::from(path),
+            content: None,
+        });
     }
     if changes.is_empty() {
         return Ok(BranchCommit::NothingToCommit);
@@ -2614,23 +2630,54 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     for b in &recipients {
         let is_current = cur.as_deref().is_some_and(|c| same_branch(c, b));
         if is_current {
-            if active.is_empty() {
+            // T-000244: markers this branch still tracks leave it as deletions
+            // — even with nothing else to commit and with `docs/sdh_skills/`
+            // gone from disk (the list is read from HEAD). The same sync
+            // subject and identity as every other commit of this pass, so the
+            // branch still reads as holding nothing but our own sync commits.
+            let markers = match list_markers_in_rev(git, &root, "HEAD") {
+                Ok(m) => m,
+                Err(e) => {
+                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                    pass.issue(issue);
+                    continue;
+                }
+            };
+            if active.is_empty() && markers.is_empty() {
                 continue;
             }
-            let mut paths: Vec<PathBuf> = active.iter().map(PathBuf::from).collect();
-            paths.extend(exclude_specs(&active).into_iter().map(PathBuf::from));
+            let paths: Vec<PathBuf> = active.iter().map(PathBuf::from).collect();
             let (subject, body) = commit_message(&login);
             let pre_head = git_sync::rev_parse(git, &root, "HEAD").ok().flatten();
-            match commit_paths(
-                git,
-                &root,
-                b,
-                &paths,
-                &subject,
-                Some(&body),
-                SDH_COMMIT_NAME,
-                SDH_COMMIT_EMAIL,
-            ) {
+            let outcome = if markers.is_empty() {
+                let mut pathspec: Vec<PathBuf> = paths.clone();
+                pathspec.extend(exclude_specs(&active).into_iter().map(PathBuf::from));
+                commit_paths(
+                    git,
+                    &root,
+                    b,
+                    &pathspec,
+                    &subject,
+                    Some(&body),
+                    SDH_COMMIT_NAME,
+                    SDH_COMMIT_EMAIL,
+                )
+            } else {
+                // Index-only: the commit is built from HEAD plus the allowed
+                // shared paths, minus every marker it holds. A live marker can
+                // therefore be deleted but never added or modified.
+                commit_paths_index_only(
+                    git,
+                    &root,
+                    b,
+                    &paths,
+                    &subject,
+                    Some(&body),
+                    SDH_COMMIT_NAME,
+                    SDH_COMMIT_EMAIL,
+                )
+            };
+            match outcome {
                 Ok(CommitOutcome::Committed { .. }) => {
                     pass.committed = true;
                     // Our own content: it needs no import (spec R11 step 3).
@@ -6332,5 +6379,345 @@ mod tests {
         assert!(!codes(&again).contains(&Code::ManagedFileFailed));
         let file = fs::read_to_string(fx.main_dir.join("docs/bug-reports.md")).unwrap();
         assert!(!file.contains("B-500002"));
+    }
+
+    // ----- T-000244: markers leave the shared branches as deletions only -----
+
+    /// A commit this app could have made itself: the sync subject, the
+    /// participant trailer and the SDH author, so a recipient branch still reads
+    /// as holding nothing but our own sync commits.
+    fn commit_as_sdh(dir: &Path, login: &str) {
+        g(dir, &["add", "-A", "."]);
+        g(
+            dir,
+            &[
+                "-c",
+                "user.name=Solo Dev Hub",
+                "-c",
+                "user.email=noreply@solodevhub.app",
+                "commit",
+                "-q",
+                "-m",
+                &format!(
+                    "chore(sdh-sync): sync shared files\n\nShared project files merged and synced by Solo Dev Hub.\n\nSDH-Participant: {}",
+                    login
+                ),
+            ],
+        );
+    }
+
+    /// The marker files a branch still tracks in the bare remote.
+    fn remote_markers(fx: &TwoInstalls, branch: &str) -> Vec<String> {
+        use std::process::Command;
+        let out = Command::new("git")
+            .args([
+                "ls-tree",
+                "-r",
+                "--name-only",
+                branch,
+                "--",
+                "docs/sdh_skills/",
+            ])
+            .current_dir(&fx.origin)
+            .output()
+            .unwrap()
+            .stdout;
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter(|l| l.ends_with(".approved") || l.ends_with(".conflict"))
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn main_delivers_a_marker_deletion_from_his_current_branch() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The owner's agent committed the marker together with the rule edit.
+        write(&fx.main_dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write(
+            &fx.main_dir,
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved in chat\n",
+        );
+        g(&fx.main_dir, &["add", "-A", "."]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "edit + marker"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        // The refresh sweep staged the deletion; nothing else is left to commit.
+        g(
+            &fx.main_dir,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "docs/sdh_skills/sdh-alpha.md.approved",
+            ],
+        );
+
+        let out = fx.sync_main();
+
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(
+            remote_markers(&fx, "dev").is_empty(),
+            "the deletion reached the bare remote"
+        );
+        assert_eq!(
+            fx.remote_file("dev", "docs/sdh_skills/sdh-alpha.md")
+                .as_deref(),
+            Some("ALPHA\n"),
+            "the rule copy still travels"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.main_dir.join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap(),
+            "approved in chat\n",
+            "the live marker is kept byte-for-byte"
+        );
+        // Nothing about the marker is left staged: the delivered deletion is
+        // not a permanent `git status` line, and the live file is now simply
+        // untracked.
+        let status = g(&fx.main_dir, &["status", "--porcelain"]);
+        assert!(
+            !status
+                .lines()
+                .any(|l| l.starts_with('D') && l.contains(".approved")),
+            "no staged marker deletion is left: {}",
+            status
+        );
+        assert!(
+            status.contains("?? docs/sdh_skills/sdh-alpha.md.approved"),
+            "{}",
+            status
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn main_never_adds_a_marker_not_even_a_modified_one() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write(
+            &fx.main_dir,
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved\n",
+        );
+        g(&fx.main_dir, &["add", "-A", "."]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "edit + marker"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        // A live marker of another rule, and the tracked one rewritten.
+        write(
+            &fx.main_dir,
+            "docs/sdh_skills/sdh-beta.md.approved",
+            "approved\n",
+        );
+        fs::write(
+            fx.main_dir.join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "MODIFIED\n",
+        )
+        .unwrap();
+
+        let out = fx.sync_main();
+
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(remote_markers(&fx, "dev").is_empty(), "nothing was added");
+        assert!(
+            fx.remote_file("dev", "docs/sdh_skills/sdh-alpha.md")
+                .is_some(),
+            "the copy itself still travels"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.main_dir.join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap(),
+            "MODIFIED\n",
+            "the local marker keeps its new text"
+        );
+        assert!(fx
+            .main_dir
+            .join("docs/sdh_skills/sdh-beta.md.approved")
+            .exists());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn main_plumbs_a_marker_deletion_into_a_participants_branch() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The helper's branch carries a marker committed by a sync-shaped
+        // commit; the helper's own sync swept it out of its index.
+        write(&fx.helper_dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write(
+            &fx.helper_dir,
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved\n",
+        );
+        commit_as_sdh(&fx.helper_dir, "helper");
+        g(&fx.helper_dir, &["push", "-q", "origin", "helper-dev"]);
+        g(
+            &fx.helper_dir,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "docs/sdh_skills/sdh-alpha.md.approved",
+            ],
+        );
+
+        let out = fx.sync_main();
+
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(
+            remote_markers(&fx, "helper-dev").is_empty(),
+            "the plumbed deletion reached the participant's branch"
+        );
+        assert!(
+            fx.remote_file("helper-dev", "docs/sdh_skills/sdh-alpha.md")
+                .is_some(),
+            "the rule copy is not deleted with it"
+        );
+        assert_eq!(
+            fx.remote_file("dev", "docs/sdh_skills/sdh-alpha.md"),
+            None,
+            "the owner never publishes a rule copy he does not have"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn contributor_delivers_a_marker_deletion_without_any_shared_content() {
+        let fx = two_installs();
+        fx.make_participant();
+        // A contributor's checkout has no shared content at all: only the
+        // deletion can travel, and it must — a branch may not keep a marker.
+        write(
+            &fx.helper_dir,
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved\n",
+        );
+        commit_as_sdh(&fx.helper_dir, "helper");
+        g(&fx.helper_dir, &["push", "-q", "origin", "helper-dev"]);
+        g(
+            &fx.helper_dir,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "docs/sdh_skills/sdh-alpha.md.approved",
+            ],
+        );
+
+        let out = fx.sync_helper();
+
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(remote_markers(&fx, "helper-dev").is_empty());
+        assert_eq!(
+            fx.remote_file("helper-dev", "docs/sdh_skills/sdh-alpha.md"),
+            None,
+            "a contributor still publishes no rule copies"
+        );
+        assert!(
+            fx.helper_dir
+                .join("docs/sdh_skills/sdh-alpha.md.approved")
+                .exists(),
+            "the local marker survives the delivery"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn pending_helper_plumbs_a_marker_deletion_out_of_mains_dev() {
+        let fx = two_installs();
+        fx.enable_main();
+        // The owner's agent committed a marker into dev before the helper joined.
+        write(&fx.main_dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write(
+            &fx.main_dir,
+            "docs/sdh_skills/sdh-alpha.md.conflict",
+            "# Hand-back not taken: conflict\n",
+        );
+        g(&fx.main_dir, &["add", "-A", "."]);
+        g(
+            &fx.main_dir,
+            &["commit", "-q", "-m", "reason file committed"],
+        );
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+
+        let out = fx.sync_helper();
+
+        // A pending helper always reports its pending status; that is the only
+        // issue of this pass.
+        assert_eq!(
+            codes(&out),
+            vec![Code::SharedPendingApproval],
+            "{:?}",
+            out.issues
+        );
+        assert!(
+            remote_markers(&fx, "dev").is_empty(),
+            "the pending helper's sync removed the marker from dev"
+        );
+        assert!(
+            fx.remote_file("dev", "docs/sdh_skills/sdh-alpha.md")
+                .is_some(),
+            "the copy stays"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_marker_deletion_keeps_the_sync_commit_shape_of_the_branch() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write(
+            &fx.main_dir,
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved\n",
+        );
+        g(&fx.main_dir, &["add", "-A", "."]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "edit + marker"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        g(
+            &fx.main_dir,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "docs/sdh_skills/sdh-alpha.md.approved",
+            ],
+        );
+        fx.sync_main();
+
+        // The deletion commit has the sync subject, the SDH author and the
+        // participant trailer, and touches shared paths only — so the guard
+        // that keeps a recipient branch pushable still accepts the branch.
+        let shown = g(
+            &fx.main_dir,
+            &["show", "-s", "--format=%an%n%ae%n%s", "HEAD"],
+        );
+        assert!(shown.contains("Solo Dev Hub"), "{}", shown);
+        assert!(
+            shown.contains("chore(sdh-sync): sync shared files"),
+            "{}",
+            shown
+        );
+        assert!(
+            g(&fx.main_dir, &["show", "-s", "--format=%b", "HEAD"])
+                .contains("SDH-Participant: Owner"),
+            "the participant trailer is in the body"
+        );
+        assert!(
+            g(
+                &fx.main_dir,
+                &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]
+            )
+            .lines()
+            .all(|f| f.starts_with("docs/sdh_skills/")),
+            "the commit touches shared paths only"
+        );
+        // And the next sync is a no-op that pushes nothing new.
+        let before = fx.remote_rev("dev").unwrap();
+        let again = fx.sync_main();
+        assert!(again.issues.is_empty(), "{:?}", again.issues);
+        assert_eq!(fx.remote_rev("dev").unwrap(), before);
     }
 }

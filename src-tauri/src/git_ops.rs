@@ -351,7 +351,10 @@ pub fn is_ignored_for_add(
     check_ignore(git, local_path, rel_path, no_index)
 }
 
-fn check_ignore(
+/// `check-ignore` for one path; `no_index` skips the index, so a tracked file
+/// is judged by its ignore rules alone. T-000244: the managed-block regression
+/// tests of `sync::gitignore` use it against the real bundled template.
+pub(crate) fn check_ignore(
     git: &GitBinary,
     local_path: &Path,
     rel_path: &Path,
@@ -400,6 +403,312 @@ pub fn list_gitignored_tracked(git: &GitBinary, local_path: &Path) -> Result<Vec
     }
 
     parse_null_terminated_paths(&out.stdout)
+}
+
+/// T-000244: pathspecs matching every rule hand-back marker under
+/// `docs/sdh_skills/` — `<name>.md.approved` (the agent's approval marker) and
+/// `<name>.md.conflict` (the app's reason file). `*` also covers the `.md`
+/// before the suffix. Local service files: they never belong in a commit.
+pub const MARKER_PATHSPECS: &[&str] = &["docs/sdh_skills/*.approved", "docs/sdh_skills/*.conflict"];
+
+/// Tracked files matching `pathspecs` (`git ls-files -z -- …`), read from the
+/// INDEX rather than from the work tree: a pass may have already deleted the
+/// worktree file while the index entry that keeps it in the branch is still
+/// there. NUL-separated output, paths passed through literally — no shell
+/// expansion ever sees them.
+pub fn list_tracked_files(
+    git: &GitBinary,
+    local_path: &Path,
+    pathspecs: &[&str],
+) -> Result<Vec<PathBuf>, String> {
+    if pathspecs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let out = spawn_cmd(&git.0)
+        .args(["ls-files", "-z", "--"])
+        .args(pathspecs)
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git ls-files failed to start: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    parse_null_terminated_paths(&out.stdout)
+}
+
+/// T-000244: does `rel_path` name a rule hand-back marker? Pathspec globbing is
+/// not used to decide this — a plain suffix check on a `docs/sdh_skills/` path.
+pub fn is_rule_marker(rel_path: &Path) -> bool {
+    rel_path.starts_with("docs/sdh_skills/")
+        && rel_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".approved") || n.ends_with(".conflict"))
+}
+
+/// The rule hand-back markers `rev` (e.g. `HEAD`) still carries in its tree
+/// (`git ls-tree -r --name-only`). A deletion this app has to deliver is read
+/// from the branch's history, never from the worktree or the current index:
+/// after a restart or a failed commit the marker is still there even though the
+/// folder on disk may be gone.
+pub fn list_markers_in_rev(
+    git: &GitBinary,
+    local_path: &Path,
+    rev: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let out = spawn_cmd(&git.0)
+        .args([
+            "ls-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            rev,
+            "--",
+            "docs/sdh_skills/",
+        ])
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git ls-tree failed to start: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-tree exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(parse_null_terminated_paths(&out.stdout)?
+        .into_iter()
+        .filter(|p| is_rule_marker(p))
+        .collect())
+}
+
+/// A throw-away index file, removed together with its lock on every exit path.
+struct TempIndex(PathBuf);
+
+impl Drop for TempIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        // `git read-tree` / `git add` may leave a stale lock behind if killed.
+        let mut lock = self.0.as_os_str().to_owned();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(PathBuf::from(lock));
+    }
+}
+
+static INDEX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Path of a throw-away index inside the repo's git dir. Resolved with
+/// `--git-path`, so a linked worktree gets its own private directory. The name
+/// lives in its own namespace (`git_sync`'s plumbing index is `sdh-index-*`), so
+/// the two can never borrow each other's file.
+fn temp_index_path(git: &GitBinary, local_path: &Path) -> Result<TempIndex, String> {
+    let name = format!(
+        "sdh-untrack-index-{}-{}",
+        std::process::id(),
+        INDEX_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let out = spawn_cmd(&git.0)
+        .args(["rev-parse", "--git-path", name.as_str()])
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git rev-parse failed to start: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-parse exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    Ok(TempIndex(if p.is_absolute() {
+        p
+    } else {
+        local_path.join(p)
+    }))
+}
+
+/// True while `GIT_INDEX_FILE` of `cmd` points at the throw-away `index`.
+fn with_temp_index(cmd: &mut Command, index: &TempIndex) {
+    cmd.env("GIT_INDEX_FILE", &index.0);
+}
+
+/// T-000244: commit the deletion of every rule hand-back marker git still
+/// tracks, plus the allowed ordinary changes of `content_paths`, on top of HEAD
+/// through a throw-away index.
+///
+/// `commit_paths` cannot carry a marker path: it runs `git add -A` and then a
+/// pathspec `git commit`, so a live worktree marker would be swept in, and the
+/// marker exclusion would also exclude the deletion. Here instead:
+///
+/// * the throw-away index starts as HEAD's tree (`read-tree HEAD`), takes the
+///   `git add -A -- content_paths` of those paths alone, and then loses every
+///   marker it holds (`update-index --force-remove`) — so a marker can be
+///   deleted but never added or modified, whatever `content_paths` names;
+/// * the commit is made from that index without a pathspec, so it is exactly
+///   the snapshot just built — never the caller's real index;
+/// * hooks and signing are NOT bypassed (no `--no-verify`, no
+///   `-c commit.gpgsign=false`); identity still goes through `-c`, which does
+///   not touch the repo config;
+/// * the real index is reconciled afterwards for the committed paths only
+///   (`git reset -q HEAD -- …`): without it a file this commit added would sit
+///   in `git status` as a staged deletion forever. Everyone else's staged and
+///   unstaged work is left exactly as it was;
+/// * no file is ever deleted from the worktree and nothing is force-added. A
+///   failed commit leaves the real index — including a staged marker deletion —
+///   untouched, so the next pass simply tries again.
+///
+/// Same branch guard as `commit_paths`: `WrongBranch` touches nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_paths_index_only(
+    git: &GitBinary,
+    local_path: &Path,
+    expected_branch: &str,
+    content_paths: &[PathBuf],
+    subject: &str,
+    body: Option<&str>,
+    author_name: &str,
+    author_email: &str,
+) -> Result<CommitOutcome, String> {
+    // Branch guard — identical to `commit_paths`, never checks anything out.
+    let current = current_branch(git, local_path)?;
+    if current.as_deref() != Some(expected_branch) {
+        return Ok(CommitOutcome::WrongBranch {
+            current,
+            expected: expected_branch.to_string(),
+        });
+    }
+    // An unborn branch has no tree to delete anything from.
+    if !rev_exists(git, local_path, "HEAD")? {
+        return Ok(CommitOutcome::NothingToCommit);
+    }
+    let index = temp_index_path(git, local_path)?;
+    // A stale file at this path (crashed run, recycled pid) must never act as a
+    // starting index or block the lock; start clean.
+    let _ = std::fs::remove_file(&index.0);
+    let run = |args: &[&str]| -> Result<std::process::Output, String> {
+        let mut cmd = spawn_cmd(&git.0);
+        with_temp_index(&mut cmd, &index);
+        cmd.args(args)
+            .current_dir(local_path)
+            .output()
+            .map_err(|e| format!("git {} failed to start: {}", args[0], e))
+    };
+    run(&["read-tree", "HEAD"])?;
+    if !content_paths.is_empty() {
+        let mut args: Vec<&str> = vec!["add", "-A", "--"];
+        args.extend(content_paths.iter().map(|p| p.to_str().unwrap_or("")));
+        let out = run(&args)?;
+        if !out.status.success() {
+            return Err(format!(
+                "git add exit {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    // Every marker the throw-away index holds goes, whether HEAD tracked it or
+    // `add -A` just staged it: the deletion is the only thing markers may do
+    // in a commit.
+    let markers = {
+        let mut ls: Vec<String> = vec!["ls-files".into(), "-z".into(), "--".into()];
+        ls.extend(MARKER_PATHSPECS.iter().map(|s| s.to_string()));
+        let args: Vec<&str> = ls.iter().map(|s| s.as_str()).collect();
+        let out = run(&args)?;
+        if !out.status.success() {
+            return Err(format!(
+                "git ls-files exit {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        parse_null_terminated_paths(&out.stdout)?
+    };
+    for marker in &markers {
+        let path = marker.to_string_lossy().into_owned();
+        let out = run(&["update-index", "--force-remove", "--", path.as_str()])?;
+        if !out.status.success() {
+            return Err(format!(
+                "git update-index exit {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    // What does this index change against HEAD? Nothing = nothing to commit.
+    let changed = {
+        let out = run(&["diff-index", "--cached", "--name-only", "-z", "HEAD"])?;
+        if !out.status.success() {
+            return Err(format!(
+                "git diff-index exit {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        parse_null_terminated_paths(&out.stdout)?
+    };
+    if changed.is_empty() {
+        return Ok(CommitOutcome::NothingToCommit);
+    }
+    let mut cmd = spawn_cmd(&git.0);
+    with_temp_index(&mut cmd, &index);
+    cmd.arg("-c")
+        .arg(format!("user.name={}", author_name))
+        .arg("-c")
+        .arg(format!("user.email={}", author_email))
+        .arg("commit")
+        .arg("-m")
+        .arg(subject);
+    if let Some(b) = body {
+        cmd.arg("-m").arg(b);
+    }
+    let out = cmd
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git commit failed to start: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("nothing to commit") || stderr.contains("no changes added") {
+            return Ok(CommitOutcome::NothingToCommit);
+        }
+        return Err(format!("git commit exit {}: {}", out.status, stderr));
+    }
+    // The real index was never the input; bring it up to the new HEAD for the
+    // committed paths alone, so no phantom staged deletion survives and no
+    // foreign staged change is dropped.
+    let mut reset: Vec<&str> = vec!["--", "HEAD"];
+    reset.extend(content_paths.iter().map(|p| p.to_str().unwrap_or("")));
+    reset.extend(markers.iter().map(|p| p.to_str().unwrap_or("")));
+    let out = spawn_cmd(&git.0)
+        .args(["reset", "-q"])
+        .args(&reset)
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git reset failed to start: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git reset exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(CommitOutcome::Committed {
+        files: changed.len(),
+    })
+}
+
+/// Does `rev` resolve? (`rev-parse --verify --quiet`, no error text parsing.)
+fn rev_exists(git: &GitBinary, local_path: &Path, rev: &str) -> Result<bool, String> {
+    let spec = format!("{}^{{commit}}", rev);
+    let out = spawn_cmd(&git.0)
+        .args(["rev-parse", "--verify", "--quiet", spec.as_str()])
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git rev-parse failed to start: {}", e))?;
+    Ok(out.status.success())
 }
 
 /// Untrack `files` in batches of 100 (`git rm --cached <a> <b> ...`).
@@ -1067,5 +1376,370 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome, CommitOutcome::NothingToCommit);
+    }
+
+    // ── T-000244: marker listing + the scoped index-only commit ──────────────
+
+    /// `<status> <path>` of everything staged against HEAD.
+    fn staged_status(dir: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["diff", "--cached", "--name-status", "-z"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let fields: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
+        fields
+            .chunks(2)
+            .map(|c| format!("{} {}", c[0], c[1]))
+            .collect()
+    }
+
+    /// Files of HEAD's tree.
+    fn head_tree(dir: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// A repo whose HEAD already tracks a rule copy, an approval marker and a
+    /// reason file under `docs/sdh_skills/`.
+    fn repo_with_tracked_marker(dir: &Path, marker_note: &str) {
+        init_test_repo(dir);
+        write_file(dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write_file(dir, "docs/sdh_skills/sdh-alpha.md.approved", marker_note);
+        write_file(dir, "docs/sdh_skills/sdh-alpha.md.conflict", "reason\n");
+        run_git(dir, &["add", "-A", "."]);
+        run_git(dir, &["commit", "-q", "-m", "marker committed by an agent"]);
+    }
+
+    fn write_file(dir: &Path, rel: &str, content: &str) {
+        let full = dir.join(rel);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, content).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_list_tracked_files_reads_the_index_not_the_disk() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        // The worktree marker is gone (a collection already took it up); the
+        // index entry — what keeps it in the branch — is still there.
+        fs::remove_file(tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap();
+
+        let git = check_git_available().expect("git available");
+        let listed = list_tracked_files(&git, tmp.path(), MARKER_PATHSPECS).unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                PathBuf::from("docs/sdh_skills/sdh-alpha.md.approved"),
+                PathBuf::from("docs/sdh_skills/sdh-alpha.md.conflict"),
+            ]
+        );
+        // The rule copy itself is not a marker.
+        assert!(!is_rule_marker(Path::new("docs/sdh_skills/sdh-alpha.md")));
+        assert!(is_rule_marker(Path::new("docs/sdh_skills/a.md.conflict")));
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_list_markers_in_rev_reads_the_history_not_the_worktree() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        // Folder gone from disk entirely — the deletion is still to be delivered.
+        fs::remove_dir_all(tmp.path().join("docs/sdh_skills")).unwrap();
+
+        let git = check_git_available().expect("git available");
+        assert_eq!(
+            list_markers_in_rev(&git, tmp.path(), "HEAD").unwrap(),
+            vec![
+                PathBuf::from("docs/sdh_skills/sdh-alpha.md.approved"),
+                PathBuf::from("docs/sdh_skills/sdh-alpha.md.conflict"),
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_deletes_the_marker_and_keeps_the_file() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved in chat\n");
+        let marker = tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved");
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+
+        // Both markers left the branch; the rule copy stayed; nothing on disk
+        // was deleted.
+        assert!(!head_tree(tmp.path())
+            .iter()
+            .any(|f| f.contains(".approved")));
+        assert!(!head_tree(tmp.path())
+            .iter()
+            .any(|f| f.contains(".conflict")));
+        assert!(head_tree(tmp.path()).contains(&"docs/sdh_skills/sdh-alpha.md".to_string()));
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "approved in chat\n",
+            "the live marker is byte-for-byte intact"
+        );
+        // And the delivery left nothing staged behind.
+        assert!(
+            staged_status(tmp.path()).is_empty(),
+            "{:?}",
+            staged_status(tmp.path())
+        );
+
+        // Second run: nothing left to deliver.
+        let again = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(again, CommitOutcome::NothingToCommit);
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_never_adds_a_live_or_modified_marker() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        // A live marker of another rule beside the copies, and the tracked one
+        // rewritten on disk: neither may reach the branch.
+        write_file(tmp.path(), "docs/sdh_skills/sdh-beta.md.approved", "NEW\n");
+        fs::write(
+            tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "MODIFIED\n",
+        )
+        .unwrap();
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[PathBuf::from("docs/sdh_skills")],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+
+        let tree = head_tree(tmp.path());
+        assert!(
+            !tree
+                .iter()
+                .any(|f| f.ends_with(".approved") || f.ends_with(".conflict")),
+            "no marker in the tree: {:?}",
+            tree
+        );
+        assert!(tree.contains(&"docs/sdh_skills/sdh-alpha.md".to_string()));
+        assert!(
+            !tree.contains(&"docs/sdh_skills/sdh-beta.md".to_string()),
+            "a live marker's copy was never a content path"
+        );
+        // The modified text stayed in the worktree, not in git.
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap(),
+            "MODIFIED\n"
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_preserves_foreign_staged_and_unstaged_work() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        // A tracked file the dev has since edited (unstaged), foreign staged
+        // work and a foreign untracked file.
+        write_file(tmp.path(), "README.md", "clean\n");
+        run_git(tmp.path(), &["add", "README.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "readme"]);
+        write_file(tmp.path(), "src/lib.rs", "fn main() {}\n");
+        run_git(tmp.path(), &["add", "src/lib.rs"]);
+        fs::write(tmp.path().join("README.md"), "dirty\n").unwrap();
+        write_file(tmp.path(), "scratch.txt", "mine\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+
+        // None of the foreign work is in the commit.
+        let tree = head_tree(tmp.path());
+        assert!(!tree.contains(&"src/lib.rs".to_string()), "{:?}", tree);
+        assert!(!tree.contains(&"scratch.txt".to_string()));
+        assert!(tree.contains(&"README.md".to_string()), "{:?}", tree);
+        // And all of it is still where it was.
+        assert!(staged_status(tmp.path()).contains(&"A src/lib.rs".to_string()));
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&status.stdout).to_string();
+        assert!(text.contains(" M README.md"), "{}", text);
+        assert!(text.contains("?? scratch.txt"), "{}", text);
+        // The markers the commit deleted are now plain untracked files.
+        assert!(
+            text.contains("?? docs/sdh_skills/sdh-alpha.md.approved"),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains("?? docs/sdh_skills/sdh-alpha.md.conflict"),
+            "{}",
+            text
+        );
+        assert!(
+            !text.lines().any(|l| l.ends_with("sdh-alpha.md")),
+            "the untouched rule copy shows no change: {}",
+            text
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_carries_the_ordinary_content_paths() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[PathBuf::from("docs/server-api")],
+            "chore(sdh-sync): sync cross-repo files",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 3 });
+
+        let tree = head_tree(tmp.path());
+        assert!(
+            tree.contains(&"docs/server-api/api.md".to_string()),
+            "{:?}",
+            tree
+        );
+        assert!(!tree.iter().any(|f| f.ends_with(".approved")));
+        // The committed file left no phantom staged deletion behind.
+        assert!(
+            staged_status(tmp.path()).is_empty(),
+            "{:?}",
+            staged_status(tmp.path())
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_wrong_branch_touches_nothing() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "dev",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            CommitOutcome::WrongBranch {
+                current: Some("master".to_string()),
+                expected: "dev".to_string(),
+            }
+        );
+        assert!(
+            head_tree(tmp.path())
+                .iter()
+                .any(|f| f.ends_with(".approved")),
+            "the marker is still tracked: the deletion waits for the allowed branch"
+        );
+        assert!(staged_status(tmp.path()).is_empty());
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_no_temp_index_left_behind() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        let git = check_git_available().expect("git available");
+        commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+        let out = Command::new("git")
+            .args(["rev-parse", "--git-dir"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let git_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let left: Vec<_> = fs::read_dir(if git_dir.is_absolute() {
+            git_dir
+        } else {
+            tmp.path().join(git_dir)
+        })
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("sdh-index-") || n.starts_with("sdh-untrack-index-"))
+        .collect();
+        assert!(
+            left.is_empty(),
+            "throw-away index files left behind: {:?}",
+            left
+        );
     }
 }

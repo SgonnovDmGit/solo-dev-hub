@@ -897,6 +897,119 @@ fn collect_approved_skill_edits(
     out.sorted()
 }
 
+/// T-000244: take every rule hand-back marker git still tracks out of the index
+/// of every local checkout — the sweep half of "markers are local service
+/// files".
+///
+/// Dogfooding showed the other half was missing: a contributor's agent
+/// committed the marker together with the rule edit, so the take-up succeeded
+/// while git kept tracking the marker. The app then deleted the worktree file
+/// and left a permanent uncommitted deletion, and a tracked copy coming back
+/// from the remote restored the marker — whose next collection then read as
+/// `lost`, since the copy already equalled the canon.
+///
+/// The sweep is idempotent and runs on every refresh and at startup (startup
+/// does not go through `refresh_rules_locked`): a marker can arrive later, so
+/// there is no "already done" flag and no migration. It takes the FULL list of
+/// repos with a local path, not `rules_repos`: a shared contributor's or
+/// pending helper's checkout renders no copies and collects no markers, but its
+/// branch may still track one. The collection and the render keep their filter.
+///
+/// What it does per checkout: read the markers the INDEX still lists
+/// (`git ls-files`, not the disk — the collection may already have deleted the
+/// worktree file while the index entry keeps the marker in the branch) and
+/// remove each with `git rm --cached`, no `-f`, nothing deleted or overwritten
+/// in the worktree. A checkout that is mid-merge, mid-rebase, unmerged or on a
+/// detached HEAD waits for a safer pass; the index is not touched. Non-git and
+/// missing checkouts, and a machine without git, are skipped silently; anything
+/// else is a `RuleFailed`, never fatal — the next pass tries again. Git runs
+/// through `cached_git` / `spawn_cmd` (no console window on Windows) and the
+/// state is read with `git_sync::repo_state` (`--git-path`), so a linked
+/// worktree is judged too, which `git_ops::detect_repo_state` cannot do.
+///
+/// The sweep only stages the deletion. Delivering it to the remote needs an
+/// allowed auto-commit (`sync::autocommit`, `sync::shared`) or the owner's own
+/// commit; until then the remote still carries the marker.
+pub(crate) fn untrack_rule_markers(db: &AppDb, report: &mut RulesRefresh) {
+    let Some(git) = crate::git_ops::cached_git() else {
+        return;
+    };
+    let repos = match db.list_repos_with_local_path(None) {
+        Ok(r) => r,
+        Err(e) => {
+            report.errors.push(
+                SyncIssue::new(SyncIssueCode::RuleFailed, "")
+                    .target("repositories")
+                    .detail(e),
+            );
+            return;
+        }
+    };
+    for repo in &repos {
+        let Some(base) = existing_checkout(repo) else {
+            continue;
+        };
+        if !crate::git_ops::is_git_repo(base) || !marker_sweep_safe(&git, base) {
+            continue;
+        }
+        let tracked = match crate::git_ops::list_tracked_files(
+            &git,
+            base,
+            crate::git_ops::MARKER_PATHSPECS,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                sweep_failed(report, repo, e);
+                continue;
+            }
+        };
+        if tracked.is_empty() {
+            continue;
+        }
+        match crate::git_ops::untrack_files(&git, base, &tracked) {
+            Ok(r) if r.errors.is_empty() => {}
+            // A chunk that git refused is reported inside a successful
+            // `UntrackReport`, not as an `Err` — both paths are a `RuleFailed`.
+            Ok(r) => sweep_failed(report, repo, r.errors.join("; ")),
+            Err(e) => sweep_failed(report, repo, e),
+        }
+    }
+}
+
+/// May this checkout's index be touched by the marker sweep? Mid-merge /
+/// mid-rebase (a linked worktree included, through `--git-path`), a detached
+/// HEAD and unmerged index entries all postpone it. A refusal here never turns
+/// into a forced removal or a re-add.
+fn marker_sweep_safe(git: &crate::git_ops::GitBinary, base: &Path) -> bool {
+    if !matches!(
+        crate::git_sync::repo_state(git, base),
+        Ok(crate::git_ops::RepoState::Clean)
+    ) {
+        return false;
+    }
+    if !matches!(crate::git_ops::current_branch(git, base), Ok(Some(_))) {
+        return false;
+    }
+    match crate::git_ops::spawn_cmd(&git.0)
+        .args(["ls-files", "-u", "-z"])
+        .current_dir(base)
+        .output()
+    {
+        Ok(o) => o.status.success() && o.stdout.iter().all(|&b| b == 0),
+        Err(_) => false,
+    }
+}
+
+/// One checkout's sweep step failed: reported, never fatal — the next refresh
+/// runs the sweep again.
+fn sweep_failed(report: &mut RulesRefresh, repo: &Repository, e: impl std::fmt::Display) {
+    report.errors.push(
+        SyncIssue::new(SyncIssueCode::RuleFailed, rule_copy_label(repo))
+            .target("docs/sdh_skills/")
+            .detail(e),
+    );
+}
+
 /// T-000206: the error of `resolve_conflict` when the rule has no open
 /// conflict (it was decided meanwhile). The frontend matches the string.
 pub const ERR_CONFLICT_GONE: &str = "rule_conflict_gone";
@@ -1094,6 +1207,10 @@ pub(crate) fn refresh_rules_locked(
 
     let collected = collect_approved_skill_edits(db, &repos, settings_edit);
     report.absorb(collected);
+    // T-000244: after the collection, before anything is rendered — the
+    // collection may have taken a marker's worktree file while git still tracks
+    // it, and the render must not be the pass that leaves that behind.
+    untrack_rule_markers(db, &mut report);
     let everywhere = !report.taken.is_empty();
     render_scope(db, claude_dir, scope, everywhere, &repos, &mut report);
     reconcile_fork_canon(db, &mut report);
@@ -1296,6 +1413,9 @@ pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option
     let mut report = RulesRefresh::default();
     let repos = portfolio_repos(db, &mut report);
     report.absorb(collect_approved_skill_edits(db, &repos, None));
+    // T-000244: after the collection and before the seed — startup does not go
+    // through `refresh_rules_locked`, so its own sweep lives here.
+    untrack_rule_markers(db, &mut report);
 
     let seeded = match crate::template_seeder::seed_bundled_templates(db) {
         Ok(n) => n,
@@ -2969,5 +3089,517 @@ mod tests {
             .path()
             .join("docs/sdh_skills/sdh-cross-repo-req-send.md")
             .exists());
+    }
+
+    // ── T-000244: markers must never stay git-tracked ────────────────────────
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git invocation failed");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `git` that is allowed to fail (a conflicted merge is the point here).
+    fn git_conflict(dir: &Path, args: &[&str]) {
+        let _ = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output();
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Paths the index still lists for one pathspec.
+    fn ls_files(dir: &Path, spec: &str) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args(["ls-files", "-z", "--", spec])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// `<status> <path>` of everything staged against HEAD.
+    fn staged_status(dir: &Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-status", "-z"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let fields: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
+        fields
+            .chunks(2)
+            .map(|c| format!("{} {}", c[0], c[1]))
+            .collect()
+    }
+
+    fn init_git(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "t@example.com"]);
+        git(dir, &["config", "user.name", "T"]);
+        git(dir, &["symbolic-ref", "HEAD", "refs/heads/master"]);
+    }
+
+    /// A git checkout of `dir` whose HEAD tracks the rendered rule copies and
+    /// `marker` beside them — what a contributor's agent leaves behind when it
+    /// commits the marker together with the rule edit. Returns the repo row.
+    fn git_repo_with_tracked_marker(
+        db: &AppDb,
+        dir: &Path,
+        name: &str,
+        marker: &str,
+        note: &str,
+    ) -> Repository {
+        init_git(dir);
+        render_skills_to_repo(db, dir).unwrap();
+        fs::write(dir.join("docs/sdh_skills").join(marker), note).unwrap();
+        git(dir, &["add", "-A", "."]);
+        git(dir, &["commit", "-q", "-m", "marker committed by an agent"]);
+        db.insert_local_repository(&dir.to_string_lossy(), name, None, None)
+            .unwrap()
+    }
+
+    fn marker_sweep(db: &AppDb) -> RulesRefresh {
+        let mut report = RulesRefresh::default();
+        untrack_rule_markers(db, &mut report);
+        report
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_untracks_a_tracked_marker_and_keeps_the_worktree_file() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved");
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/one",
+            "sdh-alpha.md.approved",
+            "approved in chat\n",
+        );
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.approved").is_empty(),
+            "no marker in the index any more"
+        );
+        assert!(ls_files(tmp.path(), "docs/sdh_skills/*.conflict").is_empty());
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "approved in chat\n",
+            "the live marker is byte-for-byte intact"
+        );
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.approved".to_string()],
+            "the deletion is staged, waiting for an allowed commit"
+        );
+        assert!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.md")
+                .contains(&"docs/sdh_skills/sdh-alpha.md".to_string()),
+            "the rule copy keeps its tracking"
+        );
+
+        // Idempotent: a second sweep changes nothing.
+        let again = marker_sweep(&db);
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.approved".to_string()]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_untracks_a_tracked_conflict_reason_file() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/two",
+            "sdh-alpha.md.conflict",
+            "# Hand-back not taken: conflict\n",
+        );
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(ls_files(tmp.path(), "docs/sdh_skills/*.conflict").is_empty());
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.conflict".to_string()]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_without_tracked_markers_is_a_noop() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        init_git(tmp.path());
+        render_skills_to_repo(&db, tmp.path()).unwrap();
+        // Untracked marker beside the copies: nothing to untrack.
+        fs::write(
+            tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "approved\n",
+        )
+        .unwrap();
+        git(tmp.path(), &["add", "docs/sdh_skills/sdh-alpha.md"]);
+        git(tmp.path(), &["commit", "-q", "-m", "copies"]);
+        fs::write(
+            tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "approved\n",
+        )
+        .unwrap();
+        db.insert_local_repository(&tmp.path().to_string_lossy(), "acme/three", None, None)
+            .unwrap();
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(staged_status(tmp.path()).is_empty(), "no change staged");
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_refresh_untracks_a_marker_whose_worktree_file_the_collection_deleted() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let skills = tmp.path().join("docs/sdh_skills");
+        // A marker beside an UNCHANGED copy: the collection reports it lost and
+        // deletes the worktree marker before the sweep runs. The index entry is
+        // what the sweep has to find.
+        git_repo_with_tracked_marker(&db, tmp.path(), "acme/four", "sdh-alpha.md.approved", "x\n");
+        let label = tmp.path().to_string_lossy().to_string();
+
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+
+        assert_eq!(report.lost, vec![format!("sdh-alpha ({})", label)]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            !skills.join("sdh-alpha.md.approved").exists(),
+            "the collection took the worktree marker"
+        );
+        assert!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.approved").is_empty(),
+            "the sweep still found the index entry"
+        );
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.approved".to_string()]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_startup_untracks_a_tracked_marker_without_a_new_seed() {
+        let tmp = TempDir::new().unwrap();
+        let db = AppDb::new(tmp.path().join("test.db")).unwrap();
+        db.upsert_template_file("_global", "skill.sdh-alpha.md.tmpl", "ALPHA BODY", false)
+            .unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        git_repo_with_tracked_marker(
+            &db,
+            repo_dir.path(),
+            "acme/five",
+            "sdh-debugging.md.approved",
+            "approved\n",
+        );
+
+        deliver_rules_at_startup(&db, None);
+
+        assert!(
+            ls_files(repo_dir.path(), "docs/sdh_skills/*.approved").is_empty(),
+            "startup swept the marker out of the index"
+        );
+        assert_eq!(
+            staged_status(repo_dir.path()),
+            vec!["D docs/sdh_skills/sdh-debugging.md.approved".to_string()]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_a_sweep_before_the_collection_leaves_a_pending_handback_alone() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let skills = tmp.path().join("docs/sdh_skills");
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/six",
+            "sdh-alpha.md.approved",
+            "approved\n",
+        );
+        // The agent edited its copy and re-dropped the marker: a pending
+        // hand-back whose marker git also tracks.
+        fs::write(skills.join("sdh-alpha.md"), "ALPHA REVISED\n").unwrap();
+        git(tmp.path(), &["add", "-A", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "edit + marker"]);
+
+        marker_sweep(&db);
+
+        assert_eq!(
+            fs::read_to_string(skills.join("sdh-alpha.md")).unwrap(),
+            "ALPHA REVISED\n",
+            "the sweep does not touch the text"
+        );
+        assert_eq!(
+            fs::read_to_string(skills.join("sdh-alpha.md.approved")).unwrap(),
+            "approved\n",
+            "nor the marker"
+        );
+        assert!(ls_files(tmp.path(), "docs/sdh_skills/*.approved").is_empty());
+
+        // And the full refresh still takes the edit, keeping the staged
+        // deletion of the marker alive through the take-up.
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+
+        assert_eq!(report.taken, vec!["sdh-alpha".to_string()]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!skills.join("sdh-alpha.md.approved").exists());
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.approved".to_string()]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_covers_a_shared_contributor_checkout_but_collects_nothing_there() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/seven",
+            "sdh-alpha.md.approved",
+            "approved\n",
+        );
+        // The agent edited the copy before handing back: were the collection to
+        // reach this checkout, the text would be taken up.
+        fs::write(
+            tmp.path().join("docs/sdh_skills/sdh-alpha.md"),
+            "ALPHA REVISED\n",
+        )
+        .unwrap();
+        git(tmp.path(), &["add", "-A", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "edit + marker"]);
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        assert!(
+            skips_rule_copies(&db, repo.id),
+            "the uptake filter is unchanged"
+        );
+
+        let report = marker_sweep(&db);
+        // The collection of a real refresh runs over `rules_repos`, which
+        // leaves a contributor's checkout out — its uptake filter is unchanged.
+        let repos: Vec<Repository> = db
+            .list_repos_with_local_path(None)
+            .unwrap()
+            .into_iter()
+            .filter(|r| !skips_rule_copies(&db, r.id))
+            .collect();
+        let collected = collect_approved_skill_edits(&db, &repos, None);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(ls_files(tmp.path(), "docs/sdh_skills/*.approved").is_empty());
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.approved".to_string()]
+        );
+        assert!(
+            collected.taken.is_empty(),
+            "a contributor hands nothing back"
+        );
+    }
+
+    #[test]
+    fn test_sweep_skips_non_git_and_missing_checkouts_without_an_error() {
+        let db = db_with_skill();
+        let plain = TempDir::new().unwrap();
+        render_skills_to_repo(&db, plain.path()).unwrap();
+        fs::write(
+            plain.path().join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "approved\n",
+        )
+        .unwrap();
+        db.insert_local_repository(&plain.path().to_string_lossy(), "acme/plain", None, None)
+            .unwrap();
+        insert_repo(&db, "acme/ghost", "F:/definitely/not/cloned/here");
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_leaves_a_mid_merge_checkout_alone() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/merge",
+            "sdh-alpha.md.approved",
+            "approved\n",
+        );
+        fs::write(tmp.path().join(".git/MERGE_HEAD"), "deadbeef\n").unwrap();
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.approved"),
+            vec!["docs/sdh_skills/sdh-alpha.md.approved".to_string()],
+            "the index is not touched mid-merge"
+        );
+        assert!(staged_status(tmp.path()).is_empty());
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_leaves_a_detached_head_checkout_alone() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/detached",
+            "sdh-alpha.md.approved",
+            "approved\n",
+        );
+        git(tmp.path(), &["checkout", "-q", "--detach"]);
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.approved").len(),
+            1,
+            "a detached HEAD is not the place to move the index"
+        );
+        assert!(staged_status(tmp.path()).is_empty());
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_leaves_an_unmerged_index_alone() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/unmerged",
+            "sdh-alpha.md.approved",
+            "approved\n",
+        );
+        // A merge that conflicts on an unrelated file leaves unmerged entries.
+        fs::write(tmp.path().join("README.md"), "base\n").unwrap();
+        git(tmp.path(), &["add", "README.md"]);
+        git(tmp.path(), &["commit", "-q", "-m", "base"]);
+        git(tmp.path(), &["checkout", "-q", "-b", "other"]);
+        fs::write(tmp.path().join("README.md"), "theirs\n").unwrap();
+        git(tmp.path(), &["commit", "-q", "-am", "theirs"]);
+        git(tmp.path(), &["checkout", "-q", "master"]);
+        fs::write(tmp.path().join("README.md"), "ours\n").unwrap();
+        git(tmp.path(), &["commit", "-q", "-am", "ours"]);
+        git_conflict(tmp.path(), &["merge", "other"]);
+        assert!(
+            !git_out(tmp.path(), &["ls-files", "-u"]).is_empty(),
+            "the merge really conflicted"
+        );
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(ls_files(tmp.path(), "docs/sdh_skills/*.approved").len(), 1);
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_reads_a_linked_worktree_state_through_git_path() {
+        let db = db_with_skill();
+        let main = TempDir::new().unwrap();
+        init_git(main.path());
+        fs::write(main.path().join("README.md"), "# r\n").unwrap();
+        git(main.path(), &["add", "."]);
+        git(main.path(), &["commit", "-q", "-m", "init"]);
+        let wt = main.path().join("wt");
+        git(
+            main.path(),
+            &["worktree", "add", "-q", "-b", "wt", wt.to_str().unwrap()],
+        );
+        render_skills_to_repo(&db, &wt).unwrap();
+        fs::write(
+            wt.join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "approved\n",
+        )
+        .unwrap();
+        git(&wt, &["add", "-A", "."]);
+        git(&wt, &["commit", "-q", "-m", "marker"]);
+        db.insert_local_repository(&wt.to_string_lossy(), "acme/wt", None, None)
+            .unwrap();
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            ls_files(&wt, "docs/sdh_skills/*.approved").is_empty(),
+            "a linked worktree is a normal checkout for the sweep"
+        );
+
+        // Mid-merge of THAT worktree is read through `--git-path`: the marker
+        // file of the main checkout would hide it from a `.git/` lookup.
+        let merge_head = git_out(&wt, &["rev-parse", "--git-path", "MERGE_HEAD"]);
+        fs::write(Path::new(&merge_head), "deadbeef\n").unwrap();
+        let other = TempDir::new().unwrap();
+        init_git(other.path());
+        render_skills_to_repo(&db, other.path()).unwrap();
+        fs::write(
+            other.path().join("docs/sdh_skills/sdh-beta.md.conflict"),
+            "reason\n",
+        )
+        .unwrap();
+        git(other.path(), &["add", "-A", "."]);
+        git(other.path(), &["commit", "-q", "-m", "reason file"]);
+        db.insert_local_repository(&other.path().to_string_lossy(), "acme/other", None, None)
+            .unwrap();
+
+        let second = marker_sweep(&db);
+
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(
+            ls_files(&wt, "docs/sdh_skills/*.md").len(),
+            2,
+            "the mid-merge worktree is left alone"
+        );
+        assert!(ls_files(other.path(), "docs/sdh_skills/*.conflict").is_empty());
     }
 }
