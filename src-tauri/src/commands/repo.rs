@@ -368,13 +368,19 @@ fn scan_dir(
     let git_config = dir.join(".git").join("config");
     if git_config.exists() {
         if let Ok(content) = std::fs::read_to_string(&git_config) {
+            // T-000242: GitHub owner/repo paths are case-insensitive, but the
+            // remote URL keeps the case the clone used — on a case-sensitive
+            // filesystem `Server_Airouter` and `server_airouter` are different
+            // folders, so match without regard to case.
+            let content = content.to_lowercase();
             for name in github_names {
                 // Match against common remote URL patterns
+                let lowered = name.to_lowercase();
                 let patterns = [
-                    format!("github.com/{}.git", name),
-                    format!("github.com/{}", name),
-                    format!("github.com:{}.git", name),
-                    format!("github.com:{}", name),
+                    format!("github.com/{}.git", lowered),
+                    format!("github.com/{}", lowered),
+                    format!("github.com:{}.git", lowered),
+                    format!("github.com:{}", lowered),
                 ];
                 for pat in &patterns {
                     if content.contains(pat) {
@@ -397,5 +403,67 @@ fn scan_dir(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn repo_dir(root: &Path, folder: &str, remote: &str) -> PathBuf {
+        let dir = root.join(folder);
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(
+            dir.join(".git").join("config"),
+            format!("[remote \"origin\"]\n\turl = {}\n", remote),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_scan_matches_remote_url_regardless_of_case() {
+        // T-000242: on Linux `Server_Airouter` and `server_airouter` are
+        // different folders; the remote URL keeps the clone's case while
+        // github_name keeps GitHub's — the match must not care.
+        let tmp = tempfile::TempDir::new().unwrap();
+        repo_dir(
+            tmp.path(),
+            "server_airouter",
+            "git@github.com:owner/Server_Airouter.git",
+        );
+        repo_dir(
+            tmp.path(),
+            "other",
+            "https://github.com/Owner/Other_Repo",
+        );
+
+        let found = scan_workspace_for_repos(
+            tmp.path().to_string_lossy().to_string(),
+            vec![
+                "owner/server_airouter".to_string(),
+                "owner/other_repo".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(found.len(), 2, "{:?}", found);
+        assert!(found["owner/server_airouter"].ends_with("server_airouter"));
+        assert!(found["owner/other_repo"].ends_with("other"));
+    }
+
+    #[test]
+    fn test_scan_does_not_match_a_different_repo_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        repo_dir(tmp.path(), "airouter", "git@github.com:owner/server_airouter.git");
+
+        let found = scan_workspace_for_repos(
+            tmp.path().to_string_lossy().to_string(),
+            vec!["owner/airouter_extra".to_string()],
+        )
+        .unwrap();
+
+        assert!(found.is_empty(), "{:?}", found);
     }
 }
