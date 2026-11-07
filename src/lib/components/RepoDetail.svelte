@@ -83,10 +83,6 @@
   let approving = $state<string | null>(null);
   // Why switching shared mode on was refused (project / dev branch missing).
   let preflightErrors = $state<string[]>([]);
-  // A change of status / role reloads the structure and the requests.
-  const sharedSignature = $derived(
-    `${sharedState?.shared_role ?? ''}|${sharedState?.shared_status ?? ''}|${sharedState?.shared_mode ?? ''}`,
-  );
 
   const participantRows = $derived(
     buildParticipantRows(structure, isOwnerInstall ? joinRequests : [], $githubLogin, isOwnerInstall),
@@ -176,9 +172,13 @@
     preflightErrors = [];
   });
 
+  // T-000239: re-read the structure and the join requests on every shared-state
+  // refresh — after each sync the store holds new objects, and a request or a
+  // structure update arrives without touching this repo's own role/status/mode
+  // (the old signature string missed exactly that case).
   $effect(() => {
     void $selectedRepoId;
-    void sharedSignature;
+    void sharedState;
     void loadSharedDetails();
   });
 
