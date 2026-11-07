@@ -2,14 +2,20 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Changelog.ru.md](Changelog.ru.md).
 
-## [Unreleased]
+## [1.22.1] — 2026-11-08
+
+Contributor-mode dogfood patch: the owner's Participants tab sees a new join request without a repo switch, macOS gets its native traffic lights, and a Linux clone whose folder case differs from the GitHub name is found again.
+
+### Changed
+- **`sdh-phase-workflow`: a conditionally visible element is counted on live data.** A UI element shown by role, permission or state gets a Verification item saying how many items on the owner's data show it and how many hide it. Retro of v1.22.0: the shared-mode switch showed on every foreign repository, and nobody counted before the owner looked.
 
 ### Fixed
 - **The Participants tab stayed stale until a repository switch (T-000239).** A join request or a structure update arriving on sync did not reach the screen, because the details loader keyed on a role/status/mode signature that such updates never touch. It now follows every shared-state refresh.
 - **macOS window chrome (T-000240).** On macOS the window uses the native overlay title bar — traffic-light buttons on the left, our own min/max/close buttons hidden, content shifted clear of the buttons. Windows and Linux are unchanged.
+- **A Linux clone is found when its folder case differs from the GitHub name (T-000242).** The workspace scan matched the remote URL in `.git/config` case-sensitively, so `server_airouter` never matched `Server_Airouter` and the repo stayed without a local path. GitHub owner/repo paths are case-insensitive; the match now ignores case.
 
-### Changed
-- **`sdh-phase-workflow`: a conditionally visible element is counted on live data.** A UI element shown by role, permission or state gets a Verification item saying how many items on the owner's data show it and how many hide it. Retro of v1.22.0: the shared-mode switch showed on every foreign repository, and nobody counted before the owner looked.
+### Tests
+- 956 Rust (+4 over v1.22.0's 952: case-insensitive remote-URL scan ×2, contributor approves own-but-not-followed rules; 127 spawn `git` and run in CI only). 206 vitest (+1 in 21 files: shared-state refresh identity), svelte-check clean. Numbers from `067c5c7`.
 
 ## [1.22.0] — 2026-10-25
 
