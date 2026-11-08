@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_shared_render_keeps_the_marker_globs_and_drops_the_folder() {
-        let shared = gitignore_template_for(&bundled_gitignore(), true);
+        let shared = gitignore_template_for(&bundled_gitignore(), true, true);
         assert!(
             !shared.lines().any(|l| l.trim() == "docs/sdh_skills/"),
             "shared render stops ignoring the owner's rule copies:\n{}",
@@ -264,7 +264,7 @@ mod tests {
     fn test_shared_render_leaves_the_rule_copy_visible_but_ignores_the_markers() {
         let tmp = TempDir::new().unwrap();
         init_git(tmp.path());
-        let shared = gitignore_template_for(&bundled_gitignore(), true);
+        let shared = gitignore_template_for(&bundled_gitignore(), true, true);
         sync_gitignore_section(&shared, tmp.path()).unwrap();
         let git = GitBinary(PathBuf::from("git"));
 
@@ -288,6 +288,42 @@ mod tests {
                 marker
             );
         }
+    }
+
+    /// T-000243: judged by `git check-ignore`, not by the text alone — with the
+    /// flag off even an EMPTY custom template must leave the specs folder
+    /// ignored (the ensured managed rule answers), and turning the flag back on
+    /// with the same empty template removes the stale rule again.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_off_render_keeps_the_specs_ignored_with_an_empty_template() {
+        let tmp = TempDir::new().unwrap();
+        init_git(tmp.path());
+        let git = GitBinary(PathBuf::from("git"));
+
+        sync_gitignore_section(&gitignore_template_for("", true, false), tmp.path()).unwrap();
+        assert!(
+            check_ignore(
+                &git,
+                tmp.path(),
+                Path::new("docs/superpowers/specs/x.md"),
+                true
+            )
+            .unwrap(),
+            "off keeps the specs ignored even with an empty custom template"
+        );
+
+        sync_gitignore_section(&gitignore_template_for("", true, true), tmp.path()).unwrap();
+        assert!(
+            !check_ignore(
+                &git,
+                tmp.path(),
+                Path::new("docs/superpowers/specs/x.md"),
+                true
+            )
+            .unwrap(),
+            "on with the same empty template drops the stale managed rule"
+        );
     }
 
     #[test]

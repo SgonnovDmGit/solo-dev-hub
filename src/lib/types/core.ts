@@ -43,6 +43,12 @@ export interface RepoSharedState {
    * `{"branch":"dev","message":"..."}`; the others: a plain reason text.
    */
   shared_status_detail: string | null;
+  /**
+   * T-000243: whether `docs/superpowers/` (specs, plans, mockups) travels in
+   * shared mode. Default true; settable before shared mode is enabled, so it
+   * is independent of `shared_mode`.
+   */
+  share_specs: boolean;
 }
 
 export interface RenderedFile {

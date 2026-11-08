@@ -248,7 +248,8 @@ export interface ProjectStructure {
   format: number;
   project: { name: string; type: string };
   main: { login: string; dev_branch: string };
-  repos: { github: string; role: string }[];
+  /** T-000243: absent `share_specs` (legacy structure) means the default on. */
+  repos: { github: string; role: string; share_specs?: boolean }[];
   microservices: string[];
   participants: StructureParticipant[];
 }

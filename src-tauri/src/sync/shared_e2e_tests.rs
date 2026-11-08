@@ -1613,3 +1613,177 @@ fn bug3_the_contributor_drops_a_stale_structure_the_owner_could_not_remove() {
     assert_eq!(shared_role(&w.fx.helper_db, w.fx.helper_repo), None);
     w.check_origin();
 }
+
+// ---------------------------------------------------------------------------
+// T-000243: docs/superpowers/ in the shared set
+// ---------------------------------------------------------------------------
+
+/// `git check-ignore -v` of one path: `None` when nothing ignores it. Judges
+/// the rules only (`--no-index`), like the product's own probe.
+fn ignored(dir: &Path, path: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["check-ignore", "-v", "--no-index", "--", path])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// T-000243 Part 1, through the real sync (skeleton render included): while the
+/// policy shares specs, the managed `.gitignore` of BOTH installs stops
+/// ignoring the folder (the local-only docs stay ignored), the owner's specs,
+/// plans and HTML mockups reach the contributor, and the contributor's own
+/// plan travels back.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn t000243_specs_are_shared_end_to_end_while_the_flag_is_on() {
+    let w = World::new();
+    let fx = &w.fx;
+    // The owner's specs exist before sharing is switched on (the dogfood case).
+    write(
+        &fx.main_dir,
+        "docs/superpowers/specs/t-000243.md",
+        "# the spec\n",
+    );
+    write(
+        &fx.main_dir,
+        "docs/superpowers/mockups/ui.html",
+        "<html><body>mock</body></html>\n",
+    );
+    w.owner_shares();
+    w.join();
+    w.settle();
+
+    // The managed .gitignore of both installs stopped ignoring the folder,
+    // while the local-only docs stay ignored.
+    for text in [w.owner_file(".gitignore"), w.helper_file(".gitignore")] {
+        assert!(
+            !text.lines().any(|l| l.trim() == "docs/superpowers/"),
+            "the shared render must drop the specs ignore:\n{}",
+            text
+        );
+        assert!(
+            text.lines().any(|l| l.trim() == "docs/codex/"),
+            "the local-only docs stay ignored:\n{}",
+            text
+        );
+    }
+    // The folder really is visible to git, and the files arrived.
+    for dir in [&fx.main_dir, &fx.helper_dir] {
+        assert_eq!(
+            ignored(dir, "docs/superpowers/specs/t-000243.md"),
+            None,
+            "nothing may ignore the specs anymore"
+        );
+    }
+    assert!(fx
+        .helper_dir
+        .join("docs/superpowers/specs/t-000243.md")
+        .is_file());
+    assert!(fx
+        .helper_dir
+        .join("docs/superpowers/mockups/ui.html")
+        .is_file());
+    for rev in ["dev", "helper-dev"] {
+        assert!(
+            fx.remote_file(rev, "docs/superpowers/specs/t-000243.md")
+                .is_some(),
+            "{} lacks the spec",
+            rev
+        );
+    }
+
+    // The helper's own spec (a plan) travels back to the owner.
+    write(
+        &fx.helper_dir,
+        "docs/superpowers/plans/impl.md",
+        "# the plan\n",
+    );
+    w.settle();
+    assert!(fx.main_dir.join("docs/superpowers/plans/impl.md").is_file());
+    assert!(fx
+        .remote_file("dev", "docs/superpowers/plans/impl.md")
+        .is_some());
+}
+
+/// T-000243 Part 2, the owner's case, through the real sync: opting out BEFORE
+/// the first specs commit keeps the folder ignored (`git check-ignore` answers
+/// with the managed rule) and local on BOTH installs — nothing under
+/// `docs/superpowers/` reaches origin/dev or the participant branch, no file is
+/// ever tracked — while todo/done/bug-reports keep travelling. The helper's own
+/// default-on database is overridden by the accepted structure before its
+/// first render and commit.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn t000243_off_before_the_first_commit_keeps_specs_local_on_both_installs() {
+    let w = World::new();
+    let fx = &w.fx;
+    // The owner's choice is stored before sharing is enabled.
+    fx.main_db
+        .set_repo_share_specs(fx.main_repo, false)
+        .unwrap();
+    w.owner_shares();
+    w.join();
+
+    // Both installs write a spec of their own; both folders stay ignored —
+    // the managed render answers for the rule on both sides.
+    write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+    write(&fx.helper_dir, "docs/superpowers/plans/y.md", "# y\n");
+    for (dir, path) in [
+        (&fx.main_dir, "docs/superpowers/specs/x.md"),
+        (&fx.helper_dir, "docs/superpowers/plans/y.md"),
+    ] {
+        let v = ignored(dir, path).expect("the specs folder must stay ignored");
+        assert!(v.contains("docs/superpowers/"), "{}", v);
+    }
+    // The helper's database still says the default on — the structure won.
+    assert!(
+        fx.helper_db
+            .get_shared_state(fx.helper_repo)
+            .unwrap()
+            .share_specs
+    );
+
+    w.sync_owner();
+    w.sync_helper();
+    w.sync_owner();
+
+    // Nothing under the folder in origin/dev or the participant branch.
+    for rev in ["dev", "helper-dev"] {
+        let files = tracked(&fx.origin, rev);
+        assert!(
+            files.iter().all(|f| !f.starts_with("docs/superpowers/")),
+            "{} carries specs: {:?}",
+            rev,
+            files
+        );
+    }
+    // Never tracked on either clone.
+    for dir in [&fx.main_dir, &fx.helper_dir] {
+        assert!(g(dir, &["ls-files", "--", "docs/superpowers/"])
+            .trim()
+            .is_empty());
+    }
+    // The contributor-mode backbone is untouched by the flag.
+    assert!(fx
+        .remote_file("dev", "docs/done.md")
+        .unwrap()
+        .contains("T-000900"));
+    assert!(w.helper_file("docs/done.md").contains("T-000900"));
+    // The whole status may be dirty from .gitignore/.sdh/other documents, but
+    // the specs themselves must not show up as pending content.
+    assert!(g(
+        &fx.main_dir,
+        &["status", "--porcelain", "--", "docs/superpowers/"]
+    )
+    .trim()
+    .is_empty());
+    assert!(g(
+        &fx.helper_dir,
+        &["status", "--porcelain", "--", "docs/superpowers/"]
+    )
+    .trim()
+    .is_empty());
+}

@@ -31,6 +31,7 @@ function state(over: Partial<RepoSharedState> = {}): RepoSharedState {
     shared_role: null,
     shared_status: null,
     shared_status_detail: null,
+    share_specs: true,
     ...over,
   };
 }

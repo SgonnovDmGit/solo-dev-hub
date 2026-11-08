@@ -172,8 +172,70 @@ pub fn is_shared_repo(db: &AppDb, repo_id: i64) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// T-000243: the per-repo `docs/superpowers/` policy
+// ---------------------------------------------------------------------------
+
+/// This install's own stored `share_specs` policy for `repo_id` (the owner's
+/// checkbox; the default is share). What `build_structure` publishes and what
+/// the pre-enable checks read — before a role exists, the owner's own stored
+/// choice is the only policy there is.
+fn own_share_specs(db: &AppDb, repo_id: i64) -> bool {
+    db.get_shared_state(repo_id)
+        .map(|s| s.share_specs)
+        .unwrap_or(true)
+}
+
+/// The validated structure of the repo's work tree, if any: the same trusted
+/// read (`read_structure_file`) that settles a helper's role. A file that is
+/// absent, unparsable or untrusted yields `None` — an untrusted structure
+/// never supplies the policy.
+fn validated_structure_of(db: &AppDb, repo: &Repository) -> Option<ProjectStructure> {
+    let (Some(path), Some(gh)) = (repo.local_path.as_deref(), repo.github_name.as_deref()) else {
+        return None;
+    };
+    let admins = ss::AdminVerified::load(db);
+    ss::read_structure_file(Path::new(path), gh, &admins)
+        .ok()
+        .flatten()
+}
+
+/// The effective `docs/superpowers/` policy of one repo of this install,
+/// resolved the way the spec fixes it: this install being the repo's owner
+/// ("main") publishes its own stored setting; a contributor / pending helper
+/// accepts the owner's flag for THIS repo from the same validated structure
+/// that supplied its role — never from folder existence, `.gitignore`, or a
+/// sibling repo of the project. A helper without (or with an untrusted)
+/// structure keeps the default on. `structure` is a validated structure the
+/// caller already holds (the sync pass); `None` reads the work-tree file the
+/// same validated way. Meaningful only while the repo is shared.
+pub fn effective_share_specs(
+    db: &AppDb,
+    repo: &Repository,
+    structure: Option<&ProjectStructure>,
+) -> bool {
+    let state = db.get_shared_state(repo.id).ok();
+    if state
+        .as_ref()
+        .is_some_and(|s| s.shared_mode || s.shared_role.as_deref() == Some("main"))
+    {
+        // This install is the repo's owner: its own setting is the policy.
+        return state.is_some_and(|s| s.share_specs);
+    }
+    let structure = structure
+        .map(|s| s.to_owned())
+        .or_else(|| validated_structure_of(db, repo));
+    match (structure, repo.github_name.as_deref()) {
+        (Some(s), Some(gh)) => ss::share_specs_for(&s, gh),
+        _ => true,
+    }
+}
+
 /// `.gitignore` template lines dropped for a shared repo: the files that travel
-/// through git (spec R10), plus `docs/sdh_skills/` (the owner commits them).
+/// through git (spec R10), plus `docs/sdh_skills/` (the owner commits them) and
+/// `docs/superpowers/` (T-000243 — but ONLY while the per-repo `share_specs`
+/// policy shares it; every consumer of this list applies that flag to the
+/// superpowers line, see `gitignore_template_for` / `probe_paths`).
 pub const SHARED_UNIGNORED_LINES: &[&str] = &[
     "docs/todo.md",
     "docs/done.md",
@@ -186,7 +248,12 @@ pub const SHARED_UNIGNORED_LINES: &[&str] = &[
     "docs/microservice-announcements/",
     "docs/InOutBox/",
     "docs/sdh_skills/",
+    "docs/superpowers/",
 ];
+
+/// T-000243: the specs folder of the shared set, as the `.gitignore` line
+/// spells it.
+const SPECS_IGNORE_LINE: &str = "docs/superpowers/";
 
 /// `.gitattributes` lines added for a shared repo.
 pub const SHARED_ATTRIBUTE_LINES: &[&str] = &[
@@ -197,7 +264,11 @@ pub const SHARED_ATTRIBUTE_LINES: &[&str] = &[
 
 /// The `.gitignore` template to render for a repo: unchanged when it is not
 /// shared, minus the shared paths when it is. Identical for every role.
-pub fn gitignore_template_for(template: &str, shared: bool) -> String {
+/// T-000243: `docs/superpowers/` leaves the render only while the effective
+/// `share_specs` policy shares it; opted out, the managed render MUST keep the
+/// folder ignored even when the custom (or empty) template lacks the line —
+/// off is "never committed", whatever the template says.
+pub fn gitignore_template_for(template: &str, shared: bool, share_specs: bool) -> String {
     if !shared {
         return template.to_string();
     }
@@ -208,6 +279,9 @@ pub fn gitignore_template_for(template: &str, shared: bool) -> String {
     // A trailing newline is not part of any managed rule; keep the text tidy.
     while out.last().is_some_and(|l| l.trim().is_empty()) {
         out.pop();
+    }
+    if !share_specs && !out.iter().any(|l| l.trim() == SPECS_IGNORE_LINE) {
+        out.push(SPECS_IGNORE_LINE);
     }
     out.join("\n")
 }
@@ -229,6 +303,8 @@ pub fn gitattributes_template_for(template: &str, shared: bool) -> String {
 // ---------------------------------------------------------------------------
 
 pub(super) const SKILLS_DIR: &str = "docs/sdh_skills";
+/// T-000243: the specs folder of the shared set, as a pathspec spells it.
+const SPECS_DIR: &str = "docs/superpowers";
 const SKILLS_EXCLUDES: [&str; 2] = [
     ":(exclude)docs/sdh_skills/*.approved",
     ":(exclude)docs/sdh_skills/*.conflict",
@@ -239,8 +315,11 @@ fn request_rel_path(login: &str) -> String {
 }
 
 /// Files and folders a role commits (positive pathspecs only; see
-/// `exclude_specs` for the exclusions).
-pub fn shared_pathspec(role: Role, login: &str) -> Vec<String> {
+/// `exclude_specs` for the exclusions). T-000243: `docs/superpowers/` travels
+/// for BOTH the owner and a contributor — but only while `share_specs` is on;
+/// a pending helper never sends specs, whatever the flag says. `docs/sdh_skills/`
+/// stays main-only.
+pub fn shared_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String> {
     if role == Role::Pending {
         return vec![request_rel_path(login)];
     }
@@ -262,6 +341,9 @@ pub fn shared_pathspec(role: Role, login: &str) -> Vec<String> {
         v.push(STRUCTURE_REL_PATH.to_string());
         v.push(REQUESTS_REL_DIR.to_string());
         v.push(SKILLS_DIR.to_string());
+    }
+    if share_specs {
+        v.push(SPECS_DIR.to_string());
     }
     v
 }
@@ -1307,6 +1389,10 @@ struct RepoPass {
     /// `None` when the repo is not processed (untrusted structure, no login).
     role: Option<Role>,
     structure: Option<ProjectStructure>,
+    /// T-000243: the effective `docs/superpowers/` policy this pass settled on
+    /// (phase A). Phase B resolves it again: a toggle between the phases must
+    /// not leave the old `on` in the deferred half of the pass.
+    share_specs: bool,
     own_branch: Option<String>,
     recipients: Vec<String>,
     notes: Vec<StatusNote>,
@@ -1585,7 +1671,11 @@ fn local_tip_if_ours(git: &GitBinary, root: &Path, branch: &str) -> Result<Optio
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let specs = shared_pathspec(Role::Main, "");
+    // T-000243: this is the HISTORICAL allow-list of SDH paths, not the set of
+    // files the current flag sends: a sync commit made while specs were shared
+    // is still ours after the owner opts out (off stops future commits only),
+    // so the specs path is always allowed here.
+    let specs = shared_pathspec(Role::Main, "", true);
     for commit in String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
@@ -1803,6 +1893,7 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         login: login.to_string(),
         role: None,
         structure: None,
+        share_specs: true,
         own_branch: None,
         recipients: Vec::new(),
         notes: Vec::new(),
@@ -1866,6 +1957,9 @@ fn phase_a_main(
             return pass;
         }
     }
+    // T-000243: the owner's own stored setting is the policy (its structure
+    // file may still hold the previous value until phase B rewrites it).
+    pass.share_specs = effective_share_specs(db, repo, pass.structure.as_ref());
     pass.own_branch = own_branch_of(db, repo.id);
     match &pass.own_branch {
         None => pass.note(SharedStatus::NoOwnBranch, ""),
@@ -1980,6 +2074,9 @@ fn phase_a_foreign(
             if role != Role::Main {
                 drop_untracked_rule_copies(git, root);
             }
+            // T-000243: the helper takes the specs policy from the very
+            // structure that gave it the role, before any path is computed.
+            pass.share_specs = effective_share_specs(db, repo, Some(&s));
             pass.structure = Some(s);
             after_fetch(db, git, &mut pass);
             Some(pass)
@@ -2363,7 +2460,7 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
         return;
     }
     let cur = current_branch(git, &pass.root).ok().flatten();
-    let pathspec = shared_pathspec(role, &pass.login);
+    let pathspec = shared_pathspec(role, &pass.login, pass.share_specs);
     let recipients = pass.recipients.clone();
     for b in &recipients {
         let remote = remote_ref(b);
@@ -2553,8 +2650,8 @@ fn settle_status(db: &AppDb, pass: &RepoPass, out: &mut SharedOutcome) {
 
 /// What a plumbed commit may touch: the role's shared files without the managed
 /// root files, which are committed on the current branch only.
-fn plumb_pathspec(role: Role, login: &str) -> Vec<String> {
-    shared_pathspec(role, login)
+fn plumb_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String> {
+    shared_pathspec(role, login, share_specs)
         .into_iter()
         .filter(|p| !MANAGED_ROOT_FILES.contains(&p.as_str()))
         .collect()
@@ -2606,8 +2703,12 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     if pass.recipients.is_empty() {
         return;
     }
-    let pathspec = shared_pathspec(role, &login);
-    let plumb_spec = plumb_pathspec(role, &login);
+    // T-000243: resolved HERE, not carried from phase A — a toggle between the
+    // phases must not leave the old `on` in this deferred half of the pass
+    // (the owner's setting is read fresh from the database).
+    let share_specs = effective_share_specs(db, &pass.repo, pass.structure.as_ref());
+    let pathspec = shared_pathspec(role, &login, share_specs);
+    let plumb_spec = plumb_pathspec(role, &login, share_specs);
     let approved: Vec<String> = match (role, &pass.structure) {
         (Role::Main, Some(s)) => s.participants.iter().map(|p| p.login.clone()).collect(),
         _ => Vec::new(),
@@ -2801,9 +2902,13 @@ fn push_recipients(git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
 /// Paths probed for a user-section `.gitignore` line that still ignores them.
 /// Folders are probed through a file inside, since a folder pattern
 /// (`dir/`) only matches something git knows to be a folder.
-fn probe_paths() -> Vec<String> {
+/// T-000243: with the specs policy off, `docs/superpowers/` is not a shared
+/// path — a user rule ignoring it is the user's own business and is neither
+/// probed nor offered for removal.
+fn probe_paths(share_specs: bool) -> Vec<String> {
     let mut v: Vec<String> = SHARED_UNIGNORED_LINES
         .iter()
+        .filter(|l| share_specs || **l != SPECS_IGNORE_LINE)
         .map(|l| {
             if l.ends_with('/') {
                 format!("{}sdh-probe.md", l)
@@ -2837,8 +2942,14 @@ fn managed_block_lines(text: &str) -> HashSet<u32> {
 
 /// User-section lines of the repo's own `.gitignore` that still ignore a shared
 /// path. Lines of the managed block are not reported (the sync rewrites it).
-pub fn blocking_ignore_lines(git: &GitBinary, root: &Path) -> Result<Vec<IgnoreLine>, String> {
-    let probes = probe_paths();
+/// T-000243: `share_specs` filters the specs folder out of the probe set when
+/// the policy is off (see `probe_paths`).
+pub fn blocking_ignore_lines(
+    git: &GitBinary,
+    root: &Path,
+    share_specs: bool,
+) -> Result<Vec<IgnoreLine>, String> {
+    let probes = probe_paths(share_specs);
     let mut input = Vec::new();
     for p in &probes {
         input.extend_from_slice(p.as_bytes());
@@ -2922,8 +3033,12 @@ pub fn shared_mode_preflight(
         .map_err(|e| e.to_string())?
         .map(|b| b.trim().to_string())
         .filter(|b| !b.is_empty());
+    // T-000243: the owner's own stored policy — preflight also runs before a
+    // role exists, and with specs opted out the folder is not a shared path,
+    // so a user rule ignoring it is not a blocker to offer for removal.
+    let share_specs = own_share_specs(db, repo_id);
     Ok(SharedPreflight {
-        blocking_lines: blocking_ignore_lines(git, &root)?,
+        blocking_lines: blocking_ignore_lines(git, &root, share_specs)?,
         missing_project: repo.project_id.is_none(),
         missing_dev_branch: branch.is_none(),
     })
@@ -2966,7 +3081,9 @@ pub fn enable_shared_mode(
     let existing = ss::read_structure_file(&root, &gh, &ss::AdminVerified::load(db))?;
     // Validates: owner or administrator, project, dev branch.
     let built = ss::build_structure(db, repo_id, &login, existing.as_ref())?;
-    let blocking = blocking_ignore_lines(git, &root)?;
+    // T-000243: the blocking check follows the policy being published — with
+    // specs opted out the folder stays ignored and its rules are no blocker.
+    let blocking = blocking_ignore_lines(git, &root, own_share_specs(db, repo_id))?;
     if !blocking.is_empty() {
         if !remove_lines {
             return Err(format!(
@@ -2989,6 +3106,29 @@ pub fn enable_shared_mode(
         ss::write_shared_import(db, repo_id, &imp)?;
     }
     Ok(())
+}
+
+/// T-000243: store the owner's `docs/superpowers/` choice for `repo_id`.
+/// Refused unless this install knows its GitHub login and may act as the
+/// repo's main — the owner, or an administrator verified by the frontend (the
+/// same trust rule as switching shared mode on) — so a contributor, a pending
+/// helper or an unknown login cannot flip the flag, not even through a direct
+/// IPC call. Settable before sharing is enabled; the structure publish, the
+/// `.gitignore` render and the pathspecs follow on the next sync.
+pub fn set_repo_share_specs(db: &AppDb, repo_id: i64, on: bool) -> Result<(), String> {
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let gh = repo
+        .github_name
+        .clone()
+        .ok_or_else(|| "the specs switch needs a repository linked to GitHub".to_string())?;
+    let login = db.github_login().ok_or_else(|| {
+        "the GitHub login of this install is unknown - save the token again".to_string()
+    })?;
+    if !ss::can_enable_shared(&gh, &login, &ss::AdminVerified::load(db)) {
+        return Err(ss::refusal_not_owner_or_admin(&login, &gh));
+    }
+    db.set_repo_share_specs(repo_id, on)
+        .map_err(|e| e.to_string())
 }
 
 /// Tracked files only (no untracked ones) under `paths`.
@@ -4031,11 +4171,16 @@ mod tests {
 
     #[test]
     fn gitignore_block_for_a_shared_repo_drops_exactly_the_shared_paths() {
+        // A non-shared repo keeps the template, whatever the policy would be.
         assert_eq!(
-            gitignore_template_for(GITIGNORE_TMPL, false),
+            gitignore_template_for(GITIGNORE_TMPL, false, true),
             GITIGNORE_TMPL
         );
-        let shared = gitignore_template_for(GITIGNORE_TMPL, true);
+        assert_eq!(
+            gitignore_template_for(GITIGNORE_TMPL, false, false),
+            GITIGNORE_TMPL
+        );
+        let shared = gitignore_template_for(GITIGNORE_TMPL, true, true);
         for line in SHARED_UNIGNORED_LINES {
             assert!(
                 GITIGNORE_TMPL.lines().any(|l| l.trim() == *line),
@@ -4054,7 +4199,6 @@ mod tests {
             ".claude/",
             "docs/project.md",
             "docs/codex/",
-            "docs/superpowers/",
         ] {
             assert!(
                 shared.lines().any(|l| l.trim() == kept),
@@ -4062,6 +4206,11 @@ mod tests {
                 kept
             );
         }
+        // T-000243: opted out of specs, the shared render keeps ignoring the
+        // folder (the template line survives the shared drop).
+        let off = gitignore_template_for(GITIGNORE_TMPL, true, false);
+        assert!(off.lines().any(|l| l.trim() == "docs/superpowers/"));
+        assert!(!off.lines().any(|l| l.trim() == "docs/sdh_skills/"));
     }
 
     #[test]
@@ -4080,7 +4229,7 @@ mod tests {
     #[test]
     fn rendered_gitignore_block_is_stable_on_rewrite() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tpl = gitignore_template_for(GITIGNORE_TMPL, true);
+        let tpl = gitignore_template_for(GITIGNORE_TMPL, true, true);
         assert!(crate::sync::sync_gitignore_section(&tpl, tmp.path()).unwrap());
         let first = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         assert!(!first.contains("docs/todo.md"));
@@ -4091,6 +4240,211 @@ mod tests {
             first,
             fs::read_to_string(tmp.path().join(".gitignore")).unwrap()
         );
+    }
+
+    // ----- T-000243: the specs policy in the managed render -------------------
+
+    /// Off must guarantee the ignore even when the custom (or empty) template
+    /// lacks the line; on with an empty template must not leave a stale managed
+    /// ignore rule behind. The user's own block is preserved throughout.
+    #[test]
+    fn off_render_ensures_the_specs_ignore_with_custom_and_empty_templates() {
+        // A custom template without the line: the off render carries it anyway.
+        let custom = gitignore_template_for("target\nnode_modules\n", true, false);
+        assert!(custom.lines().any(|l| l.trim() == "docs/superpowers/"));
+        // An empty template: the managed render is exactly the ensured rule.
+        assert_eq!(gitignore_template_for("", true, false), "docs/superpowers/");
+        // On with an empty template renders nothing at all.
+        assert_eq!(gitignore_template_for("", true, true), "");
+        // A non-shared repo is untouched, whatever the policy.
+        assert_eq!(gitignore_template_for("", false, false), "");
+
+        // The whole on/off/on cycle over a user .gitignore: the managed state
+        // follows the flag every time and the user's lines survive.
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), "# mine\n*.log\n").unwrap();
+        let on = gitignore_template_for(GITIGNORE_TMPL, true, true);
+        let off = gitignore_template_for(GITIGNORE_TMPL, true, false);
+        assert!(crate::sync::sync_gitignore_section(&on, tmp.path()).unwrap());
+        let text_on = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(!text_on.contains("docs/superpowers/"));
+        assert!(text_on.contains("# mine") && text_on.contains("*.log"));
+
+        assert!(crate::sync::sync_gitignore_section(&off, tmp.path()).unwrap());
+        let text_off = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(
+            text_off.matches("docs/superpowers/").count(),
+            1,
+            "off keeps exactly one ignore of the folder:\n{}",
+            text_off
+        );
+        assert!(text_off.contains("# mine") && text_off.contains("*.log"));
+        // Re-rendering the same policy is idempotent.
+        assert!(!crate::sync::sync_gitignore_section(&off, tmp.path()).unwrap());
+
+        assert!(crate::sync::sync_gitignore_section(&on, tmp.path()).unwrap());
+        let back_on = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(!back_on.contains("docs/superpowers/"));
+        assert!(back_on.contains("# mine") && back_on.contains("*.log"));
+    }
+
+    /// The empty-template corner of the same contract: a managed block written
+    /// by an off render is removed when the policy turns on and the custom
+    /// template renders nothing — off → on must not keep the stale rule.
+    #[test]
+    fn an_empty_template_does_not_keep_a_stale_managed_specs_rule() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // off: the ensured rule lands in the managed block
+        assert!(crate::sync::sync_gitignore_section(
+            &gitignore_template_for("", true, false),
+            tmp.path()
+        )
+        .unwrap());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
+            "# --- solo-dev-hub:begin ---\ndocs/superpowers/\n# --- solo-dev-hub:end ---\n"
+        );
+        // on with the same empty template: the block is gone, not kept
+        assert!(crate::sync::sync_gitignore_section(
+            &gitignore_template_for("", true, true),
+            tmp.path()
+        )
+        .unwrap());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
+            ""
+        );
+        // and an absent file stays absent
+        let fresh = tempfile::TempDir::new().unwrap();
+        assert!(!crate::sync::sync_gitignore_section(
+            &gitignore_template_for("", true, true),
+            fresh.path()
+        )
+        .unwrap());
+        assert!(!fresh.path().join(".gitignore").exists());
+    }
+
+    /// The setter's authority: the owner and a verified administrator may flip
+    /// the flag; a contributor, a pending helper and an unknown login are
+    /// refused — the same trust rule as enabling sharing.
+    #[test]
+    fn the_specs_switch_is_stored_for_the_owner_or_a_verified_admin_only() {
+        // The owner of the repo.
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "Owner").unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        set_repo_share_specs(&db, repo.id, false).unwrap();
+        assert!(!db.get_shared_state(repo.id).unwrap().share_specs);
+        set_repo_share_specs(&db, repo.id, true).unwrap();
+        assert!(db.get_shared_state(repo.id).unwrap().share_specs);
+
+        // A verified administrator of an organization's repo may too.
+        let (org_db, org_repo) = org_db("boss");
+        let err = set_repo_share_specs(&org_db, org_repo.id, false).unwrap_err();
+        assert!(err.contains("repo owner or an administrator"), "{}", err);
+        ss::record_admin_verification(&org_db, "Acme-Org/web", "boss", true).unwrap();
+        set_repo_share_specs(&org_db, org_repo.id, false).unwrap();
+        assert!(!org_db.get_shared_state(org_repo.id).unwrap().share_specs);
+
+        // A contributor (a helper on somebody else's repo) and a pending
+        // helper are refused; nothing is stored either way.
+        let helper = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        helper.set_setting("github_login", "helper").unwrap();
+        helper
+            .upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let hrepo = helper.get_repository_by_name("Owner/api").unwrap();
+        helper
+            .set_shared_role(hrepo.id, Some("contributor"))
+            .unwrap();
+        assert!(set_repo_share_specs(&helper, hrepo.id, false).is_err());
+        helper.set_shared_role(hrepo.id, Some("pending")).unwrap();
+        assert!(set_repo_share_specs(&helper, hrepo.id, true).is_err());
+        assert!(helper.get_shared_state(hrepo.id).unwrap().share_specs);
+
+        // An unknown login is refused before anything is checked.
+        let no_login = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        no_login
+            .upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let nrepo = no_login.get_repository_by_name("Owner/api").unwrap();
+        let err = set_repo_share_specs(&no_login, nrepo.id, false).unwrap_err();
+        assert!(err.contains("unknown"), "{}", err);
+        // A repo without a GitHub name has no specs policy at all.
+        no_login.set_setting("github_login", "Owner").unwrap();
+        no_login
+            .upsert_repository("local-only", None, None, None, None, None)
+            .unwrap();
+        let local = no_login.get_repository_by_name("local-only").unwrap();
+        assert!(set_repo_share_specs(&no_login, local.id, false).is_err());
+    }
+
+    /// `effective_share_specs`: the owner's own stored setting wins on the
+    /// owner's install; a helper's install takes the owner's published flag
+    /// for THIS repo from the validated structure, defaulting to on.
+    #[test]
+    fn effective_specs_follow_the_owner_db_on_main_and_the_structure_on_helpers() {
+        // Owner: its own DB row, even when the (stale) structure says else.
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "Owner").unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        db.set_shared_mode(repo.id, true).unwrap();
+        db.set_shared_role(repo.id, Some("main")).unwrap();
+        let mut st = sample_structure();
+        st.repos[0].share_specs = Some(true);
+        assert!(effective_share_specs(&db, &repo, Some(&st)));
+        db.set_repo_share_specs(repo.id, false).unwrap();
+        assert!(!effective_share_specs(&db, &repo, Some(&st)));
+
+        // Helper: the flag comes from the structure, per repo; a repo the
+        // structure does not list means the default on.
+        let helper = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        helper.set_setting("github_login", "helper").unwrap();
+        helper
+            .upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let hrepo = helper.get_repository_by_name("Owner/api").unwrap();
+        helper
+            .set_shared_role(hrepo.id, Some("contributor"))
+            .unwrap();
+        // The helper's own DB is irrelevant — even an explicit local off.
+        helper.set_repo_share_specs(hrepo.id, false).unwrap();
+        let mut on_struct = sample_structure();
+        on_struct.repos[0].share_specs = Some(true);
+        assert!(effective_share_specs(&helper, &hrepo, Some(&on_struct)));
+        let mut off_struct = sample_structure();
+        off_struct.repos[0].share_specs = Some(false);
+        assert!(!effective_share_specs(&helper, &hrepo, Some(&off_struct)));
+        let mut legacy = sample_structure();
+        legacy.repos[0].share_specs = None; // legacy structure: default on
+        assert!(effective_share_specs(&helper, &hrepo, Some(&legacy)));
+        // No structure at all: the default on.
+        assert!(effective_share_specs(&helper, &hrepo, None));
+    }
+
+    fn sample_structure() -> ProjectStructure {
+        ProjectStructure {
+            format: 1,
+            project: ss::StructProject {
+                name: "Acme".into(),
+                project_type: "standard".into(),
+            },
+            main: ss::StructMain {
+                login: "Owner".into(),
+                dev_branch: "dev".into(),
+            },
+            repos: vec![ss::StructRepo {
+                github: "Owner/api".into(),
+                role: "server".into(),
+                share_specs: None,
+            }],
+            microservices: vec![],
+            participants: vec![],
+        }
     }
 
     #[test]
@@ -4125,6 +4479,7 @@ mod tests {
             shared_role: role.map(String::from),
             shared_status: None,
             shared_status_detail: None,
+            share_specs: true,
         };
         assert!(!is_shared_state(&st(false, None)));
         assert!(is_shared_state(&st(true, None)));
@@ -4136,7 +4491,7 @@ mod tests {
 
     #[test]
     fn pathspec_per_role() {
-        let main = shared_pathspec(Role::Main, "Owner");
+        let main = shared_pathspec(Role::Main, "Owner", true);
         for p in [
             "docs/todo.md",
             "docs/done.md",
@@ -4149,21 +4504,36 @@ mod tests {
             ".sdh/project.json",
             ".sdh/requests",
             "docs/sdh_skills",
+            "docs/superpowers",
         ] {
             assert!(main.iter().any(|x| x == p), "main lacks {}", p);
         }
         assert_eq!(exclude_specs(&main).len(), 2);
 
-        let contributor = shared_pathspec(Role::Contributor, "helper");
+        // T-000243: the specs folder leaves the pathspec of BOTH roles when the
+        // policy is off; `docs/sdh_skills/` stays main-only either way.
+        let main_off = shared_pathspec(Role::Main, "Owner", false);
+        assert!(!main_off.iter().any(|x| x == "docs/superpowers"));
+        assert!(main_off.iter().any(|x| x == "docs/sdh_skills"));
+
+        let contributor = shared_pathspec(Role::Contributor, "helper", true);
         assert!(contributor.iter().any(|x| x == "docs/todo.md"));
+        assert!(contributor.iter().any(|x| x == "docs/superpowers"));
         assert!(!contributor.iter().any(|x| x.starts_with(".sdh")));
         assert!(!contributor.iter().any(|x| x == "docs/sdh_skills"));
         assert!(exclude_specs(&contributor).is_empty());
 
-        assert_eq!(
-            shared_pathspec(Role::Pending, "helper"),
-            vec![".sdh/requests/helper.json".to_string()]
-        );
+        let contributor_off = shared_pathspec(Role::Contributor, "helper", false);
+        assert!(!contributor_off.iter().any(|x| x == "docs/superpowers"));
+
+        // A pending helper sends only its request — specs never travel for it,
+        // whatever the flag says.
+        for flag in [true, false] {
+            assert_eq!(
+                shared_pathspec(Role::Pending, "helper", flag),
+                vec![".sdh/requests/helper.json".to_string()]
+            );
+        }
     }
 
     // ----- owner side ---------------------------------------------------------
@@ -4340,6 +4710,9 @@ mod tests {
         let head_before = g(&fx.helper_dir, &["rev-parse", "HEAD"]);
         write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
         write(&fx.helper_dir, "docs/server-api/api.md", "# API\n");
+        // T-000243: a spec file of a pending helper never travels either,
+        // whatever the specs flag says.
+        write(&fx.helper_dir, "docs/superpowers/specs/p.md", "# p\n");
         let out = fx.sync_helper();
 
         let changed = g(&fx.origin, &["diff", "--name-only", &before, "dev"]);
@@ -4818,6 +5191,423 @@ mod tests {
             None
         );
         assert_eq!(fx.remote_file("dev", "docs/sdh_skills/sdh-y.md"), None);
+    }
+
+    // ----- T-000243: docs/superpowers/ in the shared set -----------------------
+
+    /// Preflight treats the rules that hide the specs folder exactly per the
+    /// specs flag: while specs are shared they are blockers a user must confirm
+    /// to remove; opted out, the folder is not a shared path and its rules are
+    /// the user's own business. A rule of the managed block is never reported.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn preflight_treats_superpowers_rules_per_the_specs_flag() {
+        let fx = two_installs();
+        // A user rule like this repo's own `superpowers/`: it hides
+        // docs/superpowers/ without naming it.
+        write(&fx.main_dir, ".gitignore", "superpowers/\n");
+        let pre = shared_mode_preflight(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert_eq!(
+            pre.blocking_lines,
+            vec![IgnoreLine {
+                line_no: 1,
+                text: "superpowers/".into()
+            }],
+            "while specs are shared, a rule hiding the folder blocks them"
+        );
+        // The direct spelling is diagnosed the same way.
+        write(&fx.main_dir, ".gitignore", "docs/superpowers/\n");
+        let pre = shared_mode_preflight(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert_eq!(
+            pre.blocking_lines,
+            vec![IgnoreLine {
+                line_no: 1,
+                text: "docs/superpowers/".into()
+            }]
+        );
+
+        // Opted out: the very same rules are no blockers and are not offered
+        // for removal — the folder is meant to stay ignored.
+        fx.main_db
+            .set_repo_share_specs(fx.main_repo, false)
+            .unwrap();
+        let pre = shared_mode_preflight(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(pre.blocking_lines.is_empty(), "{:?}", pre.blocking_lines);
+        // And back on, they are blockers again (diagnosed, never auto-removed).
+        fx.main_db.set_repo_share_specs(fx.main_repo, true).unwrap();
+        let pre = shared_mode_preflight(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert_eq!(pre.blocking_lines.len(), 1);
+
+        // A managed-only rule is the sync's own business, not the user's.
+        write(
+            &fx.main_dir,
+            ".gitignore",
+            "# --- solo-dev-hub:begin ---\ndocs/superpowers/\n# --- solo-dev-hub:end ---\n",
+        );
+        let pre = shared_mode_preflight(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(pre.blocking_lines.is_empty(), "{:?}", pre.blocking_lines);
+    }
+
+    /// Part 1: while the policy shares specs, they travel both ways — the
+    /// owner's specs, plans and HTML mockups reach the contributor, the
+    /// contributor's own specs reach the owner, and two sides adding different
+    /// spec files both survive (no merge driver, different files never collide).
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn specs_travel_between_owner_and_contributor_while_shared() {
+        let fx = two_installs();
+        fx.make_participant();
+
+        // Owner -> contributor: a spec, a plan and an HTML mockup.
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# spec\n");
+        write(&fx.main_dir, "docs/superpowers/plans/p.md", "# plan\n");
+        write(
+            &fx.main_dir,
+            "docs/superpowers/mockups/m.html",
+            "<html><body>mock</body></html>\n",
+        );
+        fx.sync_main();
+        for branch in ["dev", "helper-dev"] {
+            for path in [
+                "docs/superpowers/specs/x.md",
+                "docs/superpowers/plans/p.md",
+                "docs/superpowers/mockups/m.html",
+            ] {
+                assert!(
+                    fx.remote_file(branch, path).is_some(),
+                    "{} lacks {}",
+                    branch,
+                    path
+                );
+            }
+        }
+        fx.sync_helper();
+        assert!(fx.helper_dir.join("docs/superpowers/specs/x.md").is_file());
+        assert!(fx
+            .helper_dir
+            .join("docs/superpowers/mockups/m.html")
+            .is_file());
+
+        // Contributor -> owner: its own spec travels back.
+        write(
+            &fx.helper_dir,
+            "docs/superpowers/specs/helper.md",
+            "# helper spec\n",
+        );
+        fx.sync_helper();
+        fx.sync_main();
+        assert!(fx
+            .main_dir
+            .join("docs/superpowers/specs/helper.md")
+            .is_file());
+
+        // Two sides add DIFFERENT spec files: both survive everywhere.
+        write(&fx.main_dir, "docs/superpowers/specs/mine.md", "# mine\n");
+        write(
+            &fx.helper_dir,
+            "docs/superpowers/specs/theirs.md",
+            "# theirs\n",
+        );
+        fx.sync_main();
+        fx.sync_helper();
+        fx.sync_main();
+        fx.sync_helper();
+        for branch in ["dev", "helper-dev"] {
+            for path in [
+                "docs/superpowers/specs/mine.md",
+                "docs/superpowers/specs/theirs.md",
+            ] {
+                assert!(
+                    fx.remote_file(branch, path).is_some(),
+                    "{} lacks {}",
+                    branch,
+                    path
+                );
+            }
+        }
+        assert!(fx
+            .main_dir
+            .join("docs/superpowers/specs/theirs.md")
+            .is_file());
+        // The helper committed `theirs.md` while origin/helper-dev had already
+        // taken main's plumbed `mine.md` commit, so its own branch diverged —
+        // the transport's designed state, identical for every shared path in
+        // this interleaving (see `main_plumbs_a_merged_todo_into_a_participant_
+        // branch`): the files travelled (both remotes, and main's checkout got
+        // theirs.md), the helper's checkout waits for the Merge button.
+        assert_eq!(
+            fx.helper_status().as_deref(),
+            Some("needs_manual_merge"),
+            "the diverged own branch is reported, not silently merged"
+        );
+        assert_eq!(
+            fx.helper_status_detail().as_deref(),
+            Some(r#"{"branch":"helper-dev","current":true}"#)
+        );
+        // Two sides adding DIFFERENT spec files: the merge keeps both (specs
+        // carry no merge driver; different files never collide).
+        let res = merge_shared_upstream(&fx.helper_db, &gb(), fx.helper_repo).unwrap();
+        assert_eq!(res.outcome, "merged");
+        assert!(fx
+            .helper_dir
+            .join("docs/superpowers/specs/mine.md")
+            .is_file());
+        assert!(fx
+            .helper_dir
+            .join("docs/superpowers/specs/theirs.md")
+            .is_file());
+        fx.sync_helper();
+        assert_eq!(fx.helper_status(), None);
+        // After the merge both files live on every branch.
+        for branch in ["dev", "helper-dev"] {
+            for path in [
+                "docs/superpowers/specs/mine.md",
+                "docs/superpowers/specs/theirs.md",
+            ] {
+                assert!(fx.remote_file(branch, path).is_some());
+            }
+        }
+    }
+
+    /// Part 2, the owner's case: opting out BEFORE the first specs commit keeps
+    /// the folder out of the transport on both installs — nothing under
+    /// docs/superpowers/ reaches origin/dev or the participant branch, while
+    /// todo keeps travelling and no file is ever tracked.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn specs_opted_out_before_the_first_commit_never_leave_the_install() {
+        let fx = two_installs();
+        // The owner's choice is stored before sharing is even enabled.
+        fx.main_db
+            .set_repo_share_specs(fx.main_repo, false)
+            .unwrap();
+        fx.make_participant();
+        // ... and is published in the trusted structure the helper accepts.
+        assert!(fx
+            .remote_file("dev", ".sdh/project.json")
+            .unwrap()
+            .contains("\"share_specs\": false"));
+
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        write(&fx.helper_dir, "docs/superpowers/specs/y.md", "# y\n");
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        fx.sync_main();
+        fx.sync_helper();
+        fx.sync_main();
+
+        for branch in ["dev", "helper-dev"] {
+            for path in ["docs/superpowers/specs/x.md", "docs/superpowers/specs/y.md"] {
+                assert_eq!(
+                    fx.remote_file(branch, path),
+                    None,
+                    "{} must not carry {}",
+                    branch,
+                    path
+                );
+            }
+            // The contributor-mode backbone is untouched by the flag.
+            assert!(fx
+                .remote_file(branch, "docs/todo.md")
+                .unwrap()
+                .contains("T-500000"));
+        }
+        // Never tracked on either clone.
+        assert!(g(&fx.main_dir, &["ls-files", "--", "docs/superpowers/"])
+            .trim()
+            .is_empty());
+        assert!(g(&fx.helper_dir, &["ls-files", "--", "docs/superpowers/"])
+            .trim()
+            .is_empty());
+        // The helper's own database still says the default on: the accepted
+        // structure overrode it before any path was computed.
+        assert!(
+            fx.helper_db
+                .get_shared_state(fx.helper_repo)
+                .unwrap()
+                .share_specs
+        );
+    }
+
+    /// Part 2, off AFTER specs were committed: the files stay tracked, local
+    /// edits stay visible modifications, the history stays reachable — and no
+    /// NEW SDH commit carries the folder on the current branch or a recipient
+    /// branch, for either role. On resumes sharing.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn off_keeps_committed_specs_tracked_and_out_of_new_sync_commits() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        fx.sync_main();
+        assert!(fx
+            .remote_file("dev", "docs/superpowers/specs/x.md")
+            .is_some());
+        fx.sync_helper();
+        assert!(fx.helper_dir.join("docs/superpowers/specs/x.md").is_file());
+
+        // The owner opts out and edits the file.
+        fx.main_db
+            .set_repo_share_specs(fx.main_repo, false)
+            .unwrap();
+        write(
+            &fx.main_dir,
+            "docs/superpowers/specs/x.md",
+            "# x edited by owner\n",
+        );
+        fx.sync_main();
+        // Tracked (off never untracks) and visibly modified, but carried by no
+        // new commit: a plain work-tree modification, nothing staged. (`g()`
+        // trims the leading space of a porcelain line, so judge via diff.)
+        assert_eq!(
+            g(&fx.main_dir, &["ls-files", "--", "docs/superpowers/"]).trim(),
+            "docs/superpowers/specs/x.md"
+        );
+        assert_eq!(
+            g(
+                &fx.main_dir,
+                &["diff", "--name-only", "--", "docs/superpowers/"]
+            ),
+            "docs/superpowers/specs/x.md",
+            "the edit stays a visible local modification"
+        );
+        assert_eq!(
+            g(
+                &fx.main_dir,
+                &["diff", "--cached", "--name-only", "--", "docs/superpowers/"]
+            ),
+            "",
+            "nothing under the folder is staged into a new commit"
+        );
+        // The edit reached no NEW commit, on the current branch (dev) or the
+        // participant branch (helper-dev).
+        for branch in ["dev", "helper-dev"] {
+            assert_eq!(
+                fx.remote_file(branch, "docs/superpowers/specs/x.md")
+                    .as_deref(),
+                Some("# x\n"),
+                "{} must keep the last shared version",
+                branch
+            );
+        }
+        // The history of the file is intact.
+        assert!(g(
+            &fx.main_dir,
+            &["log", "--oneline", "--", "docs/superpowers/"]
+        )
+        .contains("sdh-sync"));
+
+        // The contributor accepts the opt-out from the structure; its own edit
+        // stays local too, while todo keeps travelling.
+        fx.sync_helper();
+        write(
+            &fx.helper_dir,
+            "docs/superpowers/specs/x.md",
+            "# x edited by helper\n",
+        );
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500001"]));
+        fx.sync_helper();
+        for branch in ["helper-dev", "dev"] {
+            assert_eq!(
+                fx.remote_file(branch, "docs/superpowers/specs/x.md")
+                    .as_deref(),
+                Some("# x\n")
+            );
+        }
+        assert!(fx
+            .remote_file("helper-dev", "docs/todo.md")
+            .unwrap()
+            .contains("T-500001"));
+
+        // On resumes sharing: the owner's edit finally travels. One more OFF
+        // sync first, so dev is up to date with the helper's todo plumb — a
+        // dirty specs file is outside the off pathspec, so the fast-forward
+        // runs and leaves the work-tree edit alone (the incoming commit never
+        // touched the file).
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("dev", "docs/superpowers/specs/x.md")
+                .as_deref(),
+            Some("# x\n"),
+            "the off sync still carries no specs"
+        );
+        fx.main_db.set_repo_share_specs(fx.main_repo, true).unwrap();
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("dev", "docs/superpowers/specs/x.md")
+                .as_deref(),
+            Some("# x edited by owner\n")
+        );
+    }
+
+    /// A specs commit created while the policy was ON but not yet pushed stays
+    /// ours after the owner opts out: the branch is judged by the historical
+    /// SDH allow-list, not by the current send set, so the pending commit is
+    /// pushed as it is (off filters future commits only).
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_unsent_specs_commit_made_while_on_is_still_ours_after_off() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The push of the participant branch is refused: main's plumbed commit
+        // carrying a spec stays local (created, not yet sent).
+        let hook = block_pushes_to(&fx, "refs/heads/helper-dev");
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("helper-dev", "docs/superpowers/specs/x.md"),
+            None
+        );
+        fs::remove_file(&hook).unwrap();
+
+        // The owner opts out; the already-created commit is not filtered away.
+        fx.main_db
+            .set_repo_share_specs(fx.main_repo, false)
+            .unwrap();
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("helper-dev", "docs/superpowers/specs/x.md")
+                .as_deref(),
+            Some("# x\n")
+        );
+    }
+
+    /// A missing (or empty) specs folder on either side is a successful no-op —
+    /// no "pathspec did not match" — and a first file then travels normally.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_missing_specs_folder_is_a_noop_and_new_files_then_travel() {
+        let fx = two_installs();
+        fx.make_participant();
+        // No specs folder on either side: both syncs are clean no-ops for the
+        // folder — no "pathspec did not match", no bogus commit. (The first
+        // owner sync after `make_participant` still plumbs the shared
+        // structure into the participant branch, an ordinary transport step
+        // that has nothing to do with specs, so `committed` is not asserted.)
+        let out = fx.sync_main();
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        for branch in ["dev", "helper-dev"] {
+            assert!(
+                g(&fx.origin, &["ls-tree", "-r", "--name-only", branch])
+                    .lines()
+                    .all(|l| !l.starts_with("docs/superpowers/")),
+                "{} carries specs without the folder existing",
+                branch
+            );
+        }
+        let out = fx.sync_helper();
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+
+        write(
+            &fx.helper_dir,
+            "docs/superpowers/specs/first.md",
+            "# first\n",
+        );
+        fx.sync_helper();
+        fx.sync_main();
+        assert!(fx
+            .main_dir
+            .join("docs/superpowers/specs/first.md")
+            .is_file());
     }
 
     // ----- review round: guards, classifier, throttles ------------------------------

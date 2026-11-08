@@ -743,6 +743,8 @@ impl AppDb {
             shared_role: row.get(2)?,
             shared_status: row.get(3)?,
             shared_status_detail: status_detail_of(row.get::<_, Option<String>>(4)?.as_deref()),
+            // T-000243: the column is NOT NULL DEFAULT 1 (v35).
+            share_specs: row.get::<_, i64>(5)? != 0,
         })
     }
 
@@ -750,7 +752,7 @@ impl AppDb {
     pub fn get_shared_state(&self, repo_id: i64) -> SqlResult<RepoSharedState> {
         let conn = self.conn.lock().unwrap();
         match conn.query_row(
-            "SELECT id, shared_mode, shared_role, shared_status, shared_import
+            "SELECT id, shared_mode, shared_role, shared_status, shared_import, share_specs
              FROM repositories WHERE id = ?1",
             rusqlite::params![repo_id],
             Self::row_to_shared_state,
@@ -762,6 +764,9 @@ impl AppDb {
                 shared_role: None,
                 shared_status: None,
                 shared_status_detail: None,
+                // T-000243: the default policy is share; UI pre-configuration
+                // reads this getter, not `list_shared_states`.
+                share_specs: true,
             }),
             Err(e) => Err(e),
         }
@@ -771,7 +776,7 @@ impl AppDb {
     pub fn list_shared_states(&self) -> SqlResult<Vec<RepoSharedState>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, shared_mode, shared_role, shared_status, shared_import FROM repositories
+            "SELECT id, shared_mode, shared_role, shared_status, shared_import, share_specs FROM repositories
              WHERE shared_mode = 1 OR shared_role IS NOT NULL OR shared_status IS NOT NULL
              ORDER BY id",
         )?;
@@ -785,6 +790,18 @@ impl AppDb {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE repositories SET shared_mode = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            rusqlite::params![on as i64, repo_id],
+        )?;
+        Ok(())
+    }
+
+    /// T-000243: the per-repo `share_specs` switch — whether `docs/superpowers/`
+    /// travels in shared mode. Lives on the row itself, independent of
+    /// `shared_mode` (settable before sharing is enabled, survives its toggles).
+    pub fn set_repo_share_specs(&self, repo_id: i64, on: bool) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE repositories SET share_specs = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             rusqlite::params![on as i64, repo_id],
         )?;
         Ok(())
@@ -1850,11 +1867,15 @@ mod tests {
                 shared_role: None,
                 shared_status: None,
                 shared_status_detail: None,
+                // T-000243: specs default to share, even before shared mode.
+                share_specs: true,
             }
         );
-        // Unknown repo id: still the "not shared" state, no error.
+        // Unknown repo id: still the "not shared" state, no error — and the
+        // specs default stays on for it too.
         let missing = db.get_shared_state(99999).unwrap();
         assert!(!missing.shared_mode && missing.shared_role.is_none());
+        assert!(missing.share_specs);
     }
 
     #[test]
@@ -1867,6 +1888,67 @@ mod tests {
         assert!(db.get_shared_state(repo.id).unwrap().shared_mode);
         db.set_shared_mode(repo.id, false).unwrap();
         assert!(!db.get_shared_state(repo.id).unwrap().shared_mode);
+    }
+
+    // ── T-000243: share_specs flag ───────────────────────────────────────────
+
+    #[test]
+    fn test_set_repo_share_specs_roundtrip_and_no_shared_mode_reset() {
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/sh-spec-a", "sh-spec-a", None, None)
+            .unwrap();
+        // Default on, settable BEFORE shared mode is enabled.
+        assert!(db.get_shared_state(repo.id).unwrap().share_specs);
+        db.set_repo_share_specs(repo.id, false).unwrap();
+        assert!(!db.get_shared_state(repo.id).unwrap().share_specs);
+        // Disabling / re-enabling shared mode must not lose the flag: the
+        // setters above touch their own column only.
+        db.set_shared_mode(repo.id, true).unwrap();
+        assert!(!db.get_shared_state(repo.id).unwrap().share_specs);
+        db.set_shared_mode(repo.id, false).unwrap();
+        assert!(!db.get_shared_state(repo.id).unwrap().share_specs);
+        // And it travels in the participating-repos list.
+        db.set_shared_mode(repo.id, true).unwrap();
+        let listed = db.list_shared_states().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].share_specs);
+        // Back on.
+        db.set_repo_share_specs(repo.id, true).unwrap();
+        assert!(db.get_shared_state(repo.id).unwrap().share_specs);
+    }
+
+    #[test]
+    fn test_share_specs_survives_a_restart_and_is_per_repo() {
+        // Restart-equivalent: a file-backed DB re-opened reads the same flag.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("sh-specs.db");
+        let repo_id = {
+            let db = AppDb::new(path.clone()).unwrap();
+            let a = db
+                .insert_local_repository("/tmp/sh-spec-b", "sh-spec-b", None, None)
+                .unwrap();
+            let b = db
+                .insert_local_repository("/tmp/sh-spec-c", "sh-spec-c", None, None)
+                .unwrap();
+            db.set_repo_share_specs(a.id, false).unwrap();
+            // b keeps the default; one repo's off must not leak to the other.
+            assert!(!db.get_shared_state(a.id).unwrap().share_specs);
+            assert!(db.get_shared_state(b.id).unwrap().share_specs);
+            a.id
+        };
+        let db = AppDb::new(path).unwrap();
+        assert!(
+            !db.get_shared_state(repo_id).unwrap().share_specs,
+            "the flag survives a restart"
+        );
+        let all = db.list_all_repos().unwrap();
+        assert_eq!(all.len(), 2);
+        for r in &all {
+            if r.id != repo_id {
+                assert!(db.get_shared_state(r.id).unwrap().share_specs);
+            }
+        }
     }
 
     #[test]

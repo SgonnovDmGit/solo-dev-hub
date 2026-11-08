@@ -59,6 +59,11 @@ pub struct StructMain {
 pub struct StructRepo {
     pub github: String,
     pub role: String,
+    /// T-000243: whether `docs/superpowers/` travels in shared mode for THIS
+    /// repo. `None` = legacy structure without the field = default ON. A wrong
+    /// JSON type is a parse error, never a silent fallback to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_specs: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,6 +439,19 @@ pub fn validate_structure(
     Ok(())
 }
 
+/// T-000243: the effective `docs/superpowers/` policy of a VALIDATED structure
+/// for one repo: `true` (share) when the repo is absent from `repos` or the
+/// field is missing (legacy structure = default on). Per repo — the value of
+/// one repo never applies to another. An untrusted structure never reaches
+/// this function (`read_structure_file` / `discover_structure` refuse it).
+pub fn share_specs_for(s: &ProjectStructure, github_name: &str) -> bool {
+    s.repos
+        .iter()
+        .find(|r| r.github.eq_ignore_ascii_case(github_name))
+        .and_then(|r| r.share_specs)
+        .unwrap_or(true)
+}
+
 // ---------------------------------------------------------------------------
 // Files
 // ---------------------------------------------------------------------------
@@ -634,7 +652,19 @@ pub fn build_structure(
             if !is_valid_repo_full_name(&github) || role.trim().is_empty() {
                 return None;
             }
-            Some(StructRepo { github, role })
+            // T-000243: the published specs policy comes from THIS repo's own
+            // stored setting (never from folder existence or .gitignore, and
+            // never copied from a sibling repo of the project). The getter
+            // synthesizes the default — share — for a repo with no row.
+            let share_specs = db
+                .get_shared_state(r.id)
+                .map(|s| s.share_specs)
+                .unwrap_or(true);
+            Some(StructRepo {
+                github,
+                role,
+                share_specs: Some(share_specs),
+            })
         })
         .collect();
 
@@ -1505,10 +1535,12 @@ mod tests {
                 StructRepo {
                     github: "Owner/web".into(),
                     role: "client".into(),
+                    share_specs: None,
                 },
                 StructRepo {
                     github: "Owner/api".into(),
                     role: "server".into(),
+                    share_specs: None,
                 },
             ],
             microservices: vec!["mailer".into()],
@@ -1689,6 +1721,168 @@ mod tests {
         assert!(build_structure(&db, solo, "Owner", None)
             .unwrap_err()
             .contains("project"));
+    }
+
+    // ----- T-000243: per-repo share_specs policy --------------------------------
+
+    /// A legacy structure file (format 1, written before the field existed):
+    /// every repo parses with `share_specs: None` and means the default ON.
+    #[test]
+    fn share_specs_legacy_structure_without_the_field_means_on() {
+        let legacy = r#"{
+            "format": 1,
+            "project": {"name": "Acme", "type": "standard"},
+            "main": {"login": "Owner", "dev_branch": "dev"},
+            "repos": [
+                {"github": "Owner/web", "role": "client"},
+                {"github": "Owner/api", "role": "server"}
+            ],
+            "microservices": ["mailer"],
+            "participants": []
+        }"#;
+        let s: ProjectStructure = serde_json::from_str(legacy).unwrap();
+        assert!(s.repos.iter().all(|r| r.share_specs.is_none()));
+        assert!(validate_structure(&s, "Owner/web", &AdminVerified::default()).is_ok());
+        // default on for a listed repo (case-insensitively) and for one that
+        // the structure does not list at all
+        assert!(share_specs_for(&s, "Owner/web"));
+        assert!(share_specs_for(&s, "owner/API"));
+        assert!(share_specs_for(&s, "Owner/unlisted"));
+        // a `None` repo is not written back with the field: the file stays legacy
+        assert!(!serialize_structure(&s).contains("share_specs"));
+    }
+
+    #[test]
+    fn share_specs_explicit_values_round_trip_per_repo() {
+        let mut s = sample();
+        s.repos[0].share_specs = Some(false); // Owner/web
+        s.repos[1].share_specs = Some(true); // Owner/api
+        let text = serialize_structure(&s);
+        assert!(text.contains("\"share_specs\": false"));
+        assert!(text.contains("\"share_specs\": true"));
+        // serialize sorts repos by name, so look them up after the round trip
+        let back: ProjectStructure = serde_json::from_str(&text).unwrap();
+        let by_name = |name: &str| {
+            back.repos
+                .iter()
+                .find(|r| r.github == name)
+                .unwrap()
+                .share_specs
+        };
+        assert_eq!(by_name("Owner/web"), Some(false));
+        assert_eq!(by_name("Owner/api"), Some(true));
+        // the accessor reads each repo's own value, never a sibling's
+        assert!(!share_specs_for(&back, "Owner/web"));
+        assert!(!share_specs_for(&back, "owner/WEB"));
+        assert!(share_specs_for(&back, "Owner/api"));
+        // and the whole thing still validates
+        assert!(validate_structure(&back, "Owner/web", &AdminVerified::default()).is_ok());
+    }
+
+    /// A wrong JSON type for the flag is a hard error at parse time — never a
+    /// silent fallback to the default (which would quietly turn sharing on).
+    #[test]
+    fn share_specs_wrong_type_is_a_hard_error_not_a_fallback() {
+        let with = |repos: &str| {
+            format!(
+                r#"{{"format":1,"project":{{"name":"Acme","type":"standard"}},
+                "main":{{"login":"Owner","dev_branch":"dev"}},
+                "repos":[{repos}],"microservices":[],"participants":[]}}"#
+            )
+        };
+        for bad in [
+            r#"{"github":"Owner/web","role":"client","share_specs":"yes"}"#,
+            r#"{"github":"Owner/web","role":"client","share_specs":"true"}"#,
+            r#"{"github":"Owner/web","role":"client","share_specs":1}"#,
+            r#"{"github":"Owner/web","role":"client","share_specs":["off"]}"#,
+        ] {
+            let raw = with(bad);
+            assert!(
+                serde_json::from_str::<ProjectStructure>(&raw).is_err(),
+                "must be rejected: {}",
+                bad
+            );
+        }
+        // explicit null is the canonical form of "no value": parses as None,
+        // exactly like a legacy file without the field, and means the default on
+        let null_raw = with(r#"{"github":"Owner/web","role":"client","share_specs":null}"#);
+        let null_s: ProjectStructure = serde_json::from_str(&null_raw).unwrap();
+        assert!(null_s.repos[0].share_specs.is_none());
+        assert!(share_specs_for(&null_s, "Owner/web"));
+        // and it surfaces as a structure error through the real read path
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(".sdh")).unwrap();
+        fs::write(
+            tmp.path().join(".sdh/project.json"),
+            with(r#"{"github":"Owner/web","role":"client","share_specs":"yes"}"#),
+        )
+        .unwrap();
+        assert!(read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default()).is_err());
+        // the same file with a proper boolean is fine
+        fs::write(
+            tmp.path().join(".sdh/project.json"),
+            with(r#"{"github":"Owner/web","role":"client","share_specs":false}"#),
+        )
+        .unwrap();
+        let ok = read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default())
+            .unwrap()
+            .unwrap();
+        assert!(!share_specs_for(&ok, "Owner/web"));
+    }
+
+    #[test]
+    fn build_structure_publishes_each_repos_own_share_specs() {
+        let db = make_db();
+        let (api_id, pid) = seeded(&db);
+        db.set_autocommit_branch(api_id, Some("dev")).unwrap();
+        // only the api repo opts out; the sibling keeps the default
+        db.set_repo_share_specs(api_id, false).unwrap();
+        // a third repo of the same project, also untouched
+        let extra = local_repo(&db, "Owner/extra");
+        db.assign_repository(extra, Some(pid), Some("tool"))
+            .unwrap();
+
+        let s = build_structure(&db, api_id, "Owner", None).unwrap();
+        let by_name = |s: &ProjectStructure, name: &str| {
+            s.repos.iter().find(|r| r.github == name).unwrap().clone()
+        };
+        assert_eq!(by_name(&s, "Owner/api").share_specs, Some(false));
+        assert_eq!(
+            by_name(&s, "Owner/web").share_specs,
+            Some(true),
+            "one repo's off must not leak to a sibling"
+        );
+        assert_eq!(by_name(&s, "Owner/extra").share_specs, Some(true));
+        assert!(validate_structure(&s, "Owner/api", &AdminVerified::default()).is_ok());
+        assert!(!share_specs_for(&s, "Owner/api"));
+        assert!(share_specs_for(&s, "Owner/web"));
+
+        // a fresh read of the same project follows a later toggle
+        db.set_repo_share_specs(api_id, true).unwrap();
+        let s2 = build_structure(&db, api_id, "Owner", None).unwrap();
+        assert_eq!(by_name(&s2, "Owner/api").share_specs, Some(true));
+    }
+
+    /// An untrusted structure (here: `main.login` is not the repo owner) never
+    /// supplies the policy — the same fail-closed path the trust tests use.
+    #[test]
+    fn share_specs_from_an_untrusted_structure_is_not_used() {
+        let mut s = sample();
+        s.repos[0].share_specs = Some(false);
+        s.main.login = "helper".into();
+        assert!(validate_structure(&s, "Owner/web", &AdminVerified::default()).is_err());
+        let tmp = TempDir::new().unwrap();
+        write_structure_if_changed(tmp.path(), &s).unwrap();
+        // the file exists and names off, but it is refused wholesale
+        assert!(read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default()).is_err());
+        // the very same content from the real owner is usable and says off
+        let mut trusted = s;
+        trusted.main.login = "Owner".into();
+        write_structure_if_changed(tmp.path(), &trusted).unwrap();
+        let ok = read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default())
+            .unwrap()
+            .unwrap();
+        assert!(!share_specs_for(&ok, "Owner/web"));
     }
 
     // ----- roles and bands -------------------------------------------------
@@ -2009,6 +2203,7 @@ mod tests {
             .map(|i| StructRepo {
                 github: format!("Owner/{}-{}", "r".repeat(90), i),
                 role: "tool".into(),
+                share_specs: None,
             })
             .collect();
         assert!(serialize_structure(&big).len() as u64 > MAX_STRUCTURE_BYTES);
@@ -2379,6 +2574,7 @@ mod tests {
         s.repos = vec![StructRepo {
             github: ORG_REPO.into(),
             role: "client".into(),
+            share_specs: None,
         }];
         s
     }
@@ -2564,6 +2760,7 @@ mod tests {
         s.repos.push(StructRepo {
             github: "Acme-Org/api".into(),
             role: "server".into(),
+            share_specs: None,
         });
         // without a verification the structure is refused outright
         assert!(apply_structure_locally(&db, web, &s).is_err());
@@ -2607,6 +2804,7 @@ mod tests {
         s.repos.push(StructRepo {
             github: "Stranger/api".into(),
             role: "server".into(),
+            share_specs: None,
         });
         apply_structure_locally(&db, web, &s).unwrap();
         assert!(db.get_repository(web).unwrap().project_id.is_some());

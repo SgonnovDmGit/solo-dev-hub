@@ -45,6 +45,22 @@ pub fn set_shared_admin_verified(
     crate::sync::shared_structure::record_admin_verification(&db, &repo_full_name, &login, admin)
 }
 
+/// T-000243: the owner's per-repo `docs/superpowers/` switch (the checkbox
+/// next to the shared-mode switch). The backend re-checks the authority — a
+/// known GitHub login and owner / verified-administrator rights for the repo,
+/// the same trust rule as enabling sharing — so a contributor, a pending
+/// helper or an unknown login is refused, also through a direct IPC call.
+/// Settable before sharing is enabled; the next sync publishes the flag in
+/// `.sdh/project.json`, re-renders `.gitignore` and narrows the pathspecs.
+#[tauri::command]
+pub fn set_repo_share_specs(
+    db: State<AppDb>,
+    repo_id: i64,
+    share_specs: bool,
+) -> Result<(), String> {
+    shared::set_repo_share_specs(&db, repo_id, share_specs)
+}
+
 /// Switch shared mode off; the deletion of `.sdh/` is committed and pushed now.
 #[tauri::command(async)]
 pub fn disable_shared_mode(db: State<AppDb>, repo_id: i64) -> Result<SharedDisableResult, String> {

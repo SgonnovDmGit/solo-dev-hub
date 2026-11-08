@@ -91,6 +91,13 @@ export async function enableSharedMode(repoId: number, removeLines: boolean): Pr
   return invoke<void>('enable_shared_mode', { repoId, removeLines });
 }
 
+/** T-000243: the owner's per-repo `docs/superpowers/` switch (the checkbox
+ *  next to the shared-mode switch). A local preference published by the next
+ *  sync in `.sdh/project.json`; settable before shared mode is enabled. */
+export async function setRepoShareSpecs(repoId: number, shareSpecs: boolean): Promise<void> {
+  return invoke<void>('set_repo_share_specs', { repoId, shareSpecs });
+}
+
 export async function disableSharedMode(repoId: number): Promise<SharedDisableResult> {
   return invoke<SharedDisableResult>('disable_shared_mode', { repoId });
 }

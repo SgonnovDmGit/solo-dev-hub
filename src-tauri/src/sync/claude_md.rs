@@ -471,6 +471,7 @@ mod tests {
             repos: vec![StructRepo {
                 github: "owner/app".into(),
                 role: "tool".into(),
+                share_specs: None,
             }],
             microservices: vec![],
             participants: participants

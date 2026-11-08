@@ -17,10 +17,11 @@ use std::path::Path;
 ///
 /// Returns true if file was modified.
 pub fn sync_managed_block(template: &str, target: &Path) -> Result<bool, String> {
-    if template.trim().is_empty() {
-        return Ok(false);
-    }
-
+    // T-000243: an empty template manages NOTHING — including any managed block
+    // an earlier render wrote, which is stale now and is removed by the normal
+    // zero-new-rules path below (a shared repo with `share_specs` on renders an
+    // empty template when the custom one is empty; the old off-render's ignore
+    // rule must not survive that). A file without a block is left as it is.
     let existing = if target.exists() {
         fs::read_to_string(target).map_err(|e| e.to_string())?
     } else {

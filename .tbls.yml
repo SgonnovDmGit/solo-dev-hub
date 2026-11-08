@@ -65,6 +65,11 @@ comments:
         access). NULL means the repo is not shared.
       shared_status: v34 — status code of the shared-mode sync (e.g. 'needs_manual_merge'); NULL means no pending condition.
       shared_import: v34 — JSON map of the last imported blob sha per shared file, so an unchanged file is not imported again.
+      share_specs: >-
+        v35 (T-000243) — per-repo opt-out for sharing docs/superpowers/ in
+        contributor mode. 1 (default) = the folder travels with the shared set;
+        0 = specs stay local-only. Independent of shared_mode: settable before
+        sharing is enabled, so it lives on the row, not in shared_import JSON.
 
   - table: settings
     tableComment: >-

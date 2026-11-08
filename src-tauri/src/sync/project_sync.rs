@@ -237,7 +237,8 @@ fn write_repo_skeletons(
         c.push(file_issue("docs/project.md", e));
     }
     // F-000044: the shared-repo block (owner, branch, this install's band).
-    let shared_block = sync::shared_block_for(db, repo, shared.structure_of(repo.id));
+    let shared_structure = shared.structure_of(repo.id);
+    let shared_block = sync::shared_block_for(db, repo, shared_structure);
     if let Err(e) = sync::update_claude_md_section(
         db,
         Some(md_project_id),
@@ -262,8 +263,13 @@ fn write_repo_skeletons(
     }
     // F-000044: a shared repo (any role) renders the blocks without the shared
     // paths; the same text for the owner and for contributors, so it never churns.
+    // T-000243: the render drops `docs/superpowers/` only while the effective
+    // policy shares it; opted out, the managed render keeps ignoring the folder.
+    // Both callers of `gitignore_template_for` resolve the same policy, so the
+    // render here and the pathspecs of the shared pass never disagree.
     let shared = sync::shared::is_shared_repo(db, repo.id);
-    let gitignore = sync::shared::gitignore_template_for(&tpl.gitignore, shared);
+    let share_specs = sync::shared::effective_share_specs(db, repo, shared_structure);
+    let gitignore = sync::shared::gitignore_template_for(&tpl.gitignore, shared, share_specs);
     let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
     if let Err(e) = sync::sync_gitignore_section(&gitignore, base) {
         c.push(file_issue(".gitignore", e));

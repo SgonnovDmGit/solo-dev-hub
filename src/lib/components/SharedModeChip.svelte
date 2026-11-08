@@ -9,7 +9,7 @@
   import { verifyAdmin } from '$lib/sync-core';
   import { needsOwnAdminCheck } from '$lib/utils/shared-admin';
   import { addToast } from '$lib/stores/ui';
-  import { sharedModePreflight, enableSharedMode, disableSharedMode } from '$lib/api/tauri-commands';
+  import { sharedModePreflight, enableSharedMode, disableSharedMode, setRepoShareSpecs, getRepoSharedState } from '$lib/api/tauri-commands';
   import { isRepoPublic, splitRepoFullName } from '$lib/api/github';
   import type { IgnoreLine } from '$lib/types';
   import ConfirmDialog from './ConfirmDialog.svelte';
@@ -43,6 +43,52 @@
   let showDisable = $state(false);
   let blockingLines = $state<IgnoreLine[]>([]);
   let isPublic = $state<boolean | null>(null);
+
+  // T-000243: the owner's "Делиться спеками и планами" checkbox. The flag is
+  // read from the DB through `get_repo_shared_state` on purpose: the store
+  // RepoDetail's switch reads (`list_repo_shared_states`) skips repos that
+  // never enabled sharing, so for a preconfigured non-shared repo the store's
+  // absence must never be guessed as "on". null = not loaded (or failed to):
+  // the checkbox stays disabled, the value is never defaulted.
+  let specs = $state<boolean | null>(null);
+  let specsBusy = $state(false);
+
+  async function loadSpecs() {
+    try {
+      const st = await getRepoSharedState(repoId);
+      if (!alive) return;
+      specs = st.share_specs;
+    } catch {
+      if (!alive) return;
+      specs = null;
+      addToast($tStore('shared.specs.loadFailed' as any), 'error');
+    }
+  }
+
+  // On mount and on every flip of the shared-mode switch: enabling/disabling
+  // refreshes the shared state around this chip, and the flag must not be
+  // cached across that (mid-sync changes are re-read the same way).
+  $effect(() => {
+    void checked;
+    void loadSpecs();
+  });
+
+  async function handleSpecsToggle() {
+    if (specsBusy || specs === null) return;
+    const next = !specs;
+    specsBusy = true;
+    try {
+      await setRepoShareSpecs(repoId, next);
+      // Only after the backend accepted it: a failed save must not look like
+      // a successful switch-off.
+      specs = next;
+      onChanged();
+    } catch (err) {
+      addToast($tStore('shared.specs.saveFailed' as any).replace('{0}', String(err)), 'error');
+    } finally {
+      specsBusy = false;
+    }
+  }
 
   async function checkPublic(): Promise<boolean | null> {
     if (!$pat || !githubName || !githubName.includes('/')) return null;
@@ -137,6 +183,20 @@
   </button>
 </div>
 
+<!-- T-000243: the owner's specs switch, same chip language. Rendered inside
+     this component (under RepoDetail's showSharedToggle) so it is owner/main
+     only — also before shared mode is enabled, for preconfiguration. -->
+<label class="chip" class:on={specs === true} title={$tStore('shared.specs.hint' as any)}>
+  <input
+    class="specs-check"
+    type="checkbox"
+    checked={specs === true}
+    disabled={specs === null || specsBusy}
+    onchange={handleSpecsToggle}
+  />
+  <span class="chip-label">{$tStore('shared.specs.label' as any)}</span>
+</label>
+
 {#if showEnable}
   <SharedEnableDialog
     {repoName}
@@ -219,5 +279,21 @@
   .switch.on .knob {
     transform: translateX(12px);
     background: white;
+  }
+
+  /* T-000243: the specs checkbox — the same chip language, a native checkbox
+     instead of the switch. The label wraps the input, so clicking the text
+     toggles it too (and does nothing while it is disabled). */
+  .specs-check {
+    margin: 0;
+    width: 13px;
+    height: 13px;
+    accent-color: var(--toast-success);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .specs-check:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 </style>

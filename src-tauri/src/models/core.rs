@@ -42,6 +42,11 @@ pub struct RepoSharedState {
     /// `needs_manual_merge` -> JSON `{"branch":"dev","current":true}`; the other
     /// codes -> a plain reason / message. `None` when the code needs none.
     pub shared_status_detail: Option<String>,
+    /// T-000243: per-repo opt-out for sharing `docs/superpowers/` (specs,
+    /// plans, mockups). Default on. Travels in this struct, not in
+    /// `Repository`: it is settable BEFORE shared mode is enabled, so it lives
+    /// on the row independent of `shared_mode`.
+    pub share_specs: bool,
 }
 
 impl Repository {

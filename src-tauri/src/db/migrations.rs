@@ -85,6 +85,7 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         mig_v33_rule_events_and_conflicts,
     ),
     (34, "contributor_mode", mig_v34_contributor_mode),
+    (35, "share_specs", mig_v35_share_specs),
 ];
 
 impl AppDb {
@@ -1098,6 +1099,19 @@ fn mig_v34_contributor_mode(conn: &Connection) -> SqlResult<()> {
     )
 }
 
+fn mig_v35_share_specs(conn: &Connection) -> SqlResult<()> {
+    // T-000243 (v1.23.0): per-repo opt-out for sharing `docs/superpowers/`
+    // (specs, plans, mockups) in contributor mode. A column, not
+    // `shared_import` JSON: the flag is the owner's local choice, must be
+    // settable BEFORE shared mode is enabled, and must survive disabling and
+    // re-enabling shared mode. Default ON — the shared set covers the folder
+    // unless the owner switches it off.
+    conn.execute_batch(
+        "ALTER TABLE repositories ADD COLUMN share_specs INTEGER NOT NULL DEFAULT 1;
+         PRAGMA user_version = 35;",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1390,6 +1404,120 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(version, 34);
+
+        // T-000243: v35 landed on top of v34 — same DB, same row, now with the
+        // specs flag defaulting ON for the pre-existing row.
+        mig_v35_share_specs(&conn).unwrap();
+        let share: i64 = conn
+            .query_row(
+                "SELECT share_specs FROM repositories WHERE id = ?1",
+                [repo_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(share, 1, "an upgraded row defaults to share_specs on");
+    }
+
+    /// T-000243: v35 adds `repositories.share_specs` — the per-repo opt-out
+    /// for sharing `docs/superpowers/`. Default ON (the shared set covers the
+    /// folder), and the column lives on the row itself so the flag is settable
+    /// before shared mode is enabled and survives its toggles.
+    #[test]
+    fn test_db_migration_v35_share_specs_column() {
+        // Fresh DB: the column exists, NOT NULL, default 1.
+        let db = make_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            let (dflt, notnull): (String, i32) = conn
+                .query_row(
+                    "SELECT dflt_value, \"notnull\" FROM pragma_table_info('repositories')
+                     WHERE name = 'share_specs'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(dflt, "1");
+            assert_eq!(notnull, 1);
+            conn.execute(
+                "INSERT INTO repositories (github_name) VALUES ('o/fresh')",
+                [],
+            )
+            .unwrap();
+            let share: i64 = conn
+                .query_row(
+                    "SELECT share_specs FROM repositories WHERE github_name = 'o/fresh'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(share, 1, "a fresh row defaults to share_specs on");
+        }
+
+        // Idempotency of the dispatcher: user_version is 35, so re-running
+        // migrations (also what a restart does) changes nothing.
+        db.run_migrations().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            let version: i32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 35);
+        }
+
+        // Upgrade path: a v34-shaped DB keeps its rows and they default to 1.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        for &(target, _name, mig_fn) in MIGRATIONS {
+            if target <= 34 {
+                mig_fn(&conn).unwrap();
+            }
+        }
+        conn.execute(
+            "INSERT INTO repositories (github_name, github_url, role, shared_mode) \
+             VALUES ('o/old', 'u', 'client', 1)",
+            [],
+        )
+        .unwrap();
+        let repo_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO repositories (github_name, role) VALUES ('o/old2', 'tool')",
+            [],
+        )
+        .unwrap();
+
+        mig_v35_share_specs(&conn).unwrap();
+
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM repositories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 2, "v34 rows survive the upgrade");
+        let (share, mode): (i64, i64) = conn
+            .query_row(
+                "SELECT share_specs, shared_mode FROM repositories WHERE id = ?1",
+                [repo_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(share, 1, "existing rows default to share_specs on");
+        assert_eq!(mode, 1, "v34 values are untouched");
+        let all_on: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM repositories WHERE share_specs = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(all_on, 2);
+        // both values storable
+        conn.execute(
+            "UPDATE repositories SET share_specs = 0 WHERE id = ?1",
+            [repo_id],
+        )
+        .unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 35);
     }
 
     #[test]
@@ -1400,7 +1528,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         // Update this when a new migration is added.
-        assert!(version >= 34);
+        assert!(version >= 35);
     }
 
     #[test]
@@ -1748,11 +1876,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v34 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v35 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
 
         drop(conn);
         let _ = repo;
@@ -1819,7 +1947,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
     }
 
     #[test]

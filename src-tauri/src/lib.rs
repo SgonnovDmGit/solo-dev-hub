@@ -238,6 +238,7 @@ pub fn run() {
             // F-000044: shared (contributor-mode) repos
             commands::shared::shared_mode_preflight,
             commands::shared::enable_shared_mode,
+            commands::shared::set_repo_share_specs,
             commands::shared::set_shared_admin_verified,
             commands::shared::disable_shared_mode,
             commands::shared::approve_join_request,
