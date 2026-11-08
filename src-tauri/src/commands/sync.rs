@@ -115,13 +115,12 @@ fn init_docs_for_repo_in(
     if shared {
         let policy = sync::shared::specs_policy_guard(repo_id);
         let _policy = policy.lock().unwrap();
-        // No git binary on the machine: no discovery is possible; the policy
-        // then comes from the same validated work-tree read as before (the
-        // owner's answer never needs git at all).
-        let structure = match crate::git_ops::cached_git() {
-            Some(git) => sync::shared::render_structure_of(db, &git, &repo)?,
-            None => None,
-        };
+        // No git binary on the machine: no discovery is possible. The
+        // owner's policy needs none (its database row answers); a helper's
+        // render is REFUSED rather than answered from a work-tree copy that
+        // may carry a stale ON (T-000243 review, fourth pass).
+        let git = crate::git_ops::cached_git();
+        let structure = sync::shared::render_structure_opt(db, git.as_ref(), &repo)?;
         let share_specs = sync::shared::effective_share_specs(db, &repo, structure.as_ref())?;
         let rendered = sync::shared::gitignore_template_for(&gitignore_template, true, share_specs);
         if sync::sync_gitignore_section(&rendered, base)? {

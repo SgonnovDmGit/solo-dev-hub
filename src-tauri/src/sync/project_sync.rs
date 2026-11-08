@@ -2529,4 +2529,57 @@ mod tests {
             text
         );
     }
+
+    /// T-000243 review (fourth pass): without a git binary a HELPER's specs
+    /// policy cannot be discovered — the render is refused and `.gitignore`
+    /// keeps its last written state instead of answering ON from a possibly
+    /// stale work-tree copy (the owner's policy needs no git and is covered
+    /// by the test above).
+    #[test]
+    fn the_gitignore_render_refuses_a_helper_policy_without_git() {
+        let db = make_db();
+        let project = db.create_project("P", None, "standard").unwrap();
+        let dir = TempDir::new().unwrap();
+        let repo = db
+            .upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        db.set_repo_local_path(repo.id, Some(dir.path().to_string_lossy().as_ref()))
+            .unwrap();
+        db.assign_repository(repo.id, Some(project.id), Some("tool"))
+            .unwrap();
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        // The last render kept the specs folder ignored.
+        fs::write(
+            dir.path().join(".gitignore"),
+            "# --- solo-dev-hub:begin ---\ndocs/superpowers/\n# --- solo-dev-hub:end ---\n",
+        )
+        .unwrap();
+        let tpl = SkeletonTemplates {
+            gitignore: "docs/codex/\ndocs/superpowers/\n".to_string(),
+            gitattributes: String::new(),
+            todo: String::new(),
+            bug_reports: String::new(),
+        };
+        let base = dir.path().to_path_buf();
+        let repo = db.get_repository(repo.id).unwrap();
+        let mut c = SyncCounters::new();
+        let shared = sync::shared::SharedSync::empty();
+        write_repo_skeletons(
+            &db,
+            project.id,
+            &base,
+            &repo,
+            &tpl,
+            &[],
+            &shared,
+            None,
+            &mut c,
+        );
+        let text = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(
+            text.contains("docs/superpowers/"),
+            "a refused render must leave .gitignore untouched:\n{}",
+            text
+        );
+    }
 }

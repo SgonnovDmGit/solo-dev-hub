@@ -303,6 +303,41 @@ pub fn render_structure_of(
     }
 }
 
+/// Whether this install's shared policy for `repo` is its OWN database row —
+/// the owner side (`shared_mode` on, or the cached `main` role). The only
+/// case a policy may resolve without git: a helper's policy lives in the
+/// owner's published structure and must be discovered, never guessed.
+pub fn policy_is_local(db: &AppDb, repo: &Repository) -> bool {
+    db.get_shared_state(repo.id)
+        .map(|s| s.shared_mode || s.shared_role.as_deref() == Some("main"))
+        .unwrap_or(false)
+}
+
+/// `render_structure_of` with an OPTIONAL git binary. Without git no
+/// authoritative discovery is possible: the owner's policy needs none
+/// (`Ok(None)` — its database row answers), while a HELPER's render is
+/// REFUSED (`Err`) — unavailable discovery is not evidence of absence, and
+/// the work-tree copy may carry a stale ON the fetched ref has replaced.
+pub fn render_structure_opt(
+    db: &AppDb,
+    git: Option<&GitBinary>,
+    repo: &Repository,
+) -> Result<Option<ProjectStructure>, String> {
+    match git {
+        Some(git) => render_structure_of(db, git, repo),
+        None => {
+            if policy_is_local(db, repo) {
+                Ok(None)
+            } else {
+                Err("the shared specs policy cannot be resolved: git is \
+                     unavailable, so the owner's published structure cannot \
+                     be discovered"
+                    .to_string())
+            }
+        }
+    }
+}
+
 /// `.gitignore` template lines dropped for a shared repo: the files that travel
 /// through git (spec R10), plus `docs/sdh_skills/` (the owner commits them) and
 /// `docs/superpowers/` (T-000243 — but ONLY while the per-repo `share_specs`
@@ -1649,29 +1684,28 @@ impl SharedSync {
     /// T-000243 review (third pass): the structure state a RENDER (the managed
     /// `.gitignore` of the project sync) resolves a shared repo's policy from,
     /// distinguishing "phase A discovered this repo" from "phase A never ran
-    /// for it". A pass-less repo used to fall into `Ok(None)` and answer from
-    /// the WORK TREE alone, whose stale copy could produce an ON render after
-    /// the fetched authoritative origin ref had said OFF — or had been
-    /// refused. A repo WITHOUT a pass is therefore discovered HERE, under the
-    /// caller's render guard, authoritatively and exactly the way phase A
-    /// would have (`render_structure_of`: the owner answers from its own
-    /// database row and needs no git; a helper's discovery reads the pinned /
-    /// matching origin ref; a refusal is a refusal and propagates as `Err`).
-    /// Without a git binary no discovery is possible and the legacy default
-    /// of `effective_share_specs` stands, as before.
+    /// for it". T-000243 review (fourth pass): a HELPER's answer is ALWAYS
+    /// fresh authoritative discovery (`render_structure_opt`) — a phase-A
+    /// snapshot may already be superseded by another SharedSync of this
+    /// install that fetched and accepted a newer structure between the
+    /// phases, and the work tree alone may hold the stale copy. Only the
+    /// OWNER side still answers from its pass (its policy is its own
+    /// database row anyway, so the structure matters little) or `None`.
     pub fn render_state_of(
         &self,
         db: &AppDb,
         git: Option<&GitBinary>,
         repo: &Repository,
     ) -> Result<Option<ProjectStructure>, String> {
-        if self.has_pass(repo.id) {
-            return self.structure_state_of(repo.id).map(|s| s.cloned());
+        if policy_is_local(db, repo) {
+            return match self.has_pass(repo.id) {
+                // A pass of THIS sync answers with its phase-A outcome, so a
+                // refusal stays a refusal.
+                true => self.structure_state_of(repo.id).map(|s| s.cloned()),
+                false => Ok(None),
+            };
         }
-        match git {
-            Some(git) => render_structure_of(db, git, repo),
-            None => Ok(None),
-        }
+        render_structure_opt(db, git, repo)
     }
 }
 
@@ -2774,9 +2808,24 @@ impl SharedSync {
         let passes = std::mem::take(&mut self.passes);
         let mut out = SharedOutcome::default();
         for mut pass in passes {
+            // T-000243 review (fourth pass): ONE guard hold covers phase B
+            // AND the status settlement — a writer that flipped the repo's
+            // shared state between the phases (disable / approve / enable /
+            // the specs setter) cannot land between the policy work and the
+            // status write. Passes phase B never revalidates (no git, or a
+            // pass refused back in phase A) still settle only onto a repo
+            // that REMAINS shared: a disable that completed meanwhile owns
+            // the repo's status (including a `push_failed` it is still
+            // retrying), and a stale pass must not overwrite it.
+            let guard = specs_policy_guard(pass.repo.id);
+            let _guard = guard.lock().unwrap();
             if let (Some(git), Some(_)) = (git, pass.role) {
                 phase_b_repo(db, git, &mut pass);
             }
+            let still_shared = db
+                .get_shared_state(pass.repo.id)
+                .map(|s| is_shared_state(&s))
+                .unwrap_or(false);
             let issues = std::mem::take(&mut pass.issues);
             out.issues
                 .extend(fresh_issues(pass.repo.id, &pass.root, issues));
@@ -2789,7 +2838,7 @@ impl SharedSync {
             // T-000243 review (third pass): a pass cancelled by phase B's
             // revalidation settles no status — the writer that changed the
             // repo's state under the guard owns it (see `RepoPass::cancelled`).
-            if !pass.cancelled {
+            if !pass.cancelled && still_shared {
                 settle_status(db, &pass, &mut out);
             }
         }
@@ -2967,8 +3016,20 @@ pub(crate) fn render_write_probe(repo_id: i64, root: &Path) {
 ///   in this very pass, whenever its branch already exists locally (a fresh
 ///   participant's branch is still created by the next phase A).
 ///
+/// * a HELPER's structure is re-DISCOVERED, not re-read from the work tree:
+///   another SharedSync of this install may have fetched and accepted a
+///   NEWER authoritative copy between the phases (its fetch already moved
+///   the remote-tracking refs), so the phase-A snapshot may carry a stale
+///   ON — or miss a newer refusal — exactly like the owner's work-tree file
+///   could. Discovery runs the same `discover_structure` phase A ran,
+///   against the pinned / matching origin ref. A structure that derives a
+///   DIFFERENT role for this install (approved elsewhere, removed) or is
+///   gone entirely CANCELS the pass — the next phase A re-derives
+///   everything; a refusal fails closed with the untrusted status, as in
+///   phase A.
+///
 /// Returns `true` when the pass may proceed.
-fn revalidate_pass_under_guard(db: &AppDb, pass: &mut RepoPass) -> bool {
+fn revalidate_pass_under_guard(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) -> bool {
     let Some(role) = pass.role else { return false };
     let state = match db.get_shared_state(pass.repo.id) {
         Ok(s) => s,
@@ -2988,26 +3049,62 @@ fn revalidate_pass_under_guard(db: &AppDb, pass: &mut RepoPass) -> bool {
         pass.cancelled = true;
         return false;
     }
-    if role == Role::Main {
-        let Some(gh) = pass.repo.github_name.clone() else {
-            pass.cancelled = true;
-            return false;
-        };
-        match ss::read_structure_file(&pass.root, &gh, &ss::AdminVerified::load(db)) {
-            Ok(s) => {
-                pass.structure = s;
-                if let Some(own) = pass.own_branch.clone() {
-                    let mut rec = vec![own];
-                    if let Some(s) = &pass.structure {
-                        rec.extend(s.participants.iter().map(|p| p.branch.clone()));
+    match role {
+        Role::Main => {
+            let Some(gh) = pass.repo.github_name.clone() else {
+                pass.cancelled = true;
+                return false;
+            };
+            match ss::read_structure_file(&pass.root, &gh, &ss::AdminVerified::load(db)) {
+                Ok(s) => {
+                    pass.structure = s;
+                    if let Some(own) = pass.own_branch.clone() {
+                        let mut rec = vec![own];
+                        if let Some(s) = &pass.structure {
+                            rec.extend(s.participants.iter().map(|p| p.branch.clone()));
+                        }
+                        pass.recipients = clean_recipients(rec);
                     }
-                    pass.recipients = clean_recipients(rec);
+                }
+                Err(reason) => {
+                    pass.note_untrusted(reason);
+                    pass.role = None;
+                    return false;
                 }
             }
-            Err(reason) => {
-                pass.note_untrusted(reason);
-                pass.role = None;
-                return false;
+        }
+        Role::Contributor | Role::Pending => {
+            let (Some(gh), Some(_)) = (pass.repo.github_name.clone(), pass.repo.local_path.clone())
+            else {
+                // Phase A could not have discovered without these either;
+                // the snapshot is all there is.
+                return true;
+            };
+            let pinned = ss::read_shared_import(db, pass.repo.id).pinned_dev_branch;
+            let admins = ss::AdminVerified::load(db);
+            match ss::discover_structure(git, &pass.root, &gh, pinned.as_deref(), &admins) {
+                Ok(DiscoverOutcome::Found(s, _)) => {
+                    if ss::derive_role(Some(&s), Some(pass.login.as_str())) != Some(role) {
+                        pass.cancelled = true;
+                        return false;
+                    }
+                    let main_dev = s.main.dev_branch.clone();
+                    pass.structure = Some(s);
+                    if let Some(own) = pass.own_branch.clone() {
+                        pass.recipients = match role {
+                            Role::Contributor => clean_recipients(vec![own, main_dev]),
+                            _ => clean_recipients(vec![main_dev]),
+                        };
+                    }
+                }
+                Ok(DiscoverOutcome::NotFound) => {
+                    pass.cancelled = true;
+                    return false;
+                }
+                Ok(DiscoverOutcome::Untrusted(reason)) | Err(reason) => {
+                    pass.note_untrusted(reason);
+                    return false;
+                }
             }
         }
     }
@@ -3017,21 +3114,20 @@ fn revalidate_pass_under_guard(db: &AppDb, pass: &mut RepoPass) -> bool {
 fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     let Some(role) = pass.role else { return };
     // T-000243 review: one coherent policy snapshot for the whole
-    // policy-sensitive half of the pass. The guard is held from here to the
-    // end of the function — the structure publish (which carries the flag),
-    // the `.gitignore`-driven enumeration, the pathspecs and every commit and
-    // push of THIS repo — so `set_repo_share_specs` (another thread) is never
-    // acknowledged in the middle of it: either this whole section completes
-    // under the old flag and the setter applies after it, or the setter lands
-    // first and this section reads the new flag. The managed `.gitignore`
-    // render of `project_sync` takes the same guard, so a render cannot read
-    // a flag that is being written either. The residual window is a render
-    // that finished with the old policy just before the setter landed: the
-    // file on disk is then stale until the next render, but nothing is
-    // committed with it (phase B resolves the policy again under the guard),
-    // so it self-heals without ever publishing the wrong files.
-    let policy = specs_policy_guard(pass.repo.id);
-    let _policy = policy.lock().unwrap();
+    // policy-sensitive half of the pass. The CALLER (`SharedSync::finish`)
+    // holds the per-repo guard from here to the status settlement — the
+    // structure publish (which carries the flag), the `.gitignore`-driven
+    // enumeration, the pathspecs and every commit and push of THIS repo —
+    // so `set_repo_share_specs` (another thread) is never acknowledged in
+    // the middle of it: either this whole section completes under the old
+    // flag and the setter applies after it, or the setter lands first and
+    // this section reads the new flag. The managed `.gitignore` render of
+    // `project_sync` takes the same guard, so a render cannot read a flag
+    // that is being written either. The residual window is a render that
+    // finished with the old policy just before the setter landed: the file
+    // on disk is then stale until the next render, but nothing is committed
+    // with it (phase B resolves the policy again under the guard), so it
+    // self-heals without ever publishing the wrong files.
     #[cfg(test)]
     phase_b_policy_probe(pass.repo.id, &pass.root);
     // Same guard as phase A, checked again: the repo may have changed since.
@@ -3043,7 +3139,7 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     // `disable_shared_mode`, `enable_shared_mode`) may have completed BETWEEN
     // the phases; each of them takes this same guard, but only for its own
     // run, so the phase-A snapshot may not be trusted by the deferred half.
-    if !revalidate_pass_under_guard(db, pass) {
+    if !revalidate_pass_under_guard(db, git, pass) {
         return;
     }
     let root = pass.root.clone();
@@ -5357,6 +5453,106 @@ mod tests {
         );
         // and the repo settled no status from the cancelled pass
         assert_eq!(fx.main_status(), None);
+    }
+
+    /// T-000243 review (fourth pass): two SharedSyncs of the SAME helper
+    /// install race. Pass A captures the ON structure in phase A; the owner
+    /// then publishes OFF and pass B accepts it whole; A resumes — its
+    /// phase-B revalidation must discover the NEWER authoritative structure
+    /// instead of committing with the stale ON snapshot, and the render must
+    /// resolve the same fresh policy.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_stale_helper_pass_follows_the_newer_authoritative_policy() {
+        let fx = two_installs();
+        fx.make_participant();
+        let git = gb();
+        // A spec the helper could publish if its stale ON snapshot were used.
+        write(&fx.helper_dir, "docs/superpowers/specs/x.md", "# x\n");
+        // Pass A: phase A only — the ON structure is captured.
+        let project = fx
+            .helper_db
+            .list_all_repos()
+            .unwrap()
+            .into_iter()
+            .find_map(|r| r.project_id);
+        let shared_a = run_phase_a(&fx.helper_db, Some(&git), project);
+        // The owner turns specs OFF and publishes it; pass B accepts it.
+        fx.main_db
+            .set_repo_share_specs(fx.main_repo, false)
+            .unwrap();
+        fx.sync_main();
+        fx.sync_helper();
+        // Pass A resumes: phase B must see OFF — no specs commit of its own.
+        let out_a = shared_a.finish(&fx.helper_db, Some(&git));
+        assert!(out_a.issues.is_empty(), "{:?}", out_a.issues);
+        assert_eq!(
+            fx.remote_file("helper-dev", "docs/superpowers/specs/x.md"),
+            None,
+            "the stale ON pass must not publish the helper's spec"
+        );
+        assert_eq!(fx.remote_file("dev", "docs/superpowers/specs/x.md"), None);
+        // And the render resolves the same fresh policy, not the snapshot.
+        let repo = fx.helper_db.get_repository(fx.helper_repo).unwrap();
+        let state = SharedSync::empty()
+            .render_state_of(&fx.helper_db, Some(&git), &repo)
+            .unwrap();
+        assert!(
+            !effective_share_specs(&fx.helper_db, &repo, state.as_ref()).unwrap(),
+            "the render must resolve the newer OFF, not the phase-A ON"
+        );
+    }
+
+    /// T-000243 review (fourth pass): without a git binary a HELPER's specs
+    /// policy cannot be discovered — `render_structure_opt` refuses instead
+    /// of letting a possibly stale work-tree copy answer. The owner's own
+    /// policy needs no discovery and still resolves.
+    #[test]
+    fn render_structure_opt_refuses_a_helper_without_git() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "helper").unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        let err = render_structure_opt(&db, None, &repo).unwrap_err();
+        assert!(err.contains("git is unavailable"), "{}", err);
+        // The owner side answers from its own row — no git needed.
+        db.set_shared_role(repo.id, Some("main")).unwrap();
+        db.set_shared_mode(repo.id, true).unwrap();
+        assert!(render_structure_opt(&db, None, &repo).unwrap().is_none());
+    }
+
+    /// T-000243 review (fourth pass): a pass phase A REFUSED never entered
+    /// phase B (`role` is `None`), so `finish` used to settle its stale
+    /// untrusted status even after a disable that completed between the
+    /// phases had already owned the repo's state. The settlement now happens
+    /// under the same guard and only onto a repo that remains shared.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_disable_between_the_phases_keeps_the_disabled_status() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The owner's structure turns unusable: phase A refuses the pass.
+        write(&fx.main_dir, ".sdh/project.json", "{ not json");
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        // Sharing is switched off between the phases.
+        disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(
+            !fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .shared_mode
+        );
+        let _out = shared.finish(&fx.main_db, Some(&gb()));
+        assert_eq!(
+            fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .shared_status,
+            None,
+            "the disabled repo's status belongs to the disable, not the stale pass"
+        );
     }
 
     /// T-000243 review (second pass): every writer of the policy-bearing
