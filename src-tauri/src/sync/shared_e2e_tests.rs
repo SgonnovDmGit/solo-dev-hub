@@ -1813,3 +1813,53 @@ fn t000243_off_before_the_first_commit_keeps_specs_local_on_both_installs() {
     .trim()
     .is_empty());
 }
+
+/// T-000243 review (second pass): a remote structure that phase A REFUSED
+/// (here: malformed JSON on the pinned dev branch) must refuse the
+/// `.gitignore` render of the SAME pass as well — the render used to re-read
+/// the (stale but valid, default-ON) work-tree copy and write a shared-ON
+/// `.gitignore` anyway, so the promised render refusal did not hold (only
+/// phase B blocked). The helper has no `.gitignore` yet, so a render that ran
+/// would create one: the assertion is that none is written and the refusal is
+/// reported on the render itself.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn t000243_a_refused_remote_structure_refuses_the_gitignore_render() {
+    let fx = two_installs();
+    fx.make_participant();
+    // The owner's authoritative copy on the dev branch goes bad; the helper's
+    // work tree still holds the previous valid copy (the default ON).
+    write(&fx.main_dir, ".sdh/project.json", "{ not json at all");
+    g(&fx.main_dir, &["add", ".sdh"]);
+    g(&fx.main_dir, &["commit", "-q", "-m", "break the structure"]);
+    g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+
+    let home = TempDir::new().unwrap();
+    let res = run_project_sync_in(
+        &fx.helper_db,
+        fx.project_id,
+        Some(home.path().to_path_buf()),
+    )
+    .unwrap();
+    let refused = res
+        .errors
+        .iter()
+        .find(|i| i.target.as_deref() == Some(".gitignore"))
+        .expect("the refused structure must surface on the .gitignore render");
+    assert!(
+        refused
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invalid JSON"),
+        "{:?}",
+        refused
+    );
+    // No shared-ON `.gitignore` was resolved from the stale work-tree copy.
+    assert!(
+        !fx.helper_dir.join(".gitignore").exists(),
+        "the render must be skipped with an issue, never written from the stale policy"
+    );
+    // The same pass also marked the repo untrusted.
+    assert_eq!(fx.helper_status().as_deref(), Some("shared_untrusted"));
+}

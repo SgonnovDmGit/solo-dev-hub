@@ -11,7 +11,7 @@
   import { addToast } from '$lib/stores/ui';
   import { sharedModePreflight, enableSharedMode, disableSharedMode, setRepoShareSpecs, getRepoSharedState } from '$lib/api/tauri-commands';
   import { isRepoPublic, splitRepoFullName } from '$lib/api/github';
-  import { saveSpecsToggle } from '$lib/utils/specs-toggle';
+  import { saveSpecsToggle, chipActionAllowed } from '$lib/utils/specs-toggle';
   import type { IgnoreLine } from '$lib/types';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import SharedEnableDialog from './SharedEnableDialog.svelte';
@@ -82,7 +82,15 @@
   });
 
   async function handleSpecsToggle() {
-    if (specsBusy || specs === null) return;
+    // T-000243 review (second pass): one action family — while a shared-mode
+    // action is in flight (or the stored value has not loaded) the save does
+    // not start; the browser has already flipped the box, so the stored value
+    // is written back into the draft either way. (The `specs === null` check
+    // is what the gate says for `toggleSpecs`; it also narrows the type.)
+    if (specs === null || !chipActionAllowed({ specs, specsBusy, modeBusy: busy }, 'toggleSpecs')) {
+      specsChecked = specs === true;
+      return;
+    }
     const stored = specs;
     specsBusy = true;
     try {
@@ -120,7 +128,12 @@
   }
 
   async function handleToggle() {
-    if (busy) return;
+    // T-000243 review (second pass): serialized with the specs save — the
+    // enable direction especially, whose first autosync must see the
+    // persisted specs choice, never the default while a save is pending.
+    if (!chipActionAllowed({ specs, specsBusy, modeBusy: busy }, checked ? 'disableMode' : 'enableMode')) {
+      return;
+    }
     if (checked) {
       showDisable = true;
       return;
@@ -159,7 +172,10 @@
   }
 
   async function confirmEnable() {
-    if (busy) return;
+    if (!chipActionAllowed({ specs, specsBusy, modeBusy: busy }, 'enableMode')) {
+      showEnable = false;
+      return;
+    }
     busy = true;
     try {
       await enableSharedMode(repoId, blockingLines.length > 0);
@@ -175,7 +191,7 @@
 
   async function confirmDisable() {
     showDisable = false;
-    if (busy) return;
+    if (!chipActionAllowed({ specs, specsBusy, modeBusy: busy }, 'disableMode')) return;
     busy = true;
     try {
       const res = await disableSharedMode(repoId);
@@ -192,6 +208,10 @@
 
 <div class="chip" class:on={checked} title={$tStore('shared.chipHint' as any)}>
   <span class="chip-label">{$tStore('shared.chipLabel' as any)}:</span>
+  <!-- T-000243 review (second pass): the switch is disabled while ANY action
+       of the chip is in flight, and the enable direction also while the
+       stored specs value has not loaded (the first autosync must see the
+       persisted choice). -->
   <button
     type="button"
     class="switch"
@@ -199,7 +219,7 @@
     role="switch"
     aria-checked={checked}
     aria-label={$tStore('shared.chipLabel' as any)}
-    disabled={busy}
+    disabled={busy || specsBusy || (!checked && specs === null)}
     onclick={handleToggle}
   >
     <span class="knob"></span>
@@ -217,7 +237,7 @@
     class="specs-check"
     type="checkbox"
     bind:checked={specsChecked}
-    disabled={specs === null || specsBusy}
+    disabled={specs === null || specsBusy || busy}
     onchange={handleSpecsToggle}
   />
   <span class="chip-label">{$tStore('shared.specs.label' as any)}</span>
@@ -229,7 +249,7 @@
     {devBranch}
     {isPublic}
     {blockingLines}
-    {busy}
+    busy={busy || specsBusy}
     onConfirm={confirmEnable}
     onCancel={() => (showEnable = false)}
   />

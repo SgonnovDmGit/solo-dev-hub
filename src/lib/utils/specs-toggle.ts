@@ -73,3 +73,43 @@ export async function saveSpecsToggle(
     return { ok: false, value: input.stored, kind: 'failed', error: err };
   }
 }
+
+// T-000243 review (second pass): the chip's two switches are ONE action
+// family and must be serialized against each other. The specs save runs an
+// administrator verification (a GitHub round trip) before it persists, and
+// enabling shared mode starts the first autosync — if the enable could run
+// while an OFF save was still in flight, the autosync would see the stored
+// default ON before the user's choice persisted (the spec's
+// save-before-enable). The component checks this pure decision before every
+// handler and in every `disabled` binding, and sets its busy flag
+// synchronously before the first `await`, so the answer cannot change
+// mid-flight (JS is single-threaded; the flag closes the gate before any
+// promise resolves).
+
+/** Which chip action is asking for permission. */
+export type ChipAction = 'toggleSpecs' | 'enableMode' | 'disableMode';
+
+/** What the chip knows right now (a snapshot of its state). */
+export interface ChipGateState {
+  /** The stored specs value: null while it has not loaded (or failed to). */
+  specs: boolean | null;
+  /** A specs save (verify + set) is in flight. */
+  specsBusy: boolean;
+  /** A shared-mode action (preflight / enable / disable) is in flight. */
+  modeBusy: boolean;
+}
+
+/** May the action start now? One action of the chip at a time, never during
+ * another one's flight, and the enable direction additionally waits for the
+ * stored specs value: the first autosync it triggers must see the persisted
+ * choice, not the default. */
+export function chipActionAllowed(state: ChipGateState, action: ChipAction): boolean {
+  if (state.specsBusy || state.modeBusy) return false;
+  switch (action) {
+    case 'toggleSpecs':
+    case 'enableMode':
+      return state.specs !== null;
+    case 'disableMode':
+      return true;
+  }
+}

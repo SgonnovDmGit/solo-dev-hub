@@ -103,24 +103,42 @@ fn init_docs_for_repo_in(
     // F-000044: a shared repo renders both blocks for sharing (same as the sync).
     // T-000243: the same effective `share_specs` policy the sync pass uses —
     // the owner's stored setting, the owner's published flag for a helper.
-    // T-000243 review: the policy read, the render and the write run under the
-    // same per-repo guard as phase B of the shared pass, and a structure that
-    // is present but unusable is an error (never a guessed `on`). A repo that
-    // is not shared resolves no policy at all.
+    // T-000243 review (second pass): a helper resolves the policy from the
+    // SAME authoritative discovery the sync runs (`render_structure_of`) —
+    // reading only the work tree let a stale copy supply the policy after
+    // phase A had refused a malformed remote one. The guard spans the policy
+    // read AND the `.gitignore` write (an old-ON render must not land after
+    // an OFF save or overwrite a newer OFF render), and a refused structure
+    // errors the command instead of writing a guessed-on `.gitignore`. A repo
+    // that is not shared resolves no policy at all.
     let shared = sync::shared::is_shared_repo(db, repo_id);
-    let gitignore_template = if !shared {
-        sync::shared::gitignore_template_for(&gitignore_template, false, true)
-    } else {
+    if shared {
         let policy = sync::shared::specs_policy_guard(repo_id);
         let _policy = policy.lock().unwrap();
-        let share_specs = sync::shared::effective_share_specs(db, &repo, None)?;
-        sync::shared::gitignore_template_for(&gitignore_template, true, share_specs)
-    };
+        // No git binary on the machine: no discovery is possible; the policy
+        // then comes from the same validated work-tree read as before (the
+        // owner's answer never needs git at all).
+        let structure = match crate::git_ops::cached_git() {
+            Some(git) => sync::shared::render_structure_of(db, &git, &repo)?,
+            None => None,
+        };
+        let share_specs = sync::shared::effective_share_specs(db, &repo, structure.as_ref())?;
+        let rendered = sync::shared::gitignore_template_for(&gitignore_template, true, share_specs);
+        if sync::sync_gitignore_section(&rendered, base)? {
+            updated.push(".gitignore (section)".to_string());
+        }
+        // Test rendezvous: fires while the guard is still held, right after
+        // the write (see `render_write_probe`).
+        #[cfg(test)]
+        sync::shared::render_write_probe(repo_id, base);
+    } else {
+        let rendered = sync::shared::gitignore_template_for(&gitignore_template, false, true);
+        if sync::sync_gitignore_section(&rendered, base)? {
+            updated.push(".gitignore (section)".to_string());
+        }
+    }
     let gitattributes_template =
         sync::shared::gitattributes_template_for(&gitattributes_template, shared);
-    if sync::sync_gitignore_section(&gitignore_template, base)? {
-        updated.push(".gitignore (section)".to_string());
-    }
     if sync::sync_gitattributes_section(&gitattributes_template, base)? {
         updated.push(".gitattributes (section)".to_string());
     }
@@ -872,6 +890,90 @@ mod tests {
             );
             assert!(!skills.join(format!("{}.md.approved", name)).exists());
         }
+    }
+
+    /// T-000243 review (second pass): the standalone init-docs render takes
+    /// the same per-repo policy guard as the sync, and holds it THROUGH the
+    /// `.gitignore` write — the probe fires right after the write and the
+    /// guard is still held there, so a specs save (or a phase B policy
+    /// section) cannot interleave between the policy read and the write.
+    #[test]
+    fn test_init_docs_holds_the_policy_guard_through_the_write() {
+        let db = make_db();
+        let dir = TempDir::new().unwrap();
+        let repo = db
+            .insert_local_repository(dir.path().to_string_lossy().as_ref(), "render", None, None)
+            .unwrap();
+        let repo_id = repo.id;
+        db.set_shared_mode(repo_id, true).unwrap();
+        db.set_shared_role(repo_id, Some("main")).unwrap();
+        // The owner opts out: the render must keep the specs folder ignored.
+        db.set_repo_share_specs(repo_id, false).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        crate::sync::shared::install_render_write_probe(
+            repo_id,
+            dir.path(),
+            entered_tx,
+            release_rx,
+        );
+        let home = TempDir::new().unwrap();
+        let init = std::thread::spawn(move || {
+            init_docs_for_repo_in(&db, Some(home.path().to_path_buf()), repo_id).unwrap()
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the render probe never fired: the render did not run");
+        assert!(
+            crate::sync::shared::specs_policy_guard(repo_id)
+                .try_lock()
+                .is_err(),
+            "the guard must still be held AFTER the .gitignore write"
+        );
+        release_tx.send(1).unwrap();
+        init.join().unwrap();
+        let text = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(
+            text.contains("docs/superpowers/"),
+            "the OFF render keeps the specs folder ignored:\n{}",
+            text
+        );
+    }
+
+    /// T-000243 review (second pass): the standalone init-docs path resolves a
+    /// helper's policy through the same authoritative discovery as the sync
+    /// (`render_structure_of`) — a malformed remote copy refuses the whole
+    /// render (the command errors) instead of falling back to the stale
+    /// work-tree copy and writing a shared-ON `.gitignore`.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn test_init_docs_refuses_the_render_when_the_structure_is_refused() {
+        use crate::sync::shared::test_support::{g, two_installs, write};
+        let fx = two_installs();
+        fx.make_participant();
+        // The owner's authoritative copy on the dev branch goes bad; the
+        // helper's work tree still holds the previous valid (default-ON) copy.
+        write(&fx.main_dir, ".sdh/project.json", "{ not json at all");
+        g(&fx.main_dir, &["add", ".sdh"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "break the structure"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        // The standalone button does not fetch; the corrupted ref must be in
+        // the helper's remote-tracking view, as the last sync left it.
+        g(&fx.helper_dir, &["fetch", "-q", "origin"]);
+
+        let home = TempDir::new().unwrap();
+        let err = init_docs_for_repo_in(
+            &fx.helper_db,
+            Some(home.path().to_path_buf()),
+            fx.helper_repo,
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid JSON"), "{}", err);
+        assert!(
+            !fx.helper_dir.join(".gitignore").exists(),
+            "no `.gitignore` may be written from the stale work-tree policy"
+        );
     }
 
     /// T-000207 follow-up: the global-rules button renders `~/.claude/skills/`.

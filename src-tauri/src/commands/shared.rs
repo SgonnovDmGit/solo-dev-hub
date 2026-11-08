@@ -52,7 +52,15 @@ pub fn set_shared_admin_verified(
 /// helper or an unknown login is refused, also through a direct IPC call.
 /// Settable before sharing is enabled; the next sync publishes the flag in
 /// `.sdh/project.json`, re-renders `.gitignore` and narrows the pathspecs.
-#[tauri::command]
+///
+/// T-000243 review (second pass): `(async)` like the neighbours. The setter
+/// waits on the per-repo policy guard, which phase B holds across its commit
+/// and push (network, up to the git timeouts) — as a plain synchronous
+/// command that wait ran on the Tauri main/UI thread and froze the window for
+/// as long as the sync was in flight. `(async)` runs the body on the async
+/// runtime's worker thread, so only this call waits; the UI stays responsive
+/// (the TS `invoke` was already async, nothing changes for the frontend).
+#[tauri::command(async)]
 pub fn set_repo_share_specs(
     db: State<AppDb>,
     repo_id: i64,

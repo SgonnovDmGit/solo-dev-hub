@@ -60,10 +60,49 @@ pub struct StructRepo {
     pub github: String,
     pub role: String,
     /// T-000243: whether `docs/superpowers/` travels in shared mode for THIS
-    /// repo. `None` = legacy structure without the field = default ON. A wrong
-    /// JSON type is a parse error, never a silent fallback to `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// repo. `None` = the field is ABSENT (a legacy structure) = default ON.
+    /// T-000243 review (second pass): a PRESENT value must be a real boolean.
+    /// Serde's plain `Option<bool>` folds an explicit JSON `null` into `None`
+    /// too, which would silently turn sharing ON for a file that says no such
+    /// thing — the spec grants the default only to a field that is MISSING
+    /// («неверный тип — ошибка, не fallback»), and `null` is a wrong type like
+    /// any other. Omission (serde `default`) is the only road to `None`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_share_specs",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub share_specs: Option<bool>,
+}
+
+/// `share_specs` deserializer: absent → serde `default` → `None`; present →
+/// `true` / `false` only. Explicit `null` — and every other JSON type — is a
+/// hard parse error, so the file surfaces as untrusted instead of resolving
+/// to the default-on.
+fn deserialize_share_specs<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Bool(b) => Ok(Some(b)),
+        other => Err(D::Error::custom(format!(
+            "share_specs must be true or false, not {}",
+            json_kind(&other)
+        ))),
+    }
+}
+
+/// The JSON type of a non-boolean `share_specs` value, for the parse error.
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1178,7 +1217,13 @@ pub fn pin_after_accept(db: &AppDb, repo_id: i64, s: &ProjectStructure) -> Resul
 /// A copy that is PRESENT but cannot be parsed (malformed JSON, a wrong field
 /// type) is `Untrusted` with the parse reason — T-000243 review: it is never
 /// allowed to fall back to an older valid copy, whose `share_specs` policy may
-/// be exactly what the unreadable copy came to change.
+/// be exactly what the unreadable copy came to change. The second review pass
+/// extends that to a copy that PARSES but does not VALIDATE (an unsupported
+/// format, a main this install does not trust): the authoritative copy — the
+/// pinned ref, or the origin ref the work tree's own dev branch names —
+/// exists and is refused, so the work-tree fallback never supplies the policy
+/// either. Only a ref that carries no structure at all leaves the work tree
+/// in charge.
 pub fn discover_structure(
     git: &GitBinary,
     repo_root: &Path,
@@ -1251,7 +1296,18 @@ pub fn discover_structure(
                 }
                 match validate_structure(&s, github_name, admins) {
                     Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", pin))),
-                    Err(reason) => untrusted = Some(format!("origin/{}: {}", pin, reason)),
+                    // T-000243 review (second pass): the AUTHORITATIVE copy
+                    // exists but does not validate (an unsupported format, an
+                    // untrusted main) — the refusal is final. Recording it and
+                    // letting a valid stale WORKTREE copy win would revive
+                    // exactly the stale `share_specs` policy the bad copy may
+                    // have come to change.
+                    Err(reason) => {
+                        return Ok(DiscoverOutcome::Untrusted(format!(
+                            "origin/{}: {}",
+                            pin, reason
+                        )))
+                    }
                 }
             }
             Ok(None) => {}
@@ -1280,13 +1336,41 @@ pub fn discover_structure(
                                 branch, e
                             )));
                         }
-                        Ok(Some(o))
-                            if o.main.dev_branch == branch
-                                && validate_structure(&o, github_name, admins).is_ok() =>
-                        {
-                            return Ok(DiscoverOutcome::Found(o, format!("origin/{}", branch)));
+                        Ok(Some(o)) => {
+                            if o.main.dev_branch != branch {
+                                // T-000243 review (second pass): the ref the
+                                // work tree names carries a structure that
+                                // does not even claim to be that branch's —
+                                // not an authoritative copy we can accept, so
+                                // the stale work-tree policy does not stand in
+                                // for it either.
+                                return Ok(DiscoverOutcome::Untrusted(format!(
+                                    "origin/{}: the structure names dev branch {}",
+                                    branch, o.main.dev_branch
+                                )));
+                            }
+                            match validate_structure(&o, github_name, admins) {
+                                Ok(()) => {
+                                    return Ok(DiscoverOutcome::Found(
+                                        o,
+                                        format!("origin/{}", branch),
+                                    ))
+                                }
+                                // T-000243 review (second pass): the origin ref
+                                // matching the work tree's dev branch EXISTS
+                                // but does not validate — fail closed instead
+                                // of silently skipping the invalid copy (an
+                                // unsupported format or an untrusted main must
+                                // not revive a stale ON policy).
+                                Err(reason) => {
+                                    return Ok(DiscoverOutcome::Untrusted(format!(
+                                        "origin/{}: {}",
+                                        branch, reason
+                                    )))
+                                }
+                            }
                         }
-                        _ => {}
+                        Ok(None) => {}
                     }
                     return Ok(DiscoverOutcome::Found(s, SOURCE_WORKTREE.to_string()));
                 }
@@ -1823,6 +1907,9 @@ mod tests {
 
     /// A wrong JSON type for the flag is a hard error at parse time — never a
     /// silent fallback to the default (which would quietly turn sharing on).
+    /// T-000243 review (second pass): explicit `null` is one of those wrong
+    /// types, not "absent" — the default-on is granted only to a field that is
+    /// MISSING, and a present `null` must never resolve to it.
     #[test]
     fn share_specs_wrong_type_is_a_hard_error_not_a_fallback() {
         let with = |repos: &str| {
@@ -1837,6 +1924,8 @@ mod tests {
             r#"{"github":"Owner/web","role":"client","share_specs":"true"}"#,
             r#"{"github":"Owner/web","role":"client","share_specs":1}"#,
             r#"{"github":"Owner/web","role":"client","share_specs":["off"]}"#,
+            r#"{"github":"Owner/web","role":"client","share_specs":null}"#,
+            r#"{"github":"Owner/web","role":"client","share_specs":{}}"#,
         ] {
             let raw = with(bad);
             assert!(
@@ -1845,21 +1934,24 @@ mod tests {
                 bad
             );
         }
-        // explicit null is the canonical form of "no value": parses as None,
-        // exactly like a legacy file without the field, and means the default on
-        let null_raw = with(r#"{"github":"Owner/web","role":"client","share_specs":null}"#);
-        let null_s: ProjectStructure = serde_json::from_str(&null_raw).unwrap();
-        assert!(null_s.repos[0].share_specs.is_none());
-        assert!(share_specs_for(&null_s, "Owner/web"));
-        // and it surfaces as a structure error through the real read path
+        // Omission stays the one legacy form that means the default on.
+        let legacy = with(r#"{"github":"Owner/web","role":"client"}"#);
+        let legacy_s: ProjectStructure = serde_json::from_str(&legacy).unwrap();
+        assert!(legacy_s.repos[0].share_specs.is_none());
+        assert!(share_specs_for(&legacy_s, "Owner/web"));
+        // a present null surfaces as a structure error through the real read
+        // path, exactly like a wrong scalar type — never a default-on
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join(".sdh")).unwrap();
         fs::write(
             tmp.path().join(".sdh/project.json"),
-            with(r#"{"github":"Owner/web","role":"client","share_specs":"yes"}"#),
+            with(r#"{"github":"Owner/web","role":"client","share_specs":null}"#),
         )
         .unwrap();
-        assert!(read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default()).is_err());
+        let err =
+            read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default()).unwrap_err();
+        assert!(err.contains("share_specs"), "{}", err);
+        assert!(err.contains("null"), "{}", err);
         // the same file with a proper boolean is fine
         fs::write(
             tmp.path().join(".sdh/project.json"),
@@ -2326,6 +2418,93 @@ mod tests {
                 assert!(reason.contains("invalid JSON"), "{}", reason)
             }
             other => panic!("expected Untrusted, got {:?}", other),
+        }
+    }
+
+    /// T-000243 review (second pass), through discovery: an explicit
+    /// `"share_specs": null` in the AUTHORITATIVE copy is a wrong type, not
+    /// "absent" — it must surface as `Untrusted`, never let the valid stale
+    /// work-tree copy answer (and never resolve to the default on).
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_null_share_specs_in_the_authoritative_copy_is_untrusted_not_a_default_on() {
+        for pinned in [Some("dev"), None] {
+            let fx = fx();
+            publish_raw(
+                &fx,
+                "dev",
+                "{\"format\":1,\"project\":{\"name\":\"Acme\",\"type\":\"standard\"},\
+                 \"main\":{\"login\":\"Owner\",\"dev_branch\":\"dev\"},\
+                 \"repos\":[{\"github\":\"Owner/web\",\"role\":\"server\",\
+                 \"share_specs\":null}],\"microservices\":[],\"participants\":[]}",
+            );
+            let c = contributor(&fx);
+            // The stale but perfectly valid work-tree copy opts the specs OUT:
+            // if the null were folded into "absent", the default ON would win;
+            // if the stale copy were allowed to answer, OFF would win. Neither
+            // may happen — the copy is present and unreadable.
+            let mut stale = sample();
+            stale.repos[0].share_specs = Some(false);
+            write_structure_if_changed(&c, &stale).unwrap();
+            match discover_structure(&gb(), &c, REPO, pinned, &AdminVerified::default()).unwrap() {
+                DiscoverOutcome::Untrusted(reason) => {
+                    assert!(reason.contains("share_specs"), "{}", reason);
+                    assert!(reason.contains("null"), "{}", reason);
+                }
+                other => panic!("pinned={:?}: expected Untrusted, got {:?}", pinned, other),
+            }
+        }
+    }
+
+    /// T-000243 review (second pass), through discovery: an authoritative copy
+    /// that PARSES but does not VALIDATE (an unsupported format, a main this
+    /// install does not trust) used to be recorded and then silently replaced
+    /// by a valid stale work-tree copy — reviving a stale ON policy. Both the
+    /// pinned and the unpinned path must refuse it instead.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_origin_structure_that_fails_validation_is_never_replaced_by_a_stale_worktree_copy() {
+        // (mutation, a word of the refusal reason): a format from the future,
+        // and a main that is not the repo owner.
+        let cases: [(&dyn Fn(&mut ProjectStructure), &str); 2] = [
+            (
+                &|s: &mut ProjectStructure| s.format = 2,
+                "unsupported format",
+            ),
+            (
+                &|s: &mut ProjectStructure| s.main.login = "helper".into(),
+                "main is not the repo owner",
+            ),
+        ];
+        for (mutate, word) in cases {
+            for pinned in [Some("dev"), None] {
+                let fx = fx();
+                let mut bad = sample();
+                mutate(&mut bad);
+                publish_struct(&fx, "dev", &bad, "2026-01-01T00:00:00Z");
+                let c = contributor(&fx);
+                // A perfectly valid, perfectly stale ON copy in the work tree:
+                // exactly the policy the bad origin copy may have come to change.
+                let mut stale = sample();
+                stale.repos[0].share_specs = Some(true);
+                write_structure_if_changed(&c, &stale).unwrap();
+                assert!(
+                    share_specs_for(&stale, REPO),
+                    "fixture: the stale copy is ON"
+                );
+                match discover_structure(&gb(), &c, REPO, pinned, &AdminVerified::default())
+                    .unwrap()
+                {
+                    DiscoverOutcome::Untrusted(reason) => {
+                        assert!(reason.starts_with("origin/dev:"), "{}", reason);
+                        assert!(reason.contains(word), "{}", reason);
+                    }
+                    other => panic!(
+                        "pinned={:?}, case {}: expected Untrusted, got {:?}",
+                        pinned, word, other
+                    ),
+                }
+            }
         }
     }
 

@@ -11,7 +11,7 @@
  * `bind:checked` mechanism.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { saveSpecsToggle, type SpecsSaveDeps } from '../specs-toggle';
+import { saveSpecsToggle, chipActionAllowed, type SpecsSaveDeps } from '../specs-toggle';
 
 type VerifyFn = (token: string, repo: string, login: string) => Promise<{ admin: boolean }>;
 type SaveFn = (repoId: number, on: boolean) => Promise<unknown>;
@@ -107,5 +107,64 @@ describe('saveSpecsToggle', () => {
     const res = await saveSpecsToggle({ repoId: 1, repoFullName: null, login: 'me', token: null, stored: false }, d);
     expect(res).toEqual({ ok: true, value: true, note: null });
     expect(d.verifyAdmin).not.toHaveBeenCalled();
+  });
+});
+
+// T-000243 review (second pass): the chip's serialization gate. The component
+// cannot be driven (no jsdom in this repo), so the decision is pure and tested
+// here — the component's part is checking it before every handler and setting
+// its busy flag synchronously before the first await.
+describe('chipActionAllowed', () => {
+  const idle = { specs: true, specsBusy: false, modeBusy: false };
+
+  it('allows one action at a time when idle and the stored value is loaded', () => {
+    for (const action of ['toggleSpecs', 'enableMode', 'disableMode'] as const) {
+      expect(chipActionAllowed(idle, action)).toBe(true);
+    }
+  });
+
+  it('nothing starts while a specs save is in flight — enabling cannot overtake a pending OFF save', () => {
+    const saving = { ...idle, specsBusy: true };
+    for (const action of ['toggleSpecs', 'enableMode', 'disableMode'] as const) {
+      expect(chipActionAllowed(saving, action)).toBe(false);
+    }
+  });
+
+  it('nothing starts while a shared-mode action is in flight — a specs save waits for the enable', () => {
+    const enabling = { ...idle, modeBusy: true };
+    for (const action of ['toggleSpecs', 'enableMode', 'disableMode'] as const) {
+      expect(chipActionAllowed(enabling, action)).toBe(false);
+    }
+  });
+
+  it('the enable direction and the checkbox wait for the stored specs value; switching off does not', () => {
+    const loading = { ...idle, specs: null };
+    expect(chipActionAllowed(loading, 'enableMode')).toBe(false);
+    expect(chipActionAllowed(loading, 'toggleSpecs')).toBe(false);
+    expect(chipActionAllowed(loading, 'disableMode')).toBe(true);
+  });
+
+  it('a deferred specs save keeps the gate closed for the enable until it settles', async () => {
+    let resolveVerify!: (v: { admin: boolean }) => void;
+    const d = deps({
+      verify: () => new Promise<{ admin: boolean }>((res) => { resolveVerify = res; }),
+      save: vi.fn(async () => null),
+    });
+    // The org repo: the save runs its administrator verification first.
+    const gate: { specs: boolean | null; specsBusy: boolean; modeBusy: boolean } = {
+      specs: true,
+      specsBusy: false,
+      modeBusy: false,
+    };
+    const pending = saveSpecsToggle({ ...orgRepo, stored: true }, d);
+    // The component flips its busy flag synchronously, before the first await.
+    gate.specsBusy = true;
+    expect(chipActionAllowed(gate, 'enableMode')).toBe(false);
+    expect(chipActionAllowed(gate, 'disableMode')).toBe(false);
+    resolveVerify({ admin: true });
+    await pending;
+    gate.specsBusy = false;
+    expect(chipActionAllowed(gate, 'enableMode')).toBe(true);
+    expect(d.setRepoShareSpecs).toHaveBeenCalledWith(8, false);
   });
 });

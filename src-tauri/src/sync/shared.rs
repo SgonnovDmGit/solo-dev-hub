@@ -188,15 +188,17 @@ fn own_share_specs(db: &AppDb, repo_id: i64) -> bool {
 
 /// T-000243 review: the per-repo guard that serializes a `share_specs` change
 /// with the policy-sensitive work of the sync for the SAME repo. The setter
-/// (`set_repo_share_specs`, a Tauri command on another thread) takes it while
-/// it reads the role, diagnoses and writes the flag; phase B holds it for its
-/// whole policy section (the structure publish, the pathspecs and every commit
-/// of that repo), and the managed `.gitignore` render sites hold it while they
-/// resolve the policy and write the file. Nothing inside a guard awaits or
-/// takes another repo's guard, so the order cannot deadlock. Phase A is
-/// deliberately NOT guarded: its `pass.share_specs` only steers the
-/// fast-forward / divergence detection, and phase B resolves the policy again
-/// under the guard anyway.
+/// (`set_repo_share_specs`, an async Tauri command on another thread) takes it
+/// while it reads the role, diagnoses and writes the flag; phase B holds it for
+/// its whole policy section (the structure publish, the pathspecs and every
+/// commit and push of that repo); the managed `.gitignore` render sites hold it
+/// while they resolve the policy AND write the file; and every other writer of
+/// the policy-bearing structure — `enable_shared_mode`, `approve_join_request`
+/// and `disable_shared_mode` (it commits the deletion) — holds it across its
+/// read→build→write sequence. Nothing inside a guard awaits or takes another
+/// repo's guard, so the order cannot deadlock. Phase A is deliberately NOT
+/// guarded: its `pass.share_specs` only steers the fast-forward / divergence
+/// detection, and phase B resolves the policy again under the guard anyway.
 pub(crate) fn specs_policy_guard(repo_id: i64) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<i64, Arc<Mutex<()>>>>> = OnceLock::new();
     let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -258,6 +260,46 @@ pub fn effective_share_specs(
     match (structure, repo.github_name.as_deref()) {
         (Some(s), Some(gh)) => Ok(ss::share_specs_for(&s, gh)),
         _ => Ok(true),
+    }
+}
+
+/// T-000243 review (second pass): the authoritative structure a STANDALONE
+/// render (the init-docs button, `init_docs_for_repo_in`) resolves a helper's
+/// policy from — the same `discover_structure` the sync pass runs, so a
+/// malformed / untrusted AUTHORITATIVE copy refuses the render instead of the
+/// work-tree file (a possibly stale policy) answering. `Ok(None)`: this
+/// install is the repo's owner (its policy is its own database row, which
+/// `effective_share_specs` reads anyway), or no structure was found anywhere
+/// (the legacy default). Reads the remote-tracking refs the last fetch left
+/// (the button does not fetch); a refused or failed discovery is `Err` — the
+/// render fails closed, it never guesses.
+pub fn render_structure_of(
+    db: &AppDb,
+    git: &GitBinary,
+    repo: &Repository,
+) -> Result<Option<ProjectStructure>, String> {
+    let state = db.get_shared_state(repo.id).map_err(|e| e.to_string())?;
+    if state.shared_mode || state.shared_role.as_deref() == Some("main") {
+        return Ok(None);
+    }
+    let (Some(path), Some(gh)) = (repo.local_path.as_deref(), repo.github_name.as_deref()) else {
+        return Ok(None);
+    };
+    let root = Path::new(path);
+    if !is_git_repo(root) {
+        return Ok(None);
+    }
+    let pinned = ss::read_shared_import(db, repo.id).pinned_dev_branch;
+    match ss::discover_structure(
+        git,
+        root,
+        gh,
+        pinned.as_deref(),
+        &ss::AdminVerified::load(db),
+    ) {
+        Ok(DiscoverOutcome::Found(s, _)) => Ok(Some(s)),
+        Ok(DiscoverOutcome::NotFound) => Ok(None),
+        Ok(DiscoverOutcome::Untrusted(reason)) | Err(reason) => Err(reason),
     }
 }
 
@@ -1419,6 +1461,13 @@ struct RepoPass {
     /// `None` when the repo is not processed (untrusted structure, no login).
     role: Option<Role>,
     structure: Option<ProjectStructure>,
+    /// T-000243 review (second pass): why `structure` is `None` when discovery
+    /// REFUSED a copy (malformed / untrusted authoritative structure): the
+    /// reason must survive to the render, which may not quietly re-read the
+    /// work tree — its (possibly stale) policy is exactly what the refusal
+    /// rejected. `None` here + `None` in `structure` = no structure anywhere
+    /// (the legacy default-on).
+    structure_refused: Option<String>,
     /// T-000243: the effective `docs/superpowers/` policy this pass settled on
     /// (phase A). Phase B resolves it again: a toggle between the phases must
     /// not leave the old `on` in the deferred half of the pass.
@@ -1548,6 +1597,29 @@ impl SharedSync {
             .iter()
             .find(|p| p.repo.id == repo_id)
             .and_then(|p| p.structure.as_ref())
+    }
+
+    /// T-000243 review (second pass): phase A's structure outcome for
+    /// `repo_id` as the TRI-STATE the policy needs. `Ok(None)` = no structure
+    /// anywhere (or no pass for the repo — discovery was not refused, it just
+    /// did not run): the legacy default applies, and `effective_share_specs`
+    /// re-reads the work tree the same validated way. `Ok(Some(_))` = a
+    /// structure phase A accepted. `Err(reason)` = discovery REFUSED a copy
+    /// (malformed / untrusted authoritative structure): the caller must block
+    /// the policy-sensitive operation and report the reason — re-reading the
+    /// work tree would hand the policy to a stale copy the refusal just
+    /// rejected. (The owner's own work-tree read error in `phase_a_main` is
+    /// deliberately NOT a refusal: the owner's policy is its own database
+    /// row, which stays readable, and its phase B never runs with a broken
+    /// file.)
+    pub fn structure_state_of(&self, repo_id: i64) -> Result<Option<&ProjectStructure>, String> {
+        match self.passes.iter().find(|p| p.repo.id == repo_id) {
+            Some(p) => match &p.structure_refused {
+                Some(reason) => Err(reason.clone()),
+                None => Ok(p.structure.as_ref()),
+            },
+            None => Ok(None),
+        }
     }
 }
 
@@ -1923,6 +1995,7 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         login: login.to_string(),
         role: None,
         structure: None,
+        structure_refused: None,
         share_specs: true,
         own_branch: None,
         recipients: Vec::new(),
@@ -2028,8 +2101,11 @@ fn phase_a_foreign(
                 pass.issue(
                     repo_issue(Code::ManagedFileFailed, repo)
                         .target(STRUCTURE_REL_PATH)
-                        .detail(e),
+                        .detail(e.clone()),
                 );
+                // T-000243 review (second pass): discovery failed outright —
+                // the render must not fall back to the work-tree copy either.
+                pass.structure_refused = Some(e);
                 return Some(pass);
             }
             return None;
@@ -2054,7 +2130,12 @@ fn phase_a_foreign(
             for l in ss::candidate_admin_logins(git, root, gh, pinned.as_deref()) {
                 pass.ask_admin_check(gh, &l);
             }
-            pass.note_untrusted(reason);
+            pass.note_untrusted(reason.clone());
+            // T-000243 review (second pass): the refusal survives to the
+            // render (see `structure_state_of`): the `.gitignore` render is
+            // refused with this reason instead of re-reading the work tree,
+            // whose stale policy is what the refusal just rejected.
+            pass.structure_refused = Some(reason);
             Some(pass)
         }
         DiscoverOutcome::Found(s, _source) => {
@@ -2749,6 +2830,63 @@ fn phase_b_policy_probe(repo_id: i64, root: &Path) {
     }
 }
 
+// T-000243 review (second pass): the same rendezvous mechanism for the
+// managed `.gitignore` RENDER sites — fired right AFTER the file write, while
+// the per-repo policy guard is still held (the guard must outlive the write,
+// not just the policy read: a render computed with the old policy may not
+// land after an OFF save or overwrite a newer OFF render). The concurrency
+// tests use it to prove a specs save / phase B cannot interleave between the
+// read and the write. Matched by repo id AND repo root, like the phase B
+// probe; production never installs one.
+#[cfg(test)]
+struct RenderWriteProbe {
+    repo: i64,
+    root: PathBuf,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+#[cfg(test)]
+static RENDER_WRITE_PROBE: OnceLock<Mutex<Option<RenderWriteProbe>>> = OnceLock::new();
+
+/// Install the render rendezvous for the repo at `root`: the render sends the
+/// repo id on `entered` after it wrote `.gitignore` (still holding the guard)
+/// and waits for one message on `release`. Only one probe exists at a time.
+#[cfg(test)]
+pub(crate) fn install_render_write_probe(
+    repo: i64,
+    root: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = RENDER_WRITE_PROBE.get_or_init(|| Mutex::new(None));
+    *cell.lock().unwrap() = Some(RenderWriteProbe {
+        repo,
+        root: root.to_path_buf(),
+        entered,
+        release,
+    });
+}
+
+/// Fire the installed render probe, if any. Callers call this INSIDE the
+/// held policy guard, after the `.gitignore` write.
+#[cfg(test)]
+pub(crate) fn render_write_probe(repo_id: i64, root: &Path) {
+    let cell = RENDER_WRITE_PROBE.get_or_init(|| Mutex::new(None));
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        match g.as_ref() {
+            Some(p) if p.repo == repo_id && p.root == root => g.take(),
+            _ => None,
+        }
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        // The render still holds the per-repo guard while it waits.
+        let _ = p.release.recv();
+    }
+}
+
 fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     let Some(role) = pass.role else { return };
     // T-000243 review: one coherent policy snapshot for the whole
@@ -3261,6 +3399,16 @@ pub fn enable_shared_mode(
         .github_name
         .clone()
         .ok_or_else(|| "shared mode needs a GitHub repository".to_string())?;
+    // T-000243 review (second pass): the whole read→build→write sequence of
+    // the POLICY-BEARING structure runs under the per-repo guard (see
+    // `specs_policy_guard`). Without it an enable could interleave with a
+    // specs save / a sync's policy section: the structure built from the old
+    // flag would be written after the sync already published the new one, and
+    // the next pass would commit the stale policy. The DB flips sit inside
+    // the guard as well, so the mode and the published structure are one
+    // coherent snapshot.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
     let existing = ss::read_structure_file(&root, &gh, &ss::AdminVerified::load(db))?;
     // Validates: owner or administrator, project, dev branch.
     let built = ss::build_structure(db, repo_id, &login, existing.as_ref())?;
@@ -3411,6 +3559,14 @@ pub fn disable_shared_mode(
     if !state.shared_mode || state.shared_role.as_deref().is_some_and(|r| r != "main") {
         return Err("shared mode can only be switched off by the owner of the repo".into());
     }
+    // T-000243 review (second pass): the switch-off DELETES the policy-bearing
+    // structure (a commit and a push of the deletion), so it is serialized
+    // with everything else that reads or writes it — phase B's policy section
+    // (the guard spans its commit + push too), the specs setter, enable and
+    // the approval. Without the guard a phase B publishing the structure
+    // could interleave with the deletion commit and resurrect `.sdh/`.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
     let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
     let tracked = ls_files_tracked(git, &root, &sdh)?;
     // The participants' branches carry `.sdh/` too (the sync plumbed it there):
@@ -3708,6 +3864,15 @@ pub fn approve_join_request(
     let me = db
         .github_login()
         .ok_or_else(|| "the GitHub login of this install is unknown".to_string())?;
+    // T-000243 review (second pass): the approval rebuilds and writes the
+    // POLICY-BEARING structure, so it takes the same per-repo guard as phase B
+    // and the specs setter. Unguarded, an approval built with the old flag
+    // could land after a sync's policy section (or after a specs save) and
+    // publish / commit a stale policy — or clobber the sync's structure write
+    // mid-section. All the request reading, the build and the write sit
+    // inside the guard.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
     let existing = ss::read_structure_file(&root, &gh, &ss::AdminVerified::load(db))?;
     let base = ss::build_structure(db, repo_id, &me, existing.as_ref())?;
     let req = all_join_requests(db, git, &root, &gh, Some(&base.main.dev_branch))
@@ -4721,6 +4886,20 @@ mod tests {
         );
         let err = effective_share_specs(&helper, &hrepo, None).unwrap_err();
         assert!(err.contains("invalid JSON"), "{}", err);
+        // T-000243 review (second pass): an explicit `null` is a wrong type,
+        // not "absent" — the default-on is granted only to a MISSING field,
+        // so this must be the same refusal, never a silent on.
+        write(
+            dir.path(),
+            ".sdh/project.json",
+            "{\"format\":1,\"project\":{\"name\":\"Acme\",\"type\":\"standard\"},\
+             \"main\":{\"login\":\"Owner\",\"dev_branch\":\"dev\"},\
+             \"repos\":[{\"github\":\"Owner/api\",\"role\":\"server\",\
+             \"share_specs\":null}],\"microservices\":[],\"participants\":[]}",
+        );
+        let err = effective_share_specs(&helper, &hrepo, None).unwrap_err();
+        assert!(err.contains("share_specs"), "{}", err);
+        assert!(err.contains("null"), "{}", err);
         // And an untrusted source (a main this install cannot verify) is not a
         // policy either: still an error, never `on`.
         write(
@@ -4855,6 +5034,151 @@ mod tests {
             .remote_file("dev", ".sdh/project.json")
             .unwrap()
             .contains("\"share_specs\": false"));
+    }
+
+    /// T-000243 review (second pass): `approve_join_request` and
+    /// `enable_shared_mode` also write the policy-bearing structure, so they
+    /// take the same per-repo guard as phase B and the specs setter. The
+    /// deterministic order (the probe parks phase B inside its policy
+    /// section): phase B (still ON, without the new participant) → the
+    /// approval (adds `helper2`) → the OFF setter → one more sync. Whatever
+    /// order the queued writers wake in, nothing COMMITTED after the OFF save
+    /// says on again, and the approval is never clobbered by phase B's stale
+    /// structure snapshot. Without the guard the approval ran to completion
+    /// DURING the parked section and phase B's rebuild (from the phase-A
+    /// snapshot) silently dropped the new participant — the blocking
+    /// assertions below fail without it.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_approval_and_a_specs_toggle_never_publish_a_stale_on_structure() {
+        let fx = two_installs();
+        fx.make_participant();
+        // A second helper asks to join; the request waits in the owner's tree.
+        write(
+            &fx.main_dir,
+            ".sdh/requests/helper2.json",
+            "{\"login\":\"helper2\",\"branch\":\"helper2-dev\"}\n",
+        );
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_phase_b_policy_probe(fx.main_repo, &fx.main_dir, entered_tx, release_rx);
+        let (ap_tx, ap_rx) = std::sync::mpsc::channel();
+        let (en_tx, en_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|s| {
+            let sync = s.spawn(|| fx.sync_main());
+            let in_section = entered_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("phase B never entered its policy section (the probe did not fire)");
+            assert_eq!(in_section, fx.main_repo);
+            // Both structure writers queue on the guard phase B holds.
+            s.spawn(|| {
+                let _ = ap_tx.send(approve_join_request(
+                    &fx.main_db,
+                    Some(&gb()),
+                    fx.main_repo,
+                    "helper2",
+                ));
+            });
+            s.spawn(|| {
+                let _ = en_tx.send(enable_shared_mode(&fx.main_db, &gb(), fx.main_repo, false));
+            });
+            assert!(
+                ap_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "the approval must wait for the per-repo policy guard"
+            );
+            assert!(
+                en_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "enable must wait for the per-repo policy guard"
+            );
+            release_tx.send(1).unwrap();
+            let out = sync.join().unwrap();
+            assert!(out.issues.is_empty(), "{:?}", out.issues);
+            assert!(
+                ap_rx.recv_timeout(Duration::from_secs(60)).unwrap().is_ok(),
+                "the approval must finish right after the policy section"
+            );
+            assert!(
+                en_rx.recv_timeout(Duration::from_secs(60)).unwrap().is_ok(),
+                "enable must finish right after the policy section"
+            );
+        });
+        // The OFF save happens after the guarded writers: whatever they wrote,
+        // the next pass publishes the new policy coherently — a stale ON
+        // structure is never committed after the save.
+        assert!(set_repo_share_specs(&fx.main_db, fx.main_repo, false)
+            .unwrap()
+            .is_none());
+        let out = fx.sync_main();
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        let published = fx.remote_file("dev", ".sdh/project.json").unwrap();
+        assert!(
+            published.contains("\"share_specs\": false"),
+            "the structure committed after the OFF save must be off:\n{}",
+            published
+        );
+        assert!(
+            published.contains("helper2"),
+            "the approval must survive the interleaving:\n{}",
+            published
+        );
+    }
+
+    /// T-000243 review (second pass): every writer of the policy-bearing
+    /// structure waits for the per-repo guard — `enable_shared_mode`,
+    /// `approve_join_request` and `disable_shared_mode` (it commits the
+    /// deletion of `.sdh/`) are not answered while a policy section holds it.
+    /// The end-to-end interleaving with phase B and the OFF setter is
+    /// `an_approval_and_a_specs_toggle_never_publish_a_stale_on_structure`.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn structure_writers_wait_for_the_policy_guard() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "Owner").unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        // A bare folder with a `.git` entry passes `repo_root`; every writer
+        // then reaches the guard without spawning git (they fail fast on the
+        // missing project / dev branch / checkout only after the release).
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        db.set_repo_local_path(repo.id, Some(dir.path().to_str().unwrap()))
+            .unwrap();
+        db.set_shared_mode(repo.id, true).unwrap();
+        db.set_shared_role(repo.id, Some("main")).unwrap();
+
+        let guard = specs_policy_guard(repo.id);
+        let (en_tx, en_rx) = std::sync::mpsc::channel();
+        let (ap_tx, ap_rx) = std::sync::mpsc::channel();
+        let (di_tx, di_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let held = guard.lock().unwrap();
+            s.spawn(|| {
+                let _ = en_tx.send(enable_shared_mode(&db, &gb(), repo.id, false));
+            });
+            s.spawn(|| {
+                let _ = ap_tx.send(approve_join_request(&db, Some(&gb()), repo.id, "someone"));
+            });
+            s.spawn(|| {
+                let _ = di_tx.send(disable_shared_mode(&db, &gb(), repo.id));
+            });
+            assert!(
+                en_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "enable must wait for the policy guard"
+            );
+            assert!(
+                ap_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "the approval must wait for the policy guard"
+            );
+            assert!(
+                di_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "disable must wait for the policy guard"
+            );
+            // Release before the scope joins the writers.
+            drop(held);
+        });
     }
 
     /// T-000243 review (already-shared repos): a user rule that keeps the

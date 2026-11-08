@@ -238,6 +238,9 @@ fn write_repo_skeletons(
     }
     // F-000044: the shared-repo block (owner, branch, this install's band).
     let shared_structure = shared.structure_of(repo.id);
+    // T-000243 review (second pass): the TRI-STATE of phase A's discovery —
+    // computed before `shared` below is shadowed by the shared-or-not bool.
+    let shared_state = shared.structure_state_of(repo.id);
     let shared_block = sync::shared_block_for(db, repo, shared_structure);
     if let Err(e) = sync::update_claude_md_section(
         db,
@@ -265,14 +268,20 @@ fn write_repo_skeletons(
     // paths; the same text for the owner and for contributors, so it never churns.
     // T-000243: the render drops `docs/superpowers/` only while the effective
     // policy shares it; opted out, the managed render keeps ignoring the folder.
-    // T-000243 review: the policy read and the render run under the same
-    // per-repo guard as phase B of the shared pass, so the render never reads a
-    // flag that is being written; a structure that IS present but unusable
-    // (malformed / untrusted) is never guessed as `on` — the `.gitignore` is
-    // left as it is and the reason is reported instead. A repo that is not
-    // shared never resolves a policy at all (a leftover `.sdh/` file of an
-    // ordinary repo must not break its render).
+    // T-000243 review (second pass): the guard spans the policy read AND the
+    // `.gitignore` WRITE below — binding it inside the `else` let it drop
+    // before the write, so an old-ON render could land after an OFF save or
+    // overwrite a newer OFF render. `Option<MutexGuard>` holds nothing for a
+    // repo that is not shared (a leftover `.sdh/` file of an ordinary repo
+    // must not break its render or serialize anything).
+    // The structure comes from phase A's discovery outcome as a TRI-STATE: a
+    // REFUSED structure (malformed / untrusted authoritative copy) skips the
+    // render with an issue instead of re-reading the work tree, whose stale
+    // policy is exactly what the refusal rejected. A repo that is not shared
+    // never resolves a policy at all.
     let shared = sync::shared::is_shared_repo(db, repo.id);
+    let policy_guard = shared.then(|| sync::shared::specs_policy_guard(repo.id));
+    let _policy = policy_guard.as_ref().map(|g| g.lock().unwrap());
     let gitignore = if !shared {
         Some(sync::shared::gitignore_template_for(
             &tpl.gitignore,
@@ -280,27 +289,41 @@ fn write_repo_skeletons(
             true,
         ))
     } else {
-        // The guard spans the policy read and the write of the file below.
-        let policy = sync::shared::specs_policy_guard(repo.id);
-        let _policy = policy.lock().unwrap();
-        match sync::shared::effective_share_specs(db, repo, shared_structure) {
-            Ok(share_specs) => Some(sync::shared::gitignore_template_for(
-                &tpl.gitignore,
-                true,
-                share_specs,
-            )),
-            Err(e) => {
-                c.push(file_issue(".gitignore", e));
+        match shared_state {
+            // Accepted by phase A, or no structure anywhere (the legacy
+            // default; `None` re-reads the work tree the same validated way).
+            Ok(state) => match sync::shared::effective_share_specs(db, repo, state) {
+                Ok(share_specs) => Some(sync::shared::gitignore_template_for(
+                    &tpl.gitignore,
+                    true,
+                    share_specs,
+                )),
+                Err(e) => {
+                    c.push(file_issue(".gitignore", e));
+                    None
+                }
+            },
+            // Refused: no `.gitignore` is written for this repo this pass.
+            Err(reason) => {
+                c.push(file_issue(".gitignore", reason));
                 None
             }
         }
     };
-    let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
     if let Some(gitignore) = gitignore {
         if let Err(e) = sync::sync_gitignore_section(&gitignore, base) {
             c.push(file_issue(".gitignore", e));
         }
     }
+    if shared {
+        // Test rendezvous: fires while the guard is still held, right after
+        // the write (see `render_write_probe`).
+        #[cfg(test)]
+        sync::shared::render_write_probe(repo.id, base);
+    }
+    drop(_policy);
+    drop(policy_guard);
+    let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
     if let Err(e) = sync::sync_gitattributes_section(&gitattributes, base) {
         c.push(file_issue(".gitattributes", e));
     }
@@ -2423,6 +2446,66 @@ mod tests {
         assert!(
             b_pact.join("PACT-001_shared.md").exists(),
             "unlinking must not delete history"
+        );
+    }
+
+    /// T-000243 review (second pass): the render's policy guard must outlive
+    /// the `.gitignore` WRITE, not just the policy read — binding the guard
+    /// inside the `else` branch let it drop before the write, so an old-ON
+    /// render could land after an OFF save or overwrite a newer OFF render.
+    /// The probe fires from inside `write_repo_skeletons` right after the
+    /// write, while the guard is still held: a specs save (or a phase B policy
+    /// section) cannot interleave between the read and the write any more.
+    #[test]
+    fn the_gitignore_render_holds_the_policy_guard_through_the_write() {
+        let db = make_db();
+        let project = db.create_project("P", None, "standard").unwrap();
+        let dir = TempDir::new().unwrap();
+        let repo = db
+            .insert_local_repository(
+                dir.path().to_string_lossy().as_ref(),
+                "render",
+                Some(project.id),
+                Some("tool"),
+            )
+            .unwrap();
+        let repo_id = repo.id;
+        db.set_shared_mode(repo_id, true).unwrap();
+        db.set_shared_role(repo_id, Some("main")).unwrap();
+        // The owner opts out: the render must keep the specs folder ignored.
+        db.set_repo_share_specs(repo_id, false).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        sync::shared::install_render_write_probe(repo_id, dir.path(), entered_tx, release_rx);
+        let tpl = SkeletonTemplates {
+            gitignore: "docs/codex/\ndocs/superpowers/\n".to_string(),
+            gitattributes: String::new(),
+            todo: String::new(),
+            bug_reports: String::new(),
+        };
+        let base = dir.path().to_path_buf();
+        let render = std::thread::spawn(move || {
+            let mut c = SyncCounters::new();
+            let shared = sync::shared::SharedSync::empty();
+            write_repo_skeletons(&db, project.id, &base, &repo, &tpl, &[], &shared, &mut c);
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the render probe never fired: the render did not run");
+        assert!(
+            sync::shared::specs_policy_guard(repo_id)
+                .try_lock()
+                .is_err(),
+            "the guard must still be held AFTER the .gitignore write"
+        );
+        release_tx.send(1).unwrap();
+        render.join().unwrap();
+        let text = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(
+            text.contains("docs/superpowers/"),
+            "the OFF render keeps the specs folder ignored:\n{}",
+            text
         );
     }
 }
