@@ -1175,6 +1175,10 @@ pub fn pin_after_accept(db: &AppDb, repo_id: i64, s: &ProjectStructure) -> Resul
 ///   are `Untrusted("ambiguous structure: ...")` - none is ever picked.
 ///
 /// A worktree file that fails validation does not stop the search of the refs.
+/// A copy that is PRESENT but cannot be parsed (malformed JSON, a wrong field
+/// type) is `Untrusted` with the parse reason — T-000243 review: it is never
+/// allowed to fall back to an older valid copy, whose `share_specs` policy may
+/// be exactly what the unreadable copy came to change.
 pub fn discover_structure(
     git: &GitBinary,
     repo_root: &Path,
@@ -1202,7 +1206,13 @@ pub fn discover_structure(
         }
     }
 
-    let read_ref = |full: &str| -> Option<ProjectStructure> {
+    // Read `.sdh/project.json` out of `full`: `Ok(None)` = the ref carries no
+    // such file, `Ok(Some)` = parsed, `Err` = the file IS there but cannot be
+    // parsed (malformed JSON, a wrong field type). T-000243 review: that third
+    // case must surface as untrusted — an authoritative copy that cannot be
+    // read is never allowed to fall back to an older work-tree copy (a stale
+    // copy may carry an abandoned `share_specs` policy).
+    let read_ref = |full: &str| -> Result<Option<ProjectStructure>, String> {
         match git_sync::show_file_capped(
             git,
             repo_root,
@@ -1210,8 +1220,9 @@ pub fn discover_structure(
             STRUCTURE_REL_PATH,
             MAX_STRUCTURE_BYTES,
         ) {
-            Ok(Some(b)) => parse_structure(&b).ok(),
-            _ => None,
+            Ok(Some(b)) => parse_structure(&b).map(Some),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
         }
     };
 
@@ -1219,21 +1230,31 @@ pub fn discover_structure(
     // be older (a helper branches off `origin/dev` before being approved and
     // its checkout then never sees the approval), so an origin copy that
     // validates always wins. The work tree is the fallback (no remote ref yet,
-    // offline, or the origin copy does not validate).
+    // offline, or the origin copy does not validate) — but NOT for a copy that
+    // is present and unusable: that is an error, not a reason to trust a stale
+    // local file.
     if let Some(pin) = pinned {
         let full = format!("refs/remotes/origin/{}", pin);
-        if let Some(s) = read_ref(&full) {
-            if s.main.dev_branch != pin {
-                // Never hidden by a work-tree copy that still names the pin.
-                return Ok(DiscoverOutcome::Untrusted(dev_branch_changed_reason(
-                    pin,
-                    &s.main.dev_branch,
-                )));
+        match read_ref(&full) {
+            Err(e) => {
+                // The authoritative copy exists and cannot be read: never
+                // hidden by a work-tree copy that still names the pin.
+                return Ok(DiscoverOutcome::Untrusted(format!("origin/{}: {}", pin, e)));
             }
-            match validate_structure(&s, github_name, admins) {
-                Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", pin))),
-                Err(reason) => untrusted = Some(format!("origin/{}: {}", pin, reason)),
+            Ok(Some(s)) => {
+                if s.main.dev_branch != pin {
+                    // Never hidden by a work-tree copy that still names the pin.
+                    return Ok(DiscoverOutcome::Untrusted(dev_branch_changed_reason(
+                        pin,
+                        &s.main.dev_branch,
+                    )));
+                }
+                match validate_structure(&s, github_name, admins) {
+                    Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", pin))),
+                    Err(reason) => untrusted = Some(format!("origin/{}: {}", pin, reason)),
+                }
             }
+            Ok(None) => {}
         }
     }
 
@@ -1249,12 +1270,23 @@ pub fn discover_structure(
                     // if it validates and names itself, is the newer truth.
                     let branch = s.main.dev_branch.clone();
                     let full = format!("refs/remotes/origin/{}", branch);
-                    if let Some(o) = read_ref(&full) {
-                        if o.main.dev_branch == branch
-                            && validate_structure(&o, github_name, admins).is_ok()
+                    match read_ref(&full) {
+                        Err(e) => {
+                            // Present but unreadable: the newer truth cannot
+                            // be used, and the stale work-tree policy is not
+                            // accepted in its place.
+                            return Ok(DiscoverOutcome::Untrusted(format!(
+                                "origin/{}: {}",
+                                branch, e
+                            )));
+                        }
+                        Ok(Some(o))
+                            if o.main.dev_branch == branch
+                                && validate_structure(&o, github_name, admins).is_ok() =>
                         {
                             return Ok(DiscoverOutcome::Found(o, format!("origin/{}", branch)));
                         }
+                        _ => {}
                     }
                     return Ok(DiscoverOutcome::Found(s, SOURCE_WORKTREE.to_string()));
                 }
@@ -1281,7 +1313,17 @@ pub fn discover_structure(
         let Some(branch) = full.strip_prefix("refs/remotes/origin/") else {
             continue;
         };
-        let Some(s) = read_ref(&full) else { continue };
+        let s = match read_ref(&full) {
+            Ok(Some(s)) => s,
+            // A ref that sits on its own dev branch but cannot be parsed is
+            // reported, not silently skipped: a malformed copy must not let a
+            // stale work-tree policy win (a valid candidate still does).
+            Err(e) => {
+                untrusted.get_or_insert(format!("origin/{}: {}", branch, e));
+                continue;
+            }
+            Ok(None) => continue,
+        };
         if s.main.dev_branch != branch {
             continue;
         }
@@ -2209,10 +2251,82 @@ mod tests {
         assert!(serialize_structure(&big).len() as u64 > MAX_STRUCTURE_BYTES);
         publish_struct(&fx, "dev", &big, "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
-        assert_eq!(
-            discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap(),
-            DiscoverOutcome::NotFound
+        // T-000243 review: a copy that IS present but cannot be read (here:
+        // past the size cap) is untrusted, not silently skipped — an
+        // unreadable authoritative copy must never let a stale local policy win.
+        match discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap() {
+            DiscoverOutcome::Untrusted(reason) => {
+                assert!(reason.contains("too large"), "{}", reason)
+            }
+            other => panic!("expected Untrusted, got {:?}", other),
+        }
+    }
+
+    /// Commit a RAW `.sdh/project.json` (not the serialized model) onto branch
+    /// `name` and push it: the fixture of an unreadable authoritative copy.
+    fn publish_raw(fx: &Fx, name: &str, content: &str) {
+        g(&fx.a, &["checkout", "-q", "-B", name, "HEAD"]);
+        fs::create_dir_all(fx.a.join(".sdh")).unwrap();
+        fs::write(fx.a.join(".sdh/project.json"), content).unwrap();
+        g(&fx.a, &["add", ".sdh"]);
+        g(&fx.a, &["commit", "-q", "-m", "structure"]);
+        g(&fx.a, &["push", "-q", "origin", name]);
+        // back to a structure-free base for the next branch
+        let base = g(&fx.a, &["rev-list", "--max-parents=0", "HEAD"]);
+        g(&fx.a, &["checkout", "-q", "--detach", &base]);
+    }
+
+    /// T-000243 review: the authoritative copy of the owner's dev branch being
+    /// malformed (invalid JSON, a wrong field type) must surface as
+    /// `Untrusted` — the older valid copy in the work tree is NOT accepted in
+    /// its place, because its `share_specs` policy may be exactly what the
+    /// unreadable copy came to change («неверный тип — ошибка, не fallback»).
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_malformed_origin_structure_is_never_replaced_by_a_stale_worktree_copy() {
+        for pinned in [Some("dev"), None] {
+            let fx = fx();
+            publish_raw(&fx, "dev", "{ not json at all");
+            let c = contributor(&fx);
+            // The stale but perfectly valid work-tree copy opts the specs out.
+            let mut stale = sample();
+            stale.repos[0].share_specs = Some(false);
+            write_structure_if_changed(&c, &stale).unwrap();
+            match discover_structure(&gb(), &c, REPO, pinned, &AdminVerified::default()).unwrap() {
+                DiscoverOutcome::Untrusted(reason) => {
+                    assert!(reason.contains("invalid JSON"), "{}", reason);
+                    assert!(reason.starts_with("origin/dev:"), "{}", reason);
+                }
+                other => panic!("pinned={:?}: expected Untrusted, got {:?}", pinned, other),
+            }
+        }
+    }
+
+    /// The same refusal for a wrong FIELD TYPE (not just broken JSON): a
+    /// structure that says `"share_specs": "yes"` cannot be read, so its
+    /// policy is an error rather than a fallback to the stale copy.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_wrongly_typed_share_specs_field_is_refused_not_fallback() {
+        let fx = fx();
+        publish_raw(
+            &fx,
+            "dev",
+            "{\"format\":1,\"project\":{\"name\":\"Acme\",\"type\":\"standard\"},\
+             \"main\":{\"login\":\"Owner\",\"dev_branch\":\"dev\"},\
+             \"repos\":[{\"github\":\"Owner/web\",\"role\":\"server\",\
+             \"share_specs\":\"yes\"}],\"microservices\":[],\"participants\":[]}",
         );
+        let c = contributor(&fx);
+        let mut stale = sample();
+        stale.repos[0].share_specs = Some(false);
+        write_structure_if_changed(&c, &stale).unwrap();
+        match discover_structure(&gb(), &c, REPO, Some("dev"), &AdminVerified::default()).unwrap() {
+            DiscoverOutcome::Untrusted(reason) => {
+                assert!(reason.contains("invalid JSON"), "{}", reason)
+            }
+            other => panic!("expected Untrusted, got {:?}", other),
+        }
     }
 
     // ----- apply locally -----------------------------------------------------

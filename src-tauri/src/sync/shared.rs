@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::db::AppDb;
@@ -186,18 +186,44 @@ fn own_share_specs(db: &AppDb, repo_id: i64) -> bool {
         .unwrap_or(true)
 }
 
+/// T-000243 review: the per-repo guard that serializes a `share_specs` change
+/// with the policy-sensitive work of the sync for the SAME repo. The setter
+/// (`set_repo_share_specs`, a Tauri command on another thread) takes it while
+/// it reads the role, diagnoses and writes the flag; phase B holds it for its
+/// whole policy section (the structure publish, the pathspecs and every commit
+/// of that repo), and the managed `.gitignore` render sites hold it while they
+/// resolve the policy and write the file. Nothing inside a guard awaits or
+/// takes another repo's guard, so the order cannot deadlock. Phase A is
+/// deliberately NOT guarded: its `pass.share_specs` only steers the
+/// fast-forward / divergence detection, and phase B resolves the policy again
+/// under the guard anyway.
+pub(crate) fn specs_policy_guard(repo_id: i64) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<i64, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    // The registry lock is released before anybody waits on a repo guard.
+    let mut m = map.lock().unwrap();
+    m.entry(repo_id)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 /// The validated structure of the repo's work tree, if any: the same trusted
-/// read (`read_structure_file`) that settles a helper's role. A file that is
-/// absent, unparsable or untrusted yields `None` — an untrusted structure
-/// never supplies the policy.
-fn validated_structure_of(db: &AppDb, repo: &Repository) -> Option<ProjectStructure> {
+/// read (`read_structure_file`) that settles a helper's role.
+/// `Ok(None)` = ABSENT (a repo that never carried a structure, or a legacy
+/// one): the default policy applies. `Err` = PRESENT BUT UNUSABLE — malformed
+/// JSON, a wrong field type, or a source this install does not trust.
+/// T-000243 review: that case is never folded into a policy (and least of all
+/// into the default `on`, which would publish specs on a guess) — the callers
+/// surface it and block the policy-sensitive operation instead.
+fn validated_structure_of(
+    db: &AppDb,
+    repo: &Repository,
+) -> Result<Option<ProjectStructure>, String> {
     let (Some(path), Some(gh)) = (repo.local_path.as_deref(), repo.github_name.as_deref()) else {
-        return None;
+        return Ok(None);
     };
     let admins = ss::AdminVerified::load(db);
     ss::read_structure_file(Path::new(path), gh, &admins)
-        .ok()
-        .flatten()
 }
 
 /// The effective `docs/superpowers/` policy of one repo of this install,
@@ -205,29 +231,33 @@ fn validated_structure_of(db: &AppDb, repo: &Repository) -> Option<ProjectStruct
 /// ("main") publishes its own stored setting; a contributor / pending helper
 /// accepts the owner's flag for THIS repo from the same validated structure
 /// that supplied its role — never from folder existence, `.gitignore`, or a
-/// sibling repo of the project. A helper without (or with an untrusted)
-/// structure keeps the default on. `structure` is a validated structure the
+/// sibling repo of the project. `structure` is a validated structure the
 /// caller already holds (the sync pass); `None` reads the work-tree file the
-/// same validated way. Meaningful only while the repo is shared.
+/// same validated way. `Ok(true)` is the answer only when the policy really
+/// resolves to share: absent structure (or no GitHub name) is the legacy
+/// default, while a structure that IS present but cannot be used is `Err` —
+/// the caller must block the render / commit on it, not guess. Meaningful
+/// only while the repo is shared.
 pub fn effective_share_specs(
     db: &AppDb,
     repo: &Repository,
     structure: Option<&ProjectStructure>,
-) -> bool {
+) -> Result<bool, String> {
     let state = db.get_shared_state(repo.id).ok();
     if state
         .as_ref()
         .is_some_and(|s| s.shared_mode || s.shared_role.as_deref() == Some("main"))
     {
         // This install is the repo's owner: its own setting is the policy.
-        return state.is_some_and(|s| s.share_specs);
+        return Ok(state.is_some_and(|s| s.share_specs));
     }
-    let structure = structure
-        .map(|s| s.to_owned())
-        .or_else(|| validated_structure_of(db, repo));
+    let structure = match structure {
+        Some(s) => Some(s.to_owned()),
+        None => validated_structure_of(db, repo)?,
+    };
     match (structure, repo.github_name.as_deref()) {
-        (Some(s), Some(gh)) => ss::share_specs_for(&s, gh),
-        _ => true,
+        (Some(s), Some(gh)) => Ok(ss::share_specs_for(&s, gh)),
+        _ => Ok(true),
     }
 }
 
@@ -1958,8 +1988,11 @@ fn phase_a_main(
         }
     }
     // T-000243: the owner's own stored setting is the policy (its structure
-    // file may still hold the previous value until phase B rewrites it).
-    pass.share_specs = effective_share_specs(db, repo, pass.structure.as_ref());
+    // file may still hold the previous value until phase B rewrites it). An
+    // `Err` cannot happen here (the owner answers from its own database row),
+    // and phase A only steers the fast-forward detection anyway — phase B
+    // resolves the policy again under the per-repo guard.
+    pass.share_specs = effective_share_specs(db, repo, pass.structure.as_ref()).unwrap_or(true);
     pass.own_branch = own_branch_of(db, repo.id);
     match &pass.own_branch {
         None => pass.note(SharedStatus::NoOwnBranch, ""),
@@ -2076,7 +2109,9 @@ fn phase_a_foreign(
             }
             // T-000243: the helper takes the specs policy from the very
             // structure that gave it the role, before any path is computed.
-            pass.share_specs = effective_share_specs(db, repo, Some(&s));
+            // Phase A only steers the fast-forward detection with it; phase B
+            // resolves the policy again under the per-repo guard.
+            pass.share_specs = effective_share_specs(db, repo, Some(&s)).unwrap_or(true);
             pass.structure = Some(s);
             after_fetch(db, git, &mut pass);
             Some(pass)
@@ -2657,8 +2692,83 @@ fn plumb_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String> {
         .collect()
 }
 
+// T-000243 review: a test-only rendezvous inside phase B's policy section —
+// fired after the per-repo guard is taken and before the policy is resolved.
+// Production never installs one; the concurrency tests use it to interleave
+// `set_repo_share_specs` (another thread) with an in-flight phase B without
+// relying on timing. The probe is matched by repo id AND repo root (the temp
+// dir of the test that installed it), so parallel tests of the same process
+// never fire somebody else's rendezvous, and it is consumed by the first pass
+// that sees it (later passes of the same test run normally).
+#[cfg(test)]
+struct PhaseBPolicyProbe {
+    repo: i64,
+    root: PathBuf,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+#[cfg(test)]
+static PHASE_B_POLICY_PROBE: OnceLock<Mutex<Option<PhaseBPolicyProbe>>> = OnceLock::new();
+
+/// Install the rendezvous for the repo at `root`: its phase B sends the repo id
+/// on `entered` and then waits for one message on `release` while it holds the
+/// per-repo guard. Only one probe exists at a time (the last one wins).
+#[cfg(test)]
+fn install_phase_b_policy_probe(
+    repo: i64,
+    root: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = PHASE_B_POLICY_PROBE.get_or_init(|| Mutex::new(None));
+    *cell.lock().unwrap() = Some(PhaseBPolicyProbe {
+        repo,
+        root: root.to_path_buf(),
+        entered,
+        release,
+    });
+}
+
+#[cfg(test)]
+fn phase_b_policy_probe(repo_id: i64, root: &Path) {
+    let cell = PHASE_B_POLICY_PROBE.get_or_init(|| Mutex::new(None));
+    // The registry lock is never held while the pass waits for the release.
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        match g.as_ref() {
+            Some(p) if p.repo == repo_id && p.root == root => g.take(),
+            _ => None,
+        }
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        // The pass holds the per-repo guard while it waits, so whatever the
+        // test interleaves here cannot sneak into this section.
+        let _ = p.release.recv();
+    }
+}
+
 fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     let Some(role) = pass.role else { return };
+    // T-000243 review: one coherent policy snapshot for the whole
+    // policy-sensitive half of the pass. The guard is held from here to the
+    // end of the function — the structure publish (which carries the flag),
+    // the `.gitignore`-driven enumeration, the pathspecs and every commit and
+    // push of THIS repo — so `set_repo_share_specs` (another thread) is never
+    // acknowledged in the middle of it: either this whole section completes
+    // under the old flag and the setter applies after it, or the setter lands
+    // first and this section reads the new flag. The managed `.gitignore`
+    // render of `project_sync` takes the same guard, so a render cannot read
+    // a flag that is being written either. The residual window is a render
+    // that finished with the old policy just before the setter landed: the
+    // file on disk is then stale until the next render, but nothing is
+    // committed with it (phase B resolves the policy again under the guard),
+    // so it self-heals without ever publishing the wrong files.
+    let policy = specs_policy_guard(pass.repo.id);
+    let _policy = policy.lock().unwrap();
+    #[cfg(test)]
+    phase_b_policy_probe(pass.repo.id, &pass.root);
     // Same guard as phase A, checked again: the repo may have changed since.
     if !repo_ready(git, &pass.root) {
         return;
@@ -2705,8 +2815,25 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     }
     // T-000243: resolved HERE, not carried from phase A — a toggle between the
     // phases must not leave the old `on` in this deferred half of the pass
-    // (the owner's setting is read fresh from the database).
-    let share_specs = effective_share_specs(db, &pass.repo, pass.structure.as_ref());
+    // (the owner's setting is read fresh from the database). The per-repo
+    // guard taken above makes this read and everything derived from it one
+    // coherent snapshot against the setter.
+    let share_specs = match effective_share_specs(db, &pass.repo, pass.structure.as_ref()) {
+        Ok(v) => v,
+        Err(e) => {
+            // T-000243 review: a structure that is present but unusable
+            // (malformed / untrusted) must not become a guessed `on` — no
+            // shared file of this repo is committed this pass and the issue
+            // says why. The repo is reported, never silently rendered.
+            pass.issue(
+                repo_issue(Code::SharedUntrusted, &pass.repo)
+                    .target(STRUCTURE_REL_PATH)
+                    .detail(e),
+            );
+            return;
+        }
+    };
+    diagnose_specs_blocking(git, pass, role, share_specs);
     let pathspec = shared_pathspec(role, &login, share_specs);
     let plumb_spec = plumb_pathspec(role, &login, share_specs);
     let approved: Vec<String> = match (role, &pass.structure) {
@@ -2940,18 +3067,16 @@ fn managed_block_lines(text: &str) -> HashSet<u32> {
     set
 }
 
-/// User-section lines of the repo's own `.gitignore` that still ignore a shared
-/// path. Lines of the managed block are not reported (the sync rewrites it).
-/// T-000243: `share_specs` filters the specs folder out of the probe set when
-/// the policy is off (see `probe_paths`).
-pub fn blocking_ignore_lines(
+/// User-section lines of the repo's own `.gitignore` that still ignore one of
+/// `probes` (a file path, probed with `git check-ignore -v`). Lines of the
+/// managed block are not reported (the sync rewrites it).
+fn ignoring_lines(
     git: &GitBinary,
     root: &Path,
-    share_specs: bool,
+    probes: &[String],
 ) -> Result<Vec<IgnoreLine>, String> {
-    let probes = probe_paths(share_specs);
     let mut input = Vec::new();
-    for p in &probes {
+    for p in probes {
         input.extend_from_slice(p.as_bytes());
         input.push(0);
     }
@@ -2999,6 +3124,64 @@ pub fn blocking_ignore_lines(
         .into_iter()
         .map(|(line_no, text)| IgnoreLine { line_no, text })
         .collect())
+}
+
+/// User-section lines of the repo's own `.gitignore` that still ignore a shared
+/// path. T-000243: `share_specs` filters the specs folder out of the probe set
+/// when the policy is off (see `probe_paths`).
+pub fn blocking_ignore_lines(
+    git: &GitBinary,
+    root: &Path,
+    share_specs: bool,
+) -> Result<Vec<IgnoreLine>, String> {
+    ignoring_lines(git, root, &probe_paths(share_specs))
+}
+
+/// T-000243 review: user-section lines that still ignore `docs/superpowers/`
+/// while the effective policy shares it. The shared enumeration honours
+/// `.gitignore` (`ls-files --others --exclude-standard`), so such a rule makes
+/// the folder silently never travel — the recurring pass diagnoses it here,
+/// while the removal itself stays behind the explicit-confirmation preflight
+/// flow of the shared switch. Covers a repo that was enabled with the flag off
+/// and switched on later, and one that upgraded to this feature already shared.
+fn specs_blocking_lines(git: &GitBinary, root: &Path) -> Result<Vec<IgnoreLine>, String> {
+    ignoring_lines(git, root, &[format!("{}sdh-probe.md", SPECS_IGNORE_LINE)])
+}
+
+/// The recurring diagnosis of the ON policy: user rules that keep the specs
+/// folder ignored are reported once per change (`fresh_issues`), never removed.
+fn diagnose_specs_blocking(git: &GitBinary, pass: &mut RepoPass, role: Role, share_specs: bool) {
+    if !share_specs || role == Role::Pending {
+        return;
+    }
+    let blocking = match specs_blocking_lines(git, &pass.root) {
+        Ok(b) => b,
+        Err(e) => {
+            pass.issue(
+                repo_issue(Code::ManagedFileFailed, &pass.repo)
+                    .target(".gitignore")
+                    .detail(format!(
+                        "could not check whether docs/superpowers/ is ignored: {}",
+                        e
+                    )),
+            );
+            return;
+        }
+    };
+    if blocking.is_empty() {
+        return;
+    }
+    let rules: Vec<&str> = blocking.iter().map(|l| l.text.as_str()).collect();
+    pass.issue(
+        repo_issue(Code::ManagedFileFailed, &pass.repo)
+            .target(".gitignore")
+            .detail(format!(
+                "user rule(s) [{}] still ignore docs/superpowers/: the specs policy is on but the \
+             folder is ignored, so specs never travel. Remove the rule(s) in the preflight of \
+             the shared switch (or switch the specs off); they are never removed automatically",
+                rules.join(", ")
+            )),
+    );
 }
 
 fn repo_root(repo: &Repository) -> Result<PathBuf, String> {
@@ -3113,9 +3296,16 @@ pub fn enable_shared_mode(
 /// repo's main — the owner, or an administrator verified by the frontend (the
 /// same trust rule as switching shared mode on) — so a contributor, a pending
 /// helper or an unknown login cannot flip the flag, not even through a direct
-/// IPC call. Settable before sharing is enabled; the structure publish, the
-/// `.gitignore` render and the pathspecs follow on the next sync.
-pub fn set_repo_share_specs(db: &AppDb, repo_id: i64, on: bool) -> Result<(), String> {
+/// IPC call. The ROLE is refused before the capability: a verified
+/// administrator of an organization this install participates in as a
+/// contributor / pending helper is still not that repo's main here.
+/// Settable before sharing is enabled; the structure publish, the
+/// `.gitignore` render and the pathspecs follow on the next sync. The write
+/// and its diagnosis run under the per-repo policy guard, so the answer is
+/// never given while a sync's policy section could still commit the old flag.
+/// Returns a warning note when the flag was switched ON for a repo that
+/// already shares and user rules still keep the folder ignored.
+pub fn set_repo_share_specs(db: &AppDb, repo_id: i64, on: bool) -> Result<Option<String>, String> {
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
     let gh = repo
         .github_name
@@ -3124,11 +3314,55 @@ pub fn set_repo_share_specs(db: &AppDb, repo_id: i64, on: bool) -> Result<(), St
     let login = db.github_login().ok_or_else(|| {
         "the GitHub login of this install is unknown - save the token again".to_string()
     })?;
+    // T-000243 review: serialize with the sync's policy section of this repo
+    // (see `specs_policy_guard`) — one coherent snapshot, either order. The
+    // guard is taken before the role read and the capability check, so the
+    // whole check+write pair stays atomic against a sync in flight.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
+    // The ROLE is refused before the capability: a verified administrator of
+    // an organization this install participates in as a contributor / pending
+    // helper is still not that repo's main here. Read under the guard, so the
+    // role cannot be settled mid-check.
+    let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if matches!(
+        state.shared_role.as_deref(),
+        Some("contributor") | Some("pending")
+    ) {
+        return Err(format!(
+            "the specs switch belongs to the repo's main: this install participates in {} as a {}",
+            gh,
+            state.shared_role.unwrap_or_default()
+        ));
+    }
     if !ss::can_enable_shared(&gh, &login, &ss::AdminVerified::load(db)) {
         return Err(ss::refusal_not_owner_or_admin(&login, &gh));
     }
+    // T-000243 review: switching a repo that already shares ON while user
+    // rules still ignore the folder would silently keep the specs local (the
+    // shared enumeration honours .gitignore) — the next sync diagnoses it as
+    // an issue, and the setter says it right away. A repo without a usable
+    // checkout (preconfiguration before the first clone) has nothing to check.
+    let note = if on && is_shared_state(&state) {
+        crate::git_ops::cached_git()
+            .and_then(|git| repo_root(&repo).ok().map(|root| (git, root)))
+            .and_then(|(git, root)| specs_blocking_lines(&git, &root).ok())
+            .filter(|lines| !lines.is_empty())
+            .map(|lines| {
+                let rules: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+                format!(
+                    "docs/superpowers/ is still ignored by user .gitignore rule(s) [{}]: the \
+                     specs will not travel until they are removed in the preflight of the \
+                     shared switch",
+                    rules.join(", ")
+                )
+            })
+    } else {
+        None
+    };
     db.set_repo_share_specs(repo_id, on)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(note)
 }
 
 /// Tracked files only (no untracked ones) under `paths`.
@@ -4326,7 +4560,10 @@ mod tests {
 
     /// The setter's authority: the owner and a verified administrator may flip
     /// the flag; a contributor, a pending helper and an unknown login are
-    /// refused — the same trust rule as enabling sharing.
+    /// refused — the same trust rule as enabling sharing. T-000243 review: the
+    /// ROLE is refused before the CAPABILITY, so even a verified administrator
+    /// of the organization cannot flip the policy of a repo this install
+    /// participates in as a contributor / pending helper.
     #[test]
     fn the_specs_switch_is_stored_for_the_owner_or_a_verified_admin_only() {
         // The owner of the repo.
@@ -4345,6 +4582,22 @@ mod tests {
         let err = set_repo_share_specs(&org_db, org_repo.id, false).unwrap_err();
         assert!(err.contains("repo owner or an administrator"), "{}", err);
         ss::record_admin_verification(&org_db, "Acme-Org/web", "boss", true).unwrap();
+        set_repo_share_specs(&org_db, org_repo.id, false).unwrap();
+        assert!(!org_db.get_shared_state(org_repo.id).unwrap().share_specs);
+
+        // T-000243 review: the same verified administrator is refused while
+        // this install's ROLE in that repo is contributor or pending — the
+        // capability alone is not the contract, and the role is checked first.
+        // (The stored value is false by now, so a refused `true` proves that
+        // nothing was written.)
+        for role in ["contributor", "pending"] {
+            org_db.set_shared_role(org_repo.id, Some(role)).unwrap();
+            let err = set_repo_share_specs(&org_db, org_repo.id, true).unwrap_err();
+            assert!(err.contains("participates in Acme-Org/web as a"), "{}", err);
+            assert!(!org_db.get_shared_state(org_repo.id).unwrap().share_specs);
+        }
+        // Back on the owner's side of the role, the same admin may set it.
+        org_db.set_shared_role(org_repo.id, Some("main")).unwrap();
         set_repo_share_specs(&org_db, org_repo.id, false).unwrap();
         assert!(!org_db.get_shared_state(org_repo.id).unwrap().share_specs);
 
@@ -4383,7 +4636,9 @@ mod tests {
 
     /// `effective_share_specs`: the owner's own stored setting wins on the
     /// owner's install; a helper's install takes the owner's published flag
-    /// for THIS repo from the validated structure, defaulting to on.
+    /// for THIS repo from the validated structure, defaulting to on. A
+    /// structure that IS present but unusable is an error (see the test below),
+    /// never a silent `on`.
     #[test]
     fn effective_specs_follow_the_owner_db_on_main_and_the_structure_on_helpers() {
         // Owner: its own DB row, even when the (stale) structure says else.
@@ -4396,9 +4651,9 @@ mod tests {
         db.set_shared_role(repo.id, Some("main")).unwrap();
         let mut st = sample_structure();
         st.repos[0].share_specs = Some(true);
-        assert!(effective_share_specs(&db, &repo, Some(&st)));
+        assert!(effective_share_specs(&db, &repo, Some(&st)).unwrap());
         db.set_repo_share_specs(repo.id, false).unwrap();
-        assert!(!effective_share_specs(&db, &repo, Some(&st)));
+        assert!(!effective_share_specs(&db, &repo, Some(&st)).unwrap());
 
         // Helper: the flag comes from the structure, per repo; a repo the
         // structure does not list means the default on.
@@ -4415,15 +4670,270 @@ mod tests {
         helper.set_repo_share_specs(hrepo.id, false).unwrap();
         let mut on_struct = sample_structure();
         on_struct.repos[0].share_specs = Some(true);
-        assert!(effective_share_specs(&helper, &hrepo, Some(&on_struct)));
+        assert!(effective_share_specs(&helper, &hrepo, Some(&on_struct)).unwrap());
         let mut off_struct = sample_structure();
         off_struct.repos[0].share_specs = Some(false);
-        assert!(!effective_share_specs(&helper, &hrepo, Some(&off_struct)));
+        assert!(!effective_share_specs(&helper, &hrepo, Some(&off_struct)).unwrap());
         let mut legacy = sample_structure();
         legacy.repos[0].share_specs = None; // legacy structure: default on
-        assert!(effective_share_specs(&helper, &hrepo, Some(&legacy)));
+        assert!(effective_share_specs(&helper, &hrepo, Some(&legacy)).unwrap());
         // No structure at all: the default on.
-        assert!(effective_share_specs(&helper, &hrepo, None));
+        assert!(effective_share_specs(&helper, &hrepo, None).unwrap());
+    }
+
+    /// T-000243 review: a work-tree structure that IS present but cannot be
+    /// used (malformed JSON, a wrong field type) is an error — the callers
+    /// block the render / commit on it instead of guessing `on`, which would
+    /// publish specs nobody opted in to. An absent file keeps the default on.
+    #[test]
+    fn an_unreadable_worktree_structure_is_an_error_not_a_silent_on() {
+        let helper = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        helper.set_setting("github_login", "helper").unwrap();
+        helper
+            .upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let hrepo = helper.get_repository_by_name("Owner/api").unwrap();
+        helper
+            .set_shared_role(hrepo.id, Some("contributor"))
+            .unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        helper
+            .set_repo_local_path(hrepo.id, Some(dir.path().to_str().unwrap()))
+            .unwrap();
+        // The row is re-read: the policy resolver looks at the repo's own
+        // `local_path`, which was empty when the row above was fetched.
+        let hrepo = helper.get_repository_by_name("Owner/api").unwrap();
+        // No file at all: the legacy default on.
+        assert!(effective_share_specs(&helper, &hrepo, None).unwrap());
+        // Malformed JSON in the trusted place: an error.
+        write(dir.path(), ".sdh/project.json", "{ not json");
+        let err = effective_share_specs(&helper, &hrepo, None).unwrap_err();
+        assert!(err.contains("invalid JSON"), "{}", err);
+        // A wrong field type is the same refusal, not a fallback (the spec:
+        // «неверный тип — ошибка, не fallback on»).
+        write(
+            dir.path(),
+            ".sdh/project.json",
+            "{\"format\":1,\"project\":{\"name\":\"Acme\",\"type\":\"standard\"},\
+             \"main\":{\"login\":\"Owner\",\"dev_branch\":\"dev\"},\
+             \"repos\":[{\"github\":\"Owner/api\",\"role\":\"server\",\
+             \"share_specs\":\"yes\"}],\"microservices\":[],\"participants\":[]}",
+        );
+        let err = effective_share_specs(&helper, &hrepo, None).unwrap_err();
+        assert!(err.contains("invalid JSON"), "{}", err);
+        // And an untrusted source (a main this install cannot verify) is not a
+        // policy either: still an error, never `on`.
+        write(
+            dir.path(),
+            ".sdh/project.json",
+            "{\"format\":1,\"project\":{\"name\":\"Acme\",\"type\":\"standard\"},\
+             \"main\":{\"login\":\"stranger\",\"dev_branch\":\"dev\"},\
+             \"repos\":[{\"github\":\"Owner/api\",\"role\":\"server\",\"share_specs\":true}],\
+             \"microservices\":[],\"participants\":[]}",
+        );
+        let err = effective_share_specs(&helper, &hrepo, None).unwrap_err();
+        assert!(err.contains("stranger"), "{}", err);
+    }
+
+    // ----- T-000243 review: the setter cannot interleave with phase B ---------
+
+    /// The per-repo policy guard really excludes: while a sync's policy section
+    /// holds it, `set_repo_share_specs` (a Tauri command on another thread) is
+    /// not answered, and it completes as soon as the section is over. This is
+    /// the lock the two interleavings below rely on.
+    #[test]
+    fn the_specs_setter_waits_for_the_syncs_policy_section() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "Owner").unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        db.set_shared_mode(repo.id, true).unwrap();
+        let guard = specs_policy_guard(repo.id);
+        let held = guard.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = tx.send(set_repo_share_specs(&db, repo.id, false));
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "the setter must not be acknowledged while the policy section runs"
+            );
+            drop(held);
+            assert!(rx.recv_timeout(Duration::from_secs(30)).is_ok());
+        });
+        assert!(!db.get_shared_state(repo.id).unwrap().share_specs);
+    }
+
+    /// Interleaving (a) — the setter arrives while phase B is already inside
+    /// its policy section: the guard forces one of the two orders, so the pass
+    /// that resolved `on` commits the WHOLE policy coherently (the spec travels,
+    /// the structure publishes on) and only then is the off acknowledged. No
+    /// half-applied state is ever observable.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_specs_toggle_mid_phase_b_commits_the_old_policy_then_persists_off() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_phase_b_policy_probe(fx.main_repo, &fx.main_dir, entered_tx, release_rx);
+
+        let out = std::thread::scope(|s| {
+            // Phase B of the sync runs here; inside its policy section it hands
+            // the repo id over and waits for the release.
+            let sync = s.spawn(|| fx.sync_main());
+            let in_section = entered_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("phase B never entered its policy section (the probe did not fire)");
+            assert_eq!(in_section, fx.main_repo);
+            // The OFF setter starts while phase B is inside the section: the
+            // guard is held, so it cannot be acknowledged until the section
+            // (structure publish, pathspec commits) is over.
+            let setter = s.spawn(|| set_repo_share_specs(&fx.main_db, fx.main_repo, false));
+            release_tx.send(1).unwrap();
+            let out = sync.join().unwrap();
+            assert!(
+                setter.join().unwrap().is_ok(),
+                "the setter must finish right after the policy section"
+            );
+            out
+        });
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        // The whole ON policy of that pass landed ...
+        assert!(fx
+            .remote_file("dev", "docs/superpowers/specs/x.md")
+            .is_some());
+        assert!(fx
+            .remote_file("dev", ".sdh/project.json")
+            .unwrap()
+            .contains("\"share_specs\": true"));
+        // ... and the off is persisted after it: one coherent order, no
+        // half-on pass and no half-off commit.
+        assert!(
+            !fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .share_specs
+        );
+        // The next pass follows the new flag alone.
+        fx.sync_main();
+        write(&fx.main_dir, "docs/superpowers/specs/after.md", "# after\n");
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("dev", "docs/superpowers/specs/after.md"),
+            None,
+            "after the off, a new spec must not travel"
+        );
+        assert!(fx
+            .remote_file("dev", "docs/superpowers/specs/x.md")
+            .is_some());
+    }
+
+    /// Interleaving (b) — the setter completes first: every policy-sensitive
+    /// step of the sync that follows sees the new flag, so a spec that exists
+    /// already stays local and nothing is published with the old `on`.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_specs_toggle_before_phase_b_is_seen_by_the_whole_pass() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        // No warning note: this repo is already shared, but its `.gitignore`
+        // carries no user rule that hides the folder.
+        assert!(set_repo_share_specs(&fx.main_db, fx.main_repo, false)
+            .unwrap()
+            .is_none());
+        let out = fx.sync_main();
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert_eq!(fx.remote_file("dev", "docs/superpowers/specs/x.md"), None);
+        // The published structure carries the off the helper will accept.
+        assert!(fx
+            .remote_file("dev", ".sdh/project.json")
+            .unwrap()
+            .contains("\"share_specs\": false"));
+    }
+
+    /// T-000243 review (already-shared repos): a user rule that keeps the
+    /// folder ignored while the effective policy is ON must not silently kill
+    /// the transport — the recurring pass diagnoses it (once per change) and
+    /// never removes the rule by itself.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_user_rule_ignoring_specs_is_diagnosed_while_the_policy_is_on() {
+        let fx = two_installs();
+        fx.make_participant();
+        // This repo's own case: a user rule that hides the folder without
+        // naming it, kept by the owner on purpose (never auto-removed).
+        write(&fx.main_dir, ".gitignore", "superpowers/\n");
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+
+        // Enabled with OFF: the folder is not a shared path, its rules are the
+        // user's own business — no diagnostic, no note, nothing travels.
+        assert!(set_repo_share_specs(&fx.main_db, fx.main_repo, false)
+            .unwrap()
+            .is_none());
+        let out = fx.sync_main();
+        assert!(
+            !out.issues
+                .iter()
+                .any(|i| i.target.as_deref() == Some(".gitignore")),
+            "{:?}",
+            out.issues
+        );
+        assert_eq!(fx.remote_file("dev", "docs/superpowers/specs/x.md"), None);
+
+        // Flipped ON later, after the repo is already shared: the setter says
+        // right away that user rules still hide the folder ...
+        let note = set_repo_share_specs(&fx.main_db, fx.main_repo, true)
+            .unwrap()
+            .expect("the ON transition of an already-shared repo must warn");
+        assert!(note.contains("superpowers/"), "{}", note);
+        // ... and the recurring pass diagnoses it instead of silently sending
+        // nothing.
+        let out = fx.sync_main();
+        let diag = out
+            .issues
+            .iter()
+            .find(|i| {
+                i.code == Code::ManagedFileFailed && i.target.as_deref() == Some(".gitignore")
+            })
+            .expect("the silently blocked specs must be diagnosed");
+        assert!(
+            diag.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("superpowers/"),
+            "{:?}",
+            diag
+        );
+        // The rule survived: removal stays behind the preflight confirmation.
+        assert_eq!(
+            fs::read_to_string(fx.main_dir.join(".gitignore")).unwrap(),
+            "superpowers/\n"
+        );
+        // And nothing was silently committed: the folder is ignored, so no
+        // specs pathspec had anything to send.
+        assert_eq!(fx.remote_file("dev", "docs/superpowers/specs/x.md"), None);
+        assert_eq!(
+            g(&fx.main_dir, &["ls-files", "--", "docs/superpowers/"]),
+            ""
+        );
+
+        // Opting out stops the diagnosis: the folder is the user's own
+        // business again, no issue, no noise.
+        set_repo_share_specs(&fx.main_db, fx.main_repo, false).unwrap();
+        let out = fx.sync_main();
+        assert!(
+            !out.issues
+                .iter()
+                .any(|i| i.target.as_deref() == Some(".gitignore")),
+            "{:?}",
+            out.issues
+        );
     }
 
     fn sample_structure() -> ProjectStructure {
@@ -5381,6 +5891,13 @@ mod tests {
         fx.main_db
             .set_repo_share_specs(fx.main_repo, false)
             .unwrap();
+        // T-000243 review: the spec files of both installs exist BEFORE the
+        // structure / join syncs, so the first syncs of the transport run over
+        // pre-existing files (a bug exposing them at the first render or commit
+        // is caught here, not only by files written later).
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        write(&fx.helper_dir, "docs/superpowers/specs/y.md", "# y\n");
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
         fx.make_participant();
         // ... and is published in the trusted structure the helper accepts.
         assert!(fx
@@ -5388,9 +5905,6 @@ mod tests {
             .unwrap()
             .contains("\"share_specs\": false"));
 
-        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
-        write(&fx.helper_dir, "docs/superpowers/specs/y.md", "# y\n");
-        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
         fx.sync_main();
         fx.sync_helper();
         fx.sync_main();

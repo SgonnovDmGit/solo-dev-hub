@@ -103,10 +103,19 @@ fn init_docs_for_repo_in(
     // F-000044: a shared repo renders both blocks for sharing (same as the sync).
     // T-000243: the same effective `share_specs` policy the sync pass uses —
     // the owner's stored setting, the owner's published flag for a helper.
+    // T-000243 review: the policy read, the render and the write run under the
+    // same per-repo guard as phase B of the shared pass, and a structure that
+    // is present but unusable is an error (never a guessed `on`). A repo that
+    // is not shared resolves no policy at all.
     let shared = sync::shared::is_shared_repo(db, repo_id);
-    let share_specs = sync::shared::effective_share_specs(db, &repo, None);
-    let gitignore_template =
-        sync::shared::gitignore_template_for(&gitignore_template, shared, share_specs);
+    let gitignore_template = if !shared {
+        sync::shared::gitignore_template_for(&gitignore_template, false, true)
+    } else {
+        let policy = sync::shared::specs_policy_guard(repo_id);
+        let _policy = policy.lock().unwrap();
+        let share_specs = sync::shared::effective_share_specs(db, &repo, None)?;
+        sync::shared::gitignore_template_for(&gitignore_template, true, share_specs)
+    };
     let gitattributes_template =
         sync::shared::gitattributes_template_for(&gitattributes_template, shared);
     if sync::sync_gitignore_section(&gitignore_template, base)? {

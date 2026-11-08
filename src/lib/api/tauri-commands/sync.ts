@@ -93,9 +93,12 @@ export async function enableSharedMode(repoId: number, removeLines: boolean): Pr
 
 /** T-000243: the owner's per-repo `docs/superpowers/` switch (the checkbox
  *  next to the shared-mode switch). A local preference published by the next
- *  sync in `.sdh/project.json`; settable before shared mode is enabled. */
-export async function setRepoShareSpecs(repoId: number, shareSpecs: boolean): Promise<void> {
-  return invoke<void>('set_repo_share_specs', { repoId, shareSpecs });
+ *  sync in `.sdh/project.json`; settable before shared mode is enabled.
+ *  Resolves to a warning note when the flag was switched ON for a repo that
+ *  already shares while user `.gitignore` rules still hide the folder (the
+ *  next sync reports it as an issue too). */
+export async function setRepoShareSpecs(repoId: number, shareSpecs: boolean): Promise<string | null> {
+  return invoke<string | null>('set_repo_share_specs', { repoId, shareSpecs });
 }
 
 export async function disableSharedMode(repoId: number): Promise<SharedDisableResult> {

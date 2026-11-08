@@ -265,14 +265,41 @@ fn write_repo_skeletons(
     // paths; the same text for the owner and for contributors, so it never churns.
     // T-000243: the render drops `docs/superpowers/` only while the effective
     // policy shares it; opted out, the managed render keeps ignoring the folder.
-    // Both callers of `gitignore_template_for` resolve the same policy, so the
-    // render here and the pathspecs of the shared pass never disagree.
+    // T-000243 review: the policy read and the render run under the same
+    // per-repo guard as phase B of the shared pass, so the render never reads a
+    // flag that is being written; a structure that IS present but unusable
+    // (malformed / untrusted) is never guessed as `on` — the `.gitignore` is
+    // left as it is and the reason is reported instead. A repo that is not
+    // shared never resolves a policy at all (a leftover `.sdh/` file of an
+    // ordinary repo must not break its render).
     let shared = sync::shared::is_shared_repo(db, repo.id);
-    let share_specs = sync::shared::effective_share_specs(db, repo, shared_structure);
-    let gitignore = sync::shared::gitignore_template_for(&tpl.gitignore, shared, share_specs);
+    let gitignore = if !shared {
+        Some(sync::shared::gitignore_template_for(
+            &tpl.gitignore,
+            false,
+            true,
+        ))
+    } else {
+        // The guard spans the policy read and the write of the file below.
+        let policy = sync::shared::specs_policy_guard(repo.id);
+        let _policy = policy.lock().unwrap();
+        match sync::shared::effective_share_specs(db, repo, shared_structure) {
+            Ok(share_specs) => Some(sync::shared::gitignore_template_for(
+                &tpl.gitignore,
+                true,
+                share_specs,
+            )),
+            Err(e) => {
+                c.push(file_issue(".gitignore", e));
+                None
+            }
+        }
+    };
     let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
-    if let Err(e) = sync::sync_gitignore_section(&gitignore, base) {
-        c.push(file_issue(".gitignore", e));
+    if let Some(gitignore) = gitignore {
+        if let Err(e) = sync::sync_gitignore_section(&gitignore, base) {
+            c.push(file_issue(".gitignore", e));
+        }
     }
     if let Err(e) = sync::sync_gitattributes_section(&gitattributes, base) {
         c.push(file_issue(".gitattributes", e));

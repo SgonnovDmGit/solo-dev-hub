@@ -1631,6 +1631,22 @@ fn ignored(dir: &Path, path: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// T-000243: `tracked` of a branch that may not exist yet (a branch not born on
+/// the remote carries nothing by definition, and `tracked` asserts git's exit
+/// code).
+fn no_specs_on(fx: &TwoInstalls, rev: &str) {
+    if fx.remote_rev(rev).is_none() {
+        return;
+    }
+    let files = tracked(&fx.origin, rev);
+    assert!(
+        files.iter().all(|f| !f.starts_with("docs/superpowers/")),
+        "{} carries specs: {:?}",
+        rev,
+        files
+    );
+}
+
 /// T-000243 Part 1, through the real sync (skeleton render included): while the
 /// policy shares specs, the managed `.gitignore` of BOTH installs stops
 /// ignoring the folder (the local-only docs stay ignored), the owner's specs,
@@ -1720,17 +1736,34 @@ fn t000243_specs_are_shared_end_to_end_while_the_flag_is_on() {
 fn t000243_off_before_the_first_commit_keeps_specs_local_on_both_installs() {
     let w = World::new();
     let fx = &w.fx;
-    // The owner's choice is stored before sharing is enabled.
-    fx.main_db
-        .set_repo_share_specs(fx.main_repo, false)
-        .unwrap();
-    w.owner_shares();
-    w.join();
-
-    // Both installs write a spec of their own; both folders stay ignored —
-    // the managed render answers for the rule on both sides.
+    // The owner's choice is stored before sharing is enabled — through the
+    // guarded setter the checkbox itself calls (no warning note: this repo has
+    // no user rule hiding the folder).
+    assert!(set_repo_share_specs(&fx.main_db, fx.main_repo, false)
+        .unwrap()
+        .is_none());
+    // T-000243 review: the spec files of BOTH installs exist BEFORE the first
+    // sync that could commit them (the owner's enable sync, the helper's first
+    // probe). Files written only after the join would leave the exposure
+    // window of a first render / commit untested.
     write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
     write(&fx.helper_dir, "docs/superpowers/plans/y.md", "# y\n");
+
+    w.owner_shares();
+    // After the owner's first committing sync: nothing under the folder on any
+    // branch the transport touches (helper-dev is not born yet).
+    for rev in ["dev", "helper-dev"] {
+        no_specs_on(fx, rev);
+    }
+
+    w.join();
+    // After the helper's join and the approval: still nothing, on either side.
+    for rev in ["dev", "helper-dev"] {
+        no_specs_on(fx, rev);
+    }
+    // Both folders stay ignored — the managed render answers for the rule on
+    // both sides — and the helper's database still says the default on: the
+    // accepted structure won before its first render and commit.
     for (dir, path) in [
         (&fx.main_dir, "docs/superpowers/specs/x.md"),
         (&fx.helper_dir, "docs/superpowers/plans/y.md"),
@@ -1738,7 +1771,6 @@ fn t000243_off_before_the_first_commit_keeps_specs_local_on_both_installs() {
         let v = ignored(dir, path).expect("the specs folder must stay ignored");
         assert!(v.contains("docs/superpowers/"), "{}", v);
     }
-    // The helper's database still says the default on — the structure won.
     assert!(
         fx.helper_db
             .get_shared_state(fx.helper_repo)
@@ -1752,13 +1784,7 @@ fn t000243_off_before_the_first_commit_keeps_specs_local_on_both_installs() {
 
     // Nothing under the folder in origin/dev or the participant branch.
     for rev in ["dev", "helper-dev"] {
-        let files = tracked(&fx.origin, rev);
-        assert!(
-            files.iter().all(|f| !f.starts_with("docs/superpowers/")),
-            "{} carries specs: {:?}",
-            rev,
-            files
-        );
+        no_specs_on(fx, rev);
     }
     // Never tracked on either clone.
     for dir in [&fx.main_dir, &fx.helper_dir] {

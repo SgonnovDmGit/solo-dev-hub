@@ -57,7 +57,7 @@ pub fn set_repo_share_specs(
     db: State<AppDb>,
     repo_id: i64,
     share_specs: bool,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     shared::set_repo_share_specs(&db, repo_id, share_specs)
 }
 
