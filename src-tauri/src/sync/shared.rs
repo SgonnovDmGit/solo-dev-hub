@@ -172,6 +172,39 @@ pub fn is_shared_repo(db: &AppDb, repo_id: i64) -> bool {
         .unwrap_or(false)
 }
 
+/// T-000243 review (fifth pass): the shared-lifecycle facts a pass was
+/// created under — mode, cached role and the pending-disable marker.
+/// `SharedSync::finish` re-reads them under the per-repo guard and compares:
+/// a difference means a writer moved the repo's lifecycle after this pass's
+/// phase-A snapshot (a disable completed, an approval flipped the role,
+/// sharing was switched on or off) and the pass is STALE — it settles no
+/// status, because the writer that moved the lifecycle owns the repo's
+/// status now (a completed disable, or the `push_failed` a disable retry is
+/// still reporting). This is deliberately NOT `is_shared_state`: a
+/// first-discovery `Untrusted` pass or a `retry_disabling` pass
+/// legitimately settles onto a repo that is not (or no longer) shared —
+/// what matters is whether the lifecycle moved AFTER the pass was sealed,
+/// not whether the repo is shared at settlement time. `shared_status` is
+/// excluded on purpose: it is what settlement itself writes.
+#[derive(PartialEq)]
+struct LifecycleMark {
+    mode: bool,
+    role: Option<String>,
+    disabling: Option<String>,
+    disabling_branches: Vec<String>,
+}
+
+fn lifecycle_mark(db: &AppDb, repo_id: i64) -> LifecycleMark {
+    let state = db.get_shared_state(repo_id).ok();
+    let imp = ss::read_shared_import(db, repo_id);
+    LifecycleMark {
+        mode: state.as_ref().is_some_and(|s| s.shared_mode),
+        role: state.and_then(|s| s.shared_role),
+        disabling: imp.disabling,
+        disabling_branches: imp.disabling_branches,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // T-000243: the per-repo `docs/superpowers/` policy
 // ---------------------------------------------------------------------------
@@ -1533,6 +1566,10 @@ struct RepoPass {
     /// `push_failed` status with its `disabling` marker must not have it
     /// cleared by a cancelled pass's empty notes).
     cancelled: bool,
+    /// T-000243 review (fifth pass): the lifecycle mark sealed at the end of
+    /// phase A (see `LifecycleMark`). `None` only for passes built outside
+    /// `run_phase_a` (tests): they settle unconditionally, as before.
+    lifecycle: Option<LifecycleMark>,
 }
 
 impl RepoPass {
@@ -1561,6 +1598,12 @@ impl RepoPass {
             rejected_branch: None,
             ui: None,
         });
+    }
+
+    /// Seal the lifecycle mark at the end of phase A — after every shared
+    /// state write this pass itself made (see `LifecycleMark`).
+    fn seal_lifecycle(&mut self, db: &AppDb) {
+        self.lifecycle = Some(lifecycle_mark(db, self.repo.id));
     }
 
     /// `Untrusted` with the reason of the structure check. A coded reason (a
@@ -1997,17 +2040,21 @@ fn run_phase_a_with(
                 // Shared mode on, but this install does not know its login.
                 let mut pass = new_pass(&repo, &root, "");
                 pass.note(SharedStatus::NoLogin, "");
+                pass.seal_lifecycle(db);
                 sync.handled.insert(repo.id);
                 sync.passes.push(pass);
                 continue;
             };
             sync.handled.insert(repo.id);
-            sync.passes.push(phase_a_main(db, git, &repo, &root, login));
+            let mut pass = phase_a_main(db, git, &repo, &root, login);
+            pass.seal_lifecycle(db);
+            sync.passes.push(pass);
             continue;
         }
         if ss::read_shared_import(db, repo.id).disabling.is_some() {
             // Switched off, but the deletion of `.sdh/` did not reach the remote.
-            if let Some(pass) = retry_disabling(db, git, &repo, &root) {
+            if let Some(mut pass) = retry_disabling(db, git, &repo, &root) {
+                pass.seal_lifecycle(db);
                 sync.passes.push(pass);
             }
             continue;
@@ -2054,13 +2101,14 @@ fn run_phase_a_with(
         } else {
             FetchMode::Probe
         };
-        if let Some(pass) = phase_a_foreign(db, git, &repo, &root, &gh, login, mode) {
+        if let Some(mut pass) = phase_a_foreign(db, git, &repo, &root, &gh, login, mode) {
             sync.handled.insert(repo.id);
             for rule in &pass.canon_changed {
                 if !sync.canon_changed.contains(rule) {
                     sync.canon_changed.push(rule.clone());
                 }
             }
+            pass.seal_lifecycle(db);
             sync.passes.push(pass);
         }
     }
@@ -2094,6 +2142,7 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         canon_changed: Vec::new(),
         admin_checks: Vec::new(),
         cancelled: false,
+        lifecycle: None,
     }
 }
 
@@ -2812,20 +2861,27 @@ impl SharedSync {
             // AND the status settlement — a writer that flipped the repo's
             // shared state between the phases (disable / approve / enable /
             // the specs setter) cannot land between the policy work and the
-            // status write. Passes phase B never revalidates (no git, or a
-            // pass refused back in phase A) still settle only onto a repo
-            // that REMAINS shared: a disable that completed meanwhile owns
-            // the repo's status (including a `push_failed` it is still
-            // retrying), and a stale pass must not overwrite it.
+            // status write.
             let guard = specs_policy_guard(pass.repo.id);
             let _guard = guard.lock().unwrap();
             if let (Some(git), Some(_)) = (git, pass.role) {
                 phase_b_repo(db, git, &mut pass);
             }
-            let still_shared = db
-                .get_shared_state(pass.repo.id)
-                .map(|s| is_shared_state(&s))
-                .unwrap_or(false);
+            // T-000243 review (fifth pass): settle only when the lifecycle
+            // this pass was sealed under is still current. A disable that
+            // completed meanwhile owns the repo's status (including a
+            // `push_failed` it is still retrying), and so does an approval
+            // or enable that moved the role — a stale pass must not
+            // overwrite it. Passes phase B never revalidates (no git, or a
+            // pass refused back in phase A) get the same protection here.
+            // This is NOT `is_shared_state`: a first-discovery `Untrusted`
+            // pass or a `retry_disabling` pass legitimately settles onto a
+            // repo that is not shared — only a lifecycle that MOVED after
+            // the seal makes a pass stale.
+            let stale = pass
+                .lifecycle
+                .as_ref()
+                .is_some_and(|mark| *mark != lifecycle_mark(db, pass.repo.id));
             let issues = std::mem::take(&mut pass.issues);
             out.issues
                 .extend(fresh_issues(pass.repo.id, &pass.root, issues));
@@ -2838,7 +2894,7 @@ impl SharedSync {
             // T-000243 review (third pass): a pass cancelled by phase B's
             // revalidation settles no status — the writer that changed the
             // repo's state under the guard owns it (see `RepoPass::cancelled`).
-            if !pass.cancelled && still_shared {
+            if !pass.cancelled && !stale {
                 settle_status(db, &pass, &mut out);
             }
         }
@@ -5483,6 +5539,17 @@ mod tests {
             .unwrap();
         fx.sync_main();
         fx.sync_helper();
+        // And THIS sync's render — the one holding the stale ON snapshot —
+        // resolves the same fresh policy: a helper's answer is always
+        // authoritative discovery, never the phase-A structure.
+        let repo = fx.helper_db.get_repository(fx.helper_repo).unwrap();
+        let state = shared_a
+            .render_state_of(&fx.helper_db, Some(&git), &repo)
+            .unwrap();
+        assert!(
+            !effective_share_specs(&fx.helper_db, &repo, state.as_ref()).unwrap(),
+            "the render must resolve the newer OFF, not the phase-A ON"
+        );
         // Pass A resumes: phase B must see OFF — no specs commit of its own.
         let out_a = shared_a.finish(&fx.helper_db, Some(&git));
         assert!(out_a.issues.is_empty(), "{:?}", out_a.issues);
@@ -5492,15 +5559,6 @@ mod tests {
             "the stale ON pass must not publish the helper's spec"
         );
         assert_eq!(fx.remote_file("dev", "docs/superpowers/specs/x.md"), None);
-        // And the render resolves the same fresh policy, not the snapshot.
-        let repo = fx.helper_db.get_repository(fx.helper_repo).unwrap();
-        let state = SharedSync::empty()
-            .render_state_of(&fx.helper_db, Some(&git), &repo)
-            .unwrap();
-        assert!(
-            !effective_share_specs(&fx.helper_db, &repo, state.as_ref()).unwrap(),
-            "the render must resolve the newer OFF, not the phase-A ON"
-        );
     }
 
     /// T-000243 review (fourth pass): without a git binary a HELPER's specs
@@ -5527,7 +5585,8 @@ mod tests {
     /// phase B (`role` is `None`), so `finish` used to settle its stale
     /// untrusted status even after a disable that completed between the
     /// phases had already owned the repo's state. The settlement now happens
-    /// under the same guard and only onto a repo that remains shared.
+    /// under the same guard and only while the lifecycle the pass was sealed
+    /// under is still current — the disable moved it, so the pass is stale.
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_disable_between_the_phases_keeps_the_disabled_status() {
