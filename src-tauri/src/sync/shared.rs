@@ -2574,6 +2574,17 @@ fn drop_stale_structure(
     net_ok: bool,
     expected_gen: u64,
 ) {
+    // T-000243 review (tenth pass): the WHOLE cleanup — the switch-off
+    // evidence check, the deletion commits, the pushes and the pin
+    // settlement — runs under the policy guard. Every lifecycle writer
+    // needs the same guard, so the generation cannot move while it is
+    // held: the freshness check below stays valid for every step, and a
+    // republished structure can never be deleted by an obsolete pass.
+    let guard = specs_policy_guard(repo.id);
+    let _g = guard.lock().unwrap();
+    if !lifecycle_is_current(repo.id, root, expected_gen) {
+        return;
+    }
     let mut imp = ss::read_shared_import(db, repo.id);
     let Some(pin) = imp.pinned_dev_branch.clone() else {
         return;
@@ -2585,17 +2596,12 @@ fn drop_stale_structure(
     if tracks_structure(git, root, &remote_ref(&pin)) != Some(false) {
         return;
     }
+    // The guard is already held — `finish` must NOT re-acquire it.
     let finish = |db: &AppDb, _imp: &mut ss::SharedImport| {
         if !root.join(STRUCTURE_REL_PATH).exists() {
-            // Clearing the pin is a lifecycle transition: guarded, gated on
-            // the observing pass's generation AND on the pin still being
-            // the one the evidence was gathered for — a newer accept may
-            // have pinned a different dev branch meanwhile.
-            let guard = specs_policy_guard(repo.id);
-            let _g = guard.lock().unwrap();
-            if !lifecycle_is_current(repo.id, root, expected_gen) {
-                return;
-            }
+            // Clearing the pin is a lifecycle transition gated on the pin
+            // still being the one the evidence was gathered for — a newer
+            // accept may have pinned a different dev branch meanwhile.
             let mut fresh = ss::read_shared_import(db, repo.id);
             if fresh.pinned_dev_branch.as_deref() != Some(pin.as_str()) {
                 return;
@@ -4499,6 +4505,12 @@ pub fn merge_shared_upstream(
     git: &GitBinary,
     repo_id: i64,
 ) -> Result<SharedMergeResult, String> {
+    // T-000243 review (tenth pass): the guard spans binding read, merge
+    // driver registration, the merge itself AND the status settlement —
+    // a repath that landed mid-merge must not let the OLD checkout's
+    // result clear the NEW binding's status or bump its generation.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
     let root = repo_root(&repo)?;
     let cur = current_branch(git, &root)?
@@ -4514,23 +4526,14 @@ pub fn merge_shared_upstream(
         MergeOutcome::Merged => {
             // T-000243 review (seventh pass): a successful merge invalidates
             // every pre-merge observation — bump unconditionally, whether or
-            // not `needs_manual_merge` was persisted. The status clear is
-            // re-verified under the guard (the pre-merge read may be stale).
-            let guard = specs_policy_guard(repo_id);
-            let _guard = guard.lock().unwrap();
+            // not `needs_manual_merge` was persisted. `root` IS the guarded
+            // binding, so the clear and the bump apply to the checkout that
+            // was actually merged.
             let st = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
             if st.shared_status.as_deref() == Some(SharedStatus::NeedsManualMerge.as_str()) {
                 let _ = db.set_shared_status(repo_id, None);
             }
-            // Bump under the CURRENT binding: a repath that landed during
-            // the merge must not leave new-path passes uninvalidated.
-            let key = db
-                .get_repository(repo_id)
-                .ok()
-                .and_then(|r| r.local_path)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| root.clone());
-            bump_lifecycle_generation(repo_id, &key);
+            bump_lifecycle_generation(repo_id, &root);
             SharedMergeResult {
                 outcome: "merged".into(),
                 files: vec![],
