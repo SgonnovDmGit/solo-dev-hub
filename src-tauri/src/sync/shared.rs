@@ -246,22 +246,29 @@ fn pass_role_transition(pass: &mut RepoPass, db: &AppDb, role: Option<&str>, exp
 /// The role+status cleanup that belongs to NO pass (the loop's stale-cache
 /// cleanup, the `NotFound` cleanup): ONE guarded freshness decision for
 /// both writes — an obsolete observation cannot erase a newer lifecycle.
-fn foreign_state_cleanup(db: &AppDb, repo_id: i64, root: &Path, expected: u64) {
+/// Returns how many generation bumps it applied, so the caller can carry
+/// the resulting expected generation forward (T-000243 review, ninth
+/// pass — the same pass's pin cleanup must not invalidate itself).
+fn foreign_state_cleanup(db: &AppDb, repo_id: i64, root: &Path, expected: u64) -> u64 {
     let guard = specs_policy_guard(repo_id);
     let _g = guard.lock().unwrap();
     if !lifecycle_is_current(repo_id, root, expected) {
-        return;
+        return 0;
     }
     let st = db.get_shared_state(repo_id).ok();
-    let Some(st) = st else { return };
+    let Some(st) = st else { return 0 };
+    let mut bumps = 0;
     if st.shared_role.is_some() {
         let _ = db.set_shared_role(repo_id, None);
         bump_lifecycle_generation(repo_id, root);
+        bumps += 1;
     }
     if st.shared_status.is_some() {
         let _ = db.set_shared_status(repo_id, None);
         bump_lifecycle_generation(repo_id, root);
+        bumps += 1;
     }
+    bumps
 }
 
 /// Rebind `local_path` atomically vs pass generation capture: the guard
@@ -2150,11 +2157,14 @@ fn run_phase_a_with(
         let lifecycle_gen = {
             let _g = guard.lock().unwrap();
             match db.get_repository(repo.id).ok().and_then(|r| r.local_path) {
-                Some(p) if Path::new(&p) != root.as_path() => {
+                // Unconditional: `Path` equality normalizes separators and
+                // `.` components while the generation key is the LITERAL
+                // string — an "equivalent" spelling would capture the wrong
+                // key's generation (T-000243 review, ninth pass).
+                Some(p) => {
                     root = PathBuf::from(&p);
                     repo.local_path = Some(p);
                 }
-                Some(_) => {}
                 None => {
                     // The binding was cleared meanwhile: nothing to sync.
                     continue;
@@ -2396,24 +2406,19 @@ fn phase_a_foreign(
     match found {
         DiscoverOutcome::NotFound => {
             let st = db.get_shared_state(repo.id).ok();
+            let mut expected = gen0 + u64::from(pass.own_bumps);
             if st.is_some_and(|s| s.shared_role.is_some() || s.shared_status.is_some()) {
                 // Repo is ordinary again (spec R15). The clear belongs to no
                 // pass — but it IS a lifecycle transition gated on THIS
                 // pass's generation: if a newer lifecycle landed after the
                 // NotFound observation (a republish + accept), the cleanup
-                // is obsolete and skipped.
-                foreign_state_cleanup(db, repo.id, root, gen0 + u64::from(pass.own_bumps));
+                // is obsolete and skipped. Its bumps carry forward so the
+                // pin cleanup below is gated on the RESULT, not the input.
+                expected += foreign_state_cleanup(db, repo.id, root, expected);
             }
             // Facts decide whether anything is left to clean up (nothing, for a repo
             // that never carried a structure).
-            drop_stale_structure(
-                db,
-                git,
-                repo,
-                root,
-                pass.net_ok,
-                gen0 + u64::from(pass.own_bumps),
-            );
+            drop_stale_structure(db, git, repo, root, pass.net_ok, expected);
             None
         }
         DiscoverOutcome::Untrusted(reason) => {
@@ -3891,7 +3896,6 @@ pub fn enable_shared_mode(
     remove_lines: bool,
 ) -> Result<(), String> {
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
-    let root = repo_root(&repo)?;
     let login = db.github_login().ok_or_else(|| {
         "the GitHub login of this install is unknown - save the token again".to_string()
     })?;
@@ -3909,6 +3913,11 @@ pub fn enable_shared_mode(
     // coherent snapshot.
     let guard = specs_policy_guard(repo_id);
     let _guard = guard.lock().unwrap();
+    // T-000243 review (ninth pass): re-read the binding UNDER the guard —
+    // a repath that completed while this command queued must not leave the
+    // structure work (or the generation bump) on the obsolete checkout.
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let root = repo_root(&repo)?;
     let existing = ss::read_structure_file(&root, &gh, &ss::AdminVerified::load(db))?;
     // Validates: owner or administrator, project, dev branch.
     let built = ss::build_structure(db, repo_id, &login, existing.as_ref())?;
@@ -3971,6 +3980,9 @@ pub fn set_repo_share_specs(db: &AppDb, repo_id: i64, on: bool) -> Result<Option
     // whole check+write pair stays atomic against a sync in flight.
     let guard = specs_policy_guard(repo_id);
     let _guard = guard.lock().unwrap();
+    // Re-read the binding under the guard: the checkout check below must
+    // run against the CURRENT local path (T-000243 review, ninth pass).
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
     // The ROLE is refused before the capability: a verified administrator of
     // an organization this install participates in as a contributor / pending
     // helper is still not that repo's main here. Read under the guard, so the
@@ -4056,8 +4068,6 @@ pub fn disable_shared_mode(
     git: &GitBinary,
     repo_id: i64,
 ) -> Result<SharedDisableResult, String> {
-    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
-    let root = repo_root(&repo)?;
     let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
     if !state.shared_mode || state.shared_role.as_deref().is_some_and(|r| r != "main") {
         return Err("shared mode can only be switched off by the owner of the repo".into());
@@ -4070,6 +4080,11 @@ pub fn disable_shared_mode(
     // could interleave with the deletion commit and resurrect `.sdh/`.
     let guard = specs_policy_guard(repo_id);
     let _guard = guard.lock().unwrap();
+    // T-000243 review (ninth pass): same rebind rule as enable — the
+    // checkout this deletion commits to is the CURRENT binding, read
+    // under the guard, and the generation bump keys off it.
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let root = repo_root(&repo)?;
     // T-000243 review (third pass): the operation-validity check is repeated
     // UNDER the guard — a first disable (or the approval) that queued on it
     // before must not be followed by a second run acting on the stale state
@@ -4371,7 +4386,6 @@ pub fn approve_join_request(
     if !state.shared_mode {
         return Err("only the owner of a shared repo can approve join requests".into());
     }
-    let root = repo_root(&repo)?;
     let gh = repo
         .github_name
         .clone()
@@ -4388,6 +4402,10 @@ pub fn approve_join_request(
     // inside the guard.
     let guard = specs_policy_guard(repo_id);
     let _guard = guard.lock().unwrap();
+    // T-000243 review (ninth pass): re-read the binding under the guard —
+    // the structure write below must land on the CURRENT checkout.
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let root = repo_root(&repo)?;
     // T-000243 review (third pass): the sharing check is repeated UNDER the
     // guard — a disable queued on it between the read above and here must not
     // be followed by an approval that writes the structure back over the
@@ -6031,6 +6049,16 @@ mod tests {
             "a pass captured under the old path must go stale"
         );
         assert_ne!(lifecycle_generation(repo.id, new), g_new);
+        // Ninth pass: a spelling that differs only by a trailing separator
+        // compares EQUAL under `Path` but is a DIFFERENT literal generation
+        // key — both spellings must be bumped, never normalized away.
+        let g_trailing = lifecycle_generation(repo.id, Path::new("/new/root/"));
+        rebind_local_path(&db, repo.id, Some("/new/root/")).unwrap();
+        assert_ne!(
+            lifecycle_generation(repo.id, Path::new("/new/root/")),
+            g_trailing,
+            "the new spelling's own key must be bumped too"
+        );
     }
 
     /// T-000243 review (eighth pass): an OBSOLETE phase-A cleanup — one
@@ -6053,16 +6081,23 @@ mod tests {
         db.set_shared_role(repo.id, Some("pending")).unwrap();
         bump_lifecycle_generation(repo.id, root);
         // A resumes: its cleanup is obsolete — the gate refuses the write.
-        foreign_state_cleanup(&db, repo.id, root, g0);
+        assert_eq!(foreign_state_cleanup(&db, repo.id, root, g0), 0);
         assert_eq!(
             db.get_shared_state(repo.id).unwrap().shared_role.as_deref(),
             Some("pending"),
             "the newer accepted role must survive the obsolete cleanup"
         );
-        // The same cleanup under the CURRENT generation does clear.
+        // The same cleanup under the CURRENT generation does clear — and
+        // reports its bump count so a same-pass pin cleanup stays gated
+        // on the RESULT (ninth pass).
         let now = lifecycle_generation(repo.id, root);
-        foreign_state_cleanup(&db, repo.id, root, now);
+        assert_eq!(foreign_state_cleanup(&db, repo.id, root, now), 1);
         assert_eq!(db.get_shared_state(repo.id).unwrap().shared_role, None);
+        assert_eq!(
+            lifecycle_generation(repo.id, root),
+            now + 1,
+            "the reported bump count matches the generation move"
+        );
     }
 
     /// T-000243 review (eighth pass): the pass's own transition is gated
