@@ -2368,7 +2368,7 @@ fn phase_a_main(
             pass.recipients = clean_recipients(rec);
         }
     }
-    after_fetch(db, git, &mut pass);
+    after_fetch(db, git, &mut pass, gen0);
     pass
 }
 
@@ -2502,7 +2502,7 @@ fn phase_a_foreign(
             // resolves the policy again under the per-repo guard.
             pass.share_specs = effective_share_specs(db, repo, Some(&s)).unwrap_or(true);
             pass.structure = Some(s);
-            after_fetch(db, git, &mut pass);
+            after_fetch(db, git, &mut pass, gen0);
             Some(pass)
         }
     }
@@ -2947,8 +2947,13 @@ fn reset_to_origin(
 }
 
 /// Fast-forward the recipients, guard the non-current ones, then the import hook.
-/// Nothing is touched unless the repo is `repo_ready`.
-fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
+/// Nothing is touched unless the repo is `repo_ready`. `gen0` is the
+/// generation the pass captured: the branch section below mutates refs —
+/// `reset_to_origin` can roll a branch back over a disable's unpushed
+/// deletion commit — so it runs under the policy guard, gated on the
+/// pass's freshness BEFORE the first ref update (T-000243 review, twelfth
+/// pass). `import_incoming` takes the guard itself and stays outside.
+fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
     let Some(role) = pass.role else { return };
     if !repo_ready(git, &pass.root) {
         return;
@@ -2956,66 +2961,80 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     let cur = current_branch(git, &pass.root).ok().flatten();
     let pathspec = shared_pathspec(role, &pass.login, pass.share_specs);
     let recipients = pass.recipients.clone();
-    for b in &recipients {
-        let remote = remote_ref(b);
-        let has_remote = matches!(git_sync::rev_parse(git, &pass.root, &remote), Ok(Some(_)));
-        let is_current = cur.as_deref().is_some_and(|c| same_branch(c, b));
-        if is_current {
-            if !has_remote {
-                continue;
-            }
-            match ff_current(git, &pass.root, &remote, &pathspec) {
-                Ok(true) => {}
-                Ok(false) => pass.note_diverged(b, true),
-                Err(e) => {
-                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
-                    pass.issue(issue)
+    #[cfg(test)]
+    after_fetch_probe(pass.repo.id, &pass.root);
+    {
+        let guard = specs_policy_guard(pass.repo.id);
+        let _g = guard.lock().unwrap();
+        if !lifecycle_is_current(pass.repo.id, &pass.root, gen0 + u64::from(pass.own_bumps)) {
+            // A lifecycle landed during the fetch (disable, re-enable,
+            // approval, repath): every ref mutation below is obsolete.
+            // The pass seals stale at `finish` regardless.
+        } else {
+            for b in &recipients {
+                let remote = remote_ref(b);
+                let has_remote =
+                    matches!(git_sync::rev_parse(git, &pass.root, &remote), Ok(Some(_)));
+                let is_current = cur.as_deref().is_some_and(|c| same_branch(c, b));
+                if is_current {
+                    if !has_remote {
+                        continue;
+                    }
+                    match ff_current(git, &pass.root, &remote, &pathspec) {
+                        Ok(true) => {}
+                        Ok(false) => pass.note_diverged(b, true),
+                        Err(e) => {
+                            let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                            pass.issue(issue)
+                        }
+                    }
+                    continue;
                 }
-            }
-            continue;
-        }
-        // Not the current branch: it may only ever hold our own sync commits.
-        let mut check = true;
-        if has_remote {
-            match git_sync::fast_forward_ref(git, &pass.root, b, &remote) {
-                Ok(FfOutcome::Diverged) => {
-                    check = false;
-                    let tip = if pass.fetched {
-                        local_tip_if_ours(git, &pass.root, b).unwrap_or(None)
-                    } else {
-                        None
-                    };
-                    let reset = tip
-                        .is_some_and(|t| reset_to_origin(git, &pass.root, b, &t).unwrap_or(false));
-                    if !reset {
-                        pass.blocked.insert(b.to_ascii_lowercase());
-                        pass.note_diverged(b, false);
+                // Not the current branch: it may only ever hold our own sync commits.
+                let mut check = true;
+                if has_remote {
+                    match git_sync::fast_forward_ref(git, &pass.root, b, &remote) {
+                        Ok(FfOutcome::Diverged) => {
+                            check = false;
+                            let tip = if pass.fetched {
+                                local_tip_if_ours(git, &pass.root, b).unwrap_or(None)
+                            } else {
+                                None
+                            };
+                            let reset = tip.is_some_and(|t| {
+                                reset_to_origin(git, &pass.root, b, &t).unwrap_or(false)
+                            });
+                            if !reset {
+                                pass.blocked.insert(b.to_ascii_lowercase());
+                                pass.note_diverged(b, false);
+                            }
+                        }
+                        Ok(FfOutcome::LocalAhead) => {}
+                        Ok(_) => check = false,
+                        Err(e) => {
+                            check = false;
+                            let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                            pass.issue(issue)
+                        }
                     }
                 }
-                Ok(FfOutcome::LocalAhead) => {}
-                Ok(_) => check = false,
-                Err(e) => {
-                    check = false;
-                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
-                    pass.issue(issue)
-                }
-            }
-        }
-        let exists = matches!(
-            git_sync::rev_parse(git, &pass.root, &local_ref(b)),
-            Ok(Some(_))
-        );
-        if check && exists {
-            match local_only_commits_are_ours(git, &pass.root, b) {
-                Ok(true) => {}
-                Ok(false) => {
-                    pass.blocked.insert(b.to_ascii_lowercase());
-                    pass.note_diverged(b, false);
-                }
-                Err(e) => {
-                    pass.blocked.insert(b.to_ascii_lowercase());
-                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
-                    pass.issue(issue)
+                let exists = matches!(
+                    git_sync::rev_parse(git, &pass.root, &local_ref(b)),
+                    Ok(Some(_))
+                );
+                if check && exists {
+                    match local_only_commits_are_ours(git, &pass.root, b) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            pass.blocked.insert(b.to_ascii_lowercase());
+                            pass.note_diverged(b, false);
+                        }
+                        Err(e) => {
+                            pass.blocked.insert(b.to_ascii_lowercase());
+                            let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                            pass.issue(issue)
+                        }
+                    }
                 }
             }
         }
@@ -3335,6 +3354,51 @@ fn retry_post_fetch_probe(repo_id: i64, root: &Path) {
         let _ = p.entered.send(repo_id);
         // The retry has NOT taken the policy guard yet — whatever the test
         // interleaves here completes before the retry's freshness check.
+        let _ = p.release.recv();
+    }
+}
+
+// T-000243 review (twelfth pass): a rendezvous for `after_fetch`'s branch
+// section — the fast-forwards and `reset_to_origin` there MUTATE refs, so
+// they run under the policy guard gated on the pass's generation. The
+// probe fires AFTER the fetch, BEFORE the guard is taken: a test can land
+// a whole disable + republish in exactly the window the review found.
+// Matched by (repo id, repo root); fires once.
+#[cfg(test)]
+struct AfterFetchProbe {
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+#[cfg(test)]
+static AFTER_FETCH_PROBES: OnceLock<Mutex<HashMap<(i64, PathBuf), AfterFetchProbe>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn install_after_fetch_probe(
+    repo: i64,
+    root: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = AFTER_FETCH_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo, root.to_path_buf()),
+        AfterFetchProbe { entered, release },
+    );
+}
+
+#[cfg(test)]
+fn after_fetch_probe(repo_id: i64, root: &Path) {
+    let cell = AFTER_FETCH_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        g.remove(&(repo_id, root.to_path_buf()))
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        // The pass has NOT taken the policy guard yet — whatever the test
+        // interleaves here completes before the freshness check.
         let _ = p.release.recv();
     }
 }
@@ -5016,6 +5080,7 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::fs;
+    use std::process::Command;
 
     // ----- T-000227: administrator checks and eligibility ---------------------
 
@@ -6080,6 +6145,86 @@ mod tests {
                 .get_shared_state(fx.main_repo)
                 .unwrap()
                 .shared_mode
+        );
+    }
+
+    /// T-000243 review (twelfth pass): phase A's branch section may
+    /// `reset_to_origin` a non-current branch — rolling it back over a
+    /// disable's unpushed deletion commit if the disable lands between the
+    /// pass's fetch and its ref updates. The section now runs under the
+    /// policy guard gated on the pass's generation: a lifecycle that moved
+    /// meanwhile makes every mutation obsolete BEFORE the first ref update.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_phase_a_reset_cannot_roll_back_an_in_flight_disable() {
+        let fx = two_installs();
+        fx.enable_main();
+        // A feature branch is checked out: `dev` stays a non-current ref —
+        // exactly the branch the phase-A reset path may move.
+        g(&fx.main_dir, &["checkout", "-q", "-b", "feature"]);
+        // The disable's push is refused, so its `.sdh/` deletion on `dev`
+        // stays pending behind the marker.
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_after_fetch_probe(fx.main_repo, &fx.main_dir, entered_tx, release_rx);
+
+        let mut deletion = String::new();
+        std::thread::scope(|s| {
+            // Phase A runs to `after_fetch` and parks before its guarded
+            // branch section.
+            let sync = s.spawn(|| run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id)));
+            let in_window = entered_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("phase A never reached its branch section");
+            assert_eq!(in_window, fx.main_repo);
+            // The disable lands inside the window: deletion commit D on
+            // `dev`, sharing off, generation bumped, push still blocked.
+            let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+            assert!(!res.pushed, "{:?}", res);
+            deletion = g(&fx.main_dir, &["rev-parse", "dev"]);
+            assert!(ss::read_shared_import(&fx.main_db, fx.main_repo)
+                .disabling
+                .is_some());
+            // A participant's commit C — a child of the pre-disable tip,
+            // still carrying `.sdh/` — lands on origin/dev, and the local
+            // remote-tracking ref sees it.
+            fs::remove_file(&hook).unwrap();
+            let p = g(&fx.main_dir, &["rev-parse", "origin/dev"]);
+            let tree = g(&fx.main_dir, &["rev-parse", &format!("{}^{{tree}}", p)]);
+            let c = g(
+                &fx.main_dir,
+                &["commit-tree", &tree, "-p", &p, "-m", "participant work"],
+            );
+            g(
+                &fx.main_dir,
+                &["push", "-q", "origin", &format!("{}:dev", c)],
+            );
+            g(&fx.main_dir, &["fetch", "-q", "origin"]);
+            release_tx.send(1).unwrap();
+            sync.join().unwrap();
+        });
+
+        // The stale pass must not have reset `dev` over the disable's
+        // deletion: the branch still points at D, the marker still waits
+        // for the retry, and no backup ref was created by a reset.
+        assert_eq!(
+            g(&fx.main_dir, &["rev-parse", "dev"]),
+            deletion,
+            "the obsolete pass must not roll dev back over the disable's commit"
+        );
+        assert!(ss::read_shared_import(&fx.main_db, fx.main_repo)
+            .disabling
+            .is_some());
+        let backup = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "refs/sdh-backup/dev"])
+            .current_dir(&fx.main_dir)
+            .output()
+            .unwrap();
+        assert!(
+            !backup.status.success(),
+            "reset_to_origin must not have run for the stale pass"
         );
     }
 
