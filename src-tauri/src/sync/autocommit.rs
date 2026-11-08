@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::git_ops::{
-    commit_paths, commit_paths_index_only, is_ignored_for_add, list_markers_in_rev, CommitOutcome,
-    GitBinary,
+    commit_paths, commit_paths_index_only, is_ignored_for_add, list_markers_in_rev, rev_exists,
+    CommitOutcome, GitBinary,
 };
 
 /// Doc subfolders that hold cross-repo synced content (REQ pairs, API contracts,
@@ -87,7 +87,15 @@ pub fn autocommit_repo(
     // HEAD, not from the worktree or the current sweep, so a restart or a
     // failed commit still finds them. `docs/sdh_skills/` is deliberately NOT
     // added to `CROSS_REPO_DIRS`: only the markers' deletion has a path in.
-    if !list_markers_in_rev(git, repo_root, "HEAD")?.is_empty() {
+    // Review fix (f0a40b2): an unborn HEAD has no history, so it can hold no
+    // marker — the initial scoped commit works exactly as before the check.
+    // Any other failure to read HEAD still errors.
+    let markers = if rev_exists(git, repo_root, "HEAD")? {
+        list_markers_in_rev(git, repo_root, "HEAD")?
+    } else {
+        Vec::new()
+    };
+    if !markers.is_empty() {
         let (subject, body) = if tracked.is_empty() {
             (MARKER_REMOVAL_SUBJECT, MARKER_REMOVAL_BODY)
         } else {
@@ -733,5 +741,175 @@ mod tests {
             .iter()
             .all(|f| !f.contains("sdh_skills")));
         assert!(staged_status(tmp.path()).is_empty());
+    }
+
+    // ── Review of f0a40b2: unborn HEAD, and merges the commit must wait out ──
+
+    /// HEAD's commit id — to assert it did not move.
+    fn head_sha(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The unmerged stage lines of the index, to compare them across a call.
+    fn unmerged_lines(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["ls-files", "-u"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A repo with no commits at all: HEAD is unborn but named.
+    fn unborn_repo(dir: &Path) {
+        init_test_repo(dir);
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_on_an_unborn_head_commits_the_initial_sync_file() {
+        let tmp = TempDir::new().unwrap();
+        unborn_repo(tmp.path());
+        // An eligible initial sync file: the first scoped commit must work,
+        // as it did before the marker check read `HEAD` unconditionally.
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Committed { files: 1 });
+        assert!(head_files(tmp.path()).contains(&"docs/server-api/api.md".to_string()));
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_on_an_unborn_head_without_sync_files_is_a_noop() {
+        let tmp = TempDir::new().unwrap();
+        unborn_repo(tmp.path());
+        // Nothing eligible and no history to hold a marker: a clean no-op,
+        // not the "invalid object name 'HEAD'" error it used to be.
+        write_file(tmp.path(), "docs/todo.md", "- [ ] x\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+    }
+
+    /// A clean merge that has not been committed: MERGE_HEAD is set, the merge
+    /// result sits staged, HEAD has not moved. Committing here would create a
+    /// two-parent commit WITHOUT the other branch's changes and clear
+    /// MERGE_HEAD.
+    fn repo_in_clean_uncommitted_merge(dir: &Path) {
+        repo_with_tracked_marker(dir);
+        run_git(dir, &["checkout", "-q", "-b", "other"]);
+        write_file(dir, "other.txt", "from other\n");
+        run_git(dir, &["add", "other.txt"]);
+        run_git(dir, &["commit", "-q", "-m", "other"]);
+        run_git(dir, &["checkout", "-q", "master"]);
+        // Diverge master too, so a real merge (never a fast-forward) runs.
+        write_file(dir, "master.txt", "from master\n");
+        run_git(dir, &["add", "master.txt"]);
+        run_git(dir, &["commit", "-q", "-m", "master"]);
+        run_git(dir, &["merge", "--no-commit", "other"]);
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_waits_out_a_clean_uncommitted_merge() {
+        let tmp = TempDir::new().unwrap();
+        repo_in_clean_uncommitted_merge(tmp.path());
+        let head_before = head_sha(tmp.path());
+        assert!(tmp.path().join(".git/MERGE_HEAD").exists());
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        assert_eq!(head_sha(tmp.path()), head_before, "HEAD must not move");
+        assert!(
+            tmp.path().join(".git/MERGE_HEAD").exists(),
+            "the in-flight merge is not concluded behind the dev's back"
+        );
+        let tree = tree_files(tmp.path());
+        assert!(
+            !tree.contains(&"docs/server-api/api.md".to_string()),
+            "{:?}",
+            tree
+        );
+        assert!(
+            !tree.contains(&"other.txt".to_string()),
+            "no two-parent commit without the other side's changes: {:?}",
+            tree
+        );
+        assert!(
+            tree.iter().any(|f| f.ends_with(".approved")),
+            "the marker deletion waits too: {:?}",
+            tree
+        );
+        assert!(
+            staged_status(tmp.path()).contains(&"A other.txt".to_string()),
+            "the staged merge result is intact: {:?}",
+            staged_status(tmp.path())
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_waits_out_a_conflicted_merge() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path());
+        write_file(tmp.path(), "README.md", "base\n");
+        run_git(tmp.path(), &["add", "README.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "base"]);
+        run_git(tmp.path(), &["checkout", "-q", "-b", "other"]);
+        fs::write(tmp.path().join("README.md"), "theirs\n").unwrap();
+        run_git(tmp.path(), &["commit", "-q", "-am", "theirs"]);
+        run_git(tmp.path(), &["checkout", "-q", "master"]);
+        fs::write(tmp.path().join("README.md"), "ours\n").unwrap();
+        run_git(tmp.path(), &["commit", "-q", "-am", "ours"]);
+        let merge = Command::new("git")
+            .args(["merge", "other"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            !merge.status.success(),
+            "the merge must conflict: {}",
+            String::from_utf8_lossy(&merge.stderr)
+        );
+        let head_before = head_sha(tmp.path());
+        let unmerged = unmerged_lines(tmp.path());
+        assert!(!unmerged.trim().is_empty(), "the fixture must conflict");
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        assert_eq!(head_sha(tmp.path()), head_before, "HEAD must not move");
+        assert_eq!(
+            unmerged_lines(tmp.path()),
+            unmerged,
+            "the unresolved entries are still in the real index"
+        );
+        assert!(tmp.path().join(".git/MERGE_HEAD").exists());
+        let tree = tree_files(tmp.path());
+        assert!(
+            !tree.contains(&"docs/server-api/api.md".to_string()),
+            "the synced file is not committed over a conflict: {:?}",
+            tree
+        );
+        assert!(
+            tree.iter().any(|f| f.ends_with(".approved")),
+            "the marker deletion waits too: {:?}",
+            tree
+        );
     }
 }

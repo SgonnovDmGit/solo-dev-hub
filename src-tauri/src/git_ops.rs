@@ -536,6 +536,41 @@ fn with_temp_index(cmd: &mut Command, index: &TempIndex) {
     cmd.env("GIT_INDEX_FILE", &index.0);
 }
 
+/// Review fix for f0a40b2, shared by `commit_paths_index_only` and the marker
+/// sweep (`sync::skills::untrack_rule_markers`): may this checkout's refs and
+/// index be touched by one of our scoped commits?
+///
+/// `Ok(false)` is a RECOGNIZED unsafe state that must wait for a safer pass —
+/// mid-merge or mid-rebase (a linked worktree included: the state is read
+/// through `git_sync::repo_state`'s `--git-path`, not a plain `.git/` lookup),
+/// a detached HEAD, or unmerged index entries. `Err` means the state could not
+/// be read at all; proceeding then would be indistinguishable from safe, so
+/// callers report it instead of skipping silently.
+pub(crate) fn commit_state_safe(git: &GitBinary, local_path: &Path) -> Result<bool, String> {
+    match crate::git_sync::repo_state(git, local_path)? {
+        RepoState::Clean => {}
+        RepoState::MidMerge | RepoState::MidRebase => return Ok(false),
+    }
+    if current_branch(git, local_path)?.is_none() {
+        return Ok(false);
+    }
+    let out = spawn_cmd(&git.0)
+        .args(["ls-files", "-u", "-z"])
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git ls-files failed to start: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    // `-z` prints nothing at all when no entry is unmerged; any byte other
+    // than the NUL separators is an unmerged stage line.
+    Ok(out.stdout.iter().all(|&b| b == 0))
+}
+
 /// T-000244: commit the deletion of every rule hand-back marker git still
 /// tracks, plus the allowed ordinary changes of `content_paths`, on top of HEAD
 /// through a throw-away index.
@@ -561,7 +596,11 @@ fn with_temp_index(cmd: &mut Command, index: &TempIndex) {
 ///   failed commit leaves the real index — including a staged marker deletion —
 ///   untouched, so the next pass simply tries again.
 ///
-/// Same branch guard as `commit_paths`: `WrongBranch` touches nothing.
+/// Same branch guard as `commit_paths`: `WrongBranch` touches nothing. The
+/// state guard of `commit_state_safe` applies too: mid-merge, mid-rebase
+/// (linked worktrees included), a detached HEAD and unresolved index entries
+/// all return `NothingToCommit` without touching HEAD, the real index or the
+/// in-flight operation — the deletion waits for a safer pass.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_paths_index_only(
     git: &GitBinary,
@@ -585,6 +624,15 @@ pub fn commit_paths_index_only(
     if !rev_exists(git, local_path, "HEAD")? {
         return Ok(CommitOutcome::NothingToCommit);
     }
+    // Review fix (BLOCKER of f0a40b2): never build the temp index, let alone
+    // commit, while a merge/rebase is in flight or index entries are
+    // unresolved. `git commit` here would fold MERGE_HEAD into a two-parent
+    // merge commit built from HEAD's tree alone — dropping the other side's
+    // changes and clearing the operation's state — and the temp index would
+    // hide the unresolved entries from every check the commit path makes.
+    if !commit_state_safe(git, local_path)? {
+        return Ok(CommitOutcome::NothingToCommit);
+    }
     let index = temp_index_path(git, local_path)?;
     // A stale file at this path (crashed run, recycled pid) must never act as a
     // starting index or block the lock; start clean.
@@ -597,7 +645,18 @@ pub fn commit_paths_index_only(
             .output()
             .map_err(|e| format!("git {} failed to start: {}", args[0], e))
     };
-    run(&["read-tree", "HEAD"])?;
+    // Review fix (MAJOR of f0a40b2): a failed init must fail closed. `run`
+    // only reports spawn errors; without this check a nonzero exit left later
+    // ops running against an absent/incomplete index, where every unrelated
+    // tracked file reads as a deletion.
+    let init = run(&["read-tree", "HEAD"])?;
+    if !init.status.success() {
+        return Err(format!(
+            "git read-tree exit {}: {}",
+            init.status,
+            String::from_utf8_lossy(&init.stderr)
+        ));
+    }
     if !content_paths.is_empty() {
         let mut args: Vec<&str> = vec!["add", "-A", "--"];
         args.extend(content_paths.iter().map(|p| p.to_str().unwrap_or("")));
@@ -679,7 +738,10 @@ pub fn commit_paths_index_only(
     // The real index was never the input; bring it up to the new HEAD for the
     // committed paths alone, so no phantom staged deletion survives and no
     // foreign staged change is dropped.
-    let mut reset: Vec<&str> = vec!["--", "HEAD"];
+    // Review fix (MAJOR of f0a40b2): `HEAD` must come BEFORE the `--`. After
+    // it, `HEAD` is a pathspec, so `git reset -q -- HEAD <paths>` reset the
+    // staged blob of any file or directory literally named `HEAD`.
+    let mut reset: Vec<&str> = vec!["HEAD", "--"];
     reset.extend(content_paths.iter().map(|p| p.to_str().unwrap_or("")));
     reset.extend(markers.iter().map(|p| p.to_str().unwrap_or("")));
     let out = spawn_cmd(&git.0)
@@ -701,7 +763,9 @@ pub fn commit_paths_index_only(
 }
 
 /// Does `rev` resolve? (`rev-parse --verify --quiet`, no error text parsing.)
-fn rev_exists(git: &GitBinary, local_path: &Path, rev: &str) -> Result<bool, String> {
+/// `pub(crate)`: `sync::autocommit` asks whether HEAD is born before reading
+/// historical markers off it.
+pub(crate) fn rev_exists(git: &GitBinary, local_path: &Path, rev: &str) -> Result<bool, String> {
     let spec = format!("{}^{{commit}}", rev);
     let out = spawn_cmd(&git.0)
         .args(["rev-parse", "--verify", "--quiet", spec.as_str()])
@@ -1380,6 +1444,32 @@ mod tests {
 
     // ── T-000244: marker listing + the scoped index-only commit ──────────────
 
+    /// Raw stdout of a successful git command.
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// HEAD's commit id — to assert it did not move.
+    fn head_sha(dir: &Path) -> String {
+        git_stdout(dir, &["rev-parse", "HEAD"]).trim().to_string()
+    }
+
+    /// The unmerged stage lines of the index, to compare them across a call.
+    fn unmerged_lines(dir: &Path) -> String {
+        git_stdout(dir, &["ls-files", "-u"])
+    }
+
     /// `<status> <path>` of everything staged against HEAD.
     fn staged_status(dir: &Path) -> Vec<String> {
         let out = Command::new("git")
@@ -1735,6 +1825,347 @@ mod tests {
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("sdh-index-") || n.starts_with("sdh-untrack-index-"))
+        .collect();
+        assert!(
+            left.is_empty(),
+            "throw-away index files left behind: {:?}",
+            left
+        );
+    }
+
+    // ── Review of f0a40b2: unsafe states, the reset pathspec, the temp index ─
+
+    /// A checkout mid-conflict: `git merge other` stopped with unresolved
+    /// entries (and MERGE_HEAD set) on an unrelated file.
+    fn repo_with_conflicted_merge(dir: &Path) {
+        repo_with_tracked_marker(dir, "approved\n");
+        write_file(dir, "README.md", "base\n");
+        run_git(dir, &["add", "README.md"]);
+        run_git(dir, &["commit", "-q", "-m", "base"]);
+        run_git(dir, &["checkout", "-q", "-b", "other"]);
+        fs::write(dir.join("README.md"), "theirs\n").unwrap();
+        run_git(dir, &["commit", "-q", "-am", "theirs"]);
+        run_git(dir, &["checkout", "-q", "master"]);
+        fs::write(dir.join("README.md"), "ours\n").unwrap();
+        run_git(dir, &["commit", "-q", "-am", "ours"]);
+        let out = Command::new("git")
+            .args(["merge", "other"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "the merge must conflict: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_leaves_a_mid_merge_checkout_alone() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        fs::write(tmp.path().join(".git/MERGE_HEAD"), "deadbeef\n").unwrap();
+        let before = head_sha(tmp.path());
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        assert_eq!(head_sha(tmp.path()), before, "HEAD must not move mid-merge");
+        assert!(
+            tmp.path().join(".git/MERGE_HEAD").exists(),
+            "the in-flight merge is not concluded behind the dev's back"
+        );
+        assert!(
+            head_tree(tmp.path())
+                .iter()
+                .any(|f| f.ends_with(".approved")),
+            "the marker stays tracked until a safer pass"
+        );
+        assert!(
+            staged_status(tmp.path()).is_empty(),
+            "the index is not touched: {:?}",
+            staged_status(tmp.path())
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_leaves_a_mid_rebase_checkout_alone() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        fs::create_dir(tmp.path().join(".git/rebase-apply")).unwrap();
+        let before = head_sha(tmp.path());
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        assert_eq!(
+            head_sha(tmp.path()),
+            before,
+            "HEAD must not move mid-rebase"
+        );
+        assert!(
+            tmp.path().join(".git/rebase-apply").exists(),
+            "the in-flight rebase is not disturbed"
+        );
+        assert!(head_tree(tmp.path())
+            .iter()
+            .any(|f| f.ends_with(".approved")));
+    }
+
+    /// A conflicted merge has MERGE_HEAD set AND unresolved entries — both
+    /// nets of the guard must hold, and the temp index may never hide the
+    /// unresolved ones from the real index.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_leaves_a_conflicted_merge_alone() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_conflicted_merge(tmp.path());
+        let before = head_sha(tmp.path());
+        let unmerged = unmerged_lines(tmp.path());
+        assert!(!unmerged.trim().is_empty(), "the fixture must conflict");
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        assert_eq!(head_sha(tmp.path()), before, "HEAD must not move");
+        assert_eq!(
+            unmerged_lines(tmp.path()),
+            unmerged,
+            "the unresolved entries are still in the real index"
+        );
+        assert!(tmp.path().join(".git/MERGE_HEAD").exists());
+        assert!(head_tree(tmp.path())
+            .iter()
+            .any(|f| f.ends_with(".approved")));
+    }
+
+    /// A conflicted merge has MERGE_HEAD set AND unresolved entries. With
+    /// MERGE_HEAD removed — what a killed merge leaves behind — only the
+    /// unmerged-index net of the guard refuses the commit.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_leaves_an_unmerged_index_alone() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_conflicted_merge(tmp.path());
+        fs::remove_file(tmp.path().join(".git/MERGE_HEAD")).unwrap();
+        assert!(!tmp.path().join(".git/MERGE_HEAD").exists());
+        let before = head_sha(tmp.path());
+        let unmerged = unmerged_lines(tmp.path());
+        assert!(!unmerged.trim().is_empty(), "the fixture must conflict");
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        assert_eq!(head_sha(tmp.path()), before, "HEAD must not move");
+        assert_eq!(
+            unmerged_lines(tmp.path()),
+            unmerged,
+            "the unresolved entries are still in the real index"
+        );
+        assert!(head_tree(tmp.path())
+            .iter()
+            .any(|f| f.ends_with(".approved")));
+    }
+
+    /// The guard reads the state through `--git-path`, so a mid-merge LINKED
+    /// worktree (whose `.git` is a file) is refused too.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_leaves_a_mid_merge_linked_worktree_alone() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        write_file(tmp.path(), "README.md", "# r\n");
+        run_git(tmp.path(), &["add", "README.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "init"]);
+        let wt = tmp.path().join("wt");
+        run_git(
+            tmp.path(),
+            &["worktree", "add", "-q", "-b", "wt", wt.to_str().unwrap()],
+        );
+        write_file(&wt, "docs/sdh_skills/sdh-alpha.md.approved", "approved\n");
+        run_git(&wt, &["add", "-A", "."]);
+        run_git(&wt, &["commit", "-q", "-m", "marker"]);
+        let merge_head = {
+            let p =
+                PathBuf::from(git_stdout(&wt, &["rev-parse", "--git-path", "MERGE_HEAD"]).trim());
+            if p.is_absolute() {
+                p
+            } else {
+                wt.join(p)
+            }
+        };
+        fs::write(&merge_head, "deadbeef\n").unwrap();
+        let before = head_sha(&wt);
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            &wt,
+            "wt",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        assert_eq!(head_sha(&wt), before, "HEAD must not move mid-merge");
+        assert!(merge_head.exists(), "the in-flight merge survives");
+        assert!(head_tree(&wt).iter().any(|f| f.ends_with(".approved")));
+    }
+
+    /// `git reset -q -- HEAD <paths>` read HEAD as a pathspec and reset the
+    /// staged blob of an unrelated file literally named `HEAD`.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_reset_spares_a_file_literally_named_head() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        write_file(tmp.path(), "HEAD", "tracked\n");
+        run_git(tmp.path(), &["add", "--", "HEAD"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "add a file named HEAD"]);
+        // The dev stages a new blob for it and removes the worktree copy —
+        // the staged blob is exactly what the broken reset destroyed. (With
+        // the file still on disk git refuses the helper's own `diff-index
+        // HEAD` as an ambiguous argument, so this is also the only shape the
+        // review's reproduction can take.)
+        fs::write(tmp.path().join("HEAD"), "service file\n").unwrap();
+        run_git(tmp.path(), &["add", "--", "HEAD"]);
+        fs::remove_file(tmp.path().join("HEAD")).unwrap();
+        assert!(
+            staged_status(tmp.path()).contains(&"M HEAD".to_string()),
+            "the fixture must have the new blob staged: {:?}",
+            staged_status(tmp.path())
+        );
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+        let staged = staged_status(tmp.path());
+        assert!(
+            staged.contains(&"M HEAD".to_string()),
+            "the dev's staged blob for the file named HEAD survives: {:?}",
+            staged
+        );
+        assert!(
+            !staged
+                .iter()
+                .any(|s| s.ends_with(".approved") || s.ends_with(".conflict")),
+            "the marker deletions are reconciled, nothing else: {:?}",
+            staged
+        );
+    }
+
+    /// A temp index whose `read-tree HEAD` failed must never reach the commit:
+    /// later ops would run against an absent index and read every unrelated
+    /// tracked file as a deletion. Injected by deleting HEAD's root tree
+    /// object — every name still resolves, only the read fails.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_fails_closed_when_the_temp_index_init_fails() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        let tree = git_stdout(tmp.path(), &["rev-parse", "HEAD^{tree}"])
+            .trim()
+            .to_string();
+        fs::remove_file(
+            tmp.path()
+                .join(format!(".git/objects/{}/{}", &tree[..2], &tree[2..])),
+        )
+        .unwrap();
+        let head_before = head_sha(tmp.path());
+        let index_before = git_stdout(tmp.path(), &["ls-files", "-s"]);
+
+        let git = check_git_available().expect("git available");
+        let failed = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        );
+
+        let err = failed.expect_err("a failed read-tree must fail the commit");
+        assert!(err.contains("read-tree"), "{}", err);
+        assert_eq!(head_sha(tmp.path()), head_before, "no commit was made");
+        assert_eq!(
+            git_stdout(tmp.path(), &["ls-files", "-s"]),
+            index_before,
+            "the real index is unchanged — no phantom deletions"
+        );
+        // The throw-away index (and its lock) did not survive the failure.
+        let git_dir = PathBuf::from(git_stdout(tmp.path(), &["rev-parse", "--git-dir"]).trim());
+        let left: Vec<_> = fs::read_dir(if git_dir.is_absolute() {
+            git_dir
+        } else {
+            tmp.path().join(git_dir)
+        })
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("sdh-untrack-index-"))
         .collect();
         assert!(
             left.is_empty(),

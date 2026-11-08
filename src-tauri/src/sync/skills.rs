@@ -922,7 +922,9 @@ fn collect_approved_skill_edits(
 /// in the worktree. A checkout that is mid-merge, mid-rebase, unmerged or on a
 /// detached HEAD waits for a safer pass; the index is not touched. Non-git and
 /// missing checkouts, and a machine without git, are skipped silently; anything
-/// else is a `RuleFailed`, never fatal — the next pass tries again. Git runs
+/// else — including a checkout whose state cannot be read — is a `RuleFailed`,
+/// never fatal, so a stuck sweep is never mistaken for a deferred one; the
+/// next pass tries again. Git runs
 /// through `cached_git` / `spawn_cmd` (no console window on Windows) and the
 /// state is read with `git_sync::repo_state` (`--git-path`), so a linked
 /// worktree is judged too, which `git_ops::detect_repo_state` cannot do.
@@ -949,8 +951,18 @@ pub(crate) fn untrack_rule_markers(db: &AppDb, report: &mut RulesRefresh) {
         let Some(base) = existing_checkout(repo) else {
             continue;
         };
-        if !crate::git_ops::is_git_repo(base) || !marker_sweep_safe(&git, base) {
+        if !crate::git_ops::is_git_repo(base) {
             continue;
+        }
+        match marker_sweep_safe(&git, base) {
+            // A recognized unsafe state waits for a safer pass, silently by
+            // design; a state that cannot be read is reported, never skipped.
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                sweep_failed(report, repo, e);
+                continue;
+            }
         }
         let tracked = match crate::git_ops::list_tracked_files(
             &git,
@@ -978,26 +990,13 @@ pub(crate) fn untrack_rule_markers(db: &AppDb, report: &mut RulesRefresh) {
 
 /// May this checkout's index be touched by the marker sweep? Mid-merge /
 /// mid-rebase (a linked worktree included, through `--git-path`), a detached
-/// HEAD and unmerged index entries all postpone it. A refusal here never turns
-/// into a forced removal or a re-add.
-fn marker_sweep_safe(git: &crate::git_ops::GitBinary, base: &Path) -> bool {
-    if !matches!(
-        crate::git_sync::repo_state(git, base),
-        Ok(crate::git_ops::RepoState::Clean)
-    ) {
-        return false;
-    }
-    if !matches!(crate::git_ops::current_branch(git, base), Ok(Some(_))) {
-        return false;
-    }
-    match crate::git_ops::spawn_cmd(&git.0)
-        .args(["ls-files", "-u", "-z"])
-        .current_dir(base)
-        .output()
-    {
-        Ok(o) => o.status.success() && o.stdout.iter().all(|&b| b == 0),
-        Err(_) => false,
-    }
+/// HEAD and unmerged index entries all postpone it (`Ok(false)`), and the
+/// check is the shared `git_ops::commit_state_safe`. A state that cannot be
+/// READ is an error, not a silent skip: without the report, a stuck sweep is
+/// indistinguishable from a deferred merge. A refusal here never turns into a
+/// forced removal or a re-add.
+fn marker_sweep_safe(git: &crate::git_ops::GitBinary, base: &Path) -> Result<bool, String> {
+    crate::git_ops::commit_state_safe(git, base)
 }
 
 /// One checkout's sweep step failed: reported, never fatal — the next refresh
@@ -3601,5 +3600,46 @@ mod tests {
             "the mid-merge worktree is left alone"
         );
         assert!(ls_files(other.path(), "docs/sdh_skills/*.conflict").is_empty());
+    }
+
+    /// Review of f0a40b2: a checkout whose state cannot be READ is reported,
+    /// not skipped. Collapsing the failure into `Ok(false)` made a stuck sweep
+    /// indistinguishable from a deferred merge. A `.git` file pointing nowhere
+    /// satisfies `is_git_repo` but fails every git command of the check.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_reports_a_checkout_whose_state_cannot_be_read() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".git"),
+            "gitdir: F:/definitely/not/a/repository\n",
+        )
+        .unwrap();
+        let repo = db
+            .insert_local_repository(&tmp.path().to_string_lossy(), "acme/broken", None, None)
+            .unwrap();
+
+        let report = marker_sweep(&db);
+
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert_eq!(
+            report.errors[0].code,
+            SyncIssueCode::RuleFailed,
+            "{}",
+            report.errors[0]
+        );
+        assert_eq!(
+            report.errors[0].subject,
+            rule_copy_label(&repo),
+            "{}",
+            report.errors[0]
+        );
+        assert_eq!(
+            report.errors[0].target.as_deref(),
+            Some("docs/sdh_skills/"),
+            "{}",
+            report.errors[0]
+        );
     }
 }
