@@ -1490,6 +1490,14 @@ struct RepoPass {
     /// (repo, login) pairs whose trust rests on a GitHub administrator check the
     /// frontend has to make (T-000227).
     admin_checks: Vec<AdminCheck>,
+    /// T-000243 review (third pass): phase B found the repo no longer in the
+    /// state phase A captured (sharing switched off, or the cached role moved,
+    /// between the phases) and cancelled the policy-sensitive half of the
+    /// pass. `finish` then settles no status from it either — the writer that
+    /// won the guard owns the repo's state now (e.g. a disable that left a
+    /// `push_failed` status with its `disabling` marker must not have it
+    /// cleared by a cancelled pass's empty notes).
+    cancelled: bool,
 }
 
 impl RepoPass {
@@ -1612,12 +1620,56 @@ impl SharedSync {
     /// deliberately NOT a refusal: the owner's policy is its own database
     /// row, which stays readable, and its phase B never runs with a broken
     /// file.)
+    ///
+    /// T-000243 review (third pass): for a repo WITHOUT a pass the `Ok(None)`
+    /// arm no longer means "authoritatively absent" — phase A is
+    /// project-scoped and never ran for the repo. A RENDER (the only consumer
+    /// that must answer for a repo it did not discover) resolves its policy
+    /// through `render_state_of` instead, which performs the discovery
+    /// itself.
     pub fn structure_state_of(&self, repo_id: i64) -> Result<Option<&ProjectStructure>, String> {
         match self.passes.iter().find(|p| p.repo.id == repo_id) {
             Some(p) => match &p.structure_refused {
                 Some(reason) => Err(reason.clone()),
                 None => Ok(p.structure.as_ref()),
             },
+            None => Ok(None),
+        }
+    }
+
+    /// Did phase A produce a pass for `repo_id` in this SharedSync? `false`
+    /// means discovery never ran for the repo HERE — phase A is
+    /// project-scoped, and a KNOWN shared repo of another project (the server
+    /// repo of a connected microservice, which this project's sync renders)
+    /// gets no pass — NOT that no structure exists authoritatively.
+    pub fn has_pass(&self, repo_id: i64) -> bool {
+        self.passes.iter().any(|p| p.repo.id == repo_id)
+    }
+
+    /// T-000243 review (third pass): the structure state a RENDER (the managed
+    /// `.gitignore` of the project sync) resolves a shared repo's policy from,
+    /// distinguishing "phase A discovered this repo" from "phase A never ran
+    /// for it". A pass-less repo used to fall into `Ok(None)` and answer from
+    /// the WORK TREE alone, whose stale copy could produce an ON render after
+    /// the fetched authoritative origin ref had said OFF — or had been
+    /// refused. A repo WITHOUT a pass is therefore discovered HERE, under the
+    /// caller's render guard, authoritatively and exactly the way phase A
+    /// would have (`render_structure_of`: the owner answers from its own
+    /// database row and needs no git; a helper's discovery reads the pinned /
+    /// matching origin ref; a refusal is a refusal and propagates as `Err`).
+    /// Without a git binary no discovery is possible and the legacy default
+    /// of `effective_share_specs` stands, as before.
+    pub fn render_state_of(
+        &self,
+        db: &AppDb,
+        git: Option<&GitBinary>,
+        repo: &Repository,
+    ) -> Result<Option<ProjectStructure>, String> {
+        if self.has_pass(repo.id) {
+            return self.structure_state_of(repo.id).map(|s| s.cloned());
+        }
+        match git {
+            Some(git) => render_structure_of(db, git, repo),
             None => Ok(None),
         }
     }
@@ -2007,6 +2059,7 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         committed: false,
         canon_changed: Vec::new(),
         admin_checks: Vec::new(),
+        cancelled: false,
     }
 }
 
@@ -2733,7 +2786,12 @@ impl SharedSync {
                     out.committed.push(name);
                 }
             }
-            settle_status(db, &pass, &mut out);
+            // T-000243 review (third pass): a pass cancelled by phase B's
+            // revalidation settles no status — the writer that changed the
+            // repo's state under the guard owns it (see `RepoPass::cancelled`).
+            if !pass.cancelled {
+                settle_status(db, &pass, &mut out);
+            }
         }
         out
     }
@@ -2781,20 +2839,27 @@ fn plumb_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String> {
 // dir of the test that installed it), so parallel tests of the same process
 // never fire somebody else's rendezvous, and it is consumed by the first pass
 // that sees it (later passes of the same test run normally).
+//
+// T-000243 review (third pass): the registry is a MAP keyed by
+// (repo id, repo root), not a single slot — a single `Option` let one test's
+// install drop another test's sender wholesale, and a test running in
+// parallel (`--test-threads=2`, the default is more) then failed with "the
+// probe never fired: Disconnected". An entry whose test has ended is inert:
+// its key contains a temp dir that no later pass ever matches.
 #[cfg(test)]
 struct PhaseBPolicyProbe {
-    repo: i64,
-    root: PathBuf,
     entered: std::sync::mpsc::Sender<i64>,
     release: std::sync::mpsc::Receiver<i64>,
 }
 
 #[cfg(test)]
-static PHASE_B_POLICY_PROBE: OnceLock<Mutex<Option<PhaseBPolicyProbe>>> = OnceLock::new();
+static PHASE_B_POLICY_PROBES: OnceLock<Mutex<HashMap<(i64, PathBuf), PhaseBPolicyProbe>>> =
+    OnceLock::new();
 
-/// Install the rendezvous for the repo at `root`: its phase B sends the repo id
-/// on `entered` and then waits for one message on `release` while it holds the
-/// per-repo guard. Only one probe exists at a time (the last one wins).
+/// Install the rendezvous for the repo at `root`: its phase B sends the repo
+/// id on `entered` and then waits for one message on `release` while it holds
+/// the per-repo guard. Installing for a key replaces only that key's probe;
+/// other tests' probes are untouched.
 #[cfg(test)]
 fn install_phase_b_policy_probe(
     repo: i64,
@@ -2802,25 +2867,20 @@ fn install_phase_b_policy_probe(
     entered: std::sync::mpsc::Sender<i64>,
     release: std::sync::mpsc::Receiver<i64>,
 ) {
-    let cell = PHASE_B_POLICY_PROBE.get_or_init(|| Mutex::new(None));
-    *cell.lock().unwrap() = Some(PhaseBPolicyProbe {
-        repo,
-        root: root.to_path_buf(),
-        entered,
-        release,
-    });
+    let cell = PHASE_B_POLICY_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo, root.to_path_buf()),
+        PhaseBPolicyProbe { entered, release },
+    );
 }
 
 #[cfg(test)]
 fn phase_b_policy_probe(repo_id: i64, root: &Path) {
-    let cell = PHASE_B_POLICY_PROBE.get_or_init(|| Mutex::new(None));
+    let cell = PHASE_B_POLICY_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
     // The registry lock is never held while the pass waits for the release.
     let probe = {
         let mut g = cell.lock().unwrap();
-        match g.as_ref() {
-            Some(p) if p.repo == repo_id && p.root == root => g.take(),
-            _ => None,
-        }
+        g.remove(&(repo_id, root.to_path_buf()))
     };
     if let Some(p) = probe {
         let _ = p.entered.send(repo_id);
@@ -2837,21 +2897,23 @@ fn phase_b_policy_probe(repo_id: i64, root: &Path) {
 // land after an OFF save or overwrite a newer OFF render). The concurrency
 // tests use it to prove a specs save / phase B cannot interleave between the
 // read and the write. Matched by repo id AND repo root, like the phase B
-// probe; production never installs one.
+// probe; production never installs one. T-000243 review (third pass): the
+// registry is a MAP keyed by (repo id, repo root) for the same
+// parallel-tests reason as `PHASE_B_POLICY_PROBES` above.
 #[cfg(test)]
 struct RenderWriteProbe {
-    repo: i64,
-    root: PathBuf,
     entered: std::sync::mpsc::Sender<i64>,
     release: std::sync::mpsc::Receiver<i64>,
 }
 
 #[cfg(test)]
-static RENDER_WRITE_PROBE: OnceLock<Mutex<Option<RenderWriteProbe>>> = OnceLock::new();
+static RENDER_WRITE_PROBES: OnceLock<Mutex<HashMap<(i64, PathBuf), RenderWriteProbe>>> =
+    OnceLock::new();
 
 /// Install the render rendezvous for the repo at `root`: the render sends the
 /// repo id on `entered` after it wrote `.gitignore` (still holding the guard)
-/// and waits for one message on `release`. Only one probe exists at a time.
+/// and waits for one message on `release`. Installing for a key replaces only
+/// that key's probe; other tests' probes are untouched.
 #[cfg(test)]
 pub(crate) fn install_render_write_probe(
     repo: i64,
@@ -2859,32 +2921,97 @@ pub(crate) fn install_render_write_probe(
     entered: std::sync::mpsc::Sender<i64>,
     release: std::sync::mpsc::Receiver<i64>,
 ) {
-    let cell = RENDER_WRITE_PROBE.get_or_init(|| Mutex::new(None));
-    *cell.lock().unwrap() = Some(RenderWriteProbe {
-        repo,
-        root: root.to_path_buf(),
-        entered,
-        release,
-    });
+    let cell = RENDER_WRITE_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo, root.to_path_buf()),
+        RenderWriteProbe { entered, release },
+    );
 }
 
 /// Fire the installed render probe, if any. Callers call this INSIDE the
 /// held policy guard, after the `.gitignore` write.
 #[cfg(test)]
 pub(crate) fn render_write_probe(repo_id: i64, root: &Path) {
-    let cell = RENDER_WRITE_PROBE.get_or_init(|| Mutex::new(None));
+    let cell = RENDER_WRITE_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
     let probe = {
         let mut g = cell.lock().unwrap();
-        match g.as_ref() {
-            Some(p) if p.repo == repo_id && p.root == root => g.take(),
-            _ => None,
-        }
+        g.remove(&(repo_id, root.to_path_buf()))
     };
     if let Some(p) = probe {
         let _ = p.entered.send(repo_id);
         // The render still holds the per-repo guard while it waits.
         let _ = p.release.recv();
     }
+}
+
+/// T-000243 review (third pass): revalidate a phase-A pass under the phase-B
+/// guard. The pass was captured before the skeleton writes; a writer of the
+/// policy-bearing structure (`approve_join_request`, `disable_shared_mode`,
+/// `enable_shared_mode`, the specs setter) may have completed between the
+/// phases — serialized by the same guard, but only for its own run. The
+/// deferred half therefore re-reads the CURRENT state instead of trusting the
+/// snapshot:
+///
+/// * the shared state from the database: a repo that stopped sharing (the
+///   switch-off landed in between) or whose cached role moved CANCELS the
+///   whole policy section — no structure publish, no commit, no push of the
+///   stale state — and marks the pass so `finish` settles no status from it
+///   either (the writer that won owns the repo's state now);
+/// * the owner's structure from the WORK TREE: an approval that landed in
+///   between wrote its participant there, and `write_main_structure` rebuilds
+///   from `existing` — rebuilding from the phase-A snapshot would silently
+///   drop the participant and re-publish the stale list. A file that is
+///   present but unusable fails closed exactly like phase A (`untrusted`,
+///   no policy work this pass). The recipients follow the refreshed
+///   structure, so a participant approved in between is plumbed and pushed
+///   in this very pass, whenever its branch already exists locally (a fresh
+///   participant's branch is still created by the next phase A).
+///
+/// Returns `true` when the pass may proceed.
+fn revalidate_pass_under_guard(db: &AppDb, pass: &mut RepoPass) -> bool {
+    let Some(role) = pass.role else { return false };
+    let state = match db.get_shared_state(pass.repo.id) {
+        Ok(s) => s,
+        Err(_) => {
+            pass.cancelled = true;
+            return false;
+        }
+    };
+    let role_still = match role {
+        Role::Main => state.shared_mode,
+        Role::Contributor => {
+            !state.shared_mode && state.shared_role.as_deref() == Some("contributor")
+        }
+        Role::Pending => !state.shared_mode && state.shared_role.as_deref() == Some("pending"),
+    };
+    if !role_still {
+        pass.cancelled = true;
+        return false;
+    }
+    if role == Role::Main {
+        let Some(gh) = pass.repo.github_name.clone() else {
+            pass.cancelled = true;
+            return false;
+        };
+        match ss::read_structure_file(&pass.root, &gh, &ss::AdminVerified::load(db)) {
+            Ok(s) => {
+                pass.structure = s;
+                if let Some(own) = pass.own_branch.clone() {
+                    let mut rec = vec![own];
+                    if let Some(s) = &pass.structure {
+                        rec.extend(s.participants.iter().map(|p| p.branch.clone()));
+                    }
+                    pass.recipients = clean_recipients(rec);
+                }
+            }
+            Err(reason) => {
+                pass.note_untrusted(reason);
+                pass.role = None;
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
@@ -2909,6 +3036,14 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     phase_b_policy_probe(pass.repo.id, &pass.root);
     // Same guard as phase A, checked again: the repo may have changed since.
     if !repo_ready(git, &pass.root) {
+        return;
+    }
+    // T-000243 review (third pass): REVALIDATE the pass under the guard — a
+    // writer of the policy-bearing structure (`approve_join_request`,
+    // `disable_shared_mode`, `enable_shared_mode`) may have completed BETWEEN
+    // the phases; each of them takes this same guard, but only for its own
+    // run, so the phase-A snapshot may not be trusted by the deferred half.
+    if !revalidate_pass_under_guard(db, pass) {
         return;
     }
     let root = pass.root.clone();
@@ -3567,6 +3702,14 @@ pub fn disable_shared_mode(
     // could interleave with the deletion commit and resurrect `.sdh/`.
     let guard = specs_policy_guard(repo_id);
     let _guard = guard.lock().unwrap();
+    // T-000243 review (third pass): the operation-validity check is repeated
+    // UNDER the guard — a first disable (or the approval) that queued on it
+    // before must not be followed by a second run acting on the stale state
+    // read above.
+    let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if !state.shared_mode || state.shared_role.as_deref().is_some_and(|r| r != "main") {
+        return Err("shared mode can only be switched off by the owner of the repo".into());
+    }
     let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
     let tracked = ls_files_tracked(git, &root, &sdh)?;
     // The participants' branches carry `.sdh/` too (the sync plumbed it there):
@@ -3873,6 +4016,15 @@ pub fn approve_join_request(
     // inside the guard.
     let guard = specs_policy_guard(repo_id);
     let _guard = guard.lock().unwrap();
+    // T-000243 review (third pass): the sharing check is repeated UNDER the
+    // guard — a disable queued on it between the read above and here must not
+    // be followed by an approval that writes the structure back over the
+    // deletion it committed. Everything below reads the state the guard
+    // protects.
+    let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if !state.shared_mode {
+        return Err("only the owner of a shared repo can approve join requests".into());
+    }
     let existing = ss::read_structure_file(&root, &gh, &ss::AdminVerified::load(db))?;
     let base = ss::build_structure(db, repo_id, &me, existing.as_ref())?;
     let req = all_join_requests(db, git, &root, &gh, Some(&base.main.dev_branch))
@@ -5123,6 +5275,88 @@ mod tests {
             "the approval must survive the interleaving:\n{}",
             published
         );
+    }
+
+    /// T-000243 review (third pass), ordering (a): phase A captures the pass;
+    /// the approval — a writer of the policy-bearing structure — completes
+    /// BETWEEN the phases (it takes the same per-repo guard, but only for its
+    /// own run; phase B is driven directly here, `run_phase_a` then `finish`).
+    /// Phase B used to rebuild the structure from the phase-A snapshot and
+    /// re-publish it, silently dropping the participant the approval added;
+    /// under the revalidation it re-reads the work-tree file the approval
+    /// wrote and publishes the approval instead.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_approval_between_phase_a_and_phase_b_survives_phase_b() {
+        let fx = two_installs();
+        fx.make_participant();
+        // A second helper asks to join; the request waits in the owner's tree.
+        write(
+            &fx.main_dir,
+            ".sdh/requests/helper2.json",
+            "{\"login\":\"helper2\",\"branch\":\"helper2-dev\"}\n",
+        );
+
+        // Phase A runs to completion and captures the OLD participant list.
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        // The approval lands between the phases.
+        approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper2").unwrap();
+        let approved =
+            fs::read_to_string(fx.main_dir.join(".sdh/project.json")).unwrap_or_default();
+        assert!(approved.contains("helper2"), "{}", approved);
+
+        // The deferred phase B publishes the approval, never clobbers it.
+        let out = shared.finish(&fx.main_db, Some(&gb()));
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        let published = fx.remote_file("dev", ".sdh/project.json").unwrap();
+        assert!(
+            published.contains("helper2"),
+            "the approval must survive phase B:\n{}",
+            published
+        );
+        // and the request file of the approved participant stays gone
+        assert!(!fx.main_dir.join(".sdh/requests/helper2.json").exists());
+    }
+
+    /// T-000243 review (third pass), ordering (b): `disable_shared_mode`
+    /// completes between the phases — the deletion of `.sdh/` is committed
+    /// and pushed and the database flipped. The deferred phase-B pass of the
+    /// run that captured the repo while sharing was on must NOT re-publish
+    /// `.sdh/project.json` (the stale Main pass used to rebuild and commit
+    /// the structure right over the deletion) — the revalidation cancels its
+    /// whole policy section.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_disable_between_phase_a_and_phase_b_cancels_the_deferred_pass() {
+        let fx = two_installs();
+        fx.make_participant();
+
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        // Sharing is switched off between the phases.
+        disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!fx.main_dir.join(".sdh/project.json").exists());
+        assert_eq!(fx.remote_file("dev", ".sdh/project.json"), None);
+
+        // The deferred phase B of the pass captured while sharing was on.
+        let out = shared.finish(&fx.main_db, Some(&gb()));
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(
+            !fx.main_dir.join(".sdh/project.json").exists(),
+            "phase B must not resurrect the structure after the switch-off"
+        );
+        assert_eq!(
+            fx.remote_file("dev", ".sdh/project.json"),
+            None,
+            "the deletion must stand on origin/dev"
+        );
+        assert!(
+            !fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .shared_mode
+        );
+        // and the repo settled no status from the cancelled pass
+        assert_eq!(fx.main_status(), None);
     }
 
     /// T-000243 review (second pass): every writer of the policy-bearing

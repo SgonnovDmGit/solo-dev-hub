@@ -223,6 +223,7 @@ fn write_repo_skeletons(
     tpl: &SkeletonTemplates,
     quiet_conflicts: &[String],
     shared: &sync::shared::SharedSync,
+    git: Option<&crate::git_ops::GitBinary>,
     c: &mut SyncCounters,
 ) {
     let role = repo.role.as_deref();
@@ -238,9 +239,9 @@ fn write_repo_skeletons(
     }
     // F-000044: the shared-repo block (owner, branch, this install's band).
     let shared_structure = shared.structure_of(repo.id);
-    // T-000243 review (second pass): the TRI-STATE of phase A's discovery —
-    // computed before `shared` below is shadowed by the shared-or-not bool.
-    let shared_state = shared.structure_state_of(repo.id);
+    // The SharedSync itself, kept reachable under its own name — `shared`
+    // below is shadowed by the shared-or-not bool.
+    let shared_sync = shared;
     let shared_block = sync::shared_block_for(db, repo, shared_structure);
     if let Err(e) = sync::update_claude_md_section(
         db,
@@ -274,11 +275,16 @@ fn write_repo_skeletons(
     // overwrite a newer OFF render. `Option<MutexGuard>` holds nothing for a
     // repo that is not shared (a leftover `.sdh/` file of an ordinary repo
     // must not break its render or serialize anything).
-    // The structure comes from phase A's discovery outcome as a TRI-STATE: a
+    // The structure state comes from phase A's discovery as a TRI-STATE: a
     // REFUSED structure (malformed / untrusted authoritative copy) skips the
     // render with an issue instead of re-reading the work tree, whose stale
-    // policy is exactly what the refusal rejected. A repo that is not shared
-    // never resolves a policy at all.
+    // policy is exactly what the refusal rejected. T-000243 review (third
+    // pass): a shared repo with NO pass in this SharedSync (phase A is
+    // project-scoped — the server repo of a connected microservice belongs to
+    // another project) is discovered HERE, under the render guard, the same
+    // authoritative way phase A would have; the work-tree file alone may be a
+    // stale copy whose policy the fetched origin ref has replaced or refused.
+    // A repo that is not shared never resolves a policy at all.
     let shared = sync::shared::is_shared_repo(db, repo.id);
     let policy_guard = shared.then(|| sync::shared::specs_policy_guard(repo.id));
     let _policy = policy_guard.as_ref().map(|g| g.lock().unwrap());
@@ -289,10 +295,11 @@ fn write_repo_skeletons(
             true,
         ))
     } else {
-        match shared_state {
-            // Accepted by phase A, or no structure anywhere (the legacy
-            // default; `None` re-reads the work tree the same validated way).
-            Ok(state) => match sync::shared::effective_share_specs(db, repo, state) {
+        match shared_sync.render_state_of(db, git, repo) {
+            // Accepted by phase A (or the just-run discovery), or no structure
+            // anywhere (the legacy default; `None` re-reads the work tree the
+            // same validated way).
+            Ok(state) => match sync::shared::effective_share_specs(db, repo, state.as_ref()) {
                 Ok(share_specs) => Some(sync::shared::gitignore_template_for(
                     &tpl.gitignore,
                     true,
@@ -1278,6 +1285,7 @@ pub(crate) fn run_project_sync_in(
             &tpl,
             &quiet_conflicts,
             &shared,
+            git.as_ref(),
             &mut c,
         );
     }
@@ -1303,6 +1311,7 @@ pub(crate) fn run_project_sync_in(
             &tpl,
             &quiet_conflicts,
             &shared,
+            git.as_ref(),
             &mut c,
         );
     }
@@ -2488,7 +2497,19 @@ mod tests {
         let render = std::thread::spawn(move || {
             let mut c = SyncCounters::new();
             let shared = sync::shared::SharedSync::empty();
-            write_repo_skeletons(&db, project.id, &base, &repo, &tpl, &[], &shared, &mut c);
+            // The repo is this install's own (shared mode on): its policy is
+            // its database row, so no git binary is needed to resolve it.
+            write_repo_skeletons(
+                &db,
+                project.id,
+                &base,
+                &repo,
+                &tpl,
+                &[],
+                &shared,
+                None,
+                &mut c,
+            );
         });
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(30))

@@ -687,10 +687,26 @@ pub fn build_structure(
         .into_iter()
         .filter_map(|r| {
             let github = r.github_name?;
-            let role = r.role?;
-            if !is_valid_repo_full_name(&github) || role.trim().is_empty() {
+            if !is_valid_repo_full_name(&github) {
                 return None;
             }
+            // T-000243 review (third pass): the repo this structure is built
+            // for — and any sibling of the project the owner already shares —
+            // publishes its specs policy even WITHOUT an architectural role:
+            // `share_specs_for` reads a missing entry as the default ON, so
+            // dropping a role-less shared repo here silently published its
+            // specs to a contributor against the owner's stored OFF. The
+            // placeholder is the `other` role the repositories.role CHECK and
+            // `REPO_ROLES` already know. A NON-shared repo without a role
+            // keeps being left out — nothing of it travels, and its policy
+            // must not appear either.
+            let role = match r.role.as_deref().map(str::trim) {
+                Some(role) if !role.is_empty() => role.to_string(),
+                _ if r.id == repo_id || crate::sync::shared::is_shared_repo(db, r.id) => {
+                    "other".to_string()
+                }
+                _ => return None,
+            };
             // T-000243: the published specs policy comes from THIS repo's own
             // stored setting (never from folder existence or .gitignore, and
             // never copied from a sibling repo of the project). The getter
@@ -1806,7 +1822,8 @@ mod tests {
         let db = make_db();
         let (api_id, pid) = seeded(&db);
         db.set_autocommit_branch(api_id, Some("dev")).unwrap();
-        // a repo without a role is left out
+        // a repo without a role that is neither shared nor the current one is
+        // left out (T-000243 review, third pass: see the test below)
         let misc = local_repo(&db, "Owner/misc");
         db.assign_repository(misc, Some(pid), None).unwrap();
         let ms = db.create_project("mailer", None, "microservice").unwrap();
@@ -1847,6 +1864,49 @@ mod tests {
         assert!(build_structure(&db, solo, "Owner", None)
             .unwrap_err()
             .contains("project"));
+    }
+
+    /// T-000243 review (third pass): the repo the structure is built FOR — and
+    /// a shared sibling of the project — publish their specs policy even
+    /// without an architectural role, normalized to `other`. `share_specs_for`
+    /// reads a MISSING entry as the default ON, so dropping such a repo used
+    /// to silently publish its specs to a contributor against the owner's
+    /// stored OFF. A non-shared role-less repo keeps being left out.
+    #[test]
+    fn build_structure_publishes_a_role_less_shared_repo_as_other() {
+        let db = make_db();
+        let (api_id, pid) = seeded(&db);
+        db.set_autocommit_branch(api_id, Some("dev")).unwrap();
+        // A shared sibling with no role at all, opted out of the specs.
+        let misc = local_repo(&db, "Owner/misc");
+        db.assign_repository(misc, Some(pid), None).unwrap();
+        db.set_shared_mode(misc, true).unwrap();
+        db.set_repo_share_specs(misc, false).unwrap();
+        // A plain role-less repo: not shared, not the current repo.
+        let plain = local_repo(&db, "Owner/plain");
+        db.assign_repository(plain, Some(pid), None).unwrap();
+
+        let s = build_structure(&db, api_id, "Owner", None).unwrap();
+        let misc_row = s.repos.iter().find(|r| r.github == "Owner/misc").unwrap();
+        assert_eq!(misc_row.role, "other");
+        assert_eq!(misc_row.share_specs, Some(false));
+        assert!(s.repos.iter().all(|r| r.github != "Owner/plain"));
+        assert!(validate_structure(&s, "Owner/api", &AdminVerified::default()).is_ok());
+        // the entry is exactly what makes the contributor accept the OFF
+        assert!(!share_specs_for(&s, "Owner/misc"));
+
+        // The CURRENT repo itself, role-less and opted out: the review's hole
+        // was the owner sharing a repo that has no architectural role.
+        db.assign_repository(api_id, Some(pid), None).unwrap();
+        db.set_repo_share_specs(api_id, false).unwrap();
+        let s2 = build_structure(&db, api_id, "Owner", None).unwrap();
+        let api_row = s2.repos.iter().find(|r| r.github == "Owner/api").unwrap();
+        assert_eq!(api_row.role, "other");
+        assert_eq!(api_row.share_specs, Some(false));
+        assert!(validate_structure(&s2, "Owner/api", &AdminVerified::default()).is_ok());
+        assert!(!share_specs_for(&s2, "Owner/api"));
+        // while the absent, non-shared sibling still reads as the legacy ON
+        assert!(share_specs_for(&s2, "Owner/plain"));
     }
 
     // ----- T-000243: per-repo share_specs policy --------------------------------

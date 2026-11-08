@@ -1814,6 +1814,84 @@ fn t000243_off_before_the_first_commit_keeps_specs_local_on_both_installs() {
     .is_empty());
 }
 
+/// T-000243 review (third pass): a shared repo WITHOUT an architectural role
+/// publishes its specs policy too. `build_structure` used to drop a role-less
+/// repo from `repos`, and a MISSING entry reads as the DEFAULT ON to a
+/// contributor (`share_specs_for`) — so the owner's stored OFF never arrived,
+/// the helper un-ignored `docs/superpowers/` and its own spec would have
+/// travelled, while the owner's own install stayed OFF: a silent disagreement
+/// between the two installs. The entry is normalized to the `other` role the
+/// schema already knows; the OFF now reaches the helper before its first
+/// render and commit, exactly like the test above.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn t000243_a_role_less_shared_repo_publishes_its_off_policy() {
+    let w = World::new();
+    let fx = &w.fx;
+    // The shared repo has no architectural role at all (sharing does not
+    // require one), and the owner opts out BEFORE enabling.
+    fx.main_db
+        .assign_repository(fx.main_repo, Some(fx.project_id), None)
+        .unwrap();
+    assert!(set_repo_share_specs(&fx.main_db, fx.main_repo, false)
+        .unwrap()
+        .is_none());
+    write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+    write(&fx.helper_dir, "docs/superpowers/plans/y.md", "# y\n");
+
+    w.owner_shares();
+    // The published structure carries the repo — as `other` — with the OFF.
+    let published = fx.remote_file("dev", ".sdh/project.json").unwrap();
+    assert!(published.contains("\"other\""), "{}", published);
+    assert!(
+        published.contains("\"share_specs\": false"),
+        "{}",
+        published
+    );
+    for rev in ["dev", "helper-dev"] {
+        no_specs_on(fx, rev);
+    }
+
+    w.join();
+    // The helper's effective policy is the entry's OFF, not the missing-entry
+    // default: nothing under the folder on any branch, never tracked, and the
+    // managed render keeps ignoring it on BOTH installs.
+    for rev in ["dev", "helper-dev"] {
+        no_specs_on(fx, rev);
+    }
+    for (dir, path) in [
+        (&fx.main_dir, "docs/superpowers/specs/x.md"),
+        (&fx.helper_dir, "docs/superpowers/plans/y.md"),
+    ] {
+        let v = ignored(dir, path).expect("the specs folder must stay ignored");
+        assert!(v.contains("docs/superpowers/"), "{}", v);
+    }
+    for dir in [&fx.main_dir, &fx.helper_dir] {
+        assert!(g(dir, &["ls-files", "--", "docs/superpowers/"])
+            .trim()
+            .is_empty());
+    }
+    assert!(g(
+        &fx.helper_dir,
+        &["status", "--porcelain", "--", "docs/superpowers/"]
+    )
+    .trim()
+    .is_empty());
+    // The helper's database still holds its own default ON: the accepted
+    // structure entry is what answered, never a local guess.
+    assert!(
+        fx.helper_db
+            .get_shared_state(fx.helper_repo)
+            .unwrap()
+            .share_specs
+    );
+    // ... and the todo/done backbone still travels with the role-less repo.
+    assert!(fx
+        .remote_file("dev", "docs/done.md")
+        .unwrap()
+        .contains("T-000900"));
+}
+
 /// T-000243 review (second pass): a remote structure that phase A REFUSED
 /// (here: malformed JSON on the pinned dev branch) must refuse the
 /// `.gitignore` render of the SAME pass as well — the render used to re-read
@@ -1862,4 +1940,138 @@ fn t000243_a_refused_remote_structure_refuses_the_gitignore_render() {
     );
     // The same pass also marked the repo untrusted.
     assert_eq!(fx.helper_status().as_deref(), Some("shared_untrusted"));
+}
+
+/// T-000243 review (third pass): the shape of the two tests below. The shared
+/// repo is a CONTRIBUTOR repo of its own project ("Acme", from the join);
+/// the project synced here only renders it as the server repo of a CONNECTED
+/// MICROSERVICE. Phase A is project-scoped, so the repo gets NO pass in that
+/// run — the render must still resolve the specs policy from the
+/// AUTHORITATIVE discovery (the fetched origin ref), never from the work-tree
+/// copy alone, which may be stale.
+fn microservice_consumer_project(fx: &TwoInstalls) -> i64 {
+    let ms = fx
+        .helper_db
+        .create_project("Ms", None, "microservice")
+        .unwrap();
+    fx.helper_db
+        .assign_repository(fx.helper_repo, Some(ms.id), Some("server"))
+        .unwrap();
+    let p = fx
+        .helper_db
+        .create_project("Consumer", None, "standard")
+        .unwrap();
+    fx.helper_db.connect_microservice(p.id, ms.id).unwrap();
+    p.id
+}
+
+/// T-000243 review (third pass): a shared repo of ANOTHER project rendered by
+/// this sync (connected microservice) has no phase-A pass; its render used to
+/// read the WORK TREE alone, whose stale default-ON copy kept producing an ON
+/// `.gitignore` after the owner's authoritative origin ref had said OFF. The
+/// render now performs the same authoritative discovery phase A would have
+/// run, under the render guard: the OFF wins and the folder stays ignored.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn t000243_another_projects_shared_repo_follows_the_authoritative_off() {
+    let fx = two_installs();
+    fx.make_participant();
+    // A real template, so a shared-ON render would visibly DROP the specs
+    // ignore line and an OFF render keeps it.
+    crate::template_seeder::seed_bundled_templates(&fx.helper_db).unwrap();
+    // The stale work-tree copy: the default-ON structure the join published,
+    // exactly what an install that has not run its own project's sync since
+    // holds on disk.
+    let on_copy = fx
+        .remote_file("dev", ".sdh/project.json")
+        .expect("the join published a structure");
+    assert!(on_copy.contains("\"share_specs\": true"), "{}", on_copy);
+
+    // The owner opts out and publishes. The helper does NOT run its own
+    // project's sync — it only fetches, exactly what that sync would start
+    // with — so its work tree keeps the stale copy while the remote-tracking
+    // ref carries the OFF structure.
+    set_repo_share_specs(&fx.main_db, fx.main_repo, false).unwrap();
+    fx.sync_main();
+    g(&fx.helper_dir, &["fetch", "-q", "origin"]);
+    write(&fx.helper_dir, ".sdh/project.json", &on_copy);
+    assert!(fx
+        .remote_file("dev", ".sdh/project.json")
+        .unwrap()
+        .contains("\"share_specs\": false"));
+
+    // The helper syncs the unrelated project that renders the shared repo as
+    // a connected microservice's server repo — no phase-A pass for it.
+    let p = microservice_consumer_project(&fx);
+    let home = TempDir::new().unwrap();
+    let res = run_project_sync_in(&fx.helper_db, p, Some(home.path().to_path_buf())).unwrap();
+    let render_issues: Vec<_> = res
+        .errors
+        .iter()
+        .filter(|i| i.target.as_deref() == Some(".gitignore"))
+        .collect();
+    assert!(render_issues.is_empty(), "{:?}", render_issues);
+
+    // The render followed the authoritative OFF, not the stale work-tree ON:
+    // the managed block keeps ignoring the folder (a work-tree ON would have
+    // dropped the line) and git agrees.
+    let gi = fs::read_to_string(fx.helper_dir.join(".gitignore")).unwrap_or_default();
+    assert!(
+        gi.lines().any(|l| l.trim() == "docs/superpowers/"),
+        "the render must follow the authoritative OFF:\n{}",
+        gi
+    );
+    write(&fx.helper_dir, "docs/superpowers/specs/mine.md", "# mine\n");
+    let v = ignored(&fx.helper_dir, "docs/superpowers/specs/mine.md")
+        .expect("the specs folder must stay ignored");
+    assert!(v.contains("docs/superpowers/"), "{}", v);
+}
+
+/// T-000243 review (third pass): the same cross-project route with a
+/// MALFORMED authoritative copy — the render must be REFUSED with an issue
+/// (skip the `.gitignore` write), never fall back to the stale work-tree
+/// policy, exactly like the in-project pass of
+/// `t000243_a_refused_remote_structure_refuses_the_gitignore_render`.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn t000243_another_projects_shared_repo_refuses_its_render_on_a_refused_structure() {
+    let fx = two_installs();
+    fx.make_participant();
+    crate::template_seeder::seed_bundled_templates(&fx.helper_db).unwrap();
+    // The stale work-tree copy the helper still holds (see the test above).
+    let on_copy = fx
+        .remote_file("dev", ".sdh/project.json")
+        .expect("the join published a structure");
+    // The authoritative copy on the dev branch goes bad; the helper only
+    // fetches — never runs the sync of the repo's own project.
+    write(&fx.main_dir, ".sdh/project.json", "{ not json at all");
+    g(&fx.main_dir, &["add", ".sdh"]);
+    g(&fx.main_dir, &["commit", "-q", "-m", "break the structure"]);
+    g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+    g(&fx.helper_dir, &["fetch", "-q", "origin"]);
+    write(&fx.helper_dir, ".sdh/project.json", &on_copy);
+
+    let p = microservice_consumer_project(&fx);
+    let home = TempDir::new().unwrap();
+    let res = run_project_sync_in(&fx.helper_db, p, Some(home.path().to_path_buf())).unwrap();
+    let refused = res
+        .errors
+        .iter()
+        .find(|i| i.target.as_deref() == Some(".gitignore"))
+        .expect("the refused structure must surface on the .gitignore render");
+    assert!(
+        refused
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invalid JSON"),
+        "{:?}",
+        refused
+    );
+    // No `.gitignore` at all was written from the stale work-tree policy (the
+    // seeded template would have produced one had the render run).
+    assert!(
+        !fx.helper_dir.join(".gitignore").exists(),
+        "the render must be skipped with an issue, never written from the stale policy"
+    );
 }
