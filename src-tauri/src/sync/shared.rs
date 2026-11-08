@@ -211,6 +211,74 @@ fn bump_lifecycle_generation(repo_id: i64, root: &Path) {
         .or_insert(0) += 1;
 }
 
+/// T-000243 review (seventh pass): a pass's OWN lifecycle transition —
+/// caller holds `specs_policy_guard`. Writes the role only when it
+/// actually changes; a real transition bumps the generation (other
+/// in-flight passes must go stale) and counts as the pass's own bump,
+/// which `seal_lifecycle_gen` subtracts again.
+fn pass_role_transition(pass: &mut RepoPass, db: &AppDb, role: Option<&str>) {
+    let guard = specs_policy_guard(pass.repo.id);
+    let _g = guard.lock().unwrap();
+    let cur = db
+        .get_shared_state(pass.repo.id)
+        .ok()
+        .and_then(|s| s.shared_role);
+    if cur.as_deref() == role {
+        return;
+    }
+    let _ = db.set_shared_role(pass.repo.id, role);
+    bump_lifecycle_generation(pass.repo.id, &pass.root);
+    pass.own_bumps += 1;
+}
+
+/// The same transition for a write that belongs to NO pass (the loop's
+/// stale-cache cleanups, the NotFound cleanup): it still bumps, so every
+/// outstanding pass of the repo sees the lifecycle moved.
+fn foreign_role_transition(db: &AppDb, repo_id: i64, root: &Path, role: Option<&str>) {
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
+    let cur = db
+        .get_shared_state(repo_id)
+        .ok()
+        .and_then(|s| s.shared_role);
+    if cur.as_deref() == role {
+        return;
+    }
+    let _ = db.set_shared_role(repo_id, role);
+    bump_lifecycle_generation(repo_id, root);
+}
+
+/// Clear the shared status only when one is actually set; a real clear is
+/// a lifecycle transition (same bump rules as `foreign_role_transition`).
+fn foreign_status_clear(db: &AppDb, repo_id: i64, root: &Path) {
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
+    let cur = db
+        .get_shared_state(repo_id)
+        .ok()
+        .and_then(|s| s.shared_status);
+    if cur.is_none() {
+        return;
+    }
+    let _ = db.set_shared_status(repo_id, None);
+    bump_lifecycle_generation(repo_id, root);
+}
+
+/// A repo's path binding changed: passes keyed by the old spelling must go
+/// stale even though the repository row is the same (T-000243 review,
+/// seventh pass — the generation key carries the path).
+pub fn invalidate_lifecycle_for_repath(
+    repo_id: i64,
+    old_path: Option<&str>,
+    new_path: Option<&str>,
+) {
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
+    for p in [old_path, new_path].into_iter().flatten() {
+        bump_lifecycle_generation(repo_id, Path::new(p));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // T-000243: the per-repo `docs/superpowers/` policy
 // ---------------------------------------------------------------------------
@@ -1577,6 +1645,11 @@ struct RepoPass {
     /// `None` only for passes built outside `run_phase_a` (tests): they
     /// settle unconditionally, as before.
     lifecycle_gen: Option<u64>,
+    /// T-000243 review (seventh pass): lifecycle bumps THIS pass caused
+    /// itself (role adoption, pin, disable-retry cleanup). `seal_lifecycle_gen`
+    /// subtracts them: only a FOREIGN bump between the capture and the seal
+    /// makes the pass stale.
+    own_bumps: u32,
 }
 
 impl RepoPass {
@@ -1607,11 +1680,20 @@ impl RepoPass {
         });
     }
 
-    /// Seal the lifecycle generation this pass was created under — captured
-    /// BEFORE phase A's decisions for the repo began (see
-    /// `lifecycle_generation`).
-    fn seal_lifecycle_gen(&mut self, gen: u64) {
-        self.lifecycle_gen = Some(gen);
+    /// Seal under the guard: adopt the current generation only when every
+    /// bump since `g0` is this pass's own lifecycle write (`own_bumps`) —
+    /// a foreign bump (another sync's transition, a disable, an approval
+    /// side effect) makes the pass stale. `g0` can never match again
+    /// because generations are monotonic, so a rejected seal stays stale.
+    fn seal_lifecycle_gen(&mut self, g0: u64) {
+        let guard = specs_policy_guard(self.repo.id);
+        let _g = guard.lock().unwrap();
+        let cur = lifecycle_generation(self.repo.id, &self.root);
+        self.lifecycle_gen = Some(if cur == g0 + u64::from(self.own_bumps) {
+            cur
+        } else {
+            g0
+        });
     }
 
     /// `Untrusted` with the reason of the structure check. A coded reason (a
@@ -1805,6 +1887,10 @@ fn unix_now() -> i64 {
 /// Is a role-less foreign repo due for a probe? Takes the slot (persisted in
 /// `SharedImport`) when it is.
 fn probe_due(db: &AppDb, repo_id: i64, now: i64) -> bool {
+    // Whole-JSON read-modify-write: hold the guard so a concurrent lifecycle
+    // writer (pin, disabling marker) cannot be clobbered by this snapshot.
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
     let mut imp = ss::read_shared_import(db, repo_id);
     if let Some(t) = imp.last_probe_unix {
         if now - t < PROBE_INTERVAL.as_secs() as i64 {
@@ -2067,16 +2153,17 @@ fn run_phase_a_with(
         }
         if ss::read_shared_import(db, repo.id).disabling.is_some() {
             // Switched off, but the deletion of `.sdh/` did not reach the remote.
-            if let Some(mut pass) = retry_disabling(db, git, &repo, &root) {
+            if let Some(mut pass) = retry_disabling(db, git, &repo, &root, lifecycle_gen) {
                 pass.seal_lifecycle_gen(lifecycle_gen);
                 sync.passes.push(pass);
             }
             continue;
         }
         if state.shared_role.as_deref() == Some("main") {
-            // Stale cache: the owner switched sharing off.
-            let _ = db.set_shared_role(repo.id, None);
-            let _ = db.set_shared_status(repo.id, None);
+            // Stale cache: the owner switched sharing off. A real clear is a
+            // lifecycle transition — outstanding passes must see it.
+            foreign_role_transition(db, repo.id, &root, None);
+            foreign_status_clear(db, repo.id, &root);
             continue;
         }
         let Some(login) = login.as_deref() else {
@@ -2157,6 +2244,7 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         admin_checks: Vec::new(),
         cancelled: false,
         lifecycle_gen: None,
+        own_bumps: 0,
     }
 }
 
@@ -2194,7 +2282,7 @@ fn phase_a_main(
     let mut pass = new_pass(repo, root, login);
     let gh = repo.github_name.clone().unwrap_or_default();
     pass.role = Some(Role::Main);
-    let _ = db.set_shared_role(repo.id, Some("main"));
+    pass_role_transition(&mut pass, db, Some("main"));
     register_driver(git, &mut pass);
     fetch_into(git, &mut pass, FetchMode::Always);
     let admins = ss::AdminVerified::load(db);
@@ -2265,9 +2353,11 @@ fn phase_a_foreign(
         DiscoverOutcome::NotFound => {
             let st = db.get_shared_state(repo.id).ok();
             if st.is_some_and(|s| s.shared_role.is_some() || s.shared_status.is_some()) {
-                // Repo is ordinary again (spec R15).
-                let _ = db.set_shared_role(repo.id, None);
-                let _ = db.set_shared_status(repo.id, None);
+                // Repo is ordinary again (spec R15). The clear belongs to no
+                // pass — but it IS a lifecycle transition, so every
+                // outstanding pass of this repo must go stale.
+                foreign_role_transition(db, repo.id, root, None);
+                foreign_status_clear(db, repo.id, root);
             }
             // Facts decide whether anything is left to clean up (nothing, for a repo
             // that never carried a structure).
@@ -2305,13 +2395,20 @@ fn phase_a_foreign(
                 );
             }
             if pinned.is_none() {
-                let _ = ss::pin_after_accept(db, repo.id, &s);
+                // Pinning is this pass's own lifecycle transition: guarded,
+                // generation-bumped, and counted so the seal forgives it.
+                let guard = specs_policy_guard(repo.id);
+                let _g = guard.lock().unwrap();
+                if ss::pin_after_accept(db, repo.id, &s).is_ok() {
+                    bump_lifecycle_generation(repo.id, root);
+                    pass.own_bumps += 1;
+                }
             }
             let role = ss::derive_role(Some(&s), Some(login));
             let Some(role) = role else {
                 return Some(pass);
             };
-            let _ = db.set_shared_role(repo.id, Some(role.as_str()));
+            pass_role_transition(&mut pass, db, Some(role.as_str()));
             pass.role = Some(role);
             register_driver(git, &mut pass);
             pass.own_branch = own_branch_of(db, repo.id)
@@ -2420,10 +2517,17 @@ fn drop_stale_structure(db: &AppDb, git: &GitBinary, repo: &Repository, root: &P
     if tracks_structure(git, root, &remote_ref(&pin)) != Some(false) {
         return;
     }
-    let finish = |db: &AppDb, imp: &mut ss::SharedImport| {
+    let finish = |db: &AppDb, _imp: &mut ss::SharedImport| {
         if !root.join(STRUCTURE_REL_PATH).exists() {
-            imp.pinned_dev_branch = None;
-            let _ = ss::write_shared_import(db, repo.id, imp);
+            // Clearing the pin is a lifecycle transition: guarded, re-read
+            // inside the guard (the caller's copy may be stale), bumped.
+            let guard = specs_policy_guard(repo.id);
+            let _g = guard.lock().unwrap();
+            let mut fresh = ss::read_shared_import(db, repo.id);
+            fresh.pinned_dev_branch = None;
+            if ss::write_shared_import(db, repo.id, &fresh).is_ok() {
+                bump_lifecycle_generation(repo.id, root);
+            }
         }
     };
     let Some(own) = own_branch_of(db, repo.id) else {
@@ -2494,6 +2598,7 @@ fn retry_disabling(
     git: &GitBinary,
     repo: &Repository,
     root: &Path,
+    gen0: u64,
 ) -> Option<RepoPass> {
     let imp = ss::read_shared_import(db, repo.id);
     let dev = imp.disabling.clone()?;
@@ -2534,7 +2639,9 @@ fn retry_disabling(
     }
     if to_push.is_empty() {
         if failures.is_empty() {
-            let _ = clear_disabling(db, repo.id, root);
+            if clear_disabling(db, repo.id, root, gen0).unwrap_or(false) {
+                pass.own_bumps += 1;
+            }
             return None;
         }
         pass.note(SharedStatus::PushFailed, failures.join("; "));
@@ -2548,7 +2655,9 @@ fn retry_disabling(
                     .iter()
                     .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)) =>
         {
-            let _ = clear_disabling(db, repo.id, root);
+            if clear_disabling(db, repo.id, root, gen0).unwrap_or(false) {
+                pass.own_bumps += 1;
+            }
             None
         }
         Ok(results) => {
@@ -2616,7 +2725,12 @@ fn refresh_pending_removal(
     Ok(())
 }
 
-fn clear_disabling(db: &AppDb, repo_id: i64, root: &Path) -> Result<(), String> {
+/// `gen0` is the lifecycle generation the retry pass was created under:
+/// only THAT operation may clear the marker. A newer disable / re-enable /
+/// another retry's cleanup bumped the generation meanwhile — clearing then
+/// would erase work this retry does not own (T-000243 review, seventh pass).
+/// Returns `Ok(true)` when the marker was actually cleared.
+fn clear_disabling(db: &AppDb, repo_id: i64, root: &Path, gen0: u64) -> Result<bool, String> {
     // T-000243 review (sixth pass): clearing the pending-disable marker is
     // a lifecycle change. It runs unguarded inside phase A's retry, so the
     // guard is taken HERE — the clear and the generation bump must be
@@ -2624,6 +2738,9 @@ fn clear_disabling(db: &AppDb, repo_id: i64, root: &Path) -> Result<(), String> 
     // land between an older pass's check and its settlement.
     let guard = specs_policy_guard(repo_id);
     let _guard = guard.lock().unwrap();
+    if lifecycle_generation(repo_id, root) != gen0 {
+        return Ok(false);
+    }
     let mut imp = ss::read_shared_import(db, repo_id);
     imp.disabling = None;
     imp.disabling_branches.clear();
@@ -2631,7 +2748,7 @@ fn clear_disabling(db: &AppDb, repo_id: i64, root: &Path) -> Result<(), String> 
     db.set_shared_status(repo_id, None)
         .map_err(|e| e.to_string())?;
     bump_lifecycle_generation(repo_id, root);
-    Ok(())
+    Ok(true)
 }
 
 fn register_driver(git: &GitBinary, pass: &mut RepoPass) {
@@ -4260,6 +4377,19 @@ pub fn accept_new_main_branch(db: &AppDb, repo_id: i64) -> Result<(), String> {
     let key_root = PathBuf::from(repo.local_path.clone().unwrap_or_default());
     let guard = specs_policy_guard(repo_id);
     let _guard = guard.lock().unwrap();
+    // T-000243 review (seventh pass): the eligibility check above ran
+    // BEFORE the guard — a sync may have settled a different status in
+    // between. Re-verify under the guard, or this accept would clear a
+    // status that is no longer the refused dev-branch one.
+    let st = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    let still_changed = st.shared_status.as_deref() == Some(SharedStatus::Untrusted.as_str())
+        && st
+            .shared_status_detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with(ss::DEV_BRANCH_CHANGED_PREFIX));
+    if !still_changed {
+        return Err("the owner's dev branch has not changed: nothing to accept".into());
+    }
     let mut v = ss::read_shared_import(db, repo_id);
     v.pinned_dev_branch = None;
     ss::write_shared_import(db, repo_id, &v)?;
@@ -4291,17 +4421,17 @@ pub fn merge_shared_upstream(
             files: vec![],
         },
         MergeOutcome::Merged => {
+            // T-000243 review (seventh pass): a successful merge invalidates
+            // every pre-merge observation — bump unconditionally, whether or
+            // not `needs_manual_merge` was persisted. The status clear is
+            // re-verified under the guard (the pre-merge read may be stale).
+            let guard = specs_policy_guard(repo_id);
+            let _guard = guard.lock().unwrap();
             let st = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
             if st.shared_status.as_deref() == Some(SharedStatus::NeedsManualMerge.as_str()) {
-                // T-000243 review (sixth pass): resolving the status is a
-                // lifecycle action — serialize with `finish`'s freshness
-                // check and bump the generation, or an older pass's notes
-                // would restore the `needs_manual_merge` just cleared.
-                let guard = specs_policy_guard(repo_id);
-                let _guard = guard.lock().unwrap();
                 let _ = db.set_shared_status(repo_id, None);
-                bump_lifecycle_generation(repo_id, &root);
             }
+            bump_lifecycle_generation(repo_id, &root);
             SharedMergeResult {
                 outcome: "merged".into(),
                 files: vec![],
@@ -5759,6 +5889,123 @@ mod tests {
             fx.helper_status(),
             None,
             "the accepted branch must not be refused again by a stale pass"
+        );
+    }
+
+    /// T-000243 review (seventh pass): an obsolete disable retry must not
+    /// clear a NEWER pending-disable marker. `clear_disabling` verifies the
+    /// lifecycle generation it was started under — a re-enable plus a fresh
+    /// disable bumped it meanwhile, so the old retry's cleanup is refused.
+    #[test]
+    fn an_obsolete_retry_cannot_clear_a_newer_disable_marker() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let mut imp = ss::SharedImport::default();
+        imp.disabling = Some("dev".into());
+        ss::write_shared_import(&db, repo.id, &imp).unwrap();
+        // The retry pass starts under the current generation…
+        let gen0 = lifecycle_generation(repo.id, root);
+        // …then a newer lifecycle lands: re-enable + a fresh disable.
+        bump_lifecycle_generation(repo.id, root);
+        bump_lifecycle_generation(repo.id, root);
+        assert_eq!(
+            clear_disabling(&db, repo.id, root, gen0).unwrap(),
+            false,
+            "the obsolete retry must leave the newer marker alone"
+        );
+        assert_eq!(
+            ss::read_shared_import(&db, repo.id).disabling.as_deref(),
+            Some("dev")
+        );
+        // The retry of the CURRENT operation may clear it.
+        let now = lifecycle_generation(repo.id, root);
+        assert_eq!(clear_disabling(&db, repo.id, root, now).unwrap(), true);
+        assert!(ss::read_shared_import(&db, repo.id).disabling.is_none());
+    }
+
+    /// T-000243 review (seventh pass): the generation key carries the local
+    /// path — rebinding the repo must stale passes keyed by the old
+    /// spelling, on both sides of the change.
+    #[test]
+    fn a_repathed_repo_invalidates_passes_keyed_by_the_old_path() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        let old = Path::new("/old/root");
+        let new = Path::new("/new/root");
+        let g_old = lifecycle_generation(repo.id, old);
+        let g_new = lifecycle_generation(repo.id, new);
+        invalidate_lifecycle_for_repath(repo.id, Some("/old/root"), Some("/new/root"));
+        assert_ne!(
+            lifecycle_generation(repo.id, old),
+            g_old,
+            "a pass captured under the old path must go stale"
+        );
+        assert_ne!(lifecycle_generation(repo.id, new), g_new);
+    }
+
+    /// T-000243 review (seventh pass): a newer phase-A `NotFound` cleanup
+    /// (belongs to no pass) clears the cached role — an OLDER pass refused
+    /// as untrusted must not settle `shared_untrusted` back over it.
+    #[test]
+    fn a_newer_not_found_cleanup_stales_an_older_refused_pass() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let mut pass = new_pass(&repo, root, "me");
+        pass.note_untrusted("structure refused".into());
+        let g0 = lifecycle_generation(repo.id, root);
+        pass.seal_lifecycle_gen(g0);
+        // The newer sync's phase A finds no structure at all: the cleanup
+        // is a lifecycle transition even though it produces no pass.
+        foreign_role_transition(&db, repo.id, root, None);
+        foreign_status_clear(&db, repo.id, root);
+        let mut sync = SharedSync::empty();
+        sync.passes.push(pass);
+        let _out = sync.finish(&db, None);
+        assert_eq!(
+            db.get_shared_state(repo.id).unwrap().shared_status,
+            None,
+            "the stale refusal must not be restored over the cleanup"
+        );
+    }
+
+    /// T-000243 review (seventh pass): the counterpart — a pass's OWN
+    /// lifecycle transition (role adoption) bumps the generation too, but
+    /// `seal_lifecycle_gen` forgives exactly its own bumps, so the pass
+    /// still settles its status.
+    #[test]
+    fn a_passs_own_role_adoption_does_not_stale_it() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let g0 = lifecycle_generation(repo.id, root);
+        let mut pass = new_pass(&repo, root, "me");
+        pass_role_transition(&mut pass, &db, Some("contributor"));
+        pass.note(SharedStatus::NoOwnBranch, "");
+        pass.seal_lifecycle_gen(g0);
+        let mut sync = SharedSync::empty();
+        sync.passes.push(pass);
+        let _out = sync.finish(&db, None);
+        assert_eq!(
+            db.get_shared_state(repo.id)
+                .unwrap()
+                .shared_status
+                .as_deref(),
+            Some("no_own_branch"),
+            "the pass's own transition must not stale it"
         );
     }
 

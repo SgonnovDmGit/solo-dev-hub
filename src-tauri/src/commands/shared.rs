@@ -86,7 +86,9 @@ pub fn approve_join_request(
 }
 
 /// Contributor: trust the owner's changed dev branch.
-#[tauri::command]
+/// Async: it waits on the per-repo policy guard, which phase B holds across
+/// git/network work — a sync command would freeze the UI thread.
+#[tauri::command(async)]
 pub fn accept_new_main_branch(db: State<AppDb>, repo_id: i64) -> Result<(), String> {
     shared::accept_new_main_branch(&db, repo_id)
 }

@@ -170,14 +170,26 @@ pub fn get_repository_by_name(db: State<AppDb>, github_name: String) -> Result<R
 
 // ── local_path command ────────────────────────────────────────────────────────
 
-#[tauri::command]
+// Async: invalidating outstanding shared passes takes the per-repo policy
+// guard, which phase B holds across git/network work.
+#[tauri::command(async)]
 pub fn set_repo_local_path(
     db: State<AppDb>,
     id: i64,
     local_path: Option<String>,
 ) -> Result<Repository, String> {
-    db.set_repo_local_path(id, local_path.as_deref())
-        .map_err(|e| e.to_string())
+    let before = db.get_repository(id).ok().and_then(|r| r.local_path);
+    let repo = db
+        .set_repo_local_path(id, local_path.as_deref())
+        .map_err(|e| e.to_string())?;
+    // T-000243 review (seventh pass): outstanding passes are keyed by the
+    // path spelling — a rebind must stale them on BOTH sides.
+    crate::sync::shared::invalidate_lifecycle_for_repath(
+        id,
+        before.as_deref(),
+        repo.local_path.as_deref(),
+    );
+    Ok(repo)
 }
 
 #[tauri::command]
