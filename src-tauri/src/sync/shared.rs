@@ -2693,9 +2693,26 @@ fn retry_disabling(
         pass.note(SharedStatus::FetchFailed, e.to_string());
         return Some(pass);
     }
+    #[cfg(test)]
+    retry_post_fetch_probe(repo.id, root);
+    // T-000243 review (eleventh pass): from here on the retry MUTATES —
+    // branch fast-forwards/resets, fresh deletion commits, the push. All of
+    // it runs under the policy guard, gated on the generation the retry was
+    // created under: a re-enable (or any newer lifecycle) that landed during
+    // the fetch makes this retry obsolete BEFORE the first mutation, not
+    // just before the database cleanup.
+    let guard = specs_policy_guard(repo.id);
+    let _g = guard.lock().unwrap();
+    if lifecycle_generation(repo.id, root) != gen0 {
+        return None;
+    }
+    let imp_now = ss::read_shared_import(db, repo.id);
+    if imp_now.disabling.as_deref() != Some(dev.as_str()) {
+        return None;
+    }
     // The dev branch and the participant branches whose deletion is pending.
     let mut branches: Vec<String> = vec![dev.clone()];
-    branches.extend(imp.disabling_branches.iter().cloned());
+    branches.extend(imp_now.disabling_branches.iter().cloned());
     let branches = clean_recipients(branches);
     let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
     let login = db.github_login().unwrap_or_default();
@@ -2721,9 +2738,9 @@ fn retry_disabling(
     }
     if to_push.is_empty() {
         if failures.is_empty() {
-            if clear_disabling(db, repo.id, root, gen0).unwrap_or(false) {
-                pass.own_bumps += 1;
-            }
+            // The clear bumps the generation; the pass is dropped either
+            // way, so there is no settlement left to account for.
+            let _ = clear_disabling_locked(db, repo.id, root);
             return None;
         }
         pass.note(SharedStatus::PushFailed, failures.join("; "));
@@ -2737,9 +2754,7 @@ fn retry_disabling(
                     .iter()
                     .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)) =>
         {
-            if clear_disabling(db, repo.id, root, gen0).unwrap_or(false) {
-                pass.own_bumps += 1;
-            }
+            let _ = clear_disabling_locked(db, repo.id, root);
             None
         }
         Ok(results) => {
@@ -2807,22 +2822,9 @@ fn refresh_pending_removal(
     Ok(())
 }
 
-/// `gen0` is the lifecycle generation the retry pass was created under:
-/// only THAT operation may clear the marker. A newer disable / re-enable /
-/// another retry's cleanup bumped the generation meanwhile — clearing then
-/// would erase work this retry does not own (T-000243 review, seventh pass).
-/// Returns `Ok(true)` when the marker was actually cleared.
-fn clear_disabling(db: &AppDb, repo_id: i64, root: &Path, gen0: u64) -> Result<bool, String> {
-    // T-000243 review (sixth pass): clearing the pending-disable marker is
-    // a lifecycle change. It runs unguarded inside phase A's retry, so the
-    // guard is taken HERE — the clear and the generation bump must be
-    // atomic with `finish`'s freshness check, or a retry success could
-    // land between an older pass's check and its settlement.
-    let guard = specs_policy_guard(repo_id);
-    let _guard = guard.lock().unwrap();
-    if lifecycle_generation(repo_id, root) != gen0 {
-        return Ok(false);
-    }
+/// Caller holds `specs_policy_guard(repo_id)` — the clear and the
+/// generation bump are already atomic with `finish`'s freshness check.
+fn clear_disabling_locked(db: &AppDb, repo_id: i64, root: &Path) -> Result<(), String> {
     let mut imp = ss::read_shared_import(db, repo_id);
     imp.disabling = None;
     imp.disabling_branches.clear();
@@ -2830,6 +2832,24 @@ fn clear_disabling(db: &AppDb, repo_id: i64, root: &Path, gen0: u64) -> Result<b
     db.set_shared_status(repo_id, None)
         .map_err(|e| e.to_string())?;
     bump_lifecycle_generation(repo_id, root);
+    Ok(())
+}
+
+/// `gen0` is the lifecycle generation the retry pass was created under:
+/// only THAT operation may clear the marker. A newer disable / re-enable /
+/// another retry's cleanup bumped the generation meanwhile — clearing then
+/// would erase work this retry does not own (T-000243 review, seventh pass).
+/// Returns `Ok(true)` when the marker was actually cleared.
+/// Production clears go through `retry_disabling`'s guard-held section;
+/// this wrapper remains for the generation-gate regression test.
+#[cfg(test)]
+fn clear_disabling(db: &AppDb, repo_id: i64, root: &Path, gen0: u64) -> Result<bool, String> {
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
+    if lifecycle_generation(repo_id, root) != gen0 {
+        return Ok(false);
+    }
+    clear_disabling_locked(db, repo_id, root)?;
     Ok(true)
 }
 
@@ -3269,6 +3289,52 @@ pub(crate) fn render_write_probe(repo_id: i64, root: &Path) {
     if let Some(p) = probe {
         let _ = p.entered.send(repo_id);
         // The render still holds the per-repo guard while it waits.
+        let _ = p.release.recv();
+    }
+}
+
+// T-000243 review (eleventh pass): a rendezvous for `retry_disabling`'s
+// post-fetch window. The fetch is the retry's last read-only step —
+// everything after it mutates (branch refresh, deletion commits, push).
+// The probe fires AFTER the fetch and BEFORE the policy guard is taken,
+// so a test can land a re-enable exactly in the window the review found:
+// the retry must then refuse before its FIRST mutation, not merely before
+// the database cleanup. Matched by (repo id, repo root); fires once.
+#[cfg(test)]
+struct RetryPostFetchProbe {
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+#[cfg(test)]
+static RETRY_POST_FETCH_PROBES: OnceLock<Mutex<HashMap<(i64, PathBuf), RetryPostFetchProbe>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn install_retry_post_fetch_probe(
+    repo: i64,
+    root: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = RETRY_POST_FETCH_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo, root.to_path_buf()),
+        RetryPostFetchProbe { entered, release },
+    );
+}
+
+#[cfg(test)]
+fn retry_post_fetch_probe(repo_id: i64, root: &Path) {
+    let cell = RETRY_POST_FETCH_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        g.remove(&(repo_id, root.to_path_buf()))
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        // The retry has NOT taken the policy guard yet — whatever the test
+        // interleaves here completes before the retry's freshness check.
         let _ = p.release.recv();
     }
 }
@@ -5951,6 +6017,69 @@ mod tests {
             fx.main_status(),
             None,
             "the superseded retry failure must not be restored"
+        );
+    }
+
+    /// T-000243 review (eleventh pass): the retry's fetch is its last
+    /// read-only step — a re-enable landing while it runs must stop the
+    /// retry BEFORE the first mutation (no branch refresh, no deletion
+    /// commit, no push), not merely before the marker cleanup. The probe
+    /// parks the retry in exactly that window.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_reenable_during_the_retry_fetch_stops_it_before_any_mutation() {
+        let fx = two_installs();
+        fx.enable_main();
+        // The disable cannot push: the `.sdh/` deletion stays pending.
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+        let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!res.pushed, "{:?}", res);
+        assert!(ss::read_shared_import(&fx.main_db, fx.main_repo)
+            .disabling
+            .is_some());
+        let head_before = g(&fx.main_dir, &["rev-parse", "HEAD"]);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_retry_post_fetch_probe(fx.main_repo, &fx.main_dir, entered_tx, release_rx);
+
+        let out = std::thread::scope(|s| {
+            // Phase A reaches the pending-disable retry; inside its
+            // post-fetch window it hands the repo id over and waits.
+            let sync = s.spawn(|| run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id)));
+            let in_window = entered_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the retry never reached its post-fetch window");
+            assert_eq!(in_window, fx.main_repo);
+            // The re-enable lands while the retry is between fetch and the
+            // guard: it bumps the lifecycle generation and clears the
+            // pending-disable marker.
+            enable_shared_mode(&fx.main_db, &gb(), fx.main_repo, false).unwrap();
+            release_tx.send(1).unwrap();
+            sync.join().unwrap()
+        });
+        fs::remove_file(&hook).unwrap();
+        assert!(
+            out.passes.is_empty(),
+            "the obsolete retry must not even produce a pass, got {:?}",
+            out.passes.len()
+        );
+
+        // The stale retry mutated NOTHING: no local deletion commit, the
+        // structure is still tracked locally and still on origin.
+        assert_eq!(
+            g(&fx.main_dir, &["rev-parse", "HEAD"]),
+            head_before,
+            "the obsolete retry must not commit the `.sdh/` deletion"
+        );
+        assert!(fx.main_dir.join(".sdh/project.json").is_file());
+        assert!(fx.remote_file("dev", ".sdh/project.json").is_some());
+        // And it settled no status of its own: the repo is shared again.
+        assert!(
+            fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .shared_mode
         );
     }
 
