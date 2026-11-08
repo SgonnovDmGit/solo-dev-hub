@@ -498,8 +498,41 @@ pub fn list_repo_peers(db: State<AppDb>, repo_id: i64) -> Result<Vec<Repository>
 
 // ── Workspace scanner ─────────────────────────────────────────────────────────
 
-#[tauri::command]
+/// Workspace scanner: walk `workspace_root` two levels deep (skipping
+/// dot-folders, `node_modules` and `target`) and map every requested GitHub
+/// name to the local folder whose git remotes fetch from it. Needs a git
+/// binary on PATH — every candidate repo's remotes are read by `git config`
+/// itself (see `remote_fetch_urls`); without git the scan is an `Err`, never
+/// a silent empty result.
+///
+/// Async like the untrack/clone commands above: every candidate repo costs a
+/// git subprocess (a single git spawn measured 0.7–7.8 s on the owner's
+/// Windows machine), and as a synchronous command that whole sequential wait
+/// was spent on Tauri's UI thread with the window frozen.
+#[tauri::command(async)]
 pub fn scan_workspace_for_repos(
+    workspace_root: String,
+    github_names: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    scan_workspace_for_repos_impl(workspace_root, github_names)
+}
+
+/// The orchestration behind `scan_workspace_for_repos`, on plain owned args
+/// (no `State`) so it is unit-testable without a Tauri runtime — same shape
+/// as `clone_repo_to_impl`. The git binary comes from the per-process probe
+/// (`cached_git`).
+fn scan_workspace_for_repos_impl(
+    workspace_root: String,
+    github_names: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    scan_workspace_for_repos_with_git(git_ops::cached_git(), workspace_root, github_names)
+}
+
+/// `scan_workspace_for_repos_impl` with the git binary injected, mirroring
+/// `clone_repo_to_impl_with_url`: tests drive the missing-git failure path
+/// with `None` instead of needing a git-less environment.
+fn scan_workspace_for_repos_with_git(
+    git: Option<git_ops::GitBinary>,
     workspace_root: String,
     github_names: Vec<String>,
 ) -> Result<HashMap<String, String>, String> {
@@ -511,15 +544,19 @@ pub fn scan_workspace_for_repos(
     let mut found: HashMap<String, String> = HashMap::new();
 
     // R1: the remote URLs are read by git itself (`git config --file ...`),
-    // so the scan needs a git binary. One per-process probe per scan via
-    // `cached_git`. Documented choice: without a git binary the URLs cannot
-    // be read, so NOTHING can match — an empty map, never an error (the
-    // scanner is a matching aid; the UI's git availability is checked
-    // separately, e.g. `check_git_available_for_repo`).
-    let git = git_ops::cached_git();
+    // so the scan needs a git binary — one per-process probe per scan via
+    // `cached_git`. Without git the URLs cannot be read, and an empty map
+    // here would make Settings report "Scan complete: found 0 repositories"
+    // as if the scan had run, so the missing binary is an actionable error
+    // instead (same stance as `list_gitignored_tracked`'s "git not
+    // available").
+    let git = git.ok_or_else(|| {
+        "git is not available on PATH — the workspace scan needs git to read repository remotes"
+            .to_string()
+    })?;
 
     // Scan 2 levels deep for .git/config
-    scan_dir(root, &github_names, &mut found, 0, 2, git.as_ref());
+    scan_dir(root, &github_names, &mut found, 0, 2, &git);
 
     Ok(found)
 }
@@ -602,14 +639,14 @@ fn scan_dir(
     found: &mut HashMap<String, String>,
     depth: usize,
     max_depth: usize,
-    git: Option<&git_ops::GitBinary>,
+    git: &git_ops::GitBinary,
 ) {
     if depth > max_depth {
         return;
     }
 
     let git_config = dir.join(".git").join("config");
-    if let (true, Some(git)) = (git_config.exists(), git) {
+    if git_config.exists() {
         // T-000242 / F-000045: git's own parser reads the config, then the
         // real fetch URLs go through the exact GitHub matcher, which compares
         // owner/repo case-insensitively (the clone keeps the case GitHub gave
@@ -665,6 +702,40 @@ mod tests {
         dir
     }
 
+    // ── scanner: the failure paths that need no git spawn ──────────────────
+
+    /// The `_impl`/`_with_git` split exists for these: the command's body is
+    /// now just the `#[tauri::command(async)]` delegate, so the orchestration
+    /// is tested without a Tauri runtime — same arrangement as the
+    /// `clone_repo_to_impl` tests below.
+    #[test]
+    fn test_scan_workspace_impl_rejects_a_missing_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("no-such-dir");
+        let err = scan_workspace_for_repos_impl(
+            missing.to_string_lossy().to_string(),
+            vec!["owner/repo".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.starts_with("Directory not found: "), "{}", err);
+    }
+
+    /// MINOR 3: a missing git binary is an actionable error, never a silent
+    /// empty map that Settings would toast as "Scan complete: found 0
+    /// repositories". Driven through the binary-injecting variant with `None`
+    /// — no git-less environment needed.
+    #[test]
+    fn test_scan_workspace_without_git_is_an_error_not_an_empty_map() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = scan_workspace_for_repos_with_git(
+            None,
+            tmp.path().to_string_lossy().to_string(),
+            vec!["owner/repo".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.contains("git"), "must name git: {}", err);
+    }
+
     // R1: the scanner reads each config through `git config` now, so every
     // scanner test spawns git — ignored like the other git-spawning tests.
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
@@ -681,7 +752,7 @@ mod tests {
         );
         repo_dir(tmp.path(), "other", "https://github.com/Owner/Other_Repo");
 
-        let found = scan_workspace_for_repos(
+        let found = scan_workspace_for_repos_impl(
             tmp.path().to_string_lossy().to_string(),
             vec![
                 "owner/server_airouter".to_string(),
@@ -705,7 +776,7 @@ mod tests {
             "git@github.com:owner/server_airouter.git",
         );
 
-        let found = scan_workspace_for_repos(
+        let found = scan_workspace_for_repos_impl(
             tmp.path().to_string_lossy().to_string(),
             vec!["owner/airouter_extra".to_string()],
         )
@@ -740,7 +811,7 @@ mod tests {
         )
         .unwrap();
 
-        let found = scan_workspace_for_repos(
+        let found = scan_workspace_for_repos_impl(
             tmp.path().to_string_lossy().to_string(),
             vec!["owner/repo".to_string()],
         )
@@ -765,7 +836,7 @@ mod tests {
         )
         .unwrap();
 
-        let found = scan_workspace_for_repos(
+        let found = scan_workspace_for_repos_impl(
             tmp.path().to_string_lossy().to_string(),
             vec!["owner/repo".to_string()],
         )
@@ -851,7 +922,7 @@ uation.git
         )
         .unwrap();
 
-        let found = scan_workspace_for_repos(
+        let found = scan_workspace_for_repos_impl(
             tmp.path().to_string_lossy().to_string(),
             vec![
                 "owner/quoted".to_string(),
