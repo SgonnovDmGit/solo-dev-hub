@@ -3642,4 +3642,63 @@ mod tests {
             report.errors[0]
         );
     }
+
+    /// Review fix (2nd pass of T-000244): `repo_state` only resolves
+    /// `--git-path`s and still succeeds here, while `symbolic-ref -q HEAD`
+    /// exits 128 — the branch ref points at itself, so HEAD resolves to
+    /// nothing. `current_branch` folded every nonzero exit into `Ok(None)`,
+    /// so `commit_state_safe` read this broken checkout as a DETACHED one and
+    /// the sweep skipped it silently; the branch-lookup failure must reach
+    /// `sweep_failed` as a `RuleFailed` instead.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_reports_a_checkout_whose_branch_cannot_be_read() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/cyclic",
+            "sdh-alpha.md.approved",
+            "approved in chat\n",
+        );
+        // A cyclic symbolic ref: `refs/heads/master` points at itself.
+        fs::write(
+            tmp.path().join(".git/refs/heads/master"),
+            "ref: refs/heads/master\n",
+        )
+        .unwrap();
+
+        let report = marker_sweep(&db);
+
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert_eq!(
+            report.errors[0].code,
+            SyncIssueCode::RuleFailed,
+            "{}",
+            report.errors[0]
+        );
+        assert_eq!(
+            report.errors[0].subject,
+            rule_copy_label(&repo),
+            "{}",
+            report.errors[0]
+        );
+        assert!(
+            report.errors[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("symbolic-ref")),
+            "the branch-lookup failure is the reported one: {}",
+            report.errors[0]
+        );
+        // Not silently skipped: the marker stays tracked and the index is
+        // untouched (`ls-files` reads the index alone — HEAD no longer
+        // resolves, so a diff against it is not a usable oracle here).
+        assert_eq!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.approved"),
+            vec!["docs/sdh_skills/sdh-alpha.md.approved".to_string()],
+            "the sweep staged nothing against the broken branch"
+        );
+    }
 }

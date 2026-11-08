@@ -195,21 +195,46 @@ pub fn detect_repo_state(local_path: &Path) -> RepoState {
     RepoState::Clean
 }
 
-/// Current checked-out branch name, or None if detached HEAD. An unborn branch
-/// (no commits yet) still has a name. Read from the symbolic ref itself:
-/// `rev-parse --abbrev-ref HEAD` prints `heads/<name>` when a tag of the same
-/// name exists.
-pub fn current_branch(git: &GitBinary, local_path: &Path) -> Result<Option<String>, String> {
+/// The full ref `HEAD` points at (`refs/heads/<name>`), or `None` when HEAD
+/// is detached.
+///
+/// Review fix (2nd pass of T-000244): only exit 1 of `symbolic-ref -q HEAD`
+/// MEANS detached. Git also exits 128 for a HEAD that cannot be resolved at
+/// all — a cyclic symbolic ref dies with `fatal: No such ref: HEAD` while
+/// `repo_state` still succeeds — and folding every nonzero exit into `None`
+/// made `commit_state_safe` read such a checkout as a detached one and defer
+/// it silently instead of letting the caller report the failure.
+fn head_symbolic_ref(git: &GitBinary, local_path: &Path) -> Result<Option<String>, String> {
     let out = spawn_cmd(&git.0)
         .args(["symbolic-ref", "-q", "HEAD"])
         .current_dir(local_path)
         .output()
         .map_err(|e| format!("git symbolic-ref failed to start: {}", e))?;
-    if !out.status.success() {
+    match out.status.code() {
+        Some(0) => {}
         // Exit 1 with -q: HEAD is detached.
-        return Ok(None);
+        Some(1) => return Ok(None),
+        _ => {
+            return Err(format!(
+                "git symbolic-ref exit {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
     }
-    let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(Some(
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    ))
+}
+
+/// Current checked-out branch name, or None if detached HEAD. An unborn branch
+/// (no commits yet) still has a name. Read from the symbolic ref itself:
+/// `rev-parse --abbrev-ref HEAD` prints `heads/<name>` when a tag of the same
+/// name exists.
+pub fn current_branch(git: &GitBinary, local_path: &Path) -> Result<Option<String>, String> {
+    let Some(full) = head_symbolic_ref(git, local_path)? else {
+        return Ok(None);
+    };
     Ok(full.strip_prefix("refs/heads/").map(|s| s.to_string()))
 }
 
@@ -699,7 +724,12 @@ pub fn commit_paths_index_only(
     }
     // What does this index change against HEAD? Nothing = nothing to commit.
     let changed = {
-        let out = run(&["diff-index", "--cached", "--name-only", "-z", "HEAD"])?;
+        // Review fix (2nd pass of T-000244): the trailing `--` keeps `HEAD` a
+        // revision. Without it, a worktree file literally named `HEAD` made
+        // git refuse the call as an ambiguous argument (`fatal: ambiguous
+        // argument 'HEAD': both revision and filename`), so the marker
+        // cleanup failed on that repo shape.
+        let out = run(&["diff-index", "--cached", "--name-only", "-z", "HEAD", "--"])?;
         if !out.status.success() {
             return Err(format!(
                 "git diff-index exit {}: {}",
@@ -765,6 +795,17 @@ pub fn commit_paths_index_only(
 /// Does `rev` resolve? (`rev-parse --verify --quiet`, no error text parsing.)
 /// `pub(crate)`: `sync::autocommit` asks whether HEAD is born before reading
 /// historical markers off it.
+///
+/// Review fix (2nd pass of T-000244): a nonzero exit is NOT uniformly "no".
+/// `rev-parse --verify --quiet 'HEAD^{commit}'` exits 1 both for a genuinely
+/// unborn HEAD (the symbolic ref's target branch has no commit yet) AND for a
+/// ref that exists but points at a missing or corrupt commit object. Only the
+/// former is `Ok(false)`; the latter is a damaged repo and propagates as
+/// `Err`, because `autocommit_repo` would otherwise answer `NothingToCommit`
+/// and silently drop the marker deletion the branch still owes. The target
+/// ref is verified WITHOUT peeling — `rev-parse --verify refs/heads/x` still
+/// exits 0 when x resolves to an oid whose object is gone, which is exactly
+/// what distinguishes "broken" from "unborn".
 pub(crate) fn rev_exists(git: &GitBinary, local_path: &Path, rev: &str) -> Result<bool, String> {
     let spec = format!("{}^{{commit}}", rev);
     let out = spawn_cmd(&git.0)
@@ -772,7 +813,43 @@ pub(crate) fn rev_exists(git: &GitBinary, local_path: &Path, rev: &str) -> Resul
         .current_dir(local_path)
         .output()
         .map_err(|e| format!("git rev-parse failed to start: {}", e))?;
-    Ok(out.status.success())
+    if out.status.success() {
+        return Ok(true);
+    }
+    // The unborn exception only exists for the symbolic HEAD; any other rev
+    // that fails to peel keeps the plain "does not resolve" answer.
+    if rev != "HEAD" {
+        return Ok(false);
+    }
+    let Some(target) = head_symbolic_ref(git, local_path)? else {
+        return Err(format!(
+            "git rev-parse exit {}: detached HEAD does not resolve to a commit: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    };
+    let target_out = spawn_cmd(&git.0)
+        .args(["rev-parse", "--verify", "--quiet", target.as_str()])
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git rev-parse failed to start: {}", e))?;
+    match target_out.status.code() {
+        // The branch ref exists but HEAD still fails to peel to a commit:
+        // its object is missing or corrupt.
+        Some(0) => Err(format!(
+            "git rev-parse exit {}: HEAD points at '{}' but it does not resolve to a commit: {}",
+            out.status,
+            target,
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        // The branch ref itself does not exist yet: HEAD is unborn.
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git rev-parse exit {}: {}",
+            target_out.status,
+            String::from_utf8_lossy(&target_out.stderr)
+        )),
+    }
 }
 
 /// Untrack `files` in batches of 100 (`git rm --cached <a> <b> ...`).
@@ -2073,10 +2150,10 @@ mod tests {
         run_git(tmp.path(), &["add", "--", "HEAD"]);
         run_git(tmp.path(), &["commit", "-q", "-m", "add a file named HEAD"]);
         // The dev stages a new blob for it and removes the worktree copy —
-        // the staged blob is exactly what the broken reset destroyed. (With
-        // the file still on disk git refuses the helper's own `diff-index
-        // HEAD` as an ambiguous argument, so this is also the only shape the
-        // review's reproduction can take.)
+        // the staged blob is exactly what the broken reset destroyed. (The
+        // worktree copy is removed so this test isolates the reset; the
+        // sibling test below covers the file-present shape that the
+        // `diff-index … HEAD --` fix made reachable.)
         fs::write(tmp.path().join("HEAD"), "service file\n").unwrap();
         run_git(tmp.path(), &["add", "--", "HEAD"]);
         fs::remove_file(tmp.path().join("HEAD")).unwrap();
@@ -2111,6 +2188,65 @@ mod tests {
                 .iter()
                 .any(|s| s.ends_with(".approved") || s.ends_with(".conflict")),
             "the marker deletions are reconciled, nothing else: {:?}",
+            staged
+        );
+    }
+
+    /// Review fix (2nd pass of T-000244): `diff-index --cached --name-only -z
+    /// HEAD` without a trailing `--` read `HEAD` as an ambiguous
+    /// revision/path argument whenever a worktree file literally named `HEAD`
+    /// existed, so the marker cleanup failed on that repo outright. With the
+    /// `--` the commit goes through WITH the file present, and both halves of
+    /// the dev's state — the staged blob and the worktree contents — come out
+    /// unchanged.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_commit_paths_index_only_copes_with_a_worktree_file_literally_named_head() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path(), "approved\n");
+        write_file(tmp.path(), "HEAD", "service file\n");
+        run_git(tmp.path(), &["add", "--", "HEAD"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "add a file named HEAD"]);
+        // The dev stages a new blob for the file and keeps it on disk — the
+        // exact shape the ambiguous-argument failure used to make unreachable.
+        fs::write(tmp.path().join("HEAD"), "staged and on disk\n").unwrap();
+        run_git(tmp.path(), &["add", "--", "HEAD"]);
+        assert!(
+            staged_status(tmp.path()).contains(&"M HEAD".to_string()),
+            "the fixture must have the new blob staged: {:?}",
+            staged_status(tmp.path())
+        );
+
+        let git = check_git_available().expect("git available");
+        let outcome = commit_paths_index_only(
+            &git,
+            tmp.path(),
+            "master",
+            &[],
+            "chore(sdh-sync): untrack rule hand-back markers",
+            None,
+            "Solo Dev Hub",
+            "hub@example.com",
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("HEAD")).unwrap(),
+            "staged and on disk\n",
+            "the worktree contents are untouched"
+        );
+        let staged = staged_status(tmp.path());
+        assert!(
+            staged.contains(&"M HEAD".to_string()),
+            "the dev's staged blob for the file named HEAD survives: {:?}",
+            staged
+        );
+        assert!(
+            !staged
+                .iter()
+                .any(|s| s.ends_with(".approved") || s.ends_with(".conflict")),
+            "only the marker deletions are reconciled: {:?}",
             staged
         );
     }

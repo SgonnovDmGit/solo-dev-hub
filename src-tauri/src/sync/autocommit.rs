@@ -801,6 +801,45 @@ mod tests {
         assert_eq!(outcome, CommitOutcome::NothingToCommit);
     }
 
+    /// Review fix (2nd pass of T-000244): a branch ref that exists but points
+    /// at a MISSING commit object is a damaged repo, not an unborn HEAD — yet
+    /// `rev_exists` folded every nonzero `rev-parse` exit into "unborn", so
+    /// autocommit answered a clean `NothingToCommit` and silently dropped the
+    /// marker deletion the branch still owed. The failure must surface.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_errors_on_a_broken_head_instead_of_a_clean_noop() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path());
+        // Break the branch: the ref stays, the commit object it names is gone.
+        let sha = head_sha(tmp.path());
+        fs::remove_file(
+            tmp.path()
+                .join(format!(".git/objects/{}/{}", &sha[..2], &sha[2..])),
+        )
+        .unwrap();
+
+        let git = check_git_available().expect("git available");
+        let failed = autocommit_repo(&git, tmp.path(), "master");
+
+        let err = failed.expect_err("a damaged repo must error, not report a no-op");
+        assert!(err.contains("rev-parse"), "{}", err);
+        // HEAD no longer resolves, so the tree is read from the index instead:
+        // the marker is still tracked and nothing was staged against the
+        // broken branch.
+        let ls = Command::new("git")
+            .args(["ls-files", "--", "docs/sdh_skills/"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let listed = String::from_utf8_lossy(&ls.stdout).into_owned();
+        assert!(
+            listed.contains("sdh-alpha.md.approved"),
+            "the marker is still tracked, nothing was committed: {}",
+            listed
+        );
+    }
+
     /// A clean merge that has not been committed: MERGE_HEAD is set, the merge
     /// result sits staged, HEAD has not moved. Committing here would create a
     /// two-parent commit WITHOUT the other branch's changes and clear
