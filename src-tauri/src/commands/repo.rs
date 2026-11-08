@@ -440,17 +440,22 @@ fn clone_repo_to_impl_with_url(
             }
             git_sync::CloneTargetError::Failed(net_err) => {
                 // R3: the incomplete-clone marker (and the partial clone or
-                // failed-checkout leftovers it names) stays in the target's
-                // parent — recovery is manual by design, so the issue names
-                // both the target and what to delete. `net_err.message` is
-                // already credential-redacted by git_sync.
+                // failed-checkout leftovers it names) sits next to the
+                // RESOLVED target identity — with an aliased pick that is not
+                // the lexical parent shown in `.target()`. Recovery is manual
+                // by design, so the issue names the actual marker path and
+                // what to delete. `net_err.message` is already
+                // credential-redacted by git_sync.
+                let marker = git_sync::clone_incomplete_marker(&target_path)
+                    .map(|m| m.display().to_string())
+                    .unwrap_or_else(|| ".sdh-clone-incomplete-*".to_string());
                 SyncIssue::new(SyncIssueCode::CloneFailed, subject)
                     .target(&target_dir)
                     .detail(format!(
-                        "{} — an incomplete-clone marker (.sdh-clone-incomplete-*) was left \
-                         in the target's parent folder together with the clone leftovers; \
-                         delete the marker and the leftovers by hand before retrying",
-                        net_err.message
+                        "{} — an incomplete-clone marker ({}) was left next to the clone \
+                         leftovers; delete the marker and the leftovers by hand before \
+                         retrying",
+                        net_err.message, marker
                     ))
             }
         });
