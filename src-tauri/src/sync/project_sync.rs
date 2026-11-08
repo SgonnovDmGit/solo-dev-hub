@@ -1377,37 +1377,7 @@ pub(crate) fn run_project_sync_in(
     let handled = shared.handled.clone();
     finish_shared(db, git.as_ref(), shared, &mut c);
     if let Some(git) = git {
-        match db.list_autocommit_repos() {
-            Ok(repos) => {
-                for (repo, branch) in repos {
-                    if handled.contains(&repo.id) {
-                        continue;
-                    }
-                    let Some(ref lp) = repo.local_path else {
-                        continue;
-                    };
-                    let path = std::path::Path::new(lp);
-                    if !crate::git_ops::is_git_repo(path) {
-                        continue;
-                    }
-                    match crate::sync::autocommit_repo(&git, path, &branch) {
-                        Ok(crate::git_ops::CommitOutcome::Committed { .. }) => {
-                            c.committed.push(repo.display_name());
-                        }
-                        // T-000198: a repo on another branch is repo state, not a
-                        // sync failure — RepoDetail shows it beside the branch
-                        // setting. Reporting it here repeated it on every sync of
-                        // every project, since this loop walks the portfolio.
-                        Ok(crate::git_ops::CommitOutcome::WrongBranch { .. }) => {}
-                        Ok(crate::git_ops::CommitOutcome::NothingToCommit) => {}
-                        Err(e) => c.push(
-                            SyncIssue::new(Code::AutocommitFailed, repo.display_name()).detail(e),
-                        ),
-                    }
-                }
-            }
-            Err(e) => c.push(SyncIssue::lookup(lookup::AUTOCOMMIT_REPOS, "").detail(e)),
-        }
+        autocommit_portfolio_repos(db, &git, &handled, &mut c);
     }
 
     // v0.20.0: record sync event. SyncResult fields per models.rs — copied + responses + migrated
@@ -1421,6 +1391,114 @@ pub(crate) fn run_project_sync_in(
     );
 
     Ok(c.into_result())
+}
+
+/// T-000137: the portfolio-wide auto-commit pass, extracted for the
+/// T-000243 review (thirteenth pass): every repo's eligibility read, fresh
+/// binding re-read and the WHOLE commit now run under the per-repo policy
+/// guard. This loop walks the whole portfolio, so a shared repo belonging
+/// to ANOTHER project is not in `handled` — the fresh `is_shared_repo`
+/// check under the same hold is what keeps phase B's commit path the only
+/// one for it. The guard also serializes the commit against a concurrent
+/// `disable_shared_mode` / repath on the same repo: `commit_paths_index_only`
+/// builds its temp index from a `read-tree HEAD` snapshot, and without the
+/// hold a disable's `.sdh/` deletion committed between that snapshot and
+/// `git commit` would be resurrected by the stale index — the deletion
+/// would look pushed while `.sdh/` stayed on origin with no retry marker.
+fn autocommit_portfolio_repos(
+    db: &AppDb,
+    git: &crate::git_ops::GitBinary,
+    handled: &std::collections::HashSet<i64>,
+    c: &mut SyncCounters,
+) {
+    match db.list_autocommit_repos() {
+        Ok(repos) => {
+            for (repo, branch) in repos {
+                if handled.contains(&repo.id) {
+                    continue;
+                }
+                let guard = sync::shared::specs_policy_guard(repo.id);
+                let _guard = guard.lock().unwrap();
+                if sync::shared::is_shared_repo(db, repo.id) {
+                    continue;
+                }
+                // Fresh binding: the list snapshot may predate a repath.
+                let Ok(fresh) = db.get_repository(repo.id) else {
+                    continue;
+                };
+                let Some(ref lp) = fresh.local_path else {
+                    continue;
+                };
+                let path = Path::new(lp);
+                if !crate::git_ops::is_git_repo(path) {
+                    continue;
+                }
+                #[cfg(test)]
+                autocommit_policy_probe(repo.id, path);
+                match crate::sync::autocommit_repo(git, path, &branch) {
+                    Ok(crate::git_ops::CommitOutcome::Committed { .. }) => {
+                        c.committed.push(repo.display_name());
+                    }
+                    // T-000198: a repo on another branch is repo state, not a
+                    // sync failure — RepoDetail shows it beside the branch
+                    // setting. Reporting it here repeated it on every sync of
+                    // every project, since this loop walks the portfolio.
+                    Ok(crate::git_ops::CommitOutcome::WrongBranch { .. }) => {}
+                    Ok(crate::git_ops::CommitOutcome::NothingToCommit) => {}
+                    Err(e) => c.push(
+                        SyncIssue::new(Code::AutocommitFailed, repo.display_name()).detail(e),
+                    ),
+                }
+            }
+        }
+        Err(e) => c.push(SyncIssue::lookup(lookup::AUTOCOMMIT_REPOS, "").detail(e)),
+    }
+}
+
+// T-000243 review (thirteenth pass): a rendezvous fired inside
+// `autocommit_portfolio_repos`'s guard hold, right before the commit —
+// the concurrency test proves the policy guard is still held across the
+// whole eligibility+commit section (a lifecycle writer on the same repo
+// cannot interleave) and that a shared repo is skipped on FRESH state.
+// Matched by (repo id, repo root); fires once.
+#[cfg(test)]
+struct AutocommitPolicyProbe {
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+#[cfg(test)]
+static AUTOCOMMIT_POLICY_PROBES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(i64, PathBuf), AutocommitPolicyProbe>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_autocommit_policy_probe(
+    repo: i64,
+    root: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = AUTOCOMMIT_POLICY_PROBES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo, root.to_path_buf()),
+        AutocommitPolicyProbe { entered, release },
+    );
+}
+
+#[cfg(test)]
+fn autocommit_policy_probe(repo_id: i64, root: &Path) {
+    let cell = AUTOCOMMIT_POLICY_PROBES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        g.remove(&(repo_id, root.to_path_buf()))
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        let _ = p.release.recv();
+    }
 }
 
 #[cfg(test)]
@@ -1922,6 +2000,117 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&status.stdout).trim().is_empty(),
             "the managed file is still uncommitted"
+        );
+    }
+
+    /// T-000243 review (thirteenth pass): a git repo on `dev` with one
+    /// uncommitted cross-repo file, registered for auto-commit. Returns
+    /// the repo id.
+    fn autocommit_fixture(db: &AppDb, dir: &Path, shared: bool) -> i64 {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {:?}: {:?}", args, out);
+        };
+        git(&["init", "-q"]);
+        git(&["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        git(&[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        let api = dir.join("docs").join("server-api");
+        fs::create_dir_all(&api).unwrap();
+        fs::write(api.join("api.md"), "# api\n").unwrap();
+        let project = db.create_project("P", None, "standard").unwrap();
+        let repo = db
+            .insert_local_repository(&dir.to_string_lossy(), "ac", Some(project.id), Some("tool"))
+            .unwrap();
+        db.set_autocommit_branch(repo.id, Some("dev")).unwrap();
+        if shared {
+            db.set_shared_mode(repo.id, true).unwrap();
+        }
+        repo.id
+    }
+
+    fn autocommit_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?}: {:?}", args, out);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// T-000243 review (thirteenth pass): the portfolio autocommit loop
+    /// walks EVERY project, so `handled` cannot see a shared repo owned by
+    /// another project. The fresh `is_shared_repo` check under the guard
+    /// is what keeps phase B's commit path the only one for it — the
+    /// cross-repo file must stay uncommitted here.
+    #[test]
+    fn a_shared_repo_is_skipped_by_the_portfolio_autocommit() {
+        let db = make_db();
+        let dir = TempDir::new().unwrap();
+        autocommit_fixture(&db, dir.path(), true);
+        let git = crate::git_ops::check_git_available().expect("git available");
+        let mut c = SyncCounters::new();
+        autocommit_portfolio_repos(&db, &git, &std::collections::HashSet::new(), &mut c);
+        assert!(c.committed.is_empty(), "{:?}", c.committed);
+        assert_eq!(
+            autocommit_git(dir.path(), &["ls-files", "--", "docs/server-api/api.md"]),
+            "",
+            "a shared repo's cross-repo files belong to phase B, not autocommit"
+        );
+    }
+
+    /// T-000243 review (thirteenth pass): the eligibility read, the fresh
+    /// binding and the whole commit run under the per-repo policy guard —
+    /// the probe parks the pass inside that hold and the guard must still
+    /// be taken, so a disable / repath on the same repo cannot interleave
+    /// between the temp index's HEAD snapshot and `git commit`.
+    #[test]
+    fn the_autocommit_commit_runs_under_the_policy_guard() {
+        let db = make_db();
+        let dir = TempDir::new().unwrap();
+        let repo_id = autocommit_fixture(&db, dir.path(), false);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_autocommit_policy_probe(repo_id, dir.path(), entered_tx, release_rx);
+        let git = crate::git_ops::check_git_available().expect("git available");
+        let c = std::thread::scope(|s| {
+            let worker = s.spawn(|| {
+                let mut c = SyncCounters::new();
+                autocommit_portfolio_repos(&db, &git, &std::collections::HashSet::new(), &mut c);
+                c
+            });
+            let in_window = entered_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the autocommit probe never fired");
+            assert_eq!(in_window, repo_id);
+            assert!(
+                sync::shared::specs_policy_guard(repo_id)
+                    .try_lock()
+                    .is_err(),
+                "the guard must be held across the whole commit"
+            );
+            release_tx.send(1).unwrap();
+            worker.join().unwrap()
+        });
+        assert_eq!(c.committed.len(), 1, "{:?}", c.committed);
+        assert_eq!(
+            autocommit_git(dir.path(), &["ls-files", "--", "docs/server-api/api.md"]),
+            "docs/server-api/api.md",
+            "the ordinary repo's cross-repo file was committed"
         );
     }
 

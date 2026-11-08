@@ -3125,9 +3125,6 @@ impl SharedSync {
             // status write.
             let guard = specs_policy_guard(pass.repo.id);
             let _guard = guard.lock().unwrap();
-            if let (Some(git), Some(_)) = (git, pass.role) {
-                phase_b_repo(db, git, &mut pass);
-            }
             // T-000243 review (sixth pass): settle only when the lifecycle
             // generation this pass's decisions started under is still
             // current. A disable that completed — even one that finished
@@ -3142,9 +3139,19 @@ impl SharedSync {
             // lifecycle that MOVED after the pass's decisions began makes
             // it stale, and the generation sees round trips a state
             // snapshot cannot.
+            // T-000243 review (thirteenth pass): the same gate covers PHASE
+            // B — a pass whose lifecycle moved (repath, disable, re-enable,
+            // approval) between its decisions and now must not commit or
+            // push from a checkout it no longer owns. The check and phase
+            // B share this one guard hold, so nothing can interleave.
             let stale = pass
                 .lifecycle_gen
                 .is_some_and(|gen| gen != lifecycle_generation(pass.repo.id, &pass.root));
+            if !stale {
+                if let (Some(git), Some(_)) = (git, pass.role) {
+                    phase_b_repo(db, git, &mut pass);
+                }
+            }
             let issues = std::mem::take(&mut pass.issues);
             out.issues
                 .extend(fresh_issues(pass.repo.id, &pass.root, issues));
@@ -6225,6 +6232,41 @@ mod tests {
         assert!(
             !backup.status.success(),
             "reset_to_origin must not have run for the stale pass"
+        );
+    }
+
+    /// T-000243 review (thirteenth pass): the generation gate covers PHASE
+    /// B too — a pass captured before a repath must not commit or push
+    /// from the checkout it no longer owns. Before the fix the deferred
+    /// half still ran (only the status settlement was suppressed), so the
+    /// old checkout's files, refs and remote all stayed untouched is the
+    /// assertion that matters.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_repathed_repo_makes_its_phase_a_pass_skip_phase_b() {
+        let fx = two_installs();
+        fx.enable_main();
+        // A spec waits for phase B to carry it to origin.
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        let dev_before = g(&fx.main_dir, &["rev-parse", "dev"]);
+        // The checkout is rebound while the pass waits for phase B.
+        rebind_local_path(
+            &fx.main_db,
+            fx.main_repo,
+            Some(fx.helper_dir.to_str().unwrap()),
+        )
+        .unwrap();
+        let _out = shared.finish(&fx.main_db, Some(&gb()));
+        assert_eq!(
+            g(&fx.main_dir, &["rev-parse", "dev"]),
+            dev_before,
+            "the stale pass must not commit from the old checkout"
+        );
+        assert_eq!(
+            fx.remote_file("dev", "docs/superpowers/specs/x.md"),
+            None,
+            "the stale pass must not push from the old checkout"
         );
     }
 
