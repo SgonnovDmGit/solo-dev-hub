@@ -172,37 +172,43 @@ pub fn is_shared_repo(db: &AppDb, repo_id: i64) -> bool {
         .unwrap_or(false)
 }
 
-/// T-000243 review (fifth pass): the shared-lifecycle facts a pass was
-/// created under — mode, cached role and the pending-disable marker.
-/// `SharedSync::finish` re-reads them under the per-repo guard and compares:
-/// a difference means a writer moved the repo's lifecycle after this pass's
-/// phase-A snapshot (a disable completed, an approval flipped the role,
-/// sharing was switched on or off) and the pass is STALE — it settles no
-/// status, because the writer that moved the lifecycle owns the repo's
-/// status now (a completed disable, or the `push_failed` a disable retry is
-/// still reporting). This is deliberately NOT `is_shared_state`: a
-/// first-discovery `Untrusted` pass or a `retry_disabling` pass
-/// legitimately settles onto a repo that is not (or no longer) shared —
-/// what matters is whether the lifecycle moved AFTER the pass was sealed,
-/// not whether the repo is shared at settlement time. `shared_status` is
-/// excluded on purpose: it is what settlement itself writes.
-#[derive(PartialEq)]
-struct LifecycleMark {
-    mode: bool,
-    role: Option<String>,
-    disabling: Option<String>,
-    disabling_branches: Vec<String>,
+/// T-000243 review (sixth pass): per-repo shared-lifecycle GENERATION.
+/// In-memory on purpose: a pass never outlives its sync call, so the
+/// counter needs no persistence (and no schema change). Keyed by
+/// (repo_id, root) like the net/probe slots — test fixtures share repo ids.
+/// Every lifecycle writer bumps it while holding `specs_policy_guard`; a
+/// pass seals the generation that was current when its phase-A decisions
+/// STARTED (before the shared-state read at the top of the repo loop), and
+/// `finish` treats a mismatch as stale. A generation — not a state
+/// snapshot — because lifecycle round trips (disable→re-enable) restore
+/// identical state, and because the pass's decisions span phase A while
+/// writers do not wait for the seal: a disable that completes between the
+/// pass's discovery and its seal still bumps the counter the pass sealed.
+fn lifecycle_generations() -> &'static Mutex<HashMap<(i64, String), u64>> {
+    static G: OnceLock<Mutex<HashMap<(i64, String), u64>>> = OnceLock::new();
+    G.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn lifecycle_mark(db: &AppDb, repo_id: i64) -> LifecycleMark {
-    let state = db.get_shared_state(repo_id).ok();
-    let imp = ss::read_shared_import(db, repo_id);
-    LifecycleMark {
-        mode: state.as_ref().is_some_and(|s| s.shared_mode),
-        role: state.and_then(|s| s.shared_role),
-        disabling: imp.disabling,
-        disabling_branches: imp.disabling_branches,
-    }
+fn lifecycle_generation(repo_id: i64, root: &Path) -> u64 {
+    lifecycle_generations()
+        .lock()
+        .unwrap()
+        .get(&(repo_id, root.to_string_lossy().into_owned()))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Bump the lifecycle generation of `repo_id` at `root`. Callers hold
+/// `specs_policy_guard(repo_id)` — the bump must be atomic with `finish`'s
+/// guarded freshness check, or a writer could land between the check and
+/// the settlement.
+fn bump_lifecycle_generation(repo_id: i64, root: &Path) {
+    let key = (repo_id, root.to_string_lossy().into_owned());
+    *lifecycle_generations()
+        .lock()
+        .unwrap()
+        .entry(key)
+        .or_insert(0) += 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1566,10 +1572,11 @@ struct RepoPass {
     /// `push_failed` status with its `disabling` marker must not have it
     /// cleared by a cancelled pass's empty notes).
     cancelled: bool,
-    /// T-000243 review (fifth pass): the lifecycle mark sealed at the end of
-    /// phase A (see `LifecycleMark`). `None` only for passes built outside
-    /// `run_phase_a` (tests): they settle unconditionally, as before.
-    lifecycle: Option<LifecycleMark>,
+    /// T-000243 review (sixth pass): the lifecycle generation sealed when
+    /// this pass's phase-A decisions started (see `lifecycle_generation`).
+    /// `None` only for passes built outside `run_phase_a` (tests): they
+    /// settle unconditionally, as before.
+    lifecycle_gen: Option<u64>,
 }
 
 impl RepoPass {
@@ -1600,10 +1607,11 @@ impl RepoPass {
         });
     }
 
-    /// Seal the lifecycle mark at the end of phase A — after every shared
-    /// state write this pass itself made (see `LifecycleMark`).
-    fn seal_lifecycle(&mut self, db: &AppDb) {
-        self.lifecycle = Some(lifecycle_mark(db, self.repo.id));
+    /// Seal the lifecycle generation this pass was created under — captured
+    /// BEFORE phase A's decisions for the repo began (see
+    /// `lifecycle_generation`).
+    fn seal_lifecycle_gen(&mut self, gen: u64) {
+        self.lifecycle_gen = Some(gen);
     }
 
     /// `Untrusted` with the reason of the structure check. A coded reason (a
@@ -2026,6 +2034,12 @@ fn run_phase_a_with(
         if !is_git_repo(&root) {
             continue;
         }
+        // T-000243 review (sixth pass): the lifecycle generation is read
+        // BEFORE this repo's shared-state read and every pass decision —
+        // any lifecycle writer that bumps it afterwards (under the per-repo
+        // guard, whenever it completes) makes this pass stale at `finish`,
+        // no matter when or where its seal happens.
+        let lifecycle_gen = lifecycle_generation(repo.id, &root);
         let Ok(state) = db.get_shared_state(repo.id) else {
             continue;
         };
@@ -2040,21 +2054,21 @@ fn run_phase_a_with(
                 // Shared mode on, but this install does not know its login.
                 let mut pass = new_pass(&repo, &root, "");
                 pass.note(SharedStatus::NoLogin, "");
-                pass.seal_lifecycle(db);
+                pass.seal_lifecycle_gen(lifecycle_gen);
                 sync.handled.insert(repo.id);
                 sync.passes.push(pass);
                 continue;
             };
             sync.handled.insert(repo.id);
             let mut pass = phase_a_main(db, git, &repo, &root, login);
-            pass.seal_lifecycle(db);
+            pass.seal_lifecycle_gen(lifecycle_gen);
             sync.passes.push(pass);
             continue;
         }
         if ss::read_shared_import(db, repo.id).disabling.is_some() {
             // Switched off, but the deletion of `.sdh/` did not reach the remote.
             if let Some(mut pass) = retry_disabling(db, git, &repo, &root) {
-                pass.seal_lifecycle(db);
+                pass.seal_lifecycle_gen(lifecycle_gen);
                 sync.passes.push(pass);
             }
             continue;
@@ -2108,7 +2122,7 @@ fn run_phase_a_with(
                     sync.canon_changed.push(rule.clone());
                 }
             }
-            pass.seal_lifecycle(db);
+            pass.seal_lifecycle_gen(lifecycle_gen);
             sync.passes.push(pass);
         }
     }
@@ -2142,7 +2156,7 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         canon_changed: Vec::new(),
         admin_checks: Vec::new(),
         cancelled: false,
-        lifecycle: None,
+        lifecycle_gen: None,
     }
 }
 
@@ -2520,7 +2534,7 @@ fn retry_disabling(
     }
     if to_push.is_empty() {
         if failures.is_empty() {
-            let _ = clear_disabling(db, repo.id);
+            let _ = clear_disabling(db, repo.id, root);
             return None;
         }
         pass.note(SharedStatus::PushFailed, failures.join("; "));
@@ -2534,7 +2548,7 @@ fn retry_disabling(
                     .iter()
                     .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)) =>
         {
-            let _ = clear_disabling(db, repo.id);
+            let _ = clear_disabling(db, repo.id, root);
             None
         }
         Ok(results) => {
@@ -2602,13 +2616,22 @@ fn refresh_pending_removal(
     Ok(())
 }
 
-fn clear_disabling(db: &AppDb, repo_id: i64) -> Result<(), String> {
+fn clear_disabling(db: &AppDb, repo_id: i64, root: &Path) -> Result<(), String> {
+    // T-000243 review (sixth pass): clearing the pending-disable marker is
+    // a lifecycle change. It runs unguarded inside phase A's retry, so the
+    // guard is taken HERE — the clear and the generation bump must be
+    // atomic with `finish`'s freshness check, or a retry success could
+    // land between an older pass's check and its settlement.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
     let mut imp = ss::read_shared_import(db, repo_id);
     imp.disabling = None;
     imp.disabling_branches.clear();
     ss::write_shared_import(db, repo_id, &imp)?;
     db.set_shared_status(repo_id, None)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    bump_lifecycle_generation(repo_id, root);
+    Ok(())
 }
 
 fn register_driver(git: &GitBinary, pass: &mut RepoPass) {
@@ -2867,21 +2890,23 @@ impl SharedSync {
             if let (Some(git), Some(_)) = (git, pass.role) {
                 phase_b_repo(db, git, &mut pass);
             }
-            // T-000243 review (fifth pass): settle only when the lifecycle
-            // this pass was sealed under is still current. A disable that
-            // completed meanwhile owns the repo's status (including a
-            // `push_failed` it is still retrying), and so does an approval
-            // or enable that moved the role — a stale pass must not
-            // overwrite it. Passes phase B never revalidates (no git, or a
-            // pass refused back in phase A) get the same protection here.
-            // This is NOT `is_shared_state`: a first-discovery `Untrusted`
-            // pass or a `retry_disabling` pass legitimately settles onto a
-            // repo that is not shared — only a lifecycle that MOVED after
-            // the seal makes a pass stale.
+            // T-000243 review (sixth pass): settle only when the lifecycle
+            // generation this pass's decisions started under is still
+            // current. A disable that completed — even one that finished
+            // BETWEEN the pass's discovery and its seal — owns the repo's
+            // status (including a `push_failed` it is still retrying), and
+            // so does an enable or a status-resolution action; a stale pass
+            // must not overwrite it. Passes phase B never revalidates (no
+            // git, or a pass refused back in phase A) get the same
+            // protection here. This is NOT a shared-membership check: a
+            // first-discovery `Untrusted` pass or a `retry_disabling` pass
+            // legitimately settles onto a repo that is not shared — only a
+            // lifecycle that MOVED after the pass's decisions began makes
+            // it stale, and the generation sees round trips a state
+            // snapshot cannot.
             let stale = pass
-                .lifecycle
-                .as_ref()
-                .is_some_and(|mark| *mark != lifecycle_mark(db, pass.repo.id));
+                .lifecycle_gen
+                .is_some_and(|gen| gen != lifecycle_generation(pass.repo.id, &pass.root));
             let issues = std::mem::take(&mut pass.issues);
             out.issues
                 .extend(fresh_issues(pass.repo.id, &pass.root, issues));
@@ -3715,6 +3740,9 @@ pub fn enable_shared_mode(
         .map_err(|e| e.to_string())?;
     db.set_shared_role(repo_id, Some("main"))
         .map_err(|e| e.to_string())?;
+    // T-000243 review (sixth pass): the lifecycle moved — passes sealed
+    // under the pre-enable generation settle no status.
+    bump_lifecycle_generation(repo_id, &root);
     ss::write_structure_if_changed(&root, &built)?;
     register_merge_driver(git, &root)?;
     // A deletion of `.sdh/` that never reached the remote is obsolete now: the
@@ -3960,6 +3988,10 @@ pub fn disable_shared_mode(
         .map_err(|e| e.to_string())?;
     db.set_shared_status(repo_id, None)
         .map_err(|e| e.to_string())?;
+    // T-000243 review (sixth pass): the lifecycle moved — passes sealed
+    // under the pre-disable generation settle no status (this covers the
+    // `disabling` marker write below as well: same transition).
+    bump_lifecycle_generation(repo_id, &root);
 
     // The same deletion on every participant branch (BUG-3): a contributor
     // whose own branch kept `.sdh/project.json` would otherwise carry it for
@@ -4217,11 +4249,24 @@ pub fn accept_new_main_branch(db: &AppDb, repo_id: i64) -> Result<(), String> {
     if !changed {
         return Err("the owner's dev branch has not changed: nothing to accept".into());
     }
+    // T-000243 review (sixth pass): accepting a new main branch clears the
+    // pin AND the status — a lifecycle-resolution action. It ran unguarded,
+    // so an older pass could settle afterwards and restore the rejection
+    // the user just accepted. Serialize the mutation with `finish`'s
+    // freshness check and bump the generation. The generation key uses the
+    // recorded local path (not `repo_root`): this command is DB-only and
+    // must not start failing on a repo without a git checkout.
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let key_root = PathBuf::from(repo.local_path.clone().unwrap_or_default());
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
     let mut v = ss::read_shared_import(db, repo_id);
     v.pinned_dev_branch = None;
     ss::write_shared_import(db, repo_id, &v)?;
     db.set_shared_status(repo_id, None)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    bump_lifecycle_generation(repo_id, &key_root);
+    Ok(())
 }
 
 /// The "merge" button: merge `origin/<current branch>` into the current branch
@@ -4248,7 +4293,14 @@ pub fn merge_shared_upstream(
         MergeOutcome::Merged => {
             let st = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
             if st.shared_status.as_deref() == Some(SharedStatus::NeedsManualMerge.as_str()) {
+                // T-000243 review (sixth pass): resolving the status is a
+                // lifecycle action — serialize with `finish`'s freshness
+                // check and bump the generation, or an older pass's notes
+                // would restore the `needs_manual_merge` just cleared.
+                let guard = specs_policy_guard(repo_id);
+                let _guard = guard.lock().unwrap();
                 let _ = db.set_shared_status(repo_id, None);
+                bump_lifecycle_generation(repo_id, &root);
             }
             SharedMergeResult {
                 outcome: "merged".into(),
@@ -5611,6 +5663,102 @@ mod tests {
                 .shared_status,
             None,
             "the disabled repo's status belongs to the disable, not the stale pass"
+        );
+    }
+
+    /// T-000243 review (sixth pass): a FAILED disable followed by a
+    /// re-enable is a lifecycle ROUND TRIP — the state fields end where
+    /// they started, which a state snapshot cannot see. The generation
+    /// can: the pass sealed before the disable must not settle over the
+    /// `push_failed` the disable left behind.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_disable_reenable_round_trip_still_makes_the_pass_stale() {
+        let fx = two_installs();
+        fx.enable_main();
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        // The disable cannot push: it flips the state AND leaves push_failed.
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+        let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!res.pushed, "{:?}", res);
+        assert_eq!(fx.main_status().as_deref(), Some("push_failed"));
+        // Sharing is switched back on before the stale pass finishes: mode
+        // and role return to exactly what the pass was created under.
+        enable_shared_mode(&fx.main_db, &gb(), fx.main_repo, false).unwrap();
+        fs::remove_file(&hook).unwrap();
+        let _out = shared.finish(&fx.main_db, Some(&gb()));
+        assert_eq!(
+            fx.main_status().as_deref(),
+            Some("push_failed"),
+            "the round-tripped lifecycle must still count as moved"
+        );
+    }
+
+    /// T-000243 review (sixth pass): a successful disable retry clears the
+    /// `disabling` marker and the status; an OLDER retry pass that failed
+    /// before the clear must not settle its obsolete `push_failed` back.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_successful_retry_supersedes_an_older_retry_failure() {
+        let fx = two_installs();
+        fx.enable_main();
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+        let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!res.pushed, "{:?}", res);
+        // Pass A: phase A only — its retry of the pending deletion fails
+        // again while the hook still blocks pushes.
+        let shared_a = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        // A second sync's retry succeeds before pass A finishes.
+        fs::remove_file(&hook).unwrap();
+        fx.sync_main();
+        assert_eq!(fx.main_status(), None);
+        // Pass A resumes: its PushFailed note is obsolete — the deletion
+        // already reached origin and the marker is gone.
+        let _out = shared_a.finish(&fx.main_db, Some(&gb()));
+        assert_eq!(
+            fx.main_status(),
+            None,
+            "the superseded retry failure must not be restored"
+        );
+    }
+
+    /// T-000243 review (sixth pass): `accept_new_main_branch` resolves the
+    /// status between phase A and `finish` — the generation bump makes the
+    /// older refused pass stale, so it cannot restore the rejection the
+    /// user just accepted.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_accepted_main_branch_is_not_restored_by_a_stale_pass() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The owner moves the dev branch: the helper's pin now refuses it.
+        let structure = fs::read_to_string(fx.main_dir.join(".sdh/project.json")).unwrap();
+        let moved = structure.replace("\"dev_branch\": \"dev\"", "\"dev_branch\": \"next\"");
+        assert_ne!(moved, structure, "the fixture structure must carry the pin");
+        write(&fx.main_dir, ".sdh/project.json", &moved);
+        g(&fx.main_dir, &["add", ".sdh"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "move dev branch"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        // The first sync settles the untrusted status; a second phase A
+        // captures the same refusal in a fresh pass.
+        fx.sync_helper();
+        assert_eq!(fx.helper_status().as_deref(), Some("shared_untrusted"));
+        let project = fx
+            .helper_db
+            .list_all_repos()
+            .unwrap()
+            .into_iter()
+            .find_map(|r| r.project_id);
+        let shared = run_phase_a(&fx.helper_db, Some(&gb()), project);
+        // The user accepts the new branch: pin and status are cleared.
+        accept_new_main_branch(&fx.helper_db, fx.helper_repo).unwrap();
+        assert_eq!(fx.helper_status(), None);
+        // The stale pass must not settle the refusal back.
+        let _out = shared.finish(&fx.helper_db, Some(&gb()));
+        assert_eq!(
+            fx.helper_status(),
+            None,
+            "the accepted branch must not be refused again by a stale pass"
         );
     }
 
