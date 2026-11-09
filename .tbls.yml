@@ -142,6 +142,77 @@ comments:
         closes only once every side still in the portfolio with a local path has
         been read again; ids, unlike labels, survive a rename.
 
+  - table: rule_proposals
+    tableComment: >-
+      v36 (T-000241) — contributor mode: this install's own rule proposals, one
+      row per proposal file `<rule>.<login>.json` under `.sdh/rule-proposals/`
+      on the shared dev branch. The row is the local mirror of the wire file
+      (seq/status/text) plus two purely local overlays: `local_state` (whether
+      the proposal text reached the local canon yet) and `resolved_*` (the
+      owner receipt this version got — never serialized back onto the wire).
+    columnComments:
+      file_name: '`<rule>.<login>.json`; PK part — one file, one row.'
+      login: GitHub login of the proposing install; equals this install's own.
+      seq: >-
+        Wire sequence of this version; a higher seq is the newer version, and a
+        re-proposal continues numbering through `rule_proposal_seq`.
+      status: 'Wire status: open | withdrawn.'
+      local_state: >-
+        pending_apply | applied — whether this version's text was written to the
+        local canon. `pending_apply` survives a crash; the next sweep finishes it.
+      text: The proposed rule text, exactly as the wire file carries it.
+      resolved_action: >-
+        The receipt's action matching this version (accept | reject); NULL while
+        the proposal awaits the owner.
+      resolved_rev: The proposal blob sha the receipt was taken against (CAS).
+      remote_ver: >-
+        `{seq,status,sha}` of the last origin-confirmed remote version — the
+        dominance check the terminal-row GC requires before deleting.
+      at: RFC 3339 UTC timestamp carried by the wire file.
+      updated_at: RFC 3339 UTC of the last local row update.
+
+  - table: rule_proposal_seq
+    tableComment: >-
+      v36 (T-000241) — seq high-water mark per proposal file. Kept apart from
+      `rule_proposals` so the GC can delete a terminal row without letting a
+      later re-proposal reuse a seq the remote already saw.
+    columnComments:
+      file_name: '`<rule>.<login>.json` — matches `rule_proposals.file_name`.'
+      max_seq: Highest seq ever issued for this file on this install.
+
+  - table: rule_acceptances
+    tableComment: >-
+      v36 (T-000241) — the owner's decisions on contributor proposals: one
+      immutable row per receipt `.sdh/rule-decisions/<rule>.<login>.<rev>.json`.
+      Two independent tracks: `status` is the local work pipeline
+      (prepared -> decided -> applied -> rendered, plus stable side states
+      conflicted / expired / superseded) and `pub_state` is the receipt's own
+      journey to origin (pending / blocked / published / overtaken), which never
+      rolls `status` back. `proposal_text` is the validated snapshot the canon
+      is applied FROM — the mutable proposal file is never re-read for it.
+    columnComments:
+      proposer_login: GitHub login on the proposal file name.
+      decided_rev: >-
+        Full blob sha of the open proposal version decided on — the CAS token
+        of the decision; part of the PK and of the receipt file name.
+      action: 'accept | reject.'
+      receipt_json: >-
+        The exact canonical JSON published to `.sdh/rule-decisions/`; written
+        once at `prepared` and never regenerated, so a receipt is immutable.
+      proposal_text: Validated snapshot of the decided proposal version's text.
+      status: >-
+        prepared | decided | applied | rendered | conflicted | expired |
+        superseded — the local pipeline; `conflicted` waits for the explicit UI
+        resolution (apply / dismiss).
+      pub_state: >-
+        pending | blocked | published | overtaken — the receipt's publication
+        life; `published` is set only from the origin-tracking ref, never from
+        the local push.
+      base_canon_hash: >-
+        sha256 of the rule's canon text at `prepared` — the divergence check an
+        apply runs against (`conflicted` when the canon moved meanwhile).
+      canon_hash: sha256 of the canon text actually applied; NULL until applied.
+
   - table: project_renames
     tableComment: >-
       Project-level twin of repo_renames (v24). Needed because

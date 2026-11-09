@@ -159,7 +159,11 @@
     if (syncing || syncBlocked) return;
     syncing = true;
     try {
-      if (await syncRulesFromApp()) await reload();
+      if (await syncRulesFromApp()) {
+        // The proposals listing lives off the shared repos' state — re-read too.
+        conflictGeneration++;
+        await reload();
+      }
     } finally {
       syncing = false;
     }
@@ -238,6 +242,7 @@
               onSave={save}
               onReset={reset}
               onResolve={resolve}
+              onChanged={() => reload(true)}
             />
           {/key}
         {/if}

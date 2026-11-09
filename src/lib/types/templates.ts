@@ -90,3 +90,60 @@ export interface TemplateLanguage {
   display_name: string;
   file_count: number;
 }
+
+/** T-000241: one wire proposal as the repo's listing shows it — the owner's
+ *  read comes off the local dev tip, the contributor's off its own rows.
+ *  Mirrors `RuleProposalView` in `models/rule_proposals.rs`. */
+export interface RuleProposalView {
+  /** `<rule>.<login>.json`. */
+  file_name: string;
+  rule: string;
+  login: string;
+  seq: number;
+  /** Wire status: `open` | `withdrawn`. */
+  status: string;
+  /** The proposed rule text. */
+  text: string;
+  /** RFC 3339 timestamp of this version. */
+  at: string;
+  /** Blob sha of THIS version — the CAS token a decision is taken against. */
+  rev: string | null;
+  /** The local dev tip carries this exact version. */
+  on_dev: boolean;
+  /** The last-seen origin snapshot carries this exact version. */
+  on_origin: boolean;
+  /** Contributor only: `pending_apply` | `applied` — the local canon write. */
+  local_state: string | null;
+  /** Resolution overlay: the receipt matching THIS version, if any. */
+  resolved_action: string | null;
+  resolved_by: string | null;
+  resolved_at: string | null;
+  /** Owner only: the in-flight acceptance for this version — a decision
+   *  already taken whose receipt still owes dev. */
+  acceptance_status: string | null;
+  acceptance_pub_state: string | null;
+  acceptance_action: string | null;
+}
+
+/** T-000241: one immutable owner decision plus its local work pipeline and
+ *  publication state. Mirrors `RuleAcceptance` in `models/rule_proposals.rs`. */
+export interface RuleAcceptance {
+  repo_id: number;
+  rule: string;
+  proposer_login: string;
+  /** Full blob sha of the open proposal version decided on. */
+  decided_rev: string;
+  /** `accept` | `reject`. */
+  action: string;
+  receipt_json: string;
+  /** The proposal text the receipt was taken against — immutable snapshot. */
+  proposal_text: string;
+  /** prepared | decided | applied | rendered | conflicted | expired | superseded. */
+  status: string;
+  /** pending | blocked | published | overtaken. */
+  pub_state: string;
+  base_canon_hash: string;
+  canon_hash: string | null;
+  created_at: string;
+  updated_at: string;
+}

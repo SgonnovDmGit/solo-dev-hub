@@ -1954,6 +1954,512 @@
       "def": "CREATE TABLE peer_links (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             repo_a_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             repo_b_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             created_at TEXT NOT NULL,\n             CHECK (repo_a_id \u003c\u003e repo_b_id),\n             CHECK (repo_a_id \u003c repo_b_id),\n             UNIQUE (repo_a_id, repo_b_id)\n         )"
     },
     {
+      "name": "rule_conflicts",
+      "type": "table",
+      "comment": "v33 (T-000206) — one row per rule whose hand-backs currently conflict (two repos handed back different texts). Lets a repeated pass tell a conflict it already reported from a new one instead of raising the same error on every sync. The conflicting texts are not stored: they stay in the repo copies.",
+      "columns": [
+        {
+          "name": "rule",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "Skill name; the primary key, so a rule has at most one open conflict."
+        },
+        {
+          "name": "opened_at",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "RFC 3339 UTC, when the conflict was first seen."
+        },
+        {
+          "name": "repo_ids",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "JSON array of repositories.id, sorted: the sides of the conflict. Only grows while the conflict is open (a repo joining is added). The conflict closes only once every side still in the portfolio with a local path has been read again; ids, unlike labels, survive a rename."
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_rule_conflicts_1",
+          "def": "PRIMARY KEY (rule)",
+          "table": "rule_conflicts",
+          "columns": [
+            "rule"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "rule",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (rule)",
+          "table": "rule_conflicts",
+          "columns": [
+            "rule"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_rule_conflicts_1",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (rule)",
+          "table": "rule_conflicts",
+          "columns": [
+            "rule"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE rule_conflicts (\n             rule TEXT PRIMARY KEY,\n             opened_at TEXT NOT NULL,\n             repo_ids TEXT NOT NULL\n         )"
+    },
+    {
+      "name": "rule_proposals",
+      "type": "table",
+      "comment": "v36 (T-000241) — contributor mode: this install's own rule proposals, one row per proposal file `\u003crule\u003e.\u003clogin\u003e.json` under `.sdh/rule-proposals/` on the shared dev branch. The row is the local mirror of the wire file (seq/status/text) plus two purely local overlays: `local_state` (whether the proposal text reached the local canon yet) and `resolved_*` (the owner receipt this version got — never serialized back onto the wire).",
+      "columns": [
+        {
+          "name": "repo_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "file_name",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "`\u003crule\u003e.\u003clogin\u003e.json`; PK part — one file, one row."
+        },
+        {
+          "name": "login",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "GitHub login of the proposing install; equals this install's own."
+        },
+        {
+          "name": "rule",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "seq",
+          "type": "INTEGER",
+          "nullable": false,
+          "comment": "Wire sequence of this version; a higher seq is the newer version, and a re-proposal continues numbering through `rule_proposal_seq`."
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "Wire status: open | withdrawn."
+        },
+        {
+          "name": "local_state",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "pending_apply | applied — whether this version's text was written to the local canon. `pending_apply` survives a crash; the next sweep finishes it."
+        },
+        {
+          "name": "text",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "The proposed rule text, exactly as the wire file carries it."
+        },
+        {
+          "name": "at",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "RFC 3339 UTC timestamp carried by the wire file."
+        },
+        {
+          "name": "resolved_action",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "The receipt's action matching this version (accept | reject); NULL while the proposal awaits the owner."
+        },
+        {
+          "name": "resolved_by",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "resolved_at",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "resolved_rev",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "The proposal blob sha the receipt was taken against (CAS)."
+        },
+        {
+          "name": "remote_ver",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "`{seq,status,sha}` of the last origin-confirmed remote version — the dominance check the terminal-row GC requires before deleting."
+        },
+        {
+          "name": "updated_at",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "RFC 3339 UTC of the last local row update."
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_rule_proposals_repo",
+          "def": "CREATE INDEX idx_rule_proposals_repo ON rule_proposals(repo_id, rule)",
+          "table": "rule_proposals",
+          "columns": [
+            "repo_id",
+            "rule"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_rule_proposals_1",
+          "def": "PRIMARY KEY (repo_id, file_name)",
+          "table": "rule_proposals",
+          "columns": [
+            "repo_id",
+            "file_name"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "repo_id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (repo_id)",
+          "table": "rule_proposals",
+          "columns": [
+            "repo_id"
+          ]
+        },
+        {
+          "name": "file_name",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (file_name)",
+          "table": "rule_proposals",
+          "columns": [
+            "file_name"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "rule_proposals",
+          "referenced_table": "repositories",
+          "columns": [
+            "repo_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_rule_proposals_1",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (repo_id, file_name)",
+          "table": "rule_proposals",
+          "columns": [
+            "repo_id",
+            "file_name"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK (status IN ('open','withdrawn'))",
+          "table": "rule_proposals",
+          "columns": [
+            "status",
+            "at"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK (local_state IN ('pending_apply','applied'))",
+          "table": "rule_proposals",
+          "columns": [
+            "local_state",
+            "at"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE rule_proposals (\n             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             file_name TEXT NOT NULL,\n             login TEXT NOT NULL,\n             rule TEXT NOT NULL,\n             seq INTEGER NOT NULL,\n             status TEXT NOT NULL CHECK (status IN ('open','withdrawn')),\n             local_state TEXT NOT NULL CHECK (local_state IN ('pending_apply','applied')),\n             text TEXT NOT NULL,\n             at TEXT NOT NULL,\n             resolved_action TEXT,\n             resolved_by TEXT,\n             resolved_at TEXT,\n             resolved_rev TEXT,\n             remote_ver TEXT,\n             updated_at TEXT NOT NULL,\n             PRIMARY KEY (repo_id, file_name)\n         )"
+    },
+    {
+      "name": "rule_proposal_seq",
+      "type": "table",
+      "comment": "v36 (T-000241) — seq high-water mark per proposal file. Kept apart from `rule_proposals` so the GC can delete a terminal row without letting a later re-proposal reuse a seq the remote already saw.",
+      "columns": [
+        {
+          "name": "repo_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "file_name",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "`\u003crule\u003e.\u003clogin\u003e.json` — matches `rule_proposals.file_name`."
+        },
+        {
+          "name": "max_seq",
+          "type": "INTEGER",
+          "nullable": false,
+          "comment": "Highest seq ever issued for this file on this install."
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_rule_proposal_seq_1",
+          "def": "PRIMARY KEY (repo_id, file_name)",
+          "table": "rule_proposal_seq",
+          "columns": [
+            "repo_id",
+            "file_name"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "repo_id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (repo_id)",
+          "table": "rule_proposal_seq",
+          "columns": [
+            "repo_id"
+          ]
+        },
+        {
+          "name": "file_name",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (file_name)",
+          "table": "rule_proposal_seq",
+          "columns": [
+            "file_name"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "rule_proposal_seq",
+          "referenced_table": "repositories",
+          "columns": [
+            "repo_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_rule_proposal_seq_1",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (repo_id, file_name)",
+          "table": "rule_proposal_seq",
+          "columns": [
+            "repo_id",
+            "file_name"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE rule_proposal_seq (\n             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             file_name TEXT NOT NULL,\n             max_seq INTEGER NOT NULL,\n             PRIMARY KEY (repo_id, file_name)\n         )"
+    },
+    {
+      "name": "rule_acceptances",
+      "type": "table",
+      "comment": "v36 (T-000241) — the owner's decisions on contributor proposals: one immutable row per receipt `.sdh/rule-decisions/\u003crule\u003e.\u003clogin\u003e.\u003crev\u003e.json`. Two independent tracks: `status` is the local work pipeline (prepared -\u003e decided -\u003e applied -\u003e rendered, plus stable side states conflicted / expired / superseded) and `pub_state` is the receipt's own journey to origin (pending / blocked / published / overtaken), which never rolls `status` back. `proposal_text` is the validated snapshot the canon is applied FROM — the mutable proposal file is never re-read for it.",
+      "columns": [
+        {
+          "name": "repo_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "rule",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "proposer_login",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "GitHub login on the proposal file name."
+        },
+        {
+          "name": "decided_rev",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "Full blob sha of the open proposal version decided on — the CAS token of the decision; part of the PK and of the receipt file name."
+        },
+        {
+          "name": "action",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "accept | reject."
+        },
+        {
+          "name": "receipt_json",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "The exact canonical JSON published to `.sdh/rule-decisions/`; written once at `prepared` and never regenerated, so a receipt is immutable."
+        },
+        {
+          "name": "proposal_text",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "Validated snapshot of the decided proposal version's text."
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "prepared | decided | applied | rendered | conflicted | expired | superseded — the local pipeline; `conflicted` waits for the explicit UI resolution (apply / dismiss)."
+        },
+        {
+          "name": "pub_state",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "pending | blocked | published | overtaken — the receipt's publication life; `published` is set only from the origin-tracking ref, never from the local push."
+        },
+        {
+          "name": "base_canon_hash",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "sha256 of the rule's canon text at `prepared` — the divergence check an apply runs against (`conflicted` when the canon moved meanwhile)."
+        },
+        {
+          "name": "canon_hash",
+          "type": "TEXT",
+          "nullable": true,
+          "comment": "sha256 of the canon text actually applied; NULL until applied."
+        },
+        {
+          "name": "created_at",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "TEXT",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_rule_acceptances_repo",
+          "def": "CREATE INDEX idx_rule_acceptances_repo ON rule_acceptances(repo_id, rule)",
+          "table": "rule_acceptances",
+          "columns": [
+            "repo_id",
+            "rule"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_rule_acceptances_1",
+          "def": "PRIMARY KEY (repo_id, rule, proposer_login, decided_rev)",
+          "table": "rule_acceptances",
+          "columns": [
+            "repo_id",
+            "rule",
+            "proposer_login",
+            "decided_rev"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "repo_id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (repo_id)",
+          "table": "rule_acceptances",
+          "columns": [
+            "repo_id"
+          ]
+        },
+        {
+          "name": "rule",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (rule)",
+          "table": "rule_acceptances",
+          "columns": [
+            "rule"
+          ]
+        },
+        {
+          "name": "proposer_login",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (proposer_login)",
+          "table": "rule_acceptances",
+          "columns": [
+            "proposer_login"
+          ]
+        },
+        {
+          "name": "decided_rev",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (decided_rev)",
+          "table": "rule_acceptances",
+          "columns": [
+            "decided_rev"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "rule_acceptances",
+          "referenced_table": "repositories",
+          "columns": [
+            "repo_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_rule_acceptances_1",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (repo_id, rule, proposer_login, decided_rev)",
+          "table": "rule_acceptances",
+          "columns": [
+            "repo_id",
+            "rule",
+            "proposer_login",
+            "decided_rev"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK (action IN ('accept','reject'))",
+          "table": "rule_acceptances",
+          "columns": [
+            "action"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK (status IN ('prepared','decided','applied','rendered','conflicted','expired','superseded'))",
+          "table": "rule_acceptances",
+          "columns": [
+            "status"
+          ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK (pub_state IN ('pending','blocked','published','overtaken'))",
+          "table": "rule_acceptances",
+          "columns": [
+            "pub_state"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE rule_acceptances (\n             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             rule TEXT NOT NULL,\n             proposer_login TEXT NOT NULL,\n             decided_rev TEXT NOT NULL,\n             action TEXT NOT NULL CHECK (action IN ('accept','reject')),\n             receipt_json TEXT NOT NULL,\n             proposal_text TEXT NOT NULL,\n             status TEXT NOT NULL CHECK (status IN ('prepared','decided','applied','rendered','conflicted','expired','superseded')),\n             pub_state TEXT NOT NULL CHECK (pub_state IN ('pending','blocked','published','overtaken')),\n             base_canon_hash TEXT NOT NULL,\n             canon_hash TEXT,\n             created_at TEXT NOT NULL,\n             updated_at TEXT NOT NULL,\n             PRIMARY KEY (repo_id, rule, proposer_login, decided_rev)\n         )"
+    },
+    {
       "name": "rule_events",
       "type": "table",
       "comment": "v33 (T-000174) — append-only history of the workflow rules: the sdh-* skills and the global CLAUDE.md section. Answers where a rule's current text came from, which until v1.19.0 lived only in a toast. Keyed by the rule name, not a templates row, so a re-seed never orphans the history.",
@@ -2018,70 +2524,14 @@
         {
           "name": "-",
           "type": "CHECK",
-          "def": "CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved'))",
+          "def": "CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved','proposed','proposal_accepted','proposal_rejected','proposal_withdrawn'))",
           "table": "rule_events",
           "columns": [
             "kind"
           ]
         }
       ],
-      "def": "CREATE TABLE rule_events (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             rule TEXT NOT NULL,\n             kind TEXT NOT NULL CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved')),\n             repo TEXT,\n             note TEXT,\n             created_at TEXT NOT NULL\n         )"
-    },
-    {
-      "name": "rule_conflicts",
-      "type": "table",
-      "comment": "v33 (T-000206) — one row per rule whose hand-backs currently conflict (two repos handed back different texts). Lets a repeated pass tell a conflict it already reported from a new one instead of raising the same error on every sync. The conflicting texts are not stored: they stay in the repo copies.",
-      "columns": [
-        {
-          "name": "rule",
-          "type": "TEXT",
-          "nullable": true,
-          "comment": "Skill name; the primary key, so a rule has at most one open conflict."
-        },
-        {
-          "name": "opened_at",
-          "type": "TEXT",
-          "nullable": false,
-          "comment": "RFC 3339 UTC, when the conflict was first seen."
-        },
-        {
-          "name": "repo_ids",
-          "type": "TEXT",
-          "nullable": false,
-          "comment": "JSON array of repositories.id, sorted: the sides of the conflict. Only grows while the conflict is open (a repo joining is added). The conflict closes only once every side still in the portfolio with a local path has been read again; ids, unlike labels, survive a rename."
-        }
-      ],
-      "indexes": [
-        {
-          "name": "sqlite_autoindex_rule_conflicts_1",
-          "def": "PRIMARY KEY (rule)",
-          "table": "rule_conflicts",
-          "columns": [
-            "rule"
-          ]
-        }
-      ],
-      "constraints": [
-        {
-          "name": "rule",
-          "type": "PRIMARY KEY",
-          "def": "PRIMARY KEY (rule)",
-          "table": "rule_conflicts",
-          "columns": [
-            "rule"
-          ]
-        },
-        {
-          "name": "sqlite_autoindex_rule_conflicts_1",
-          "type": "PRIMARY KEY",
-          "def": "PRIMARY KEY (rule)",
-          "table": "rule_conflicts",
-          "columns": [
-            "rule"
-          ]
-        }
-      ],
-      "def": "CREATE TABLE rule_conflicts (\n             rule TEXT PRIMARY KEY,\n             opened_at TEXT NOT NULL,\n             repo_ids TEXT NOT NULL\n         )"
+      "def": "CREATE TABLE \"rule_events\" (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             rule TEXT NOT NULL,\n             kind TEXT NOT NULL CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved','proposed','proposal_accepted','proposal_rejected','proposal_withdrawn')),\n             repo TEXT,\n             note TEXT,\n             created_at TEXT NOT NULL\n         )"
     }
   ],
   "relations": [
@@ -2318,6 +2768,45 @@
       ],
       "parent_cardinality": "exactly_one",
       "def": "FOREIGN KEY (repo_a_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "rule_proposals",
+      "columns": [
+        "repo_id"
+      ],
+      "cardinality": "zero_or_one",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "rule_proposal_seq",
+      "columns": [
+        "repo_id"
+      ],
+      "cardinality": "zero_or_one",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "rule_acceptances",
+      "columns": [
+        "repo_id"
+      ],
+      "cardinality": "zero_or_one",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
     }
   ],
   "driver": {

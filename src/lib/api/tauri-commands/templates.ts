@@ -7,6 +7,8 @@ import type {
   RulesOverview,
   RuleEvent,
   RuleConflictSide,
+  RuleProposalView,
+  RuleAcceptance,
 } from '$lib/types';
 
 
@@ -59,4 +61,54 @@ export async function getRuleConflict(rule: string): Promise<RuleConflictSide[]>
  *  `rule_conflict_side_gone` (that side no longer exists). */
 export async function resolveRuleConflict(rule: string, accept: string | null): Promise<TemplateSaveOutcome> {
   return invoke<TemplateSaveOutcome>('resolve_rule_conflict', { rule, accept });
+}
+
+// ── Rule proposals (T-000241, contributor mode) ─────────────────────────────
+
+/** Proposals of one shared repo — the owner's read comes off the local dev
+ *  tip, the contributor's off its own rows; the sweeps ran first. */
+export async function listRuleProposals(repoId: number): Promise<RuleProposalView[]> {
+  return invoke<RuleProposalView[]>('list_rule_proposals', { repoId });
+}
+
+/** Owner: the decision pipeline rows for the repo. */
+export async function listRuleAcceptances(repoId: number): Promise<RuleAcceptance[]> {
+  return invoke<RuleAcceptance[]>('list_rule_acceptances', { repoId });
+}
+
+/** Owner decision on an open proposal version. `expectedRev` is the blob sha
+ *  of the version seen — the CAS of the decision; `action` = accept | reject. */
+export async function decideRuleProposal(
+  repoId: number,
+  rule: string,
+  proposerLogin: string,
+  expectedRev: string,
+  action: 'accept' | 'reject',
+): Promise<RuleAcceptance> {
+  return invoke<RuleAcceptance>('decide_rule_proposal', { repoId, rule, proposerLogin, expectedRev, action });
+}
+
+/** Contributor: withdraw an own open proposal — uploads on the next pass. */
+export async function withdrawRuleProposal(repoId: number, fileName: string): Promise<void> {
+  return invoke<void>('withdraw_rule_proposal', { repoId, fileName });
+}
+
+/** The explicit action a `conflicted` acceptance waits for:
+ *  `apply` forces the proposal snapshot over the diverged canon, `dismiss`
+ *  leaves the local application (`superseded`) while the receipt keeps
+ *  publishing. */
+export async function resolveRuleAcceptanceConflict(
+  repoId: number,
+  rule: string,
+  proposerLogin: string,
+  decidedRev: string,
+  resolution: 'apply' | 'dismiss',
+): Promise<RuleAcceptance> {
+  return invoke<RuleAcceptance>('resolve_rule_acceptance_conflict', {
+    repoId,
+    rule,
+    proposerLogin,
+    decidedRev,
+    resolution,
+  });
 }
