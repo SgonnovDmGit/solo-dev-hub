@@ -218,48 +218,156 @@ pub(crate) fn rules_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-// T-000243 review (twentieth pass): a rendezvous for the phase-2 repo
-// render's policy-guard boundary. The probe fires AFTER the fresh
-// revalidation inputs are ready but BEFORE the guard is taken, so a test
-// can land a repath or a role change in exactly the window the review
-// found — the render must then revalidate and skip, not write into the
-// stale binding. Matched by repo id; fires once.
+// T-000243 review (twentieth/twenty-first passes): rendezvous probes for
+// the phase-2 repo render. `REPO_RENDER_PROBES` fires BEFORE the repo's
+// policy guard is taken — a test can land a repath or a role change in
+// exactly the window the review found, and the render must revalidate
+// and skip. `REPO_RENDER_RECHECK_PROBES` fires AFTER the recheck passed,
+// still inside the guard hold — a test can prove the guard is held
+// through the write. Both are keyed by (repo id, checkout path): the
+// path separates parallel tests' independent databases, whose first
+// repo ids collide (same isolation `shared.rs`' probes use).
 #[cfg(test)]
 struct RepoRenderProbe {
     entered: std::sync::mpsc::Sender<i64>,
-    release: std::sync::mpsc::Receiver<i64>,
+    /// Taken on the first fire — the rendezvous happens once.
+    release: Option<std::sync::mpsc::Receiver<i64>>,
+    /// Fires when the acquisition observed the guard busy — proof the
+    /// render serialized on a live holder rather than slipping past.
+    contended: std::sync::mpsc::Sender<i64>,
 }
 
 #[cfg(test)]
-static REPO_RENDER_PROBES: std::sync::OnceLock<
-    Mutex<std::collections::HashMap<i64, RepoRenderProbe>>,
-> = std::sync::OnceLock::new();
+type ProbeMap = Mutex<std::collections::HashMap<(i64, PathBuf), RepoRenderProbe>>;
+
+#[cfg(test)]
+static REPO_RENDER_PROBES: std::sync::OnceLock<ProbeMap> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static REPO_RENDER_RECHECK_PROBES: std::sync::OnceLock<ProbeMap> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 fn install_repo_render_probe(
     repo_id: i64,
+    base: &Path,
     entered: std::sync::mpsc::Sender<i64>,
     release: std::sync::mpsc::Receiver<i64>,
+    contended: std::sync::mpsc::Sender<i64>,
 ) {
     let cell = REPO_RENDER_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    cell.lock()
-        .unwrap()
-        .insert(repo_id, RepoRenderProbe { entered, release });
+    cell.lock().unwrap().insert(
+        (repo_id, base.to_path_buf()),
+        RepoRenderProbe {
+            entered,
+            release: Some(release),
+            contended,
+        },
+    );
 }
 
 #[cfg(test)]
-fn repo_render_probe(repo_id: i64) {
+fn install_repo_render_recheck_probe(
+    repo_id: i64,
+    base: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell =
+        REPO_RENDER_RECHECK_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo_id, base.to_path_buf()),
+        RepoRenderProbe {
+            // Unused on this boundary — a dead channel is fine.
+            contended: entered.clone(),
+            entered,
+            release: Some(release),
+        },
+    );
+}
+
+/// The pre-lock rendezvous: signals `entered`, then waits for `release`.
+/// The probe entry stays in the map — `contended` may still need it —
+/// but `release` is taken, so a second pass over the same key does not
+/// rendezvous again. If the test dies, the dropped sender ends the wait
+/// with an error and the render proceeds.
+#[cfg(test)]
+fn repo_render_probe(repo_id: i64, base: &Path) {
+    let key = (repo_id, base.to_path_buf());
     let cell = REPO_RENDER_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let probe = {
+    let rx = {
         let mut g = cell.lock().unwrap();
-        g.remove(&repo_id)
+        g.get_mut(&key).and_then(|p| {
+            p.release.take().map(|rx| {
+                let _ = p.entered.send(repo_id);
+                rx
+            })
+        })
     };
-    if let Some(p) = probe {
-        let _ = p.entered.send(repo_id);
+    if let Some(rx) = rx {
         // The render has NOT taken the policy guard yet — whatever the
-        // test interleaves here lands before the freshness recheck. If
-        // the test dies, the dropped sender ends the wait with an error.
-        let _ = p.release.recv();
+        // test interleaves here lands before the freshness recheck.
+        let _ = rx.recv();
+    }
+}
+
+/// The post-recheck rendezvous: the recheck passed and the policy guard
+/// is still held. Same once-only contract as `repo_render_probe`.
+#[cfg(test)]
+fn repo_render_recheck_probe(repo_id: i64, base: &Path) {
+    let key = (repo_id, base.to_path_buf());
+    let cell =
+        REPO_RENDER_RECHECK_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let rx = {
+        let mut g = cell.lock().unwrap();
+        g.get_mut(&key).and_then(|p| {
+            p.release.take().map(|rx| {
+                let _ = p.entered.send(repo_id);
+                rx
+            })
+        })
+    };
+    if let Some(rx) = rx {
+        let _ = rx.recv();
+    }
+}
+
+/// Report a contended acquisition, if a probe is installed for the key.
+#[cfg(test)]
+fn repo_render_contended(repo_id: i64, base: &Path) {
+    let cell = REPO_RENDER_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let g = cell.lock().unwrap();
+    if let Some(p) = g.get(&(repo_id, base.to_path_buf())) {
+        let _ = p.contended.send(repo_id);
+    }
+}
+
+/// The phase-2 policy-guard acquisition. Production: a plain blocking
+/// lock. Under `cfg(test)` the pre-lock rendezvous fires first, then a
+/// `try_lock` that observes the guard busy reports `contended` before
+/// the blocking wait — proof the render serialized on a live holder.
+#[cfg(not(test))]
+fn lock_repo_policy<'a>(
+    arc: &'a Mutex<()>,
+    _repo_id: i64,
+    _base: &Path,
+) -> std::sync::MutexGuard<'a, ()> {
+    arc.lock().unwrap()
+}
+
+#[cfg(test)]
+fn lock_repo_policy<'a>(
+    arc: &'a Mutex<()>,
+    repo_id: i64,
+    base: &Path,
+) -> std::sync::MutexGuard<'a, ()> {
+    repo_render_probe(repo_id, base);
+    match arc.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            repo_render_contended(repo_id, base);
+            arc.lock().unwrap()
+        }
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
     }
 }
 
@@ -1422,11 +1530,7 @@ pub fn render_pending_repo_skills(db: &AppDb, report: &mut RulesRefresh) {
                 continue;
             };
             let guard = crate::sync::shared::specs_policy_guard(repo.id);
-            // Test rendezvous: fires before the guard is taken, so a test
-            // can land a lifecycle change in exactly this window.
-            #[cfg(test)]
-            repo_render_probe(repo.id);
-            let _g = guard.lock().unwrap();
+            let _g = lock_repo_policy(&guard, repo.id, base);
             let current = db.get_repository(repo.id).ok().is_some_and(|fresh| {
                 fresh.local_path.as_deref().map(Path::new)
                     == repo.local_path.as_deref().map(Path::new)
@@ -1477,29 +1581,39 @@ pub fn render_pending_repo_skills(db: &AppDb, report: &mut RulesRefresh) {
     // nothing. A repo the everywhere pass already rendered is neither
     // rendered nor counted twice.
     use crate::models::PendingRepoTarget as Target;
-    let (repo_id, base) = match target {
-        Target::Registered { repo_id, path } => (Some(repo_id), path),
-        Target::Unregistered(path) => (None, path),
-        Target::Unknown => return,
-    };
-    if let Some(id) = repo_id {
-        if rendered.contains(&id) {
-            return;
+    match target {
+        Target::Registered { repo_id, path } => {
+            if rendered.contains(&repo_id) {
+                return;
+            }
+            let guard = crate::sync::shared::specs_policy_guard(repo_id);
+            // The guard stays held through the recheck AND the render —
+            // a lifecycle writer cannot interleave between them
+            // (T-000243 review, twenty-first pass).
+            let _g = lock_repo_policy(&guard, repo_id, &path);
+            let current = db.get_repository(repo_id).ok().is_some_and(|fresh| {
+                fresh.local_path.as_deref().map(Path::new) == Some(path.as_path())
+                    && !skips_rule_copies(db, repo_id)
+            });
+            if !current {
+                return;
+            }
+            #[cfg(test)]
+            repo_render_recheck_probe(repo_id, &path);
+            render_fallback_repo(db, report, &path);
         }
-        let guard = crate::sync::shared::specs_policy_guard(id);
-        #[cfg(test)]
-        repo_render_probe(id);
-        let _g = guard.lock().unwrap();
-        let current = db.get_repository(id).ok().is_some_and(|fresh| {
-            fresh.local_path.as_deref().map(Path::new) == Some(base.as_path())
-                && !skips_rule_copies(db, id)
-        });
-        if !current {
-            return;
-        }
+        Target::Unregistered(path) => render_fallback_repo(db, report, &path),
+        Target::Unknown => {}
     }
+}
+
+/// The shared tail of a phase-2 fallback render: rules lock, write,
+/// count, report. The caller holds whatever serialization the target
+/// needs — the policy guard for a registered repo (still alive in the
+/// match arm's scope), nothing extra for an unregistered path.
+fn render_fallback_repo(db: &AppDb, report: &mut RulesRefresh, base: &Path) {
     let _rules = rules_guard();
-    match render_skills_to_repo(db, &base) {
+    match render_skills_to_repo(db, base) {
         Ok(r) => {
             report.repos += 1;
             report
@@ -2852,7 +2966,9 @@ mod tests {
     /// rendezvous sits at the phase-2 policy-guard boundary — the worker
     /// signals it is ABOUT to take the guard, the test lands a lifecycle
     /// change, and the render must revalidate and skip rather than write
-    /// into the stale binding.
+    /// into the stale binding. The channels live INSIDE the scope so a
+    /// panicking interleave drops the release sender and frees the
+    /// worker before the scope joins (twenty-first pass).
     #[test]
     fn a_deferred_render_revalidates_at_the_policy_guard_boundary() {
         let db = db_with_skill();
@@ -2864,11 +2980,11 @@ mod tests {
         assert!(rendered.exists(), "the ordinary repo renders its copies");
         fs::remove_file(&rendered).unwrap();
 
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        install_repo_render_probe(repo.id, entered_tx, release_rx);
-
         std::thread::scope(|s| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (contended_tx, _contended_rx) = std::sync::mpsc::channel();
+            install_repo_render_probe(repo.id, tmp.path(), entered_tx, release_rx, contended_tx);
             let worker = s.spawn(|| {
                 refresh_rules(&db, None, RenderScope::Everywhere, None);
             });
@@ -2890,6 +3006,8 @@ mod tests {
 
     /// Same boundary, opposite outcome: with the lifecycle unchanged the
     /// render proceeds once the guard frees — deferred, never dropped.
+    /// The `contended` signal proves the worker's acquisition actually
+    /// observed the held guard before the test releases it.
     #[test]
     fn a_deferred_render_waits_for_a_held_policy_guard_and_still_delivers() {
         let db = db_with_skill();
@@ -2901,11 +3019,11 @@ mod tests {
         assert!(rendered.exists());
         fs::remove_file(&rendered).unwrap();
 
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        install_repo_render_probe(repo.id, entered_tx, release_rx);
-
         std::thread::scope(|s| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+            install_repo_render_probe(repo.id, tmp.path(), entered_tx, release_rx, contended_tx);
             // A lifecycle writer holds the repo's policy guard — a sync's
             // phase B. The render must WAIT for it, not skip the repo.
             let policy = crate::sync::shared::specs_policy_guard(repo.id);
@@ -2915,9 +3033,10 @@ mod tests {
             });
             entered_rx.recv().unwrap();
             release_tx.send(1).unwrap();
-            // The worker is now blocked on the held guard; the mutex makes
-            // an early write impossible, and the join below proves it
-            // delivers once the guard frees.
+            // The worker's try_lock observed the busy guard — genuine
+            // contention, not an early arrival — and it now waits on the
+            // blocking acquisition.
+            contended_rx.recv().unwrap();
             drop(held);
             worker.join().unwrap();
         });
@@ -2940,11 +3059,11 @@ mod tests {
         assert!(rendered.exists());
         fs::remove_file(&rendered).unwrap();
 
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        install_repo_render_probe(repo.id, entered_tx, release_rx);
-
         std::thread::scope(|s| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (contended_tx, _contended_rx) = std::sync::mpsc::channel();
+            install_repo_render_probe(repo.id, tmp.path(), entered_tx, release_rx, contended_tx);
             let worker = s.spawn(|| {
                 refresh_rules(&db, None, RenderScope::Everywhere, None);
             });
@@ -2970,11 +3089,11 @@ mod tests {
         let repo = repo_with_role(&db, &tmp, "acme/one", None);
         let base = tmp.path().to_path_buf();
 
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        install_repo_render_probe(repo.id, entered_tx, release_rx);
-
         std::thread::scope(|s| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (contended_tx, _contended_rx) = std::sync::mpsc::channel();
+            install_repo_render_probe(repo.id, &base, entered_tx, release_rx, contended_tx);
             let worker = s.spawn(|| {
                 refresh_rules(
                     &db,
@@ -2992,6 +3111,45 @@ mod tests {
             !base.join("docs").exists(),
             "the detached registered target writes nothing — managed or unmanaged"
         );
+    }
+
+    /// T-000243 review (twenty-first pass, major): the registered
+    /// fallback must hold the policy guard through the render itself —
+    /// a lifecycle writer cannot be allowed between the recheck and the
+    /// write. The recheck rendezvous parks the worker inside the hold; a
+    /// `try_lock` from the test proves the guard is still taken at that
+    /// boundary.
+    #[test]
+    fn the_registered_fallback_holds_the_policy_guard_through_the_render() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_role(&db, &tmp, "acme/one", None);
+        let base = tmp.path().to_path_buf();
+        let rendered = base.join("docs/sdh_skills/sdh-alpha.md");
+
+        std::thread::scope(|s| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            install_repo_render_recheck_probe(repo.id, &base, entered_tx, release_rx);
+            let worker = s.spawn(|| {
+                refresh_rules(
+                    &db,
+                    None,
+                    RenderScope::Repo(base.as_path(), Some(repo.id)),
+                    None,
+                );
+            });
+            // Parked post-recheck, inside the guard hold.
+            entered_rx.recv().unwrap();
+            let policy = crate::sync::shared::specs_policy_guard(repo.id);
+            assert!(
+                matches!(policy.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                "the policy guard must still be held at the write boundary"
+            );
+            release_tx.send(1).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(rendered.exists(), "the render completes after release");
     }
 
     /// An unregistered Repo target still renders unmanaged, and an uptake
