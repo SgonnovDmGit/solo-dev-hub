@@ -86,6 +86,7 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
     ),
     (34, "contributor_mode", mig_v34_contributor_mode),
     (35, "share_specs", mig_v35_share_specs),
+    (36, "rule_proposals", mig_v36_rule_proposals),
 ];
 
 impl AppDb {
@@ -1109,6 +1110,94 @@ fn mig_v35_share_specs(conn: &Connection) -> SqlResult<()> {
     conn.execute_batch(
         "ALTER TABLE repositories ADD COLUMN share_specs INTEGER NOT NULL DEFAULT 1;
          PRAGMA user_version = 35;",
+    )
+}
+
+fn mig_v36_rule_proposals(conn: &Connection) -> SqlResult<()> {
+    // T-000241 (v1.23.0): a contributor's `.approved` hand-back no longer dies
+    // against the owner's canon — it becomes a *proposal*, applied locally at
+    // once and carried to the owner, whose accept/reject travels back as an
+    // immutable receipt. The wire side is `.sdh/rule-proposals/` (contributor
+    // writes) and `.sdh/rule-decisions/` (owner writes) on the dev branch;
+    // these tables are each install's local state for them.
+    //
+    // `rule_proposals` — this install's own proposals, one row per proposal
+    // file: the mutable version history (seq, status) plus the receipt
+    // resolution overlay (`resolved_*`, never serialized back onto the wire).
+    // `remote_ver` holds the last origin-confirmed remote version as a
+    // `{seq,status,sha}` tuple for the terminal-row GC.
+    //
+    // `rule_proposal_seq` — the seq high-water mark per proposal file; kept
+    // separately so the GC can drop a terminal row without letting a
+    // re-proposal reuse a seq the remote once saw.
+    //
+    // `rule_acceptances` — the owner's decisions: one immutable row per
+    // receipt. `status` tracks the local work pipeline
+    // (prepared -> decided -> applied -> rendered, plus the stable side
+    // states conflicted / expired / superseded); `pub_state` tracks the
+    // receipt's own journey to origin (pending / blocked / published /
+    // overtaken) and never rolls `status` back. `proposal_text` is the
+    // validated snapshot the canon is applied FROM — the mutable proposal
+    // file is never re-read for it.
+    conn.execute_batch(
+        "CREATE TABLE rule_proposals (
+             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             file_name TEXT NOT NULL,
+             login TEXT NOT NULL,
+             rule TEXT NOT NULL,
+             seq INTEGER NOT NULL,
+             status TEXT NOT NULL CHECK (status IN ('open','withdrawn')),
+             local_state TEXT NOT NULL CHECK (local_state IN ('pending_apply','applied')),
+             text TEXT NOT NULL,
+             at TEXT NOT NULL,
+             resolved_action TEXT,
+             resolved_by TEXT,
+             resolved_at TEXT,
+             resolved_rev TEXT,
+             remote_ver TEXT,
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY (repo_id, file_name)
+         );
+         CREATE TABLE rule_proposal_seq (
+             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             file_name TEXT NOT NULL,
+             max_seq INTEGER NOT NULL,
+             PRIMARY KEY (repo_id, file_name)
+         );
+         CREATE TABLE rule_acceptances (
+             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             rule TEXT NOT NULL,
+             proposer_login TEXT NOT NULL,
+             decided_rev TEXT NOT NULL,
+             action TEXT NOT NULL CHECK (action IN ('accept','reject')),
+             receipt_json TEXT NOT NULL,
+             proposal_text TEXT NOT NULL,
+             status TEXT NOT NULL CHECK (status IN ('prepared','decided','applied','rendered','conflicted','expired','superseded')),
+             pub_state TEXT NOT NULL CHECK (pub_state IN ('pending','blocked','published','overtaken')),
+             base_canon_hash TEXT NOT NULL,
+             canon_hash TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY (repo_id, rule, proposer_login, decided_rev)
+         );
+         CREATE INDEX idx_rule_proposals_repo ON rule_proposals(repo_id, rule);
+         CREATE INDEX idx_rule_acceptances_repo ON rule_acceptances(repo_id, rule);
+         -- The proposal lifecycle adds four kinds to the rule history; the
+         -- CHECK on rule_events.kind from v33 must be widened, which SQLite
+         -- only does by rebuilding the table.
+         CREATE TABLE rule_events_v36 (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule TEXT NOT NULL,
+             kind TEXT NOT NULL CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved','proposed','proposal_accepted','proposal_rejected','proposal_withdrawn')),
+             repo TEXT,
+             note TEXT,
+             created_at TEXT NOT NULL
+         );
+         INSERT INTO rule_events_v36 SELECT * FROM rule_events;
+         DROP TABLE rule_events;
+         ALTER TABLE rule_events_v36 RENAME TO rule_events;
+         CREATE INDEX idx_rule_events_rule ON rule_events(rule, created_at);
+         PRAGMA user_version = 36;",
     )
 }
 

@@ -34,6 +34,19 @@ pub mod rule_event {
     /// conflict went away outside the app — the text did not change. `note`
     /// carries the human wording either way.
     pub const CONFLICT_RESOLVED: &str = "conflict_resolved";
+    /// T-000241: a contributor's approved copy became a proposal to the
+    /// owner. `repo` is the contributor repo, `note` `proposal to main
+    /// <login> repo <id> seq <n>`. The proposal itself wrote no canon.
+    pub const PROPOSED: &str = "proposed";
+    /// T-000241: the owner accepted a contributor's proposal — the proposed
+    /// text IS the canon now, which makes this an origin of the current text
+    /// (see `latest_origin_event`). `note` carries the decided_rev.
+    pub const PROPOSAL_ACCEPTED: &str = "proposal_accepted";
+    /// T-000241: the owner rejected a contributor's proposal. The canon did
+    /// not change.
+    pub const PROPOSAL_REJECTED: &str = "proposal_rejected";
+    /// T-000241: the contributor withdrew a proposal of theirs.
+    pub const PROPOSAL_WITHDRAWN: &str = "proposal_withdrawn";
 }
 
 /// T-000206: the `note` of a `conflict_resolved` event the app writes itself
@@ -107,15 +120,16 @@ impl AppDb {
     }
 
     /// Where the rule's current text came from: the newest event that wrote
-    /// it — taken, saved, reset, or a conflict resolved by accepting one side
-    /// (`repo` set, see `rule_event::CONFLICT_RESOLVED`). `None` when the text
-    /// predates the history (v1.19.0) or was never changed.
+    /// it — taken, saved, reset, a conflict resolved by accepting one side
+    /// (`repo` set, see `rule_event::CONFLICT_RESOLVED`), or an accepted
+    /// proposal (T-000241). `None` when the text predates the history
+    /// (v1.19.0) or was never changed.
     pub fn latest_origin_event(&self, rule: &str) -> SqlResult<Option<RuleEvent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, rule, kind, repo, note, created_at FROM rule_events
              WHERE rule = ?1
-               AND (kind IN (?2, ?3, ?4) OR (kind = ?5 AND repo IS NOT NULL))
+               AND (kind IN (?2, ?3, ?4, ?6) OR (kind = ?5 AND repo IS NOT NULL))
              ORDER BY created_at DESC, id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query_map(
@@ -124,7 +138,8 @@ impl AppDb {
                 rule_event::TAKEN,
                 rule_event::SAVED,
                 rule_event::RESET,
-                rule_event::CONFLICT_RESOLVED
+                rule_event::CONFLICT_RESOLVED,
+                rule_event::PROPOSAL_ACCEPTED
             ],
             rule_event_from_row,
         )?;

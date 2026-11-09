@@ -17,6 +17,7 @@ pub mod project_md;
 pub mod project_sync;
 pub mod requirements;
 pub mod rule_canon;
+pub mod rule_proposals;
 pub mod shared;
 pub mod shared_canon;
 #[cfg(test)]

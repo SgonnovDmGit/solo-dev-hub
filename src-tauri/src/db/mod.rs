@@ -21,6 +21,7 @@ pub mod migrations;
 pub mod peers;
 pub mod projects;
 pub mod repos;
+pub mod rule_proposals;
 pub mod rules;
 pub mod stats;
 pub mod tasks_events;
