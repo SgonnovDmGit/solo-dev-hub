@@ -1359,6 +1359,10 @@ fn id_number(id: &str) -> Option<i64> {
 /// has not happened, otherwise only the rows that differ from what the database
 /// renders are applied. A file that fails to import keeps its old stored blob,
 /// so the next sync retries it.
+/// Caller holds `specs_policy_guard(repo_id)` — `after_fetch` runs the import
+/// inside the same hold as its freshness-gated branch section, so a repath
+/// cannot slip between the generation check and the import's database and
+/// work-tree writes (T-000243 review, fourteenth pass).
 pub fn import_incoming(
     db: &AppDb,
     git: &GitBinary,
@@ -1423,12 +1427,11 @@ pub fn import_incoming(
         }
     }
     if !done.is_empty() {
-        // Whole-JSON read-modify-write: the guard makes the fresh read and
-        // the write atomic vs lifecycle writers (disable's marker, pin,
-        // disabling) — a stale snapshot must not erase them (T-000243
-        // review, eighth pass). Blob fields are not lifecycle: no bump.
-        let guard = specs_policy_guard(repo_id);
-        let _g = guard.lock().unwrap();
+        // Whole-JSON read-modify-write under the caller-held policy guard:
+        // the fresh read and the write stay atomic vs lifecycle writers
+        // (disable's marker, pin, disabling) — a stale snapshot must not
+        // erase them (T-000243 review, eighth pass). Blob fields are not
+        // lifecycle: no bump.
         let mut fresh = ss::read_shared_import(db, repo_id);
         for p in done {
             if let Some(Some(h)) = head_blob.get(p) {
@@ -2948,11 +2951,14 @@ fn reset_to_origin(
 
 /// Fast-forward the recipients, guard the non-current ones, then the import hook.
 /// Nothing is touched unless the repo is `repo_ready`. `gen0` is the
-/// generation the pass captured: the branch section below mutates refs —
-/// `reset_to_origin` can roll a branch back over a disable's unpushed
-/// deletion commit — so it runs under the policy guard, gated on the
-/// pass's freshness BEFORE the first ref update (T-000243 review, twelfth
-/// pass). `import_incoming` takes the guard itself and stays outside.
+/// generation the pass captured: everything below mutates — the branch
+/// section (`reset_to_origin` can roll a branch back over a disable's
+/// unpushed deletion commit), the incoming import and the canon adoption —
+/// so it ALL runs under the policy guard, gated on the pass's freshness
+/// BEFORE the first mutation (T-000243 review, twelfth and fourteenth
+/// passes). The import resolves the repo's CURRENT binding during
+/// reconcile: a repath that landed during the fetch must not let this
+/// pass write the old checkout's rows into the new checkout's files.
 fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
     let Some(role) = pass.role else { return };
     if !repo_ready(git, &pass.root) {
@@ -2966,11 +2972,11 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
     {
         let guard = specs_policy_guard(pass.repo.id);
         let _g = guard.lock().unwrap();
-        if !lifecycle_is_current(pass.repo.id, &pass.root, gen0 + u64::from(pass.own_bumps)) {
-            // A lifecycle landed during the fetch (disable, re-enable,
-            // approval, repath): every ref mutation below is obsolete.
-            // The pass seals stale at `finish` regardless.
-        } else {
+        // A lifecycle that landed during the fetch (disable, re-enable,
+        // approval, repath) makes every side effect below obsolete — the
+        // branch resets AND the import/canon tail. The pass seals stale at
+        // `finish` regardless (T-000243 review, fourteenth pass).
+        if lifecycle_is_current(pass.repo.id, &pass.root, gen0 + u64::from(pass.own_bumps)) {
             for b in &recipients {
                 let remote = remote_ref(b);
                 let has_remote =
@@ -3037,47 +3043,52 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
                     }
                 }
             }
-        }
-    }
-    if let Err(e) = import_incoming(db, git, pass.repo.id, &pass.root) {
-        // Recurring: `fresh_issues` reports it once until the text changes.
-        let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
-            .target("docs/bug-reports.md")
-            .detail(format!("import of the shared task files: {}", e));
-        pass.issue(issue)
-    }
-    // T-000224 (В4): the owner's committed rule copies are this install's canon.
-    if role == Role::Contributor {
-        let owner = pass
-            .structure
-            .as_ref()
-            .map(|s| (s.main.login.clone(), s.main.dev_branch.clone()));
-        if let Some((main_login, dev_branch)) = owner {
-            match crate::sync::shared_canon::adopt_main_canon(
-                db,
-                git,
-                &pass.repo,
-                &pass.root,
-                &main_login,
-                &dev_branch,
-            ) {
-                Ok(done) => {
-                    pass.canon_changed.extend(done.changed);
-                    if !done.errors.is_empty() {
-                        let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
-                            .target("docs/sdh_skills/")
-                            .detail(format!(
-                                "canon of the owner's rules: {}",
-                                done.errors.join("; ")
-                            ));
-                        pass.issue(issue)
+            // T-000243 review (fourteenth pass): the import and the canon
+            // adoption are side effects of the same observation — they run
+            // inside this hold, gated by the same freshness check. A repath
+            // during the fetch can no longer leave this pass importing the
+            // old checkout's rows into the new binding's files.
+            if let Err(e) = import_incoming(db, git, pass.repo.id, &pass.root) {
+                // Recurring: `fresh_issues` reports it once until the text changes.
+                let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                    .target("docs/bug-reports.md")
+                    .detail(format!("import of the shared task files: {}", e));
+                pass.issue(issue)
+            }
+            // T-000224 (В4): the owner's committed rule copies are this install's canon.
+            if role == Role::Contributor {
+                let owner = pass
+                    .structure
+                    .as_ref()
+                    .map(|s| (s.main.login.clone(), s.main.dev_branch.clone()));
+                if let Some((main_login, dev_branch)) = owner {
+                    match crate::sync::shared_canon::adopt_main_canon(
+                        db,
+                        git,
+                        &pass.repo,
+                        &pass.root,
+                        &main_login,
+                        &dev_branch,
+                    ) {
+                        Ok(done) => {
+                            pass.canon_changed.extend(done.changed);
+                            if !done.errors.is_empty() {
+                                let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                                    .target("docs/sdh_skills/")
+                                    .detail(format!(
+                                        "canon of the owner's rules: {}",
+                                        done.errors.join("; ")
+                                    ));
+                                pass.issue(issue)
+                            }
+                        }
+                        Err(e) => {
+                            let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                                .target("docs/sdh_skills/")
+                                .detail(format!("canon of the owner's rules: {}", e));
+                            pass.issue(issue)
+                        }
                     }
-                }
-                Err(e) => {
-                    let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
-                        .target("docs/sdh_skills/")
-                        .detail(format!("canon of the owner's rules: {}", e));
-                    pass.issue(issue)
                 }
             }
         }
@@ -6267,6 +6278,90 @@ mod tests {
             fx.remote_file("dev", "docs/superpowers/specs/x.md"),
             None,
             "the stale pass must not push from the old checkout"
+        );
+    }
+
+    /// T-000243 review (fourteenth pass): `after_fetch` released the policy
+    /// guard after the branch section and THEN ran `import_incoming` and the
+    /// canon adoption — a repath landing in that window let an obsolete pass
+    /// import the old checkout's rows and reconcile them into the NEW
+    /// binding's `docs/bug-reports.md`. The whole side-effecting tail now
+    /// sits inside the same guarded, freshness-gated hold.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_repath_during_after_fetch_stops_the_import_from_the_old_checkout() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        fx.sync_main();
+        let imp_before = ss::read_shared_import(&fx.main_db, fx.main_repo);
+        let helper_bugs_before =
+            fs::read_to_string(fx.helper_dir.join("docs/bug-reports.md")).unwrap_or_default();
+
+        // A bug row the pass's checkout holds in HEAD but the import has not
+        // seen yet — exactly what `import_incoming` would pick up.
+        write(
+            &fx.main_dir,
+            "docs/bug-reports.md",
+            &bugs_md(&[note(
+                "B-500001",
+                "committed in the stale checkout",
+                "created",
+                0,
+            )]),
+        );
+        g(&fx.main_dir, &["add", "docs/bug-reports.md"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "bug row"]);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_after_fetch_probe(fx.main_repo, &fx.main_dir, entered_tx, release_rx);
+        let project = fx
+            .main_db
+            .list_all_repos()
+            .unwrap()
+            .into_iter()
+            .find_map(|r| r.project_id);
+        std::thread::scope(|s| {
+            let sync = s.spawn(|| run_phase_a(&fx.main_db, Some(&gb()), project));
+            let in_window = entered_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("phase A never reached after_fetch");
+            assert_eq!(in_window, fx.main_repo);
+            // The checkout is rebound while the pass waits before its
+            // guarded section: the generation moves under both spellings.
+            rebind_local_path(
+                &fx.main_db,
+                fx.main_repo,
+                Some(fx.helper_dir.to_str().unwrap()),
+            )
+            .unwrap();
+            release_tx.send(1).unwrap();
+            sync.join().unwrap();
+        });
+
+        // The stale pass imported NOTHING: no row in the database, no blob
+        // bookkeeping, and the new binding's bug file was not regenerated
+        // with the old checkout's rows.
+        assert!(
+            fx.main_db
+                .get_bug_by_display_id(fx.main_repo, "B-500001")
+                .unwrap()
+                .is_none(),
+            "the obsolete pass must not import the old checkout's bug row"
+        );
+        let imp_after = ss::read_shared_import(&fx.main_db, fx.main_repo);
+        assert_eq!(
+            imp_after.blobs.get("docs/bug-reports.md"),
+            imp_before.blobs.get("docs/bug-reports.md"),
+            "the import bookkeeping must not move for a stale pass"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.helper_dir.join("docs/bug-reports.md")).unwrap_or_default(),
+            helper_bugs_before,
+            "reconcile must not write the old checkout's rows into the new binding"
         );
     }
 

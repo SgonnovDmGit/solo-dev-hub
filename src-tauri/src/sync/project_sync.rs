@@ -2097,14 +2097,16 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("the autocommit probe never fired");
             assert_eq!(in_window, repo_id);
-            assert!(
-                sync::shared::specs_policy_guard(repo_id)
-                    .try_lock()
-                    .is_err(),
-                "the guard must be held across the whole commit"
-            );
-            release_tx.send(1).unwrap();
-            worker.join().unwrap()
+            // Record first, release and join, THEN assert — a failed
+            // assertion while the worker still waits on `release_rx` would
+            // deadlock `thread::scope` (T-000243 review, fourteenth pass).
+            let held = sync::shared::specs_policy_guard(repo_id)
+                .try_lock()
+                .is_err();
+            let _ = release_tx.send(1);
+            let c = worker.join().unwrap();
+            assert!(held, "the guard must be held across the whole commit");
+            c
         });
         assert_eq!(c.committed.len(), 1, "{:?}", c.committed);
         assert_eq!(
