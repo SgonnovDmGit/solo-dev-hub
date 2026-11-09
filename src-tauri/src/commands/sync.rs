@@ -167,7 +167,7 @@ fn init_docs_for_repo_in(
     let rules = sync::refresh_rules(
         db,
         claude_dir.as_deref(),
-        sync::RenderScope::Repo(base),
+        sync::RenderScope::Repo(base, Some(repo.id)),
         None,
     );
     updated.push("docs/sdh_skills/".to_string());

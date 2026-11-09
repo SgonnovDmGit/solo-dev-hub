@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TemplateFile {
@@ -79,9 +80,28 @@ pub struct PendingRepoRender {
     /// Render every eligible repo checkout — an Everywhere scope, or any
     /// scope widened by an uptake.
     pub everywhere: bool,
-    /// One checkout to render after the everywhere pass (init docs) — the
-    /// target may not be among the stored checkouts.
-    pub repo: Option<std::path::PathBuf>,
+    /// One checkout to render after the everywhere pass (init docs).
+    pub repo: Option<PendingRepoTarget>,
+}
+
+/// The Repo-scope render target, resolved when the plan was made so phase 2
+/// revalidates an identity, not a bare path (T-000243 review, twentieth
+/// pass): a registered checkout detached between the phases must be
+/// skipped, never downgraded to an unmanaged write into the stale path.
+#[derive(Debug, Clone)]
+pub enum PendingRepoTarget {
+    /// A registered repo's checkout — its id and the local_path it was
+    /// bound to at plan time. Phase 2 takes the repo's policy guard and
+    /// renders only while the binding still matches and rule copies are
+    /// still allowed there.
+    Registered { repo_id: i64, path: PathBuf },
+    /// The target is not a registered repo — an unmanaged render under the
+    /// rules lock alone.
+    Unregistered(PathBuf),
+    /// Registration could not be determined — the repo listing failed, so
+    /// the target cannot be proven unregistered. Phase 2 renders nothing:
+    /// an unmanaged guess could write into a registered checkout.
+    Unknown,
 }
 
 impl RulesRefresh {

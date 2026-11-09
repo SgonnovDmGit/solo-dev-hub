@@ -218,6 +218,51 @@ pub(crate) fn rules_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// T-000243 review (twentieth pass): a rendezvous for the phase-2 repo
+// render's policy-guard boundary. The probe fires AFTER the fresh
+// revalidation inputs are ready but BEFORE the guard is taken, so a test
+// can land a repath or a role change in exactly the window the review
+// found — the render must then revalidate and skip, not write into the
+// stale binding. Matched by repo id; fires once.
+#[cfg(test)]
+struct RepoRenderProbe {
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+#[cfg(test)]
+static REPO_RENDER_PROBES: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<i64, RepoRenderProbe>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_repo_render_probe(
+    repo_id: i64,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = REPO_RENDER_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    cell.lock()
+        .unwrap()
+        .insert(repo_id, RepoRenderProbe { entered, release });
+}
+
+#[cfg(test)]
+fn repo_render_probe(repo_id: i64) {
+    let cell = REPO_RENDER_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        g.remove(&repo_id)
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        // The render has NOT taken the policy guard yet — whatever the
+        // test interleaves here lands before the freshness recheck. If
+        // the test dies, the dropped sender ends the wait with an error.
+        let _ = p.release.recv();
+    }
+}
+
 /// Marker dropped beside a rendered skill copy: this copy was edited on purpose
 /// and the owner has already approved the text. A suffix rather than a prefix so
 /// it sorts next to the file it belongs to, and so the prune pass — which only
@@ -1165,7 +1210,11 @@ pub enum RenderScope<'a> {
     /// `~/.claude/skills/` plus every repo with a local checkout.
     Everywhere,
     /// One checkout only (init docs). `~/.claude/skills/` is left alone.
-    Repo(&'a Path),
+    /// The second element is the registered repo the path belongs to, when
+    /// the caller knows it — phase 2 revalidates that identity under the
+    /// repo's policy guard, so a repathed checkout is skipped rather than
+    /// rendered into its stale path (T-000243 review, twentieth pass).
+    Repo(&'a Path, Option<i64>),
     /// `~/.claude/skills/` only (the global-rules button).
     Global,
     /// Nothing of its own: the caller renders the repos it owns afterwards
@@ -1307,10 +1356,47 @@ fn render_scope(
     report.pending_repo_render = Some(crate::models::PendingRepoRender {
         everywhere,
         repo: match scope {
-            RenderScope::Repo(base) => Some(base.to_path_buf()),
+            RenderScope::Repo(base, repo_id) => Some(match repo_id {
+                Some(id) => crate::models::PendingRepoTarget::Registered {
+                    repo_id: id,
+                    path: base.to_path_buf(),
+                },
+                None => classify_repo_target(db, report, base),
+            }),
             _ => None,
         },
     });
+}
+
+/// Classify a Repo-scope target the caller could not name by id: a repo
+/// registered at `base` becomes `Registered` — phase 2 revalidates it like
+/// any other — a confirmed miss `Unregistered`, and a failed listing
+/// `Unknown`, which phase 2 renders nothing for: an unmanaged guess could
+/// write into a registered checkout whose binding moved mid-pass
+/// (T-000243 review, twentieth pass).
+fn classify_repo_target(
+    db: &AppDb,
+    report: &mut RulesRefresh,
+    base: &Path,
+) -> crate::models::PendingRepoTarget {
+    match db.list_all_repos() {
+        Ok(all) => match all
+            .iter()
+            .find(|r| r.local_path.as_deref().map(Path::new) == Some(base))
+        {
+            Some(r) => crate::models::PendingRepoTarget::Registered {
+                repo_id: r.id,
+                path: base.to_path_buf(),
+            },
+            None => crate::models::PendingRepoTarget::Unregistered(base.to_path_buf()),
+        },
+        Err(e) => {
+            report
+                .errors
+                .push(SyncIssue::lookup(lookup::REPOS, "").detail(e));
+            crate::models::PendingRepoTarget::Unknown
+        }
+    }
 }
 
 /// Phase 2 of a rules render — the per-repo `docs/sdh_skills/` copies.
@@ -1336,6 +1422,10 @@ pub fn render_pending_repo_skills(db: &AppDb, report: &mut RulesRefresh) {
                 continue;
             };
             let guard = crate::sync::shared::specs_policy_guard(repo.id);
+            // Test rendezvous: fires before the guard is taken, so a test
+            // can land a lifecycle change in exactly this window.
+            #[cfg(test)]
+            repo_render_probe(repo.id);
             let _g = guard.lock().unwrap();
             let current = db.get_repository(repo.id).ok().is_some_and(|fresh| {
                 fresh.local_path.as_deref().map(Path::new)
@@ -1375,60 +1465,52 @@ pub fn render_pending_repo_skills(db: &AppDb, report: &mut RulesRefresh) {
             return;
         }
     }
-    let Some(base) = pending.repo else {
+    let Some(target) = pending.repo else {
         return;
     };
     // RenderScope::Repo fallback — rendered even after an everywhere pass:
-    // the target may not be among the stored checkouts. When it IS one, the
-    // same policy-guard serialization applies, and a repo the everywhere
-    // pass already rendered is neither rendered nor counted twice.
-    let repo_id = db.list_all_repos().ok().and_then(|all| {
-        all.iter()
-            .find(|r| r.local_path.as_deref().map(Path::new) == Some(base.as_path()))
-            .map(|r| r.id)
-    });
-    if let Some(repo_id) = repo_id {
-        if rendered.contains(&repo_id) {
+    // the target may not be among the stored checkouts. A registered target
+    // gets the same policy-guard serialization and fresh revalidation as the
+    // everywhere loop — and is NEVER downgraded to an unmanaged write when
+    // its binding no longer matches (T-000243 review, twentieth pass). An
+    // unregistered target renders unmanaged; an unknown one renders
+    // nothing. A repo the everywhere pass already rendered is neither
+    // rendered nor counted twice.
+    use crate::models::PendingRepoTarget as Target;
+    let (repo_id, base) = match target {
+        Target::Registered { repo_id, path } => (Some(repo_id), path),
+        Target::Unregistered(path) => (None, path),
+        Target::Unknown => return,
+    };
+    if let Some(id) = repo_id {
+        if rendered.contains(&id) {
             return;
         }
-        let guard = crate::sync::shared::specs_policy_guard(repo_id);
+        let guard = crate::sync::shared::specs_policy_guard(id);
+        #[cfg(test)]
+        repo_render_probe(id);
         let _g = guard.lock().unwrap();
-        let current = db.get_repository(repo_id).ok().is_some_and(|fresh| {
+        let current = db.get_repository(id).ok().is_some_and(|fresh| {
             fresh.local_path.as_deref().map(Path::new) == Some(base.as_path())
-                && !skips_rule_copies(db, repo_id)
+                && !skips_rule_copies(db, id)
         });
         if !current {
             return;
         }
-        let _rules = rules_guard();
-        match render_skills_to_repo(db, &base) {
-            Ok(r) => {
-                report.repos = 1;
-                report
-                    .errors
-                    .extend(r.held_issues(&base.display().to_string(), &report.quiet_conflicts));
-            }
-            Err(e) => report.errors.push(
-                SyncIssue::new(SyncIssueCode::ManagedFileFailed, base.display().to_string())
-                    .target("docs/sdh_skills/")
-                    .detail(e),
-            ),
+    }
+    let _rules = rules_guard();
+    match render_skills_to_repo(db, &base) {
+        Ok(r) => {
+            report.repos += 1;
+            report
+                .errors
+                .extend(r.held_issues(&base.display().to_string(), &report.quiet_conflicts));
         }
-    } else {
-        let _rules = rules_guard();
-        match render_skills_to_repo(db, &base) {
-            Ok(r) => {
-                report.repos = 1;
-                report
-                    .errors
-                    .extend(r.held_issues(&base.display().to_string(), &report.quiet_conflicts));
-            }
-            Err(e) => report.errors.push(
-                SyncIssue::new(SyncIssueCode::ManagedFileFailed, base.display().to_string())
-                    .target("docs/sdh_skills/")
-                    .detail(e),
-            ),
-        }
+        Err(e) => report.errors.push(
+            SyncIssue::new(SyncIssueCode::ManagedFileFailed, base.display().to_string())
+                .target("docs/sdh_skills/")
+                .detail(e),
+        ),
     }
 }
 
@@ -2725,7 +2807,7 @@ mod tests {
         let owner = TempDir::new().unwrap();
         repo_with_role(&db, &ordinary, "acme/one", None);
         repo_with_role(&db, &contributor, "acme/two", Some("contributor"));
-        repo_with_role(&db, &pending, "acme/three", Some("pending"));
+        let pending_repo = repo_with_role(&db, &pending, "acme/three", Some("pending"));
         let owner_repo = repo_with_role(&db, &owner, "me/four", Some("main"));
         db.set_shared_mode(owner_repo.id, true).unwrap();
         // The contributor's clone holds the owner's tracked copies, one of them
@@ -2753,18 +2835,26 @@ mod tests {
         assert!(!pending.path().join("docs").exists(), "nothing written");
         assert_eq!(count_render_targets(&db).unwrap(), 2);
         // The single-repo render of init docs honours it too.
-        let report = refresh_rules(&db, None, RenderScope::Repo(pending.path()), None);
+        let report = refresh_rules(
+            &db,
+            None,
+            RenderScope::Repo(
+                Path::new(pending_repo.local_path.as_deref().unwrap()),
+                Some(pending_repo.id),
+            ),
+            None,
+        );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(!pending.path().join("docs").exists());
     }
 
-    /// T-000243 review (nineteenth pass): the per-repo renders are deferred
-    /// past `rules_guard` and serialize on each repo's lifecycle policy
-    /// guard — a shared-mode transition landing mid-refresh can neither be
-    /// overwritten by a stale snapshot nor lose its delivery: the render
-    /// waits for the sync, then revalidates and writes.
+    /// T-000243 review (twentieth pass): the deferred per-repo render
+    /// rendezvous sits at the phase-2 policy-guard boundary — the worker
+    /// signals it is ABOUT to take the guard, the test lands a lifecycle
+    /// change, and the render must revalidate and skip rather than write
+    /// into the stale binding.
     #[test]
-    fn a_repo_render_waits_for_the_policy_guard_and_revalidates() {
+    fn a_deferred_render_revalidates_at_the_policy_guard_boundary() {
         let db = db_with_skill();
         let tmp = TempDir::new().unwrap();
         let repo = repo_with_role(&db, &tmp, "acme/one", None);
@@ -2772,27 +2862,182 @@ mod tests {
 
         refresh_rules(&db, None, RenderScope::Everywhere, None);
         assert!(rendered.exists(), "the ordinary repo renders its copies");
+        fs::remove_file(&rendered).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        install_repo_render_probe(repo.id, entered_tx, release_rx);
 
         std::thread::scope(|s| {
-            // A lifecycle writer holds the repo's policy guard — a sync's
-            // phase B. The refresh must WAIT for it, not skip the repo.
-            let policy = crate::sync::shared::specs_policy_guard(repo.id);
-            let held = policy.lock().unwrap();
-            fs::remove_file(&rendered).unwrap();
             let worker = s.spawn(|| {
                 refresh_rules(&db, None, RenderScope::Everywhere, None);
             });
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            assert!(
-                !rendered.exists(),
-                "the deferred render must wait for the policy guard"
-            );
+            // The worker is parked at the phase-2 boundary — before the guard.
+            entered_rx.recv().unwrap();
+            assert!(!rendered.exists());
+            // A repath lands in the window: the binding the plan captured
+            // is gone, so the render must skip — not write into the stale
+            // path and not fall back to an unmanaged write.
+            crate::sync::shared::rebind_local_path(&db, repo.id, Some("Q:/repathed")).unwrap();
+            release_tx.send(1).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(
+            !rendered.exists(),
+            "a repathed repo renders nothing into its stale path"
+        );
+    }
+
+    /// Same boundary, opposite outcome: with the lifecycle unchanged the
+    /// render proceeds once the guard frees — deferred, never dropped.
+    #[test]
+    fn a_deferred_render_waits_for_a_held_policy_guard_and_still_delivers() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_role(&db, &tmp, "acme/one", None);
+        let rendered = tmp.path().join("docs/sdh_skills/sdh-alpha.md");
+
+        refresh_rules(&db, None, RenderScope::Everywhere, None);
+        assert!(rendered.exists());
+        fs::remove_file(&rendered).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        install_repo_render_probe(repo.id, entered_tx, release_rx);
+
+        std::thread::scope(|s| {
+            // A lifecycle writer holds the repo's policy guard — a sync's
+            // phase B. The render must WAIT for it, not skip the repo.
+            let policy = crate::sync::shared::specs_policy_guard(repo.id);
+            let held = policy.lock().unwrap();
+            let worker = s.spawn(|| {
+                refresh_rules(&db, None, RenderScope::Everywhere, None);
+            });
+            entered_rx.recv().unwrap();
+            release_tx.send(1).unwrap();
+            // The worker is now blocked on the held guard; the mutex makes
+            // an early write impossible, and the join below proves it
+            // delivers once the guard frees.
             drop(held);
             worker.join().unwrap();
         });
         assert!(
             rendered.exists(),
             "delivery completes once the guard frees — it is deferred, not dropped"
+        );
+    }
+
+    /// The role half of the recheck: a repo that became a contributor or a
+    /// pending helper between the phases takes no rule copies.
+    #[test]
+    fn a_role_change_before_the_deferred_render_skips_the_repo() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_role(&db, &tmp, "acme/one", None);
+        let rendered = tmp.path().join("docs/sdh_skills/sdh-alpha.md");
+
+        refresh_rules(&db, None, RenderScope::Everywhere, None);
+        assert!(rendered.exists());
+        fs::remove_file(&rendered).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        install_repo_render_probe(repo.id, entered_tx, release_rx);
+
+        std::thread::scope(|s| {
+            let worker = s.spawn(|| {
+                refresh_rules(&db, None, RenderScope::Everywhere, None);
+            });
+            entered_rx.recv().unwrap();
+            db.set_shared_role(repo.id, Some("contributor")).unwrap();
+            release_tx.send(1).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(
+            !rendered.exists(),
+            "a repo that stopped taking copies renders nothing"
+        );
+    }
+
+    /// T-000243 review (twentieth pass, major): a Repo-scope target that
+    /// was REGISTERED at plan time and detached before phase 2 must not
+    /// degrade to an unmanaged write into the stale path — the everywhere
+    /// loop rejects the same binding, and so must the fallback.
+    #[test]
+    fn a_repathed_repo_scope_target_is_not_rendered_unmanaged() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_role(&db, &tmp, "acme/one", None);
+        let base = tmp.path().to_path_buf();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        install_repo_render_probe(repo.id, entered_tx, release_rx);
+
+        std::thread::scope(|s| {
+            let worker = s.spawn(|| {
+                refresh_rules(
+                    &db,
+                    None,
+                    RenderScope::Repo(base.as_path(), Some(repo.id)),
+                    None,
+                );
+            });
+            entered_rx.recv().unwrap();
+            crate::sync::shared::rebind_local_path(&db, repo.id, Some("Q:/repathed")).unwrap();
+            release_tx.send(1).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(
+            !base.join("docs").exists(),
+            "the detached registered target writes nothing — managed or unmanaged"
+        );
+    }
+
+    /// An unregistered Repo target still renders unmanaged, and an uptake
+    /// that widened the scope to everywhere counts BOTH the loop renders
+    /// and the fallback — the fallback must add, not replace, the count.
+    #[test]
+    fn an_uptake_everywhere_pass_counts_the_unregistered_repo_target() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let stray = TempDir::new().unwrap();
+        let (_repo, skills) = rendered_repo(&db, &tmp, "a");
+        hand_back(&skills, "sdh-alpha", "ALPHA REVISED", "approved");
+
+        let report = refresh_rules(&db, None, RenderScope::Repo(stray.path(), None), None);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.repos, 2,
+            "the registered repo plus the unregistered target"
+        );
+        assert!(stray.path().join("docs/sdh_skills/sdh-alpha.md").exists());
+    }
+
+    /// The dedup half: a registered Repo target the everywhere pass
+    /// already rendered is neither rendered nor counted twice.
+    #[test]
+    fn a_registered_repo_target_already_rendered_is_not_counted_twice() {
+        let db = db_with_skill();
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let (_repo_a, skills_a) = rendered_repo(&db, &tmp_a, "a");
+        let repo_b = repo_with_role(&db, &tmp_b, "b", None);
+        hand_back(&skills_a, "sdh-alpha", "ALPHA REVISED", "approved");
+        let b_path = PathBuf::from(repo_b.local_path.clone().unwrap());
+
+        let report = refresh_rules(
+            &db,
+            None,
+            RenderScope::Repo(b_path.as_path(), Some(repo_b.id)),
+            None,
+        );
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.repos, 2,
+            "repo a and repo b once each — b's fallback is deduped"
         );
     }
 
