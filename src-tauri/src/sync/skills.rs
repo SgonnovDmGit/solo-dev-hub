@@ -367,7 +367,12 @@ fn lock_repo_policy<'a>(
             repo_render_contended(repo_id, base);
             arc.lock().unwrap()
         }
-        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            // Production's `lock().unwrap()` refuses a poisoned mutex —
+            // the instrumentation must not recover what shipping code
+            // would not (T-000243 review, twenty-second pass).
+            arc.lock().unwrap()
+        }
     }
 }
 
@@ -2962,6 +2967,29 @@ mod tests {
         assert!(!pending.path().join("docs").exists());
     }
 
+    /// Bound a test-side probe wait: the probe map keeps its senders
+    /// alive, so a worker that dies before its rendezvous leaves a bare
+    /// `recv()` connected forever — the wait must fail loudly instead
+    /// (T-000243 review, twenty-second pass).
+    fn probe_recv(rx: &std::sync::mpsc::Receiver<i64>, what: &str) {
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+    }
+
+    /// Remove a test's probe entries at scope end, panic or not — the
+    /// map keeps senders alive, so leftovers would hold channels open
+    /// past the test. Keyed by (repo id, checkout path).
+    struct ProbeCleanup(i64, PathBuf);
+    impl Drop for ProbeCleanup {
+        fn drop(&mut self) {
+            for cell in [&REPO_RENDER_PROBES, &REPO_RENDER_RECHECK_PROBES] {
+                if let Some(cell) = cell.get() {
+                    cell.lock().unwrap().remove(&(self.0, self.1.clone()));
+                }
+            }
+        }
+    }
+
     /// T-000243 review (twentieth pass): the deferred per-repo render
     /// rendezvous sits at the phase-2 policy-guard boundary — the worker
     /// signals it is ABOUT to take the guard, the test lands a lifecycle
@@ -2985,11 +3013,12 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let (contended_tx, _contended_rx) = std::sync::mpsc::channel();
             install_repo_render_probe(repo.id, tmp.path(), entered_tx, release_rx, contended_tx);
+            let _cleanup = ProbeCleanup(repo.id, tmp.path().to_path_buf());
             let worker = s.spawn(|| {
                 refresh_rules(&db, None, RenderScope::Everywhere, None);
             });
             // The worker is parked at the phase-2 boundary — before the guard.
-            entered_rx.recv().unwrap();
+            probe_recv(&entered_rx, "phase-2 boundary");
             assert!(!rendered.exists());
             // A repath lands in the window: the binding the plan captured
             // is gone, so the render must skip — not write into the stale
@@ -3024,6 +3053,7 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let (contended_tx, contended_rx) = std::sync::mpsc::channel();
             install_repo_render_probe(repo.id, tmp.path(), entered_tx, release_rx, contended_tx);
+            let _cleanup = ProbeCleanup(repo.id, tmp.path().to_path_buf());
             // A lifecycle writer holds the repo's policy guard — a sync's
             // phase B. The render must WAIT for it, not skip the repo.
             let policy = crate::sync::shared::specs_policy_guard(repo.id);
@@ -3031,12 +3061,12 @@ mod tests {
             let worker = s.spawn(|| {
                 refresh_rules(&db, None, RenderScope::Everywhere, None);
             });
-            entered_rx.recv().unwrap();
+            probe_recv(&entered_rx, "phase-2 boundary");
             release_tx.send(1).unwrap();
             // The worker's try_lock observed the busy guard — genuine
             // contention, not an early arrival — and it now waits on the
             // blocking acquisition.
-            contended_rx.recv().unwrap();
+            probe_recv(&contended_rx, "contended acquisition");
             drop(held);
             worker.join().unwrap();
         });
@@ -3064,10 +3094,11 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let (contended_tx, _contended_rx) = std::sync::mpsc::channel();
             install_repo_render_probe(repo.id, tmp.path(), entered_tx, release_rx, contended_tx);
+            let _cleanup = ProbeCleanup(repo.id, tmp.path().to_path_buf());
             let worker = s.spawn(|| {
                 refresh_rules(&db, None, RenderScope::Everywhere, None);
             });
-            entered_rx.recv().unwrap();
+            probe_recv(&entered_rx, "phase-2 boundary");
             db.set_shared_role(repo.id, Some("contributor")).unwrap();
             release_tx.send(1).unwrap();
             worker.join().unwrap();
@@ -3094,6 +3125,7 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let (contended_tx, _contended_rx) = std::sync::mpsc::channel();
             install_repo_render_probe(repo.id, &base, entered_tx, release_rx, contended_tx);
+            let _cleanup = ProbeCleanup(repo.id, base.clone());
             let worker = s.spawn(|| {
                 refresh_rules(
                     &db,
@@ -3102,7 +3134,7 @@ mod tests {
                     None,
                 );
             });
-            entered_rx.recv().unwrap();
+            probe_recv(&entered_rx, "phase-2 boundary");
             crate::sync::shared::rebind_local_path(&db, repo.id, Some("Q:/repathed")).unwrap();
             release_tx.send(1).unwrap();
             worker.join().unwrap();
@@ -3131,6 +3163,7 @@ mod tests {
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             install_repo_render_recheck_probe(repo.id, &base, entered_tx, release_rx);
+            let _cleanup = ProbeCleanup(repo.id, base.clone());
             let worker = s.spawn(|| {
                 refresh_rules(
                     &db,
@@ -3140,7 +3173,7 @@ mod tests {
                 );
             });
             // Parked post-recheck, inside the guard hold.
-            entered_rx.recv().unwrap();
+            probe_recv(&entered_rx, "post-recheck boundary");
             let policy = crate::sync::shared::specs_policy_guard(repo.id);
             assert!(
                 matches!(policy.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
