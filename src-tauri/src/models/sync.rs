@@ -251,6 +251,10 @@ pub struct SharedMergeResult {
 pub struct ParticipantActivity {
     pub login: String,
     pub last_at: Option<String>,
+    /// T-000190: the app version this login last published on the shared dev
+    /// branch (`.sdh/app-versions/<login>.json`); `None` when unknown — an old
+    /// binary, a missing or malformed file, never a guessed value.
+    pub app_version: Option<String>,
 }
 
 /// F-000044 / T-000220: result of switching shared mode off.

@@ -599,14 +599,39 @@ fn request_rel_path(login: &str) -> String {
     format!("{}/{}.json", REQUESTS_REL_DIR, login)
 }
 
+/// T-000190 (versions): `.sdh/app-versions/<login>.json` — the last app
+/// version each install published on the shared dev branch. Permanent ops
+/// visibility, not a transition gate: an old binary simply has no file.
+pub const APP_VERSIONS_REL_DIR: &str = ".sdh/app-versions";
+
+/// Cap for one version file — the contract is a single short JSON object.
+const MAX_APP_VERSION_BYTES: u64 = 4 * 1024;
+
+/// `<login>.json` under the versions dir; the file name is the lower-cased
+/// login (the same key the participant map uses, ASCII case-insensitive).
+fn app_version_rel_path(login: &str) -> String {
+    format!(
+        "{}/{}.json",
+        APP_VERSIONS_REL_DIR,
+        login.to_ascii_lowercase()
+    )
+}
+
 /// Files and folders a role commits (positive pathspecs only; see
 /// `exclude_specs` for the exclusions). T-000243: `docs/superpowers/` travels
 /// for BOTH the owner and a contributor — but only while `share_specs` is on;
 /// a pending helper never sends specs, whatever the flag says. `docs/sdh_skills/`
 /// stays main-only.
 pub fn shared_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String> {
+    // T-000190: every role publishes its own `.sdh/app-versions/<login>.json`.
+    // An empty/invalid login (preflight callers) must not produce the literal
+    // `.sdh/app-versions/.json` path — the file is skipped, never guessed.
+    let own_version = ss::is_valid_request_login(login).then(|| app_version_rel_path(login));
     if role == Role::Pending {
-        return vec![request_rel_path(login)];
+        return [Some(request_rel_path(login)), own_version]
+            .into_iter()
+            .flatten()
+            .collect();
     }
     let mut v: Vec<String> = CROSS_REPO_DIRS
         .iter()
@@ -630,6 +655,9 @@ pub fn shared_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String
     if share_specs {
         v.push(SPECS_DIR.to_string());
     }
+    if let Some(p) = own_version {
+        v.push(p);
+    }
     v
 }
 
@@ -642,6 +670,11 @@ fn sdh_commit_paths(role: Role, login: &str, share_specs: bool) -> Vec<String> {
     let mut v = shared_pathspec(role, login, share_specs);
     v.push(crate::sync::rule_proposals::RULE_PROPOSALS_REL_DIR.to_string());
     v.push(crate::sync::rule_proposals::RULE_DECISIONS_REL_DIR.to_string());
+    // T-000190: this allow-list judges the commits WE made — it must cover
+    // every install's version file, not only this login's: a pending helper's
+    // plumb commit carries `.sdh/app-versions/<its login>.json` next to the
+    // join request, and a file outside the list marks the branch "not ours".
+    v.push(APP_VERSIONS_REL_DIR.to_string());
     v
 }
 
@@ -4448,6 +4481,19 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
         Role::Contributor => {}
     }
 
+    // T-000190: publish this install's app version — written before the
+    // recipients check so the same scoped commit carries it, and only on a
+    // bytes change so a steady state produces no commit churn. An install
+    // without a validated login writes nothing (never a guessed file).
+    if ss::is_valid_request_login(&login) {
+        if let Err(e) = write_own_app_version(&root, &login) {
+            let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                .target(APP_VERSIONS_REL_DIR)
+                .detail(e);
+            pass.issue(issue);
+        }
+    }
+
     if pass.recipients.is_empty() {
         return;
     }
@@ -5677,9 +5723,64 @@ fn activity_log(git: &GitBinary, root: &Path, branch: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// `.sdh/app-versions/<login>.json` = `{"app_version":"<ver>"}\n` — the file's
+/// whole contract is the version string: no timestamp, no paths, nothing
+/// machine-local. Written only on a bytes change so a steady state never
+/// produces commit churn.
+fn write_own_app_version(root: &Path, login: &str) -> Result<(), String> {
+    let path = root.join(app_version_rel_path(login));
+    let body = format!("{{\"app_version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION"));
+    if std::fs::read(&path).is_ok_and(|cur| cur == body.as_bytes()) {
+        return Ok(());
+    }
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("{}: {}", p.display(), e))?;
+    }
+    std::fs::write(&path, body.as_bytes()).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// The `app_version` string out of a version file's JSON; `None` for malformed
+/// input — a version is reported, never guessed (T-000190).
+fn parse_app_version(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    v.get("app_version")?.as_str().map(|s| s.to_string())
+}
+
+/// `<lowercased login> -> app_version` from `.sdh/app-versions/` at `rev` —
+/// typically `refs/remotes/origin/<dev>`, the last known state when offline.
+/// An install whose login produced no file (an old binary, a malformed file)
+/// is simply absent — the UI shows "unknown", never a guessed version.
+fn app_versions_at(git: &GitBinary, root: &Path, rev: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(files) = ls_tree(git, root, rev, &[APP_VERSIONS_REL_DIR.to_string()]) else {
+        return out;
+    };
+    for path in files.keys() {
+        let Some(name) = path.rsplit('/').next() else {
+            continue;
+        };
+        let Some(login) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if !ss::is_valid_request_login(login) {
+            continue;
+        }
+        let Ok(Some(bytes)) =
+            git_sync::show_file_capped(git, root, rev, path, MAX_APP_VERSION_BYTES)
+        else {
+            continue;
+        };
+        if let Some(v) = parse_app_version(&String::from_utf8_lossy(&bytes)) {
+            out.insert(login.to_ascii_lowercase(), v);
+        }
+    }
+    out
+}
+
 /// Owner's view (T-000237): per participant, the time of the newest commit with
 /// their `SDH-Participant` trailer on their own branch or on the owner's dev
-/// branch. Does not fetch: the sync does.
+/// branch, plus (T-000190) the app version their install last published on the
+/// dev branch. Does not fetch: the sync does.
 pub fn participants_activity(
     db: &AppDb,
     git: &GitBinary,
@@ -5694,21 +5795,47 @@ pub fn participants_activity(
     };
     let root = Path::new(lp);
     let dev_log = activity_log(git, root, &structure.main.dev_branch);
-    Ok(structure
-        .participants
-        .iter()
-        .map(|p| {
-            let own_log = activity_log(git, root, &p.branch);
-            let last = latest_participant_commit(&own_log, &p.login)
-                .into_iter()
-                .chain(latest_participant_commit(&dev_log, &p.login))
-                .max();
-            ParticipantActivity {
-                login: p.login.clone(),
-                last_at: last.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-            }
-        })
-        .collect())
+    let versions = app_versions_at(git, root, &remote_ref(&structure.main.dev_branch));
+    let version_of = |login: &str| versions.get(&login.to_ascii_lowercase()).cloned();
+    let dev_last = |login: &str| {
+        latest_participant_commit(&dev_log, login)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    };
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    // The owner's own install publishes a version file like anyone else.
+    rows.push(ParticipantActivity {
+        app_version: version_of(&structure.main.login),
+        last_at: dev_last(&structure.main.login),
+        login: structure.main.login.clone(),
+    });
+    seen.insert(structure.main.login.to_ascii_lowercase());
+    for p in &structure.participants {
+        let own_log = activity_log(git, root, &p.branch);
+        let last = latest_participant_commit(&own_log, &p.login)
+            .into_iter()
+            .chain(latest_participant_commit(&dev_log, &p.login))
+            .max();
+        seen.insert(p.login.to_ascii_lowercase());
+        rows.push(ParticipantActivity {
+            app_version: version_of(&p.login),
+            last_at: last.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            login: p.login.clone(),
+        });
+    }
+    // A pending helper also publishes its version file — its login has a file
+    // on dev before it ever appears in `participants`.
+    for (login_lower, version) in &versions {
+        if seen.contains(login_lower) {
+            continue;
+        }
+        rows.push(ParticipantActivity {
+            app_version: Some(version.clone()),
+            last_at: dev_last(login_lower),
+            login: login_lower.clone(),
+        });
+    }
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -7746,21 +7873,101 @@ mod tests {
         let contributor = shared_pathspec(Role::Contributor, "helper", true);
         assert!(contributor.iter().any(|x| x == "docs/todo.md"));
         assert!(contributor.iter().any(|x| x == "docs/superpowers"));
-        assert!(!contributor.iter().any(|x| x.starts_with(".sdh")));
+        // T-000190: the only `.sdh` path of a non-main role is its own
+        // version file — never the owner-only structure or requests dir.
+        assert!(contributor
+            .iter()
+            .all(|x| !x.starts_with(".sdh") || x == ".sdh/app-versions/helper.json"));
         assert!(!contributor.iter().any(|x| x == "docs/sdh_skills"));
         assert!(exclude_specs(&contributor).is_empty());
 
         let contributor_off = shared_pathspec(Role::Contributor, "helper", false);
         assert!(!contributor_off.iter().any(|x| x == "docs/superpowers"));
 
-        // A pending helper sends only its request — specs never travel for it,
-        // whatever the flag says.
+        // A pending helper sends only its request and its own version file —
+        // specs never travel for it, whatever the flag says.
         for flag in [true, false] {
             assert_eq!(
                 shared_pathspec(Role::Pending, "helper", flag),
-                vec![".sdh/requests/helper.json".to_string()]
+                vec![
+                    ".sdh/requests/helper.json".to_string(),
+                    ".sdh/app-versions/helper.json".to_string(),
+                ]
             );
         }
+
+        // An empty or unsafe login must not produce `.sdh/app-versions/.json`:
+        // the path is skipped, never guessed (preflight callers pass "").
+        assert!(shared_pathspec(Role::Main, "", true)
+            .iter()
+            .all(|x| !x.starts_with(APP_VERSIONS_REL_DIR)));
+        assert_eq!(
+            shared_pathspec(Role::Pending, "", true),
+            vec![".sdh/requests/.json".to_string()]
+        );
+    }
+
+    // ----- app versions (T-000190) ------------------------------------------
+
+    #[test]
+    fn own_app_version_writes_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_own_app_version(tmp.path(), "Helper").unwrap();
+        let path = tmp.path().join(".sdh/app-versions/helper.json");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body,
+            format!("{{\"app_version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION"))
+        );
+        // Same bytes — no rewrite (the mtime must not move).
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        write_own_app_version(tmp.path(), "Helper").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn app_version_parse_is_never_guessed() {
+        assert_eq!(parse_app_version("{}"), None);
+        assert_eq!(parse_app_version("not json"), None);
+        assert_eq!(parse_app_version("{\"app_version\":1}"), None);
+        assert_eq!(
+            parse_app_version("{\"app_version\":\"1.23.0\"}").as_deref(),
+            Some("1.23.0")
+        );
+    }
+
+    /// T-000190: both installs publish `.sdh/app-versions/<login>.json` on the
+    /// dev branch, and the owner's activity listing reports them.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn app_versions_reach_dev_and_the_activity() {
+        let fx = two_installs();
+        fx.make_participant_via_syncs();
+        // The owner's next pass merges the helper branch into dev — the
+        // contributor's version file lands there with the rest of its share.
+        fx.sync_main();
+        for login in ["owner", "helper"] {
+            let full = format!("{}/{}.json", APP_VERSIONS_REL_DIR, login);
+            let body = fx
+                .remote_file("dev", &full)
+                .unwrap_or_else(|| panic!("{} missing on dev", full));
+            assert_eq!(
+                body,
+                format!("{{\"app_version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION")),
+                "{} on dev",
+                full
+            );
+        }
+        // A steady-state sync writes nothing new.
+        fx.sync_main();
+        let rows = participants_activity(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        let by_login: HashMap<String, Option<String>> = rows
+            .iter()
+            .map(|r| (r.login.to_ascii_lowercase(), r.app_version.clone()))
+            .collect();
+        let want = Some(env!("CARGO_PKG_VERSION").to_string());
+        assert_eq!(by_login.get("owner"), Some(&want));
+        assert_eq!(by_login.get("helper"), Some(&want));
     }
 
     // ----- owner side ---------------------------------------------------------

@@ -235,6 +235,11 @@ export interface ParticipantActivity {
   login: string;
   /** ISO-8601; null when no commit with the login's trailer was found. */
   last_at: string | null;
+  /**
+   * T-000190: app version the login's install last published on the shared dev
+   * branch; null when unknown (old binary, missing/malformed file).
+   */
+  app_version: string | null;
 }
 
 export interface StructureParticipant {

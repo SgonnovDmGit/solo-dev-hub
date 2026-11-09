@@ -369,11 +369,12 @@ describe('autoSyncOffHint', () => {
 describe('activityByLogin', () => {
   it('keys by lower-cased login and keeps nulls', () => {
     const m = activityByLogin([
-      { login: 'Helper', last_at: '2026-10-20T10:00:00Z' },
+      { login: 'Helper', last_at: '2026-10-20T10:00:00Z', app_version: '1.23.0' },
       { login: 'other', last_at: null },
     ]);
-    expect(m.get('helper')).toBe('2026-10-20T10:00:00Z');
-    expect(m.get('other')).toBeNull();
+    expect(m.get('helper')).toEqual({ last_at: '2026-10-20T10:00:00Z', app_version: '1.23.0' });
+    // A missing app_version reads as unknown, never guessed.
+    expect(m.get('other')).toEqual({ last_at: null, app_version: null });
     expect(m.has('nobody')).toBe(false);
   });
 });
