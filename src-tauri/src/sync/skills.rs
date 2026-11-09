@@ -1148,6 +1148,10 @@ pub fn resolve_conflict(
     close_conflict(db, &repos, rule, repo, note, &mut out);
 
     let mut report = refresh_rules_locked(db, claude_dir, RenderScope::Everywhere, Some(rule));
+    // The per-repo renders wait for the rules lock — same defer as
+    // `refresh_rules` (T-000243 review, nineteenth pass).
+    drop(_guard);
+    render_pending_repo_skills(db, &mut report);
     let mut errors = out.errors;
     errors.append(&mut report.errors);
     report.errors = errors;
@@ -1188,8 +1192,14 @@ pub fn refresh_rules(
     scope: RenderScope,
     settings_edit: Option<&str>,
 ) -> RulesRefresh {
-    let _guard = rules_guard();
-    refresh_rules_locked(db, claude_dir, scope, settings_edit)
+    let mut report = {
+        let _guard = rules_guard();
+        refresh_rules_locked(db, claude_dir, scope, settings_edit)
+    };
+    // The per-repo renders run only now — after the rules lock is released,
+    // each serializing on its repo's policy guard (T-000243 review).
+    render_pending_repo_skills(db, &mut report);
+    report
 }
 
 /// The body of `refresh_rules` for a caller that already holds `rules_guard()`
@@ -1211,7 +1221,7 @@ pub(crate) fn refresh_rules_locked(
     // it, and the render must not be the pass that leaves that behind.
     untrack_rule_markers(db, &mut report);
     let everywhere = !report.taken.is_empty();
-    render_scope(db, claude_dir, scope, everywhere, &repos, &mut report);
+    render_scope(db, claude_dir, scope, everywhere, &mut report);
     reconcile_fork_canon(db, &mut report);
     report
 }
@@ -1271,73 +1281,154 @@ fn render_scope(
     claude_dir: Option<&Path>,
     scope: RenderScope,
     everywhere: bool,
-    repos: &[Repository],
     report: &mut RulesRefresh,
 ) {
     let everywhere = everywhere || matches!(scope, RenderScope::Everywhere);
     if everywhere {
-        let (skills, touched, errors) =
-            render_skills_everywhere(db, claude_dir, repos, &report.quiet_conflicts);
+        // Only the user-level target renders under the rules lock — it has
+        // no repo lifecycle to race. The per-repo copies are deferred to
+        // `render_pending_repo_skills`, which runs after the lock is
+        // released so each repo can serialize on its own policy guard
+        // without inverting the policy → rules order (T-000243 review,
+        // nineteenth pass).
+        let (skills, errors) = render_global_skills(db, claude_dir);
         report.skills = skills;
-        report.repos = touched;
         report.errors.extend(errors);
-        if !matches!(scope, RenderScope::Repo(_)) {
-            return;
+    }
+    if !everywhere {
+        if let RenderScope::Global = scope {
+            match claude_dir.map(|dir| render_skills_global(db, dir)) {
+                Some(Ok(n)) => report.skills = n,
+                Some(Err(e)) => report.errors.push(claude_skills_issue(e)),
+                None => {}
+            }
         }
     }
-    match scope {
-        RenderScope::Repo(base) => {
-            // Р16: a contributor's / pending helper's checkout takes no rule
-            // copies. `repos` already leaves such a repo out, so it is found by
-            // its path in the whole portfolio. T-000243 review (eighteenth
-            // pass): when the target IS a stored checkout, the same policy-
-            // guard serialization as the everywhere loop applies — a
-            // non-blocking take, a fresh binding + membership recheck, then
-            // the write; a target that is not a stored checkout has no
-            // lifecycle to race and renders unguarded as before.
-            let repo_id = db.list_all_repos().ok().and_then(|all| {
-                all.iter()
-                    .find(|r| r.local_path.as_deref().map(Path::new) == Some(base))
-                    .map(|r| r.id)
+    report.pending_repo_render = Some(crate::models::PendingRepoRender {
+        everywhere,
+        repo: match scope {
+            RenderScope::Repo(base) => Some(base.to_path_buf()),
+            _ => None,
+        },
+    });
+}
+
+/// Phase 2 of a rules render — the per-repo `docs/sdh_skills/` copies.
+/// MUST run after `rules_guard` is released: each repo is serialized on
+/// its own lifecycle policy guard — a blocking take is safe here because
+/// the policy → rules order `after_fetch → adopt_main_canon` relies on
+/// cannot invert while the rules lock is not held — and revalidated
+/// fresh, so a shared-mode transition landing mid-refresh can neither be
+/// overwritten by a stale snapshot nor lose its delivery: the write
+/// simply waits for the sync (T-000243 review, nineteenth pass).
+pub fn render_pending_repo_skills(db: &AppDb, report: &mut RulesRefresh) {
+    let Some(pending) = report.pending_repo_render.take() else {
+        return;
+    };
+    let mut rendered: HashSet<i64> = HashSet::new();
+    if pending.everywhere {
+        let repos = portfolio_repos(db, report);
+        let mut touched = 0;
+        for repo in &repos {
+            // A stored local_path can point at a checkout that only exists
+            // on another machine — normal portfolio state, skipped silently.
+            let Some(base) = existing_checkout(repo) else {
+                continue;
+            };
+            let guard = crate::sync::shared::specs_policy_guard(repo.id);
+            let _g = guard.lock().unwrap();
+            let current = db.get_repository(repo.id).ok().is_some_and(|fresh| {
+                fresh.local_path.as_deref().map(Path::new)
+                    == repo.local_path.as_deref().map(Path::new)
+                    && !skips_rule_copies(db, repo.id)
             });
-            if let Some(repo_id) = repo_id {
-                let policy = crate::sync::shared::specs_policy_guard(repo_id);
-                let Ok(_policy) = policy.try_lock() else {
-                    return;
-                };
-                let still_current = db.get_repository(repo_id).ok().is_some_and(|fresh| {
-                    fresh.local_path.as_deref().map(Path::new) == Some(base)
-                        && !skips_rule_copies(db, repo_id)
-                });
-                if !still_current {
-                    return;
-                }
+            if !current {
+                continue;
             }
-            // Rendered even after an everywhere pass: the target may not be among
-            // the stored checkouts, and an unchanged file is not rewritten anyway.
+            // T-000198: the same label the project-sync skeleton pass uses,
+            // so a held copy seen by both renders of one pass is reported
+            // once.
+            let label = rule_copy_label(repo);
+            // The rules lock is retaken for the write itself — policy →
+            // rules, the same order `after_fetch → adopt_main_canon` uses,
+            // so a concurrent pass's collection cannot read a copy mid-
+            // render (and nothing holding the rules lock ever waits on a
+            // policy guard, so the order cannot deadlock).
+            let _rules = rules_guard();
             match render_skills_to_repo(db, base) {
-                // Already rendered (and its held copies reported) by the
-                // everywhere pass when the target is a stored checkout.
-                Ok(_) if everywhere => {}
                 Ok(r) => {
-                    report.repos = 1;
-                    report.errors.extend(
-                        r.held_issues(&base.display().to_string(), &report.quiet_conflicts),
-                    );
+                    touched += 1;
+                    rendered.insert(repo.id);
+                    report
+                        .errors
+                        .extend(r.held_issues(&label, &report.quiet_conflicts));
                 }
                 Err(e) => report.errors.push(
-                    SyncIssue::new(SyncIssueCode::ManagedFileFailed, base.display().to_string())
+                    SyncIssue::new(SyncIssueCode::ManagedFileFailed, label)
                         .target("docs/sdh_skills/")
                         .detail(e),
                 ),
             }
         }
-        RenderScope::Global => match claude_dir.map(|dir| render_skills_global(db, dir)) {
-            Some(Ok(n)) => report.skills = n,
-            Some(Err(e)) => report.errors.push(claude_skills_issue(e)),
-            None => {}
-        },
-        RenderScope::Everywhere | RenderScope::UptakeOnly => {}
+        report.repos = touched;
+        if pending.repo.is_none() {
+            return;
+        }
+    }
+    let Some(base) = pending.repo else {
+        return;
+    };
+    // RenderScope::Repo fallback — rendered even after an everywhere pass:
+    // the target may not be among the stored checkouts. When it IS one, the
+    // same policy-guard serialization applies, and a repo the everywhere
+    // pass already rendered is neither rendered nor counted twice.
+    let repo_id = db.list_all_repos().ok().and_then(|all| {
+        all.iter()
+            .find(|r| r.local_path.as_deref().map(Path::new) == Some(base.as_path()))
+            .map(|r| r.id)
+    });
+    if let Some(repo_id) = repo_id {
+        if rendered.contains(&repo_id) {
+            return;
+        }
+        let guard = crate::sync::shared::specs_policy_guard(repo_id);
+        let _g = guard.lock().unwrap();
+        let current = db.get_repository(repo_id).ok().is_some_and(|fresh| {
+            fresh.local_path.as_deref().map(Path::new) == Some(base.as_path())
+                && !skips_rule_copies(db, repo_id)
+        });
+        if !current {
+            return;
+        }
+        let _rules = rules_guard();
+        match render_skills_to_repo(db, &base) {
+            Ok(r) => {
+                report.repos = 1;
+                report
+                    .errors
+                    .extend(r.held_issues(&base.display().to_string(), &report.quiet_conflicts));
+            }
+            Err(e) => report.errors.push(
+                SyncIssue::new(SyncIssueCode::ManagedFileFailed, base.display().to_string())
+                    .target("docs/sdh_skills/")
+                    .detail(e),
+            ),
+        }
+    } else {
+        let _rules = rules_guard();
+        match render_skills_to_repo(db, &base) {
+            Ok(r) => {
+                report.repos = 1;
+                report
+                    .errors
+                    .extend(r.held_issues(&base.display().to_string(), &report.quiet_conflicts));
+            }
+            Err(e) => report.errors.push(
+                SyncIssue::new(SyncIssueCode::ManagedFileFailed, base.display().to_string())
+                    .target("docs/sdh_skills/")
+                    .detail(e),
+            ),
+        }
     }
 }
 
@@ -1351,26 +1442,15 @@ impl RulesRefresh {
     }
 }
 
-/// T-000203: apply the current rule text everywhere an agent reads it from —
-/// the user-level Claude Code skills plus every repo with a local checkout.
+/// T-000203: apply the current rule text to the user-level Claude Code
+/// skills — the target with no repo lifecycle to race, so it renders under
+/// the rules lock. The per-repo half moved to `render_pending_repo_skills`,
+/// which runs after the lock is released (T-000243 review, nineteenth
+/// pass).
 ///
-/// Until this existed the two targets had unrelated triggers: `~/.claude/skills/`
-/// only on the global-rules button, `docs/sdh_skills/` only on a project sync
-/// (automatic solely for projects opted into auto-sync). An agreed rule could
-/// therefore sit undelivered for days while agents kept working off the old text.
-///
-/// Private since T-000207: reached only through `render_scope`, from
-/// `refresh_rules_locked` and `deliver_rules_at_startup`, both of which collect
-/// the hand-backs in `repos` before this overwrites them.
-///
-/// Returns `(skills, repos, errors)`. Errors are per-target and non-fatal: one
-/// unwritable repo must not stop the rest of the portfolio from being updated.
-fn render_skills_everywhere(
-    db: &AppDb,
-    claude_dir: Option<&Path>,
-    repos: &[Repository],
-    quiet: &[String],
-) -> (usize, usize, Vec<SyncIssue>) {
+/// Returns `(skills, errors)`. Errors are non-fatal: one unwritable target
+/// must not stop the rest of the portfolio from being updated.
+fn render_global_skills(db: &AppDb, claude_dir: Option<&Path>) -> (usize, Vec<SyncIssue>) {
     let mut errors = Vec::new();
     let skills = match claude_dir.map(|dir| render_skills_global(db, dir)) {
         Some(Ok(n)) => n,
@@ -1380,50 +1460,7 @@ fn render_skills_everywhere(
         }
         None => 0,
     };
-    let mut touched = 0;
-    for repo in repos {
-        // A stored local_path can point at a checkout that only exists on
-        // another machine. That is normal portfolio state, not a failure —
-        // skipped silently rather than drowning the real errors.
-        let Some(base) = existing_checkout(repo) else {
-            continue;
-        };
-        // T-000243 review (eighteenth pass): `repos` is a snapshot — a
-        // shared-mode transition landing mid-refresh must not let this
-        // write restore rule copies the new lifecycle removed or fast-
-        // forwarded away. Serialize with the repo's policy guard and
-        // revalidate binding + membership under it. `try_lock`, never
-        // `lock`: a sync that owns the repo this round renders it itself
-        // and the next refresh retries, while a non-blocking take can
-        // never invert the policy → rules order `after_fetch →
-        // adopt_main_canon` relies on (this runs under `rules_guard`).
-        let policy = crate::sync::shared::specs_policy_guard(repo.id);
-        let Ok(_policy) = policy.try_lock() else {
-            continue;
-        };
-        let still_current = db.get_repository(repo.id).ok().is_some_and(|fresh| {
-            fresh.local_path.as_deref().map(Path::new) == repo.local_path.as_deref().map(Path::new)
-                && !skips_rule_copies(db, repo.id)
-        });
-        if !still_current {
-            continue;
-        }
-        // T-000198: the same label the project-sync skeleton pass uses, so a
-        // held copy seen by both renders of one pass is reported once.
-        let label = rule_copy_label(repo);
-        match render_skills_to_repo(db, base) {
-            Ok(r) => {
-                touched += 1;
-                errors.extend(r.held_issues(&label, quiet));
-            }
-            Err(e) => errors.push(
-                SyncIssue::new(SyncIssueCode::ManagedFileFailed, label)
-                    .target("docs/sdh_skills/")
-                    .detail(e),
-            ),
-        }
-    }
-    (skills, touched, errors)
+    (skills, errors)
 }
 
 /// Startup, on every launch: collect pending hand-backs, THEN seed the bundled
@@ -1439,35 +1476,34 @@ fn render_skills_everywhere(
 ///
 /// Returns `None` when there is nothing to tell and nothing was rendered.
 pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option<RulesRefresh> {
-    let _guard = rules_guard();
-    let mut report = RulesRefresh::default();
-    let repos = portfolio_repos(db, &mut report);
-    report.absorb(collect_approved_skill_edits(db, &repos, None));
-    // T-000244: after the collection and before the seed — startup does not go
-    // through `refresh_rules_locked`, so its own sweep lives here.
-    untrack_rule_markers(db, &mut report);
+    let (mut report, render) = {
+        let _guard = rules_guard();
+        let mut report = RulesRefresh::default();
+        let repos = portfolio_repos(db, &mut report);
+        report.absorb(collect_approved_skill_edits(db, &repos, None));
+        // T-000244: after the collection and before the seed — startup does not go
+        // through `refresh_rules_locked`, so its own sweep lives here.
+        untrack_rule_markers(db, &mut report);
 
-    let seeded = match crate::template_seeder::seed_bundled_templates(db) {
-        Ok(n) => n,
-        Err(e) => {
-            report
-                .errors
-                .push(SyncIssue::lookup(lookup::SEEDING, "").detail(e));
-            0
+        let seeded = match crate::template_seeder::seed_bundled_templates(db) {
+            Ok(n) => n,
+            Err(e) => {
+                report
+                    .errors
+                    .push(SyncIssue::lookup(lookup::SEEDING, "").detail(e));
+                0
+            }
+        };
+        reconcile_fork_canon(db, &mut report);
+        let render = seeded > 0 || !report.taken.is_empty() || !report.lost.is_empty();
+        if render {
+            render_scope(db, claude_dir, RenderScope::UptakeOnly, true, &mut report);
         }
+        (report, render)
     };
-    reconcile_fork_canon(db, &mut report);
-    let render = seeded > 0 || !report.taken.is_empty() || !report.lost.is_empty();
-    if render {
-        render_scope(
-            db,
-            claude_dir,
-            RenderScope::UptakeOnly,
-            true,
-            &repos,
-            &mut report,
-        );
-    }
+    // The per-repo renders run only now — after the rules lock is released
+    // (T-000243 review, nineteenth pass).
+    render_pending_repo_skills(db, &mut report);
     if render || !report.errors.is_empty() {
         Some(report)
     } else {
@@ -2722,13 +2758,13 @@ mod tests {
         assert!(!pending.path().join("docs").exists());
     }
 
-    /// T-000243 review (eighteenth pass): the refresh's repo list is a
-    /// snapshot — a shared-mode transition landing mid-refresh must not let
-    /// the render write over the new lifecycle's copies. Each repo render
-    /// serializes on its policy guard; while a sync holds it, the refresh
-    /// skips the repo (the next pass renders it).
+    /// T-000243 review (nineteenth pass): the per-repo renders are deferred
+    /// past `rules_guard` and serialize on each repo's lifecycle policy
+    /// guard — a shared-mode transition landing mid-refresh can neither be
+    /// overwritten by a stale snapshot nor lose its delivery: the render
+    /// waits for the sync, then revalidates and writes.
     #[test]
-    fn a_repo_under_its_policy_guard_is_not_rendered_from_a_stale_snapshot() {
+    fn a_repo_render_waits_for_the_policy_guard_and_revalidates() {
         let db = db_with_skill();
         let tmp = TempDir::new().unwrap();
         let repo = repo_with_role(&db, &tmp, "acme/one", None);
@@ -2737,26 +2773,26 @@ mod tests {
         refresh_rules(&db, None, RenderScope::Everywhere, None);
         assert!(rendered.exists(), "the ordinary repo renders its copies");
 
-        fs::remove_file(&rendered).unwrap();
-        {
+        std::thread::scope(|s| {
+            // A lifecycle writer holds the repo's policy guard — a sync's
+            // phase B. The refresh must WAIT for it, not skip the repo.
             let policy = crate::sync::shared::specs_policy_guard(repo.id);
-            let _hold = policy.lock().unwrap();
-            refresh_rules(&db, None, RenderScope::Everywhere, None);
+            let held = policy.lock().unwrap();
+            fs::remove_file(&rendered).unwrap();
+            let worker = s.spawn(|| {
+                refresh_rules(&db, None, RenderScope::Everywhere, None);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
             assert!(
                 !rendered.exists(),
-                "a sync holding the repo's policy guard owns it — the refresh must not write"
+                "the deferred render must wait for the policy guard"
             );
-            let report = refresh_rules(&db, None, RenderScope::Repo(tmp.path()), None);
-            assert!(report.errors.is_empty(), "{:?}", report.errors);
-            assert!(
-                !rendered.exists(),
-                "the single-repo render defers under the guard too"
-            );
-        }
-        refresh_rules(&db, None, RenderScope::Everywhere, None);
+            drop(held);
+            worker.join().unwrap();
+        });
         assert!(
             rendered.exists(),
-            "the next refresh renders it once the guard frees"
+            "delivery completes once the guard frees — it is deferred, not dropped"
         );
     }
 

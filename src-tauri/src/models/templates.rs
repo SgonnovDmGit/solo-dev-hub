@@ -62,6 +62,26 @@ pub struct RulesRefresh {
     /// copies — so a conflict no longer fires a toast on every sync.
     #[serde(default)]
     pub quiet_conflicts: Vec<String>,
+    /// The deferred per-repo render plan, consumed by
+    /// `sync::skills::render_pending_repo_skills` — which MUST run after
+    /// `rules_guard` is released, because each repo render serializes on
+    /// the repo's lifecycle policy guard and taking that while still
+    /// holding the rules lock would invert the policy → rules order
+    /// (T-000243 review, nineteenth pass). Internal only, never serialized.
+    #[serde(skip)]
+    pub pending_repo_render: Option<PendingRepoRender>,
+}
+
+/// What a refresh still owes the per-repo `docs/sdh_skills/` targets once
+/// the rules lock is released. Internal to the render pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct PendingRepoRender {
+    /// Render every eligible repo checkout — an Everywhere scope, or any
+    /// scope widened by an uptake.
+    pub everywhere: bool,
+    /// One checkout to render after the everywhere pass (init docs) — the
+    /// target may not be among the stored checkouts.
+    pub repo: Option<std::path::PathBuf>,
 }
 
 impl RulesRefresh {
