@@ -430,6 +430,176 @@ fn sync_req_pair_legacy(
     }
 }
 
+/// Forward-slash repo-relative path for git calls (`git log -- <path>`).
+fn fwd_rel(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Names of legacy announcement files whose new-layout body was already
+/// delivered and then cleaned: re-creating the body from the leftover
+/// projection would resurrect an acknowledged announcement, so these names
+/// are barred from re-migration — the projection retire pass owns them.
+fn closed_announce_names(
+    git: &crate::git_ops::GitBinary,
+    root: &Path,
+    legacy_dir: &Path,
+    new_inbox: &Path,
+) -> std::collections::BTreeSet<String> {
+    let mut closed = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(legacy_dir) else {
+        return closed;
+    };
+    for e in entries.filter_map(|e| e.ok()) {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !(name.starts_with("ANNOUNCE-") && name.ends_with(".md")) {
+            continue;
+        }
+        if new_inbox.join(&name).exists() {
+            continue; // a live body means the pair is still open
+        }
+        let rel = fwd_rel(root, &new_inbox.join(&name));
+        if matches!(crate::git_ops::path_in_history(git, root, &rel), Ok(true)) {
+            closed.insert(name);
+        }
+    }
+    closed
+}
+
+/// The transition dual-write (T-000245, `ANNOUNCE_LEGACY_DUAL_WRITE`): every
+/// ANNOUNCE body in a shared recipient's `inbox/<sender>/` also gets a
+/// byte-identical file at the legacy role-named path — written ONCE per
+/// publication. If the file is absent but git ever carried it, an old-style
+/// delete-ack already happened and it must not be revived; an existing file
+/// is the old agent's to delete and is never rewritten. Symmetrically, a
+/// legacy file whose new-layout body was delivered and then cleaned retires
+/// with it, while a file whose new body never existed is pre-migration
+/// residue and stays.
+fn deliver_announce_projections(
+    git: &crate::git_ops::GitBinary,
+    recipient_base: &Path,
+    legacy_dir: &Path,
+    new_inbox: &Path,
+    c: &mut SyncCounters,
+) {
+    if !sync::ANNOUNCE_LEGACY_DUAL_WRITE {
+        return;
+    }
+    for body in sync::announce_bodies(new_inbox) {
+        let legacy = legacy_dir.join(&body);
+        if legacy.exists() {
+            continue;
+        }
+        let rel = fwd_rel(recipient_base, &legacy);
+        match crate::git_ops::path_in_history(git, recipient_base, &rel) {
+            Ok(true) => {} // delivered and delete-acked before — never revive
+            Ok(false) => match std::fs::read(new_inbox.join(&body)) {
+                Ok(bytes) => {
+                    if let Some(p) = legacy.parent() {
+                        if let Err(e) = std::fs::create_dir_all(p) {
+                            c.push(migration_issue(&p.display().to_string(), e));
+                            continue;
+                        }
+                    }
+                    match std::fs::write(&legacy, &bytes) {
+                        Ok(()) => c.copied += 1,
+                        Err(e) => c.push(migration_issue(&legacy.display().to_string(), e)),
+                    }
+                }
+                Err(e) => c.push(migration_issue(&body, e)),
+            },
+            Err(e) => c.push(migration_issue(&rel, e)),
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(legacy_dir) else {
+        return;
+    };
+    for e in entries.filter_map(|e| e.ok()) {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !(name.starts_with("ANNOUNCE-") && name.ends_with(".md")) {
+            continue;
+        }
+        if new_inbox.join(&name).exists() {
+            continue; // live pair — the projection stays for old agents
+        }
+        let rel = fwd_rel(recipient_base, &new_inbox.join(&name));
+        match crate::git_ops::path_in_history(git, recipient_base, &rel) {
+            // The new body existed and is gone — the pair closed; retire the
+            // projection so no stale copy lingers for a fresh checkout.
+            Ok(true) => match std::fs::remove_file(legacy_dir.join(&name)) {
+                Ok(()) => c.migrated += 1,
+                Err(e) => c.push(migration_issue(&name, e)),
+            },
+            Ok(false) => {} // never delivered on the new layout — residue stays
+            Err(e) => c.push(migration_issue(&name, e)),
+        }
+    }
+}
+
+/// T-000245: migrate the recipient-side legacy announcement folder of one
+/// vertical pair (server→client `server-announcements/<server>/`, ms→parent
+/// `microservice-announcements/<ms-project>/`) onto the pairwise layout —
+/// each body lands in the recipient's `inbox/<sender>/` replica AND the
+/// sender's `outbox/<recipient>/` master — then honour the transition
+/// dual-write for a shared recipient.
+fn sync_announce_channel(
+    db: &AppDb,
+    git: Option<&crate::git_ops::GitBinary>,
+    sender_base: &Path,
+    sender: &Repository,
+    recipient_base: &Path,
+    recipient: &Repository,
+    legacy_dir: &Path,
+    c: &mut SyncCounters,
+) {
+    let sender_name = sender.canonical_folder_name();
+    let recipient_name = recipient.canonical_folder_name();
+    let new_inbox = sync::inbox_dir(recipient_base, &sender_name);
+    let new_outbox = sync::outbox_dir(sender_base, &recipient_name);
+    let shared_recipient = db
+        .get_shared_state(recipient.id)
+        .map(|s| s.shared_mode)
+        .unwrap_or(false);
+    if shared_recipient && git.is_none() {
+        // The delivery/ack fact store for a shared repo IS its git history;
+        // without it an unclear state must not bootstrap blindly.
+        c.push(
+            SyncIssue::new(
+                Code::MigrationFailed,
+                format!("announcements → {}", recipient.display_name()),
+            )
+            .detail("shared announce migration needs git history"),
+        );
+        return;
+    }
+    let closed = match (shared_recipient, git) {
+        (true, Some(g)) => closed_announce_names(g, recipient_base, legacy_dir, &new_inbox),
+        _ => Default::default(),
+    };
+    let mut warnings = Vec::new();
+    match sync::migrate_announce_dir(
+        legacy_dir,
+        &new_inbox,
+        &new_outbox,
+        shared_recipient,
+        &closed,
+        &mut warnings,
+    ) {
+        Ok(n) => c.migrated += n,
+        Err(e) => c.push(migration_issue(&legacy_dir.display().to_string(), e)),
+    }
+    c.extend(warnings);
+    if let (true, Some(g)) = (shared_recipient, git) {
+        deliver_announce_projections(g, recipient_base, legacy_dir, &new_inbox, c);
+    }
+}
+
 /// Client → Server REQ sync + Server → Client response copy-back + api.md /
 /// handlers.md propagation. `srv_base` is the server repo root.
 fn sync_client_to_server(
@@ -437,6 +607,7 @@ fn sync_client_to_server(
     srv: &Repository,
     srv_base: &Path,
     clients: &[&Repository],
+    git: Option<&crate::git_ops::GitBinary>,
     c: &mut SyncCounters,
 ) {
     let srv_name = srv.display_name();
@@ -503,7 +674,7 @@ fn sync_client_to_server(
                 Ok(o) => {
                     c.migrated += o.migrated;
                     if o.channel_ready {
-                        fold_channel(sync::sync_peer_pair(client, srv), c);
+                        fold_channel(sync::sync_peer_pair_ctx(Some(db), client, srv), c);
                     } else {
                         // Migration rolled back — the legacy dirs are intact;
                         // keep the REQ channel alive on the old layout this pass.
@@ -519,6 +690,31 @@ fn sync_client_to_server(
                 Err(e) => c.push(migration_issue(&client_label, e)),
             }
             c.extend(mig_warnings);
+
+            // T-000245: the server→client announcement lane migrates onto the
+            // same pair — the folder name follows the SENDER's canonical, so
+            // server renames replay on it first.
+            let ann_parent = client_base.join("docs").join("server-announcements");
+            if let Ok(renames) = db.list_renames_for_repo(srv.id) {
+                for r in renames {
+                    match sync::replay_rename_in_dir(
+                        &ann_parent,
+                        &r.old_canonical,
+                        &r.new_canonical,
+                    ) {
+                        Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
+                        Ok(sync::RenameOutcome::NoOp) => {}
+                        Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
+                            &r.old_canonical,
+                            &r.new_canonical,
+                            &ann_parent,
+                        )),
+                        Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
+                    }
+                }
+            }
+            let ann_legacy = ann_parent.join(&srv_canonical);
+            sync_announce_channel(db, git, srv_base, srv, client_base, client, &ann_legacy, c);
 
             // 0.9.0: api.md + handlers.md target moved to docs/server-api/
             // Auto-migrate old docs/api.md to docs/server-api/api.md.
@@ -594,6 +790,7 @@ fn sync_server_to_microservice(
     srv_base: &Path,
     microservice_ids: &[i64],
     skip_api_contract: bool,
+    git: Option<&crate::git_ops::GitBinary>,
     c: &mut SyncCounters,
 ) {
     for ms_project_id in microservice_ids {
@@ -779,7 +976,7 @@ fn sync_server_to_microservice(
             Ok(o) => {
                 c.migrated += o.migrated;
                 if o.channel_ready {
-                    fold_channel(sync::sync_peer_pair(srv, &ms_server_repo), c);
+                    fold_channel(sync::sync_peer_pair_ctx(Some(db), srv, &ms_server_repo), c);
                 } else {
                     let srv_label = srv.display_name();
                     sync_req_pair_legacy(&srv_ms_dir, &ms_srv_dir, &srv_label, &ms_label, c);
@@ -788,6 +985,37 @@ fn sync_server_to_microservice(
             Err(e) => c.push(migration_issue(&ms_label, e)),
         }
         c.extend(mig_warnings);
+
+        // T-000245: the ms→parent announcement lane migrates onto the same
+        // pair — folder named by the ms PROJECT (like microservice-api), so
+        // project renames replay on it before the files move.
+        let ann_parent = srv_base.join("docs").join("microservice-announcements");
+        match db.list_renames_for_project(*ms_project_id) {
+            Ok(renames) => {
+                for r in renames {
+                    match sync::replay_rename_in_dir(&ann_parent, &r.old_name, &r.new_name) {
+                        Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
+                        Ok(sync::RenameOutcome::NoOp) => {}
+                        Ok(sync::RenameOutcome::Collision) => {
+                            c.push(rename_collision(&r.old_name, &r.new_name, &ann_parent))
+                        }
+                        Err(e) => c.push(rename_failed(&r.old_name, &r.new_name, e)),
+                    }
+                }
+            }
+            Err(e) => c.push(renames_lookup(&ms_name, e)),
+        }
+        let ann_legacy = ann_parent.join(&ms_name);
+        sync_announce_channel(
+            db,
+            git,
+            ms_base,
+            &ms_server_repo,
+            srv_base,
+            srv,
+            &ann_legacy,
+            c,
+        );
 
         // 0.9.0: Microservice → Parent server — api.md + handlers.md + my_api.
         // Target on parent: docs/microservice-api/<ms-project-name>/{api,handlers}.md.
@@ -865,6 +1093,7 @@ fn sync_microservice_to_parents(
     project_id: i64,
     ms_server: &Repository,
     skip_api: bool,
+    git: Option<&crate::git_ops::GitBinary>,
     c: &mut SyncCounters,
 ) {
     if let Some(ref ms_path) = ms_server.local_path {
@@ -973,7 +1202,10 @@ fn sync_microservice_to_parents(
                     Ok(o) => {
                         c.migrated += o.migrated;
                         if o.channel_ready {
-                            fold_channel(sync::sync_peer_pair(parent_server, ms_server), c);
+                            fold_channel(
+                                sync::sync_peer_pair_ctx(Some(db), parent_server, ms_server),
+                                c,
+                            );
                         } else {
                             let ms_label = ms_server.display_name();
                             sync_req_pair_legacy(
@@ -988,6 +1220,23 @@ fn sync_microservice_to_parents(
                     Err(e) => c.push(migration_issue(&parent_label, e)),
                 }
                 c.extend(mig_warnings);
+
+                // T-000245: same announce migration as the parent-driven
+                // pass — idempotent, whichever side of the pair ran first.
+                let ann_legacy = parent_base
+                    .join("docs")
+                    .join("microservice-announcements")
+                    .join(&ms_project_name);
+                sync_announce_channel(
+                    db,
+                    git,
+                    ms_base,
+                    ms_server,
+                    parent_base,
+                    parent_server,
+                    &ann_legacy,
+                    c,
+                );
             }
         }
     }
@@ -1112,7 +1361,7 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
         Ok(o) => {
             c.migrated += o.migrated;
             if o.channel_ready {
-                fold_channel(sync::sync_peer_pair(sender, recipient), c);
+                fold_channel(sync::sync_peer_pair_ctx(Some(db), sender, recipient), c);
             } else {
                 let sender_label = sender.display_name();
                 let recipient_label = recipient.display_name();
@@ -1458,8 +1707,16 @@ pub(crate) fn run_project_sync_in(
                 return Ok(c.into_result());
             }
 
-            sync_client_to_server(db, srv, srv_base, &clients, &mut c);
-            sync_server_to_microservice(db, srv, srv_base, &microservice_ids, false, &mut c);
+            sync_client_to_server(db, srv, srv_base, &clients, git.as_ref(), &mut c);
+            sync_server_to_microservice(
+                db,
+                srv,
+                srv_base,
+                &microservice_ids,
+                false,
+                git.as_ref(),
+                &mut c,
+            );
         }
     }
 
@@ -1468,7 +1725,7 @@ pub(crate) fn run_project_sync_in(
     // separately (per-lane) by run_codex_req_channels below.
     if project_type == "microservice" {
         if let Some(ms_server) = server {
-            sync_microservice_to_parents(db, project_id, ms_server, false, &mut c);
+            sync_microservice_to_parents(db, project_id, ms_server, false, git.as_ref(), &mut c);
         }
     }
 
@@ -2913,5 +3170,69 @@ mod tests {
             "a refused render must leave .gitignore untouched:\n{}",
             text
         );
+    }
+
+    /// T-000245: the shared-recipient dual-write — a live new-layout body
+    /// projects onto the legacy path once, an existing projection is never
+    /// rewritten, and a closed pair retires its projection instead of
+    /// reviving it.
+    #[test]
+    fn announce_projections_dual_write_then_retire() {
+        let dir = TempDir::new().unwrap();
+        autocommit_git(dir.path(), &["init", "-q", "-b", "dev"]);
+        autocommit_git(dir.path(), &["config", "user.email", "t@e.c"]);
+        autocommit_git(dir.path(), &["config", "user.name", "T"]);
+        autocommit_git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let git = crate::git_ops::check_git_available().expect("git available");
+        let legacy = dir.path().join("docs/server-announcements/backend");
+        let inbox = dir.path().join("docs/InOutBox/inbox/backend");
+        fs::create_dir_all(&inbox).unwrap();
+
+        // A new publication — the projection appears byte-identical.
+        fs::write(inbox.join("ANNOUNCE-001_a.md"), "v1").unwrap();
+        let mut c = SyncCounters::new();
+        deliver_announce_projections(&git, dir.path(), &legacy, &inbox, &mut c);
+        assert_eq!(
+            fs::read(legacy.join("ANNOUNCE-001_a.md")).unwrap(),
+            b"v1",
+            "live body projects onto the legacy path"
+        );
+
+        // Whatever an old agent did to the projection is its business — the
+        // pass must not "repair" the file.
+        fs::write(legacy.join("ANNOUNCE-001_a.md"), "tampered").unwrap();
+        let mut c = SyncCounters::new();
+        deliver_announce_projections(&git, dir.path(), &legacy, &inbox, &mut c);
+        assert_eq!(
+            fs::read(legacy.join("ANNOUNCE-001_a.md")).unwrap(),
+            b"tampered"
+        );
+
+        // A second announcement commits, gets acknowledged on the new layout
+        // (body deleted by cleanup), and its projection must retire — while
+        // the live one stays.
+        fs::write(inbox.join("ANNOUNCE-002_b.md"), "x").unwrap();
+        let mut c = SyncCounters::new();
+        deliver_announce_projections(&git, dir.path(), &legacy, &inbox, &mut c);
+        autocommit_git(dir.path(), &["add", "-A"]);
+        autocommit_git(dir.path(), &["commit", "-q", "-m", "published"]);
+        fs::remove_file(inbox.join("ANNOUNCE-002_b.md")).unwrap();
+        let mut c = SyncCounters::new();
+        deliver_announce_projections(&git, dir.path(), &legacy, &inbox, &mut c);
+        assert!(
+            !legacy.join("ANNOUNCE-002_b.md").exists(),
+            "the projection of a closed pair retires"
+        );
+        assert!(
+            legacy.join("ANNOUNCE-001_a.md").exists(),
+            "a live pair keeps its projection"
+        );
+
+        // And a leftover projection of that closed pair is now "closed":
+        // migration must never spawn fresh copies from it.
+        fs::write(legacy.join("ANNOUNCE-002_b.md"), "x").unwrap();
+        let closed = closed_announce_names(&git, dir.path(), &legacy, &inbox);
+        assert!(closed.contains("ANNOUNCE-002_b.md"), "{:?}", closed);
+        assert!(!closed.contains("ANNOUNCE-001_a.md"));
     }
 }

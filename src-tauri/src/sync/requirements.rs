@@ -434,6 +434,108 @@ pub fn migrate_req_pair(
     Ok(out)
 }
 
+/// T-000190/T-000245: migrate one legacy ANNOUNCE folder onto the pairwise
+/// layout. Announcements never had a sender copy, so each body lands in TWO
+/// places at once — the recipient's `inbox/<sender>/` replica AND the sender's
+/// `outbox/<recipient>/` master. The outbox copy is not optional: the mirror
+/// prunes anything absent from it, and a body migrated into the inbox alone
+/// would be eaten on the very next pass ("an absent source is not a
+/// deletion" is exactly why both halves are written before the channel runs).
+///
+/// Per file: a byte-identical destination dedups; a divergent same-name
+/// destination keeps BOTH versions and raises `MigrationDiverged`; an
+/// unwritable copy rolls back only what this file just created and reports
+/// `MigrationFailed` — the legacy file then stays and the pass retries.
+/// `keep_legacy` marks a shared recipient: there the legacy file REMAINS as
+/// the old-agent projection the dual-write would produce anyway. `closed`
+/// names files whose new-layout body was already delivered and cleaned — a
+/// leftover projection of an acknowledged announcement; they are left in
+/// place and must NOT spawn fresh copies (the projection retire pass owns
+/// them). Otherwise the legacy file goes once both new copies are verified,
+/// and the dir drops when left empty. Idempotent on repeat.
+pub fn migrate_announce_dir(
+    legacy_dir: &Path,
+    new_inbox: &Path,
+    new_outbox: &Path,
+    keep_legacy: bool,
+    closed: &std::collections::BTreeSet<String>,
+    warnings: &mut Vec<SyncIssue>,
+) -> Result<usize, String> {
+    if !legacy_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut migrated = 0usize;
+    for entry in fs::read_dir(legacy_dir).map_err(|e| format!("{}: {}", legacy_dir.display(), e))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(name.starts_with("ANNOUNCE-") && name.ends_with(".md")) || closed.contains(name) {
+            continue;
+        }
+        let src_bytes = fs::read(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+        // Divergence gate: a same-name file with different bytes at either
+        // destination freezes this file — keep both, report, never pick one.
+        let mut diverged = false;
+        for dst_dir in [new_inbox, new_outbox] {
+            let dst = dst_dir.join(name);
+            if dst.exists() {
+                let b = fs::read(&dst).map_err(|e| format!("{}: {}", dst.display(), e))?;
+                if b != src_bytes {
+                    diverged = true;
+                }
+            }
+        }
+        if diverged {
+            warnings.push(
+                SyncIssue::new(SyncIssueCode::MigrationDiverged, name.to_string())
+                    .target(legacy_dir.display().to_string()),
+            );
+            continue;
+        }
+        // Write the missing copies; on failure remove only what this file
+        // just created — the earlier identical state is not ours to undo.
+        let mut created: Vec<PathBuf> = Vec::new();
+        let mut failure: Option<String> = None;
+        for dst_dir in [new_inbox, new_outbox] {
+            let dst = dst_dir.join(name);
+            if dst.exists() {
+                continue;
+            }
+            if let Some(p) = dst.parent() {
+                if let Err(e) = fs::create_dir_all(p) {
+                    failure = Some(format!("{}: {}", p.display(), e));
+                    break;
+                }
+            }
+            if let Err(e) = fs::write(&dst, &src_bytes) {
+                failure = Some(format!("{}: {}", dst.display(), e));
+                break;
+            }
+            created.push(dst);
+        }
+        if let Some(e) = failure {
+            for c in created {
+                let _ = fs::remove_file(&c);
+            }
+            warnings.push(SyncIssue::new(SyncIssueCode::MigrationFailed, e));
+            continue;
+        }
+        migrated += 1;
+        if !keep_legacy {
+            fs::remove_file(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+        }
+    }
+    if !keep_legacy {
+        let _ = remove_dir_if_empty(legacy_dir);
+    }
+    Ok(migrated)
+}
+
 /// F-033 Stage 1f Case C: migrate files from the flat `server-requirements/`
 /// on the microservice side into per-parent subfolders `server-requirements/<parent>/`.
 ///
@@ -1228,5 +1330,121 @@ mod tests {
                 assert!(!d.join(f).exists(), "{} still holds {}", d.display(), f);
             }
         }
+    }
+
+    // ── T-000245: migrate_announce_dir legacy -> InOutBox ────────────────────
+
+    fn announce_dirs(tmp: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let legacy = tmp.join("docs/server-announcements/backend");
+        let inbox = tmp.join("docs/InOutBox/inbox/backend");
+        let outbox = tmp.join("docs/InOutBox/outbox/web-client");
+        (legacy, inbox, outbox)
+    }
+
+    #[test]
+    fn test_migrate_announce_dir_copies_to_inbox_and_outbox_byte_identical() {
+        let tmp = TempDir::new().unwrap();
+        let (legacy, inbox, outbox) = announce_dirs(tmp.path());
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("ANNOUNCE-001_new.md"), "b\u{fffd}ytes").unwrap();
+        let body = fs::read(legacy.join("ANNOUNCE-001_new.md")).unwrap();
+
+        let mut w = Vec::new();
+        let n = migrate_announce_dir(&legacy, &inbox, &outbox, false, &Default::default(), &mut w)
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(w.is_empty());
+        // Both halves exist — the mirror would prune an inbox-only orphan.
+        assert_eq!(fs::read(inbox.join("ANNOUNCE-001_new.md")).unwrap(), body);
+        assert_eq!(fs::read(outbox.join("ANNOUNCE-001_new.md")).unwrap(), body);
+        // Non-shared: the legacy file retires with the migration.
+        assert!(!legacy.exists(), "empty legacy dir is dropped");
+    }
+
+    #[test]
+    fn test_migrate_announce_dir_keep_legacy_for_a_shared_recipient() {
+        let tmp = TempDir::new().unwrap();
+        let (legacy, inbox, outbox) = announce_dirs(tmp.path());
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("ANNOUNCE-002_x.md"), "news").unwrap();
+
+        let mut w = Vec::new();
+        let n = migrate_announce_dir(&legacy, &inbox, &outbox, true, &Default::default(), &mut w)
+            .unwrap();
+        assert_eq!(n, 1);
+        // The projection stays — an older agent on the shared branch still
+        // reads announcements from here.
+        assert!(legacy.join("ANNOUNCE-002_x.md").exists());
+        assert!(inbox.join("ANNOUNCE-002_x.md").exists());
+        assert!(outbox.join("ANNOUNCE-002_x.md").exists());
+    }
+
+    #[test]
+    fn test_migrate_announce_dir_dedups_and_diverges() {
+        let tmp = TempDir::new().unwrap();
+        let (legacy, inbox, outbox) = announce_dirs(tmp.path());
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(legacy.join("ANNOUNCE-003_same.md"), "same").unwrap();
+        fs::write(inbox.join("ANNOUNCE-003_same.md"), "same").unwrap();
+        fs::write(legacy.join("ANNOUNCE-004_diff.md"), "legacy").unwrap();
+        fs::write(inbox.join("ANNOUNCE-004_diff.md"), "different").unwrap();
+
+        let mut w = Vec::new();
+        let n = migrate_announce_dir(&legacy, &inbox, &outbox, false, &Default::default(), &mut w)
+            .unwrap();
+        assert_eq!(n, 1, "only the dedup'd file migrates");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].code, crate::models::SyncIssueCode::MigrationDiverged);
+        // Diverged pair keeps both versions.
+        assert_eq!(
+            fs::read(inbox.join("ANNOUNCE-004_diff.md")).unwrap(),
+            b"different"
+        );
+        assert_eq!(
+            fs::read(legacy.join("ANNOUNCE-004_diff.md")).unwrap(),
+            b"legacy"
+        );
+        assert!(legacy.is_dir(), "the diverged file keeps the dir alive");
+    }
+
+    #[test]
+    fn test_migrate_announce_dir_never_reseeds_a_closed_announcement() {
+        let tmp = TempDir::new().unwrap();
+        let (legacy, inbox, outbox) = announce_dirs(tmp.path());
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("ANNOUNCE-005_done.md"), "old news").unwrap();
+        let closed: std::collections::BTreeSet<String> =
+            ["ANNOUNCE-005_done.md".to_string()].into_iter().collect();
+
+        let mut w = Vec::new();
+        let n = migrate_announce_dir(&legacy, &inbox, &outbox, true, &closed, &mut w).unwrap();
+        assert_eq!(n, 0, "a closed name must not spawn fresh copies");
+        assert!(!inbox.join("ANNOUNCE-005_done.md").exists());
+        assert!(!outbox.join("ANNOUNCE-005_done.md").exists());
+        // The leftover projection itself is left for the retire pass.
+        assert!(legacy.join("ANNOUNCE-005_done.md").exists());
+    }
+
+    #[test]
+    fn test_migrate_announce_dir_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let (legacy, inbox, outbox) = announce_dirs(tmp.path());
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("ANNOUNCE-006_i.md"), "x").unwrap();
+        let mut w = Vec::new();
+        migrate_announce_dir(&legacy, &inbox, &outbox, false, &Default::default(), &mut w).unwrap();
+        let mut w2 = Vec::new();
+        let n2 = migrate_announce_dir(
+            &legacy,
+            &inbox,
+            &outbox,
+            false,
+            &Default::default(),
+            &mut w2,
+        )
+        .unwrap();
+        assert_eq!(n2, 0);
+        assert!(w2.is_empty());
     }
 }
