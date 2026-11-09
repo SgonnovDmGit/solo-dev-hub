@@ -2157,7 +2157,7 @@ fn run_phase_a_with(
         // against this, so a pass never captures a post-repath generation
         // for a pre-repath path (or the reverse).
         let guard = specs_policy_guard(repo.id);
-        let lifecycle_gen = {
+        let mut lifecycle_gen = {
             let _g = guard.lock().unwrap();
             match db.get_repository(repo.id).ok().and_then(|r| r.local_path) {
                 // Unconditional: `Path` equality normalizes separators and
@@ -2240,7 +2240,12 @@ fn run_phase_a_with(
         {
             let mut pass = new_pass(&repo, &root, login);
             fetch_into(git, &mut pass, FetchMode::Probe);
-            drop_stale_structure(db, git, &repo, &root, pass.net_ok, lifecycle_gen);
+            // The cleanup's own pin-clear bumps the generation; the pass
+            // below must capture the RESULT, not the input — otherwise it
+            // seals itself stale for a transition it did not make
+            // (T-000243 review, sixteenth pass).
+            lifecycle_gen +=
+                drop_stale_structure(db, git, &repo, &root, pass.net_ok, lifecycle_gen);
         }
         // A role-less repo is probed at most every 10 minutes (persisted); one
         // that was refused as untrusted is looked at again on every sync.
@@ -2420,8 +2425,9 @@ fn phase_a_foreign(
                 expected += foreign_state_cleanup(db, repo.id, root, expected);
             }
             // Facts decide whether anything is left to clean up (nothing, for a repo
-            // that never carried a structure).
-            drop_stale_structure(db, git, repo, root, pass.net_ok, expected);
+            // that never carried a structure). No pass survives this branch,
+            // so the cleanup's bumps need no carrying.
+            let _ = drop_stale_structure(db, git, repo, root, pass.net_ok, expected);
             None
         }
         DiscoverOutcome::Untrusted(reason) => {
@@ -2502,13 +2508,13 @@ fn phase_a_foreign(
                 pass.note(SharedStatus::PendingApproval, "");
             }
             if role == Role::Contributor {
-                remove_own_stale_request(git, &pass);
+                remove_own_stale_request(git, &pass, gen0 + u64::from(pass.own_bumps));
             }
             // Р16: this install does not render rule copies here; copies an
             // earlier version (or the time before the join) left untracked
             // would stop the owner's from being fast-forwarded in.
             if role != Role::Main {
-                drop_untracked_rule_copies(git, repo.id, root);
+                drop_untracked_rule_copies(git, repo.id, root, gen0 + u64::from(pass.own_bumps));
             }
             // T-000243: the helper takes the specs policy from the very
             // structure that gave it the role, before any path is computed.
@@ -2587,48 +2593,52 @@ fn drop_stale_structure(
     root: &Path,
     net_ok: bool,
     expected_gen: u64,
-) {
+) -> u64 {
     // T-000243 review (tenth pass): the WHOLE cleanup — the switch-off
     // evidence check, the deletion commits, the pushes and the pin
     // settlement — runs under the policy guard. Every lifecycle writer
     // needs the same guard, so the generation cannot move while it is
     // held: the freshness check below stays valid for every step, and a
     // republished structure can never be deleted by an obsolete pass.
+    // Returns how many lifecycle bumps it performed: the caller's own
+    // pass must count them or it seals itself stale (T-000243 review,
+    // sixteenth pass).
     let guard = specs_policy_guard(repo.id);
     let _g = guard.lock().unwrap();
     if !lifecycle_is_current(repo.id, root, expected_gen) {
-        return;
+        return 0;
     }
     let mut imp = ss::read_shared_import(db, repo.id);
     let Some(pin) = imp.pinned_dev_branch.clone() else {
-        return;
+        return 0;
     };
     if !repo_ready(git, root) {
-        return;
+        return 0;
     }
     // The switch-off must be established by origin's pinned dev branch itself.
     if tracks_structure(git, root, &remote_ref(&pin)) != Some(false) {
-        return;
+        return 0;
     }
     // The guard is already held — `finish` must NOT re-acquire it.
-    let finish = |db: &AppDb, _imp: &mut ss::SharedImport| {
+    let finish = |db: &AppDb, _imp: &mut ss::SharedImport| -> u64 {
         if !root.join(STRUCTURE_REL_PATH).exists() {
             // Clearing the pin is a lifecycle transition gated on the pin
             // still being the one the evidence was gathered for — a newer
             // accept may have pinned a different dev branch meanwhile.
             let mut fresh = ss::read_shared_import(db, repo.id);
             if fresh.pinned_dev_branch.as_deref() != Some(pin.as_str()) {
-                return;
+                return 0;
             }
             fresh.pinned_dev_branch = None;
             if ss::write_shared_import(db, repo.id, &fresh).is_ok() {
                 bump_lifecycle_generation(repo.id, root);
+                return 1;
             }
         }
+        0
     };
     let Some(own) = own_branch_of(db, repo.id) else {
-        finish(db, &mut imp);
-        return;
+        return finish(db, &mut imp);
     };
     let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
     let login = db.github_login().unwrap_or_default();
@@ -2638,8 +2648,7 @@ fn drop_stale_structure(
     if tracks_structure(git, root, &local_ref(&own)) != Some(true)
         && tracks_structure(git, root, &remote) != Some(true)
     {
-        finish(db, &mut imp);
-        return;
+        return finish(db, &mut imp);
     }
 
     // Bring a local copy that only lags up to origin's first (the owner may have
@@ -2674,7 +2683,7 @@ fn drop_stale_structure(
             remove_sdh_from_branch(git, root, &own, &sdh, &login)
         };
         if !matches!(removed, Ok(true)) {
-            return;
+            return 0;
         }
     }
     if net_ok && remote_sha.is_some() {
@@ -2683,8 +2692,9 @@ fn drop_stale_structure(
     if tracks_structure(git, root, &local_ref(&own)) != Some(true)
         && tracks_structure(git, root, &remote) != Some(true)
     {
-        finish(db, &mut imp);
+        return finish(db, &mut imp);
     }
+    0
 }
 
 /// The owner's deletion of `.sdh/` was committed but not pushed: push it now.
@@ -2896,7 +2906,7 @@ fn clean_recipients(list: Vec<String>) -> Vec<String> {
 /// may have made the file tracked since this pass last looked, and deleting
 /// a tracked file would publish its removal (T-000243 review, fifteenth
 /// pass — same check-then-delete race as `drop_untracked_rule_copies`).
-fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass) {
+fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass, expected: u64) {
     let rel = request_rel_path(&pass.login);
     let abs = pass.root.join(&rel);
     if !abs.is_file() {
@@ -2904,6 +2914,13 @@ fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass) {
     }
     let guard = specs_policy_guard(pass.repo.id);
     let _g = guard.lock().unwrap();
+    // T-000243 review (sixteenth pass): serializing is not enough — a repath
+    // that landed since the pass captured its generation makes this delete
+    // obsolete even though the mutex is free. Skip it on the detached
+    // checkout; the pass seals stale at `finish` regardless.
+    if !lifecycle_is_current(pass.repo.id, &pass.root, expected) {
+        return;
+    }
     let tracked = spawn_cmd(&git.0)
         .args(["ls-files", "--error-unmatch", "--", &rel])
         .current_dir(&pass.root)
@@ -2924,9 +2941,15 @@ fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass) {
 /// pass's fast-forward may have made a copy tracked since this pass last
 /// looked, and deleting a tracked file would publish its removal on the next
 /// commit (T-000243 review, fifteenth pass).
-fn drop_untracked_rule_copies(git: &GitBinary, repo_id: i64, root: &Path) {
+fn drop_untracked_rule_copies(git: &GitBinary, repo_id: i64, root: &Path, expected: u64) {
     let guard = specs_policy_guard(repo_id);
     let _g = guard.lock().unwrap();
+    // T-000243 review (sixteenth pass): same freshness gate as
+    // `remove_own_stale_request` — a repathed pass must not delete files on
+    // the checkout it no longer owns.
+    if !lifecycle_is_current(repo_id, root, expected) {
+        return;
+    }
     let dir = root.join(SKILLS_DIR);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;

@@ -118,7 +118,14 @@ fn init_docs_for_repo_in(
     // managed-block writes stay inside the one hold.
     let policy = sync::shared::specs_policy_guard(repo_id);
     let _policy = policy.lock().unwrap();
-    let shared = sync::shared::is_shared_repo(db, repo_id);
+    // T-000243 review (sixteenth pass): re-read the binding under the guard
+    // — a repath that landed since `base` was captured makes the managed
+    // writes below target a detached checkout.
+    let binding_fresh = db
+        .get_repository(repo_id)
+        .map(|r| r.local_path.as_deref() == Some(path))
+        .unwrap_or(false);
+    let shared = binding_fresh && sync::shared::is_shared_repo(db, repo_id);
     if shared {
         // No git binary on the machine: no discovery is possible. The
         // owner's policy needs none (its database row answers); a helper's
@@ -135,16 +142,18 @@ fn init_docs_for_repo_in(
         // the write (see `render_write_probe`).
         #[cfg(test)]
         sync::shared::render_write_probe(repo_id, base);
-    } else {
+    } else if binding_fresh {
         let rendered = sync::shared::gitignore_template_for(&gitignore_template, false, true);
         if sync::sync_gitignore_section(&rendered, base)? {
             updated.push(".gitignore (section)".to_string());
         }
     }
-    let gitattributes_template =
-        sync::shared::gitattributes_template_for(&gitattributes_template, shared);
-    if sync::sync_gitattributes_section(&gitattributes_template, base)? {
-        updated.push(".gitattributes (section)".to_string());
+    if binding_fresh {
+        let gitattributes_template =
+            sync::shared::gitattributes_template_for(&gitattributes_template, shared);
+        if sync::sync_gitattributes_section(&gitattributes_template, base)? {
+            updated.push(".gitattributes (section)".to_string());
+        }
     }
     drop(_policy);
     drop(policy);

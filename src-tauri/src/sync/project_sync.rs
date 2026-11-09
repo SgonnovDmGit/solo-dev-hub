@@ -291,8 +291,18 @@ fn write_repo_skeletons(
     // .gitattributes) stay inside the one hold.
     let policy_guard = sync::shared::specs_policy_guard(repo.id);
     let _policy = policy_guard.lock().unwrap();
-    let shared = sync::shared::is_shared_repo(db, repo.id);
-    let gitignore = if !shared {
+    // T-000243 review (sixteenth pass): the binding itself is lifecycle
+    // state — re-read it under the guard. A repath that landed since the
+    // caller captured `repo`/`base` makes every managed-block write below
+    // target a detached checkout, so a stale binding skips them all.
+    let binding_fresh = db
+        .get_repository(repo.id)
+        .map(|r| r.local_path == repo.local_path)
+        .unwrap_or(false);
+    let shared = binding_fresh && sync::shared::is_shared_repo(db, repo.id);
+    let gitignore = if !binding_fresh {
+        None
+    } else if !shared {
         Some(sync::shared::gitignore_template_for(
             &tpl.gitignore,
             false,
@@ -332,9 +342,11 @@ fn write_repo_skeletons(
         #[cfg(test)]
         sync::shared::render_write_probe(repo.id, base);
     }
-    let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
-    if let Err(e) = sync::sync_gitattributes_section(&gitattributes, base) {
-        c.push(file_issue(".gitattributes", e));
+    if binding_fresh {
+        let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
+        if let Err(e) = sync::sync_gitattributes_section(&gitattributes, base) {
+            c.push(file_issue(".gitattributes", e));
+        }
     }
     drop(_policy);
     drop(policy_guard);
