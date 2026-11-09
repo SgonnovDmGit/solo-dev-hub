@@ -2075,3 +2075,197 @@ fn t000243_another_projects_shared_repo_refuses_its_render_on_a_refused_structur
         "the render must be skipped with an issue, never written from the stale policy"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T-000245: announcements on the shared transport
+// ---------------------------------------------------------------------------
+
+/// A non-shared microservice attached to the owner's project — the announce
+/// sender of the ms → parent lane; the shared repo (role server) is its
+/// parent. Returns (ms repo dir, its canonical name for the outbox folder).
+fn attach_announce_sender(w: &World) -> (PathBuf, String) {
+    let ms_dir = w.fx._tmp.path().join("ms");
+    fs::create_dir_all(&ms_dir).unwrap();
+    write(&ms_dir, "README.md", "ms\n");
+    let ms_proj =
+        w.fx.main_db
+            .create_project("Ms", None, "microservice")
+            .unwrap();
+    w.fx.main_db
+        .upsert_repository("Owner/ms", None, None, None, None, None)
+        .unwrap();
+    let ms_repo = w.fx.main_db.get_repository_by_name("Owner/ms").unwrap().id;
+    w.fx.main_db
+        .set_repo_local_path(ms_repo, Some(ms_dir.to_str().unwrap()))
+        .unwrap();
+    w.fx.main_db
+        .assign_repository(ms_repo, Some(ms_proj.id), Some("server"))
+        .unwrap();
+    w.fx.main_db
+        .connect_microservice(w.fx.project_id, ms_proj.id)
+        .unwrap();
+    (ms_dir, "api".to_string()) // the shared repo's canonical name
+}
+
+fn announce_body(dir: &Path, peer: &str) -> PathBuf {
+    dir.join("docs/InOutBox")
+        .join("outbox")
+        .join(peer)
+        .join("ANNOUNCE-001_break.md")
+}
+
+fn announce_ack_dir(dir: &Path, peer: &str) -> PathBuf {
+    dir.join("docs/InOutBox")
+        .join("inbox")
+        .join(peer)
+        .join("ANNOUNCE-001_break.md.ack")
+}
+
+fn drop_marker(ack_dir: &Path, key: &str) {
+    fs::create_dir_all(ack_dir).unwrap();
+    write(ack_dir, key, "");
+}
+
+/// T-000245: a shared recipient's announcement collects one marker per roster
+/// login and closes only when EVERY expected reader acknowledged — the
+/// per-participant ack the shared dev branch always needed.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn a_shared_announcement_waits_for_every_participants_marker() {
+    let w = World::new();
+    let (ms_dir, peer) = attach_announce_sender(&w);
+    w.participants();
+
+    // The ms's agent publishes — its own outbox, recipient = shared "api".
+    let body = announce_body(&ms_dir, &peer);
+    fs::create_dir_all(body.parent().unwrap()).unwrap();
+    fs::write(
+        &body,
+        "# ANNOUNCE-001: cache TTL\n\n## Why this matters to you\n\nTune retries.\n",
+    )
+    .unwrap();
+
+    w.sync_owner(); // delivers to the shared inbox + the legacy projection
+    w.sync_helper(); // dev → the helper's tree
+    assert!(
+        w.helper_file("docs/InOutBox/inbox/ms/ANNOUNCE-001_break.md")
+            .contains("ANNOUNCE-001"),
+        "the body must reach every participant through dev"
+    );
+    assert!(
+        w.helper_file("docs/microservice-announcements/Ms/ANNOUNCE-001_break.md")
+            .contains("ANNOUNCE-001"),
+        "the transition dual-write projects onto the legacy path"
+    );
+
+    // The helper's agent acknowledges — an empty marker named by its login.
+    drop_marker(&announce_ack_dir(&w.fx.helper_dir, "ms"), "helper");
+    w.sync_helper(); // the marker rides helper-dev onto dev
+    w.sync_owner(); // it lands in the owner's tree — but the owner has not read
+
+    assert!(
+        w.owner_file("docs/InOutBox/inbox/ms/ANNOUNCE-001_break.md")
+            .contains("ANNOUNCE-001"),
+        "one of two readers is not all — the body stays open"
+    );
+
+    // The owner's agent acknowledges too — now every login of the roster has.
+    drop_marker(&announce_ack_dir(&w.fx.main_dir, "ms"), "Owner");
+    w.sync_owner();
+
+    assert!(
+        w.owner_file("docs/InOutBox/inbox/ms/ANNOUNCE-001_break.md")
+            .is_empty(),
+        "fully acknowledged — the body closes"
+    );
+    assert!(
+        !announce_ack_dir(&w.fx.main_dir, "ms").exists(),
+        "the whole .ack/ group goes with the body"
+    );
+    assert!(
+        !announce_body(&ms_dir, &peer).exists(),
+        "the author's outbox copy goes with it"
+    );
+
+    w.sync_helper(); // the teardown reaches every participant
+    assert!(w
+        .helper_file("docs/InOutBox/inbox/ms/ANNOUNCE-001_break.md")
+        .is_empty());
+    assert!(!announce_ack_dir(&w.fx.helper_dir, "ms").exists());
+    assert!(
+        w.helper_file("docs/microservice-announcements/Ms/ANNOUNCE-001_break.md")
+            .is_empty(),
+        "the legacy projection retires with the pair"
+    );
+
+    // Idempotent: a repeated sync resurrects neither the body nor a marker.
+    w.sync_owner();
+    w.sync_helper();
+    assert!(w
+        .helper_file("docs/InOutBox/inbox/ms/ANNOUNCE-001_break.md")
+        .is_empty());
+    assert!(w
+        .helper_file("docs/microservice-announcements/Ms/ANNOUNCE-001_break.md")
+        .is_empty());
+}
+
+/// T-000245: editing the body resets the acknowledgements; a marker committed
+/// against the old revision on a late branch can never confirm the new one.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn a_body_revision_resets_markers_across_the_shared_branch() {
+    let w = World::new();
+    let (ms_dir, peer) = attach_announce_sender(&w);
+    w.participants();
+
+    let body = announce_body(&ms_dir, &peer);
+    fs::create_dir_all(body.parent().unwrap()).unwrap();
+    fs::write(&body, "v1\n").unwrap();
+    w.sync_owner();
+    w.sync_helper();
+
+    // The helper acks v1; the marker lands on dev.
+    drop_marker(&announce_ack_dir(&w.fx.helper_dir, "ms"), "helper");
+    w.sync_helper();
+    w.sync_owner();
+    assert!(announce_ack_dir(&w.fx.main_dir, "ms")
+        .join("helper")
+        .exists());
+
+    // The author revises the body — every marker to v1 is invalid for v2.
+    fs::write(&body, "v2\n").unwrap();
+    w.sync_owner();
+    assert!(
+        w.owner_file("docs/InOutBox/inbox/ms/ANNOUNCE-001_break.md") == "v2\n",
+        "v2 mirrors in"
+    );
+    assert!(
+        !announce_ack_dir(&w.fx.main_dir, "ms").exists(),
+        "the revision clears the .ack/ group on both copies"
+    );
+
+    w.sync_helper(); // the reset travels — the helper's marker is gone there too
+    assert!(w.helper_file("docs/InOutBox/inbox/ms/ANNOUNCE-001_break.md") == "v2\n");
+    assert!(
+        !announce_ack_dir(&w.fx.helper_dir, "ms").exists(),
+        "a stale marker must not survive on the participant's tree"
+    );
+
+    // A fresh marker against v2 is honoured; the owner reads it last, as above.
+    drop_marker(&announce_ack_dir(&w.fx.helper_dir, "ms"), "helper");
+    w.sync_helper();
+    w.sync_owner(); // the marker merges onto dev — the owner has not read yet
+    assert!(
+        announce_ack_dir(&w.fx.main_dir, "ms")
+            .join("helper")
+            .exists(),
+        "the fresh marker reaches the owner's tree before the close"
+    );
+    drop_marker(&announce_ack_dir(&w.fx.main_dir, "ms"), "Owner");
+    w.sync_owner();
+    assert!(
+        w.owner_file("docs/InOutBox/inbox/ms/ANNOUNCE-001_break.md")
+            .is_empty(),
+        "both readers acked v2 — the pair closes"
+    );
+}

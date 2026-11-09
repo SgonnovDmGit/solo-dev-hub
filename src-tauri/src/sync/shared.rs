@@ -1281,7 +1281,21 @@ fn plumb_into_branch(
                 }
             }
             (Some(w), None) => {
-                if Some(w) == bs {
+                // The branch deleted the file and we still hold bytes — a
+                // stale copy, unless the file was re-created AFTER the
+                // deletion reached this checkout. The merge base tells them
+                // apart: when the branch's deletion is an ancestor of HEAD,
+                // the file is absent at the base, so its presence here is
+                // fresh work and must publish — the empty `.ack/<key>`
+                // markers re-dropped after a revision reset are the standing
+                // case. `common` (a shared blob) is the fallback only where
+                // the histories share no merge base at all.
+                let stale_base = if base_rev.is_some() {
+                    merge_base_blob
+                } else {
+                    bs
+                };
+                if Some(w) == stale_base {
                     Plan::Skip
                 } else {
                     read_worktree(root, path).map_or(Plan::Skip, Plan::Write)
@@ -10358,6 +10372,61 @@ mod tests {
         let got = plumb_lineages(&[&k, &s0, &k, &s0], &[&k, &s0, &k]);
         assert!(got.contains("T-000001"), "re-added row lost:\n{}", got);
         assert!(got.contains("T-000002"));
+    }
+
+    /// T-000245: both histories held `rel` once (same bytes) and `other`
+    /// dropped it — the shape an `.ack/<key>` marker leaves after a revision
+    /// reset. `saw_deletion` merges the deletion into HEAD first (the merge
+    /// base then lacks the file) and re-creates it in the work tree; `false`
+    /// keeps the marker tracked on HEAD (this checkout never saw the reset).
+    fn plumb_recreated_file(saw_deletion: bool) -> Option<String> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        let rel = "docs/InOutBox/inbox/ms/ANNOUNCE-001_x.md.ack/helper";
+        write(d, rel, "");
+        g(d, &["add", rel]);
+        g(d, &["commit", "-q", "-m", "v1 ack"]);
+        if saw_deletion {
+            // The reset is an ancestor of HEAD: dev deleted the file before
+            // `other` branched off, so the merge base holds no copy of it.
+            g(d, &["rm", "-q", rel]);
+            g(d, &["commit", "-q", "-m", "reset"]);
+            g(d, &["checkout", "-q", "-b", "other"]);
+            g(d, &["checkout", "-q", "dev"]);
+            write(d, rel, "");
+        } else {
+            // The stale case: `other` deleted the file while this checkout
+            // still tracks the old copy — its bytes equal the merge base's.
+            g(d, &["checkout", "-q", "-b", "other"]);
+            g(d, &["rm", "-q", rel]);
+            g(d, &["commit", "-q", "-m", "reset"]);
+            g(d, &["checkout", "-q", "dev"]);
+        }
+        let spec = vec!["docs/InOutBox".to_string()];
+        plumb_into_branch(&gb(), d, "other", &spec, "me", &[]).unwrap();
+        if g(d, &["ls-tree", "--name-only", "other", "--", rel]).is_empty() {
+            None
+        } else {
+            Some(g(d, &["show", &format!("other:{}", rel)]))
+        }
+    }
+
+    #[test]
+    fn a_byte_identical_file_recreated_after_its_deletion_republishes() {
+        // The deletion is an ancestor of HEAD — the file is absent at the
+        // merge base — so identical bytes mean fresh intent, not a stale
+        // copy: without this a re-acknowledgement can never leave the install.
+        assert_eq!(plumb_recreated_file(true).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_still_tracked_copy_the_branch_deleted_stays_deleted() {
+        // Same bytes, but the file is still at the merge base: this checkout
+        // never saw the deletion — the branch's deletion wins.
+        assert_eq!(plumb_recreated_file(false), None);
     }
 
     fn done_md(ids: &[&str]) -> String {
