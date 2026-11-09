@@ -1222,14 +1222,16 @@ mod current_branch_tests {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_autocommit_branch(
     db: State<AppDb>,
     repo_id: i64,
     branch: Option<String>,
 ) -> Result<(), String> {
-    db.set_autocommit_branch(repo_id, branch.as_deref())
-        .map_err(|e| e.to_string())
+    // T-000243 review (eighteenth pass): the branch is the shared pass's own
+    // branch — the guarded setter bumps the lifecycle generation so an
+    // in-flight pass cannot keep pushing to the old recipient set.
+    crate::sync::shared::set_autocommit_branch_guarded(&db, repo_id, branch.as_deref())
 }
 
 // ── v0.20.0: Task sync commands ───────────────────────────────────────────────

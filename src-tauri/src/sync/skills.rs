@@ -1289,18 +1289,29 @@ fn render_scope(
         RenderScope::Repo(base) => {
             // Р16: a contributor's / pending helper's checkout takes no rule
             // copies. `repos` already leaves such a repo out, so it is found by
-            // its path in the whole portfolio.
-            if db
-                .list_all_repos()
-                .map(|all| {
-                    all.iter().any(|r| {
-                        r.local_path.as_deref().map(Path::new) == Some(base)
-                            && skips_rule_copies(db, r.id)
-                    })
-                })
-                .unwrap_or(false)
-            {
-                return;
+            // its path in the whole portfolio. T-000243 review (eighteenth
+            // pass): when the target IS a stored checkout, the same policy-
+            // guard serialization as the everywhere loop applies — a
+            // non-blocking take, a fresh binding + membership recheck, then
+            // the write; a target that is not a stored checkout has no
+            // lifecycle to race and renders unguarded as before.
+            let repo_id = db.list_all_repos().ok().and_then(|all| {
+                all.iter()
+                    .find(|r| r.local_path.as_deref().map(Path::new) == Some(base))
+                    .map(|r| r.id)
+            });
+            if let Some(repo_id) = repo_id {
+                let policy = crate::sync::shared::specs_policy_guard(repo_id);
+                let Ok(_policy) = policy.try_lock() else {
+                    return;
+                };
+                let still_current = db.get_repository(repo_id).ok().is_some_and(|fresh| {
+                    fresh.local_path.as_deref().map(Path::new) == Some(base)
+                        && !skips_rule_copies(db, repo_id)
+                });
+                if !still_current {
+                    return;
+                }
             }
             // Rendered even after an everywhere pass: the target may not be among
             // the stored checkouts, and an unchanged file is not rewritten anyway.
@@ -1377,6 +1388,26 @@ fn render_skills_everywhere(
         let Some(base) = existing_checkout(repo) else {
             continue;
         };
+        // T-000243 review (eighteenth pass): `repos` is a snapshot — a
+        // shared-mode transition landing mid-refresh must not let this
+        // write restore rule copies the new lifecycle removed or fast-
+        // forwarded away. Serialize with the repo's policy guard and
+        // revalidate binding + membership under it. `try_lock`, never
+        // `lock`: a sync that owns the repo this round renders it itself
+        // and the next refresh retries, while a non-blocking take can
+        // never invert the policy → rules order `after_fetch →
+        // adopt_main_canon` relies on (this runs under `rules_guard`).
+        let policy = crate::sync::shared::specs_policy_guard(repo.id);
+        let Ok(_policy) = policy.try_lock() else {
+            continue;
+        };
+        let still_current = db.get_repository(repo.id).ok().is_some_and(|fresh| {
+            fresh.local_path.as_deref().map(Path::new) == repo.local_path.as_deref().map(Path::new)
+                && !skips_rule_copies(db, repo.id)
+        });
+        if !still_current {
+            continue;
+        }
         // T-000198: the same label the project-sync skeleton pass uses, so a
         // held copy seen by both renders of one pass is reported once.
         let label = rule_copy_label(repo);
@@ -2689,6 +2720,44 @@ mod tests {
         let report = refresh_rules(&db, None, RenderScope::Repo(pending.path()), None);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(!pending.path().join("docs").exists());
+    }
+
+    /// T-000243 review (eighteenth pass): the refresh's repo list is a
+    /// snapshot — a shared-mode transition landing mid-refresh must not let
+    /// the render write over the new lifecycle's copies. Each repo render
+    /// serializes on its policy guard; while a sync holds it, the refresh
+    /// skips the repo (the next pass renders it).
+    #[test]
+    fn a_repo_under_its_policy_guard_is_not_rendered_from_a_stale_snapshot() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_role(&db, &tmp, "acme/one", None);
+        let rendered = tmp.path().join("docs/sdh_skills/sdh-alpha.md");
+
+        refresh_rules(&db, None, RenderScope::Everywhere, None);
+        assert!(rendered.exists(), "the ordinary repo renders its copies");
+
+        fs::remove_file(&rendered).unwrap();
+        {
+            let policy = crate::sync::shared::specs_policy_guard(repo.id);
+            let _hold = policy.lock().unwrap();
+            refresh_rules(&db, None, RenderScope::Everywhere, None);
+            assert!(
+                !rendered.exists(),
+                "a sync holding the repo's policy guard owns it — the refresh must not write"
+            );
+            let report = refresh_rules(&db, None, RenderScope::Repo(tmp.path()), None);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert!(
+                !rendered.exists(),
+                "the single-repo render defers under the guard too"
+            );
+        }
+        refresh_rules(&db, None, RenderScope::Everywhere, None);
+        assert!(
+            rendered.exists(),
+            "the next refresh renders it once the guard frees"
+        );
     }
 
     #[test]

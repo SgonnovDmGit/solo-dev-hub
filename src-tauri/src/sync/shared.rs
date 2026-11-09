@@ -228,6 +228,15 @@ fn lifecycle_is_current(repo_id: i64, root: &Path, expected: u64) -> bool {
 fn pass_role_transition(pass: &mut RepoPass, db: &AppDb, role: Option<&str>, expected: u64) {
     let guard = specs_policy_guard(pass.repo.id);
     let _g = guard.lock().unwrap();
+    pass_role_transition_locked(pass, db, role, expected);
+}
+
+/// Caller holds `specs_policy_guard(pass.repo.id)` — the locked half for
+/// acceptance sections that already hold the guard across the observation
+/// revalidation and the role write, so the two cannot be split by a
+/// structure republish that leaves the generation unchanged (T-000243
+/// review, eighteenth pass).
+fn pass_role_transition_locked(pass: &mut RepoPass, db: &AppDb, role: Option<&str>, expected: u64) {
     if !lifecycle_is_current(pass.repo.id, &pass.root, expected) {
         return;
     }
@@ -302,6 +311,30 @@ pub fn rebind_local_path(
         bump_lifecycle_generation(repo_id, Path::new(p));
     }
     Ok(repo)
+}
+
+/// T-000243 review (eighteenth pass): the auto-commit branch IS the pass's
+/// own branch (`own_branch_of`) — changing or clearing it mid-pass must
+/// stale the pass, or phase B keeps committing and pushing to the branch
+/// set the pass captured. Serialized under the policy guard and bumped on
+/// the CURRENT binding like every other lifecycle writer.
+pub fn set_autocommit_branch_guarded(
+    db: &AppDb,
+    repo_id: i64,
+    branch: Option<&str>,
+) -> Result<(), String> {
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
+    let before = db.get_autocommit_branch(repo_id).ok().flatten();
+    db.set_autocommit_branch(repo_id, branch)
+        .map_err(|e| e.to_string())?;
+    let after = db.get_autocommit_branch(repo_id).ok().flatten();
+    if before != after {
+        if let Some(p) = db.get_repository(repo_id).ok().and_then(|r| r.local_path) {
+            bump_lifecycle_generation(repo_id, Path::new(&p));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2491,7 +2524,14 @@ fn phase_a_foreign(
             // the generation) unchanged. Re-run the authoritative discovery
             // under the same hold and apply only while it still yields the
             // very structure this pass discovered.
-            {
+            // T-000243 review (eighteenth pass): a failed revalidation
+            // abandons the WHOLE acceptance — applying the structure yet
+            // still deriving its role would write a lifecycle from an
+            // observation that is no longer authoritative. The apply, the
+            // pin and the role write share this one hold, so nothing can
+            // interleave between them either; pinning is this pass's own
+            // lifecycle transition, counted so the seal forgives it.
+            let role = {
                 let guard = specs_policy_guard(repo.id);
                 let _g = guard.lock().unwrap();
                 let observation_current =
@@ -2500,35 +2540,29 @@ fn phase_a_foreign(
                             ss::discover_structure(git, root, gh, pinned.as_deref(), &admins),
                             Ok(DiscoverOutcome::Found(ref s2, _)) if *s2 == s
                         );
-                if observation_current {
-                    if let Err(e) = ss::apply_structure_locally(db, repo.id, &s) {
-                        pass.issue(
-                            repo_issue(Code::ManagedFileFailed, repo)
-                                .target(STRUCTURE_REL_PATH)
-                                .detail(e),
-                        );
-                    }
+                if !observation_current {
+                    return None;
                 }
-            }
-            if pinned.is_none() {
-                // Pinning is this pass's own lifecycle transition: guarded,
-                // freshness-checked against THIS pass's generation, bumped,
-                // and counted so the seal forgives it.
-                let guard = specs_policy_guard(repo.id);
-                let _g = guard.lock().unwrap();
-                if lifecycle_is_current(repo.id, root, gen0 + u64::from(pass.own_bumps))
-                    && ss::pin_after_accept(db, repo.id, &s).is_ok()
-                {
+                if let Err(e) = ss::apply_structure_locally(db, repo.id, &s) {
+                    pass.issue(
+                        repo_issue(Code::ManagedFileFailed, repo)
+                            .target(STRUCTURE_REL_PATH)
+                            .detail(e),
+                    );
+                }
+                if pinned.is_none() && ss::pin_after_accept(db, repo.id, &s).is_ok() {
                     bump_lifecycle_generation(repo.id, root);
                     pass.own_bumps += 1;
                 }
-            }
-            let role = ss::derive_role(Some(&s), Some(login));
+                ss::derive_role(Some(&s), Some(login)).map(|role| {
+                    let expected = gen0 + u64::from(pass.own_bumps);
+                    pass_role_transition_locked(&mut pass, db, Some(role.as_str()), expected);
+                    role
+                })
+            };
             let Some(role) = role else {
                 return Some(pass);
             };
-            let expected = gen0 + u64::from(pass.own_bumps);
-            pass_role_transition(&mut pass, db, Some(role.as_str()), expected);
             pass.role = Some(role);
             let expected = gen0 + u64::from(pass.own_bumps);
             register_driver(git, &mut pass, expected);
@@ -3249,9 +3283,26 @@ impl SharedSync {
             // approval) between its decisions and now must not commit or
             // push from a checkout it no longer owns. The check and phase
             // B share this one guard hold, so nothing can interleave.
-            let stale = pass
+            let mut stale = pass
                 .lifecycle_gen
                 .is_some_and(|gen| gen != lifecycle_generation(pass.repo.id, &pass.root));
+            // T-000243 review (eighteenth pass): a refused pass's generation
+            // can be unchanged while the structure it refused has since been
+            // repaired and accepted — revalidate the refusal itself under
+            // this hold, or an obsolete `shared_untrusted` settles onto a
+            // repo whose structure is now valid.
+            if !stale && pass.structure_refused.is_some() {
+                if let (Some(git), Some(gh)) = (git, pass.repo.github_name.as_deref()) {
+                    let pinned = ss::read_shared_import(db, pass.repo.id).pinned_dev_branch;
+                    let admins = ss::AdminVerified::load(db);
+                    if matches!(
+                        ss::discover_structure(git, &pass.root, gh, pinned.as_deref(), &admins),
+                        Ok(DiscoverOutcome::Found(_, _))
+                    ) {
+                        stale = true;
+                    }
+                }
+            }
             if !stale {
                 if let (Some(git), Some(_)) = (git, pass.role) {
                     phase_b_repo(db, git, &mut pass);
@@ -6706,6 +6757,41 @@ mod tests {
                 .as_deref(),
             Some("no_own_branch"),
             "the pass's own transition must not stale it"
+        );
+    }
+
+    /// T-000243 review (eighteenth pass): the auto-commit branch IS the
+    /// pass's own branch — changing or clearing it mid-pass must bump the
+    /// lifecycle generation, or phase B keeps committing and pushing to
+    /// the branch set the pass captured.
+    #[test]
+    fn changing_the_autocommit_branch_bumps_the_lifecycle_generation() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        db.set_repo_local_path(repo.id, Some(dir.path().to_str().unwrap()))
+            .unwrap();
+        let stored = db.get_repository(repo.id).unwrap().local_path.unwrap();
+        let root = Path::new(&stored);
+        let g0 = lifecycle_generation(repo.id, root);
+        set_autocommit_branch_guarded(&db, repo.id, Some("dev")).unwrap();
+        assert!(
+            lifecycle_generation(repo.id, root) > g0,
+            "setting the branch must stale in-flight passes"
+        );
+        let g1 = lifecycle_generation(repo.id, root);
+        set_autocommit_branch_guarded(&db, repo.id, Some("dev")).unwrap();
+        assert_eq!(
+            lifecycle_generation(repo.id, root),
+            g1,
+            "a no-op set must not stale passes"
+        );
+        set_autocommit_branch_guarded(&db, repo.id, None).unwrap();
+        assert!(
+            lifecycle_generation(repo.id, root) > g1,
+            "clearing the branch must stale in-flight passes"
         );
     }
 
