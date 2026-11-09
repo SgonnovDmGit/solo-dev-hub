@@ -1,9 +1,9 @@
 // REQ-pair-specific operations: rename-replay, nested-folder migration,
-// and bilateral pair-deletion (confirm). Called from `sync_project` and
-// `confirm_requirement` in lib.rs.
+// the T-000190 legacy->InOutBox pair migration, and bilateral pair-deletion
+// (confirm). Called from `sync_project` and `confirm_requirement` in lib.rs.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::models::{Repository, SyncIssue, SyncIssueCode};
 use crate::sync::fs::{remove_file_if_exists, scan_impl_files};
@@ -14,13 +14,15 @@ use crate::sync::fs::{remove_file_if_exists, scan_impl_files};
 /// flow works symmetrically from either project's SyncScreen (server's
 /// own view OR microservice's reverse-lookup view).
 ///
-/// Path layout per direction (source_repo.role drives selection):
+/// Path layout per direction (source_repo.role drives selection). T-000190:
+/// the REQ triple lives on the InOutBox layout — sender `outbox/<peer>`,
+/// recipient `inbox/<peer>` — and every candidate dir ALSO covers the frozen
+/// legacy path so a pair that survived as migration residue still closes.
 /// - `client | admin_client | test_client` → sender (client)
-///   `docs/backend-requirements/` + recipient (server)
-///   `docs/client-requirements/<client-canonical>/`.
-/// - `server` → sender (server)
-///   `docs/microservice-requirements/<ms-canonical>/` + recipient (ms-server)
-///   `docs/server-requirements/<server-canonical>/`.
+///   `outbox/<server>` (+ `docs/backend-requirements/`) and recipient (server)
+///   `inbox/<client>` (+ `docs/client-requirements/<client-canonical>/`).
+/// - `server` → sender (server) `outbox/<ms>` (+ `microservice-requirements/<ms>/`)
+///   and recipient (ms-server) `inbox/<server>` (+ `server-requirements/<server-canonical>/`).
 ///
 /// Returns `Err` for unsupported source roles (`tool` / `landing` / null) so
 /// callers don't silently no-op on bad input — same contract as the previous
@@ -45,26 +47,47 @@ pub fn confirm_pair(
     let response_name = filename.replace(".md", ".response.md");
     let impl_name = filename.replace(".md", ".impl.md");
     let source_role = source_repo.role.as_deref().unwrap_or("");
+    let source_inout = source_base.join("docs").join("InOutBox");
+    let target_inout = target_base.join("docs").join("InOutBox");
 
-    let (sender_dir, recipient_dir) = match source_role {
+    let (sender_dirs, recipient_dirs) = match source_role {
         "client" | "admin_client" | "test_client" => {
-            let sender = source_base.join("docs").join("backend-requirements");
-            let recipient = target_base
-                .join("docs")
-                .join("client-requirements")
-                .join(source_repo.canonical_folder_name());
-            (sender, recipient)
+            let client_canonical = source_repo.canonical_folder_name();
+            (
+                vec![
+                    source_inout
+                        .join("outbox")
+                        .join(target_repo.canonical_folder_name()),
+                    source_base.join("docs").join("backend-requirements"),
+                ],
+                vec![
+                    target_inout.join("inbox").join(&client_canonical),
+                    target_base
+                        .join("docs")
+                        .join("client-requirements")
+                        .join(&client_canonical),
+                ],
+            )
         }
         "server" => {
-            let sender = source_base
-                .join("docs")
-                .join("microservice-requirements")
-                .join(target_repo.canonical_folder_name());
-            let recipient = target_base
-                .join("docs")
-                .join("server-requirements")
-                .join(source_repo.canonical_folder_name());
-            (sender, recipient)
+            let ms_canonical = target_repo.canonical_folder_name();
+            let srv_canonical = source_repo.canonical_folder_name();
+            (
+                vec![
+                    source_inout.join("outbox").join(&ms_canonical),
+                    source_base
+                        .join("docs")
+                        .join("microservice-requirements")
+                        .join(&ms_canonical),
+                ],
+                vec![
+                    target_inout.join("inbox").join(&srv_canonical),
+                    target_base
+                        .join("docs")
+                        .join("server-requirements")
+                        .join(&srv_canonical),
+                ],
+            )
         }
         _ => {
             return Err(format!(
@@ -74,13 +97,12 @@ pub fn confirm_pair(
         }
     };
 
-    remove_file_if_exists(&sender_dir.join(filename))?;
-    remove_file_if_exists(&sender_dir.join(&response_name))?;
-    remove_file_if_exists(&recipient_dir.join(filename))?;
-    remove_file_if_exists(&recipient_dir.join(&response_name))?;
-    // F-000039: tear down the sender's `.impl.md` acknowledgement too.
-    remove_file_if_exists(&sender_dir.join(&impl_name))?;
-    remove_file_if_exists(&recipient_dir.join(&impl_name))?;
+    for dir in sender_dirs.iter().chain(recipient_dirs.iter()) {
+        remove_file_if_exists(&dir.join(filename))?;
+        remove_file_if_exists(&dir.join(&response_name))?;
+        // F-000039: tear down the sender's `.impl.md` acknowledgement too.
+        remove_file_if_exists(&dir.join(&impl_name))?;
+    }
     Ok(())
 }
 
@@ -208,6 +230,208 @@ fn folder_label(dir: &Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| dir.display().to_string())
+}
+
+// ── T-000190: legacy requirement dirs -> docs/InOutBox/{outbox,inbox} ────────
+
+/// A filename that belongs to a REQ exchange — body, response receipt or the
+/// sender's close marker. Only these move to the InOutBox layout; `registry.md`
+/// (the frozen ledger archive), unknown files and subdirectories stay behind.
+fn is_req_channel_file(name: &str) -> bool {
+    name.starts_with("REQ-")
+        && (name.ends_with(".md") || name.ends_with(".response.md") || name.ends_with(".impl.md"))
+}
+
+/// One planned move in a pair migration. `Dedup` means the destination already
+/// holds byte-identical content: the source is deleted, the copy kept.
+#[derive(Debug)]
+enum Planned {
+    Move { src: PathBuf, dst: PathBuf },
+    Dedup { src: PathBuf, dst: PathBuf },
+}
+
+/// Build the move plan for one legacy dir into its new channel dir.
+/// `conflicts` collects same-name-different-bytes pairs — both versions are
+/// preserved (source stays in the frozen legacy dir, target keeps its own),
+/// and an issue is raised rather than an overwrite or an mtime pick.
+fn plan_dir(
+    src_dir: &Path,
+    dst_dir: &Path,
+    warnings: &mut Vec<SyncIssue>,
+) -> Result<Vec<Planned>, String> {
+    let mut plan = Vec::new();
+    if !src_dir.is_dir() {
+        return Ok(plan);
+    }
+    for entry in fs::read_dir(src_dir).map_err(|e| format!("{}: {}", src_dir.display(), e))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_req_channel_file(name) {
+            continue;
+        }
+        let dst = dst_dir.join(name);
+        if dst.exists() {
+            let a = fs::read(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+            let b = fs::read(&dst).map_err(|e| format!("{}: {}", dst.display(), e))?;
+            if a == b {
+                plan.push(Planned::Dedup { src: path, dst });
+            } else {
+                warnings.push(
+                    SyncIssue::new(SyncIssueCode::MigrationDiverged, name.to_string())
+                        .target(dst_dir.display().to_string()),
+                );
+            }
+        } else {
+            plan.push(Planned::Move { src: path, dst });
+        }
+    }
+    Ok(plan)
+}
+
+/// Apply one side's plan: move (or dedup-delete) every planned file.
+/// On the first failure every completed step is rolled back — the pair works
+/// on the legacy layout for one more pass rather than half-migrated.
+fn apply_plan(plan: &[Planned]) -> Result<usize, String> {
+    let mut done = 0usize;
+    let mut moved: Vec<&Planned> = Vec::new();
+    let result = (|| -> Result<(), String> {
+        for step in plan {
+            match step {
+                Planned::Move { src, dst } => {
+                    if let Some(p) = dst.parent() {
+                        fs::create_dir_all(p).map_err(|e| format!("{}: {}", p.display(), e))?;
+                    }
+                    move_file(src, dst)?;
+                }
+                Planned::Dedup { src, .. } => {
+                    fs::remove_file(src).map_err(|e| format!("{}: {}", src.display(), e))?;
+                }
+            }
+            moved.push(step);
+            done += 1;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        // Roll back: put every moved file back to its source; a deduped
+        // source is restored by COPYING the pre-existing destination bytes —
+        // moving them would erase the target copy the dedup relied on.
+        rollback_steps(moved.into_iter().rev());
+        return Err(e);
+    }
+    Ok(done)
+}
+
+fn rollback_steps<'a>(steps: impl Iterator<Item = &'a Planned>) {
+    for step in steps {
+        match step {
+            Planned::Move { src, dst } => {
+                let _ = move_file(dst, src);
+            }
+            Planned::Dedup { src, dst } => {
+                let _ = fs::copy(dst, src);
+            }
+        }
+    }
+}
+
+/// Move `src` to `dst`, falling back to copy+remove across volumes where
+/// `fs::rename` refuses (EXDEV — e.g. repos on different drives).
+fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(src, dst)
+                .map_err(|e| format!("{} -> {}: {}", src.display(), dst.display(), e))?;
+            // Verify the copy before letting the source go.
+            let (a, b) = (
+                fs::read(src).map_err(|e| e.to_string())?,
+                fs::read(dst).map_err(|e| e.to_string())?,
+            );
+            if a != b {
+                let _ = fs::remove_file(dst);
+                return Err(format!("copy verification failed: {}", dst.display()));
+            }
+            fs::remove_file(src).map_err(|e| format!("{}: {}", src.display(), e))
+        }
+    }
+}
+
+/// Remove `dir` when it holds nothing after the migration — residue (frozen
+/// ledgers, unknown files, subdirs) keeps the archive directory alive.
+fn remove_dir_if_empty(dir: &Path) -> Result<bool, String> {
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Ok(false), // non-empty or otherwise busy — archive stays
+    }
+}
+
+/// Outcome of one REQ pair's legacy->InOutBox migration.
+#[derive(Debug, Default)]
+pub struct ReqMigrationOutcome {
+    /// Files moved or deduped into the new layout, both sides summed.
+    pub migrated: usize,
+    /// The pair's channel may sync on the new layout this pass. False when a
+    /// failure rolled the migration back — the legacy dirs keep working.
+    pub channel_ready: bool,
+}
+
+/// T-000190: move a REQ pair's legacy folders onto the InOutBox layout.
+///
+/// `legacy` is a list of `(source_dir, target_dir)` sides — for a
+/// client->server pair that is `backend-requirements/` -> `outbox/<server>`
+/// plus `client-requirements/<client>/` -> `inbox/<client>`; the same shape
+/// covers server->microservice and consumer->codex pairs.
+///
+/// The move is logically atomic for the pair: each side is planned first, and
+/// a filesystem failure rolls back everything this call already did — the
+/// channel never runs half on the old layout, half on the new. Conflicting
+/// bytes at a target keep BOTH versions (the legacy file stays, an issue is
+/// raised). Idempotent: a second call sees an empty source list and returns
+/// `channel_ready` without touching anything.
+pub fn migrate_req_pair(
+    sides: &[(&Path, &Path)],
+    warnings: &mut Vec<SyncIssue>,
+) -> Result<ReqMigrationOutcome, String> {
+    let mut plans: Vec<Vec<Planned>> = Vec::new();
+    for (src, dst) in sides {
+        plans.push(plan_dir(src, dst, warnings)?);
+    }
+    let mut out = ReqMigrationOutcome {
+        channel_ready: true,
+        ..Default::default()
+    };
+    let mut applied: Vec<(&Vec<Planned>, usize)> = Vec::new();
+    for ((_, _), plan) in sides.iter().zip(plans.iter()) {
+        match apply_plan(plan) {
+            Ok(n) => {
+                applied.push((plan, n));
+                out.migrated += n;
+            }
+            Err(e) => {
+                // This side already rolled itself back; roll the earlier
+                // sides back too so the pair stays consistent.
+                for (plan, _) in applied.iter().rev() {
+                    rollback_steps(plan.iter().rev());
+                }
+                out.channel_ready = false;
+                warnings.push(SyncIssue::new(SyncIssueCode::MigrationFailed, e));
+                return Ok(out);
+            }
+        }
+    }
+    // All sides applied — drop legacy dirs that came out empty.
+    for (src, _) in sides {
+        let _ = remove_dir_if_empty(src);
+    }
+    Ok(out)
 }
 
 /// F-033 Stage 1f Case C: migrate files from the flat `server-requirements/`
@@ -810,5 +1034,199 @@ mod tests {
         assert!(sender_dir.join("REQ-002_y.md").exists());
         assert!(recipient_dir.join("REQ-002_y.md").exists());
         assert!(recipient_dir.join("REQ-002_y.response.md").exists());
+    }
+
+    // ── T-000190: migrate_req_pair legacy -> InOutBox ────────────────────────
+
+    #[test]
+    fn test_migrate_req_pair_moves_the_triple_byte_identical() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("docs/backend-requirements");
+        let new = tmp.path().join("docs/InOutBox/outbox/backend");
+        seed_triple(&legacy, "REQ-001_login.md");
+        let body = fs::read(legacy.join("REQ-001_login.md")).unwrap();
+        let resp = fs::read(legacy.join("REQ-001_login.response.md")).unwrap();
+        let imp = fs::read(legacy.join("REQ-001_login.impl.md")).unwrap();
+
+        let mut w = Vec::new();
+        let o = migrate_req_pair(&[(legacy.as_path(), new.as_path())], &mut w).unwrap();
+        assert!(o.channel_ready);
+        assert_eq!(o.migrated, 3);
+        assert!(w.is_empty());
+        assert_eq!(fs::read(new.join("REQ-001_login.md")).unwrap(), body);
+        assert_eq!(
+            fs::read(new.join("REQ-001_login.response.md")).unwrap(),
+            resp
+        );
+        assert_eq!(fs::read(new.join("REQ-001_login.impl.md")).unwrap(), imp);
+        // Empty legacy dir is gone.
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn test_migrate_req_pair_keeps_residue_dir_alive() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let new = tmp.path().join("new");
+        seed_pair(&legacy, "REQ-001_x.md");
+        // The frozen number ledger and an unknown file are NOT channel files:
+        // they stay, and the legacy dir must survive for them.
+        fs::write(legacy.join("registry.md"), "- REQ-001 | out | x\n").unwrap();
+        fs::write(legacy.join("README.md"), "hi").unwrap();
+        // A subdirectory never migrates either.
+        fs::create_dir_all(legacy.join("nested")).unwrap();
+
+        let mut w = Vec::new();
+        let o = migrate_req_pair(&[(legacy.as_path(), new.as_path())], &mut w).unwrap();
+        assert!(o.channel_ready);
+        assert_eq!(o.migrated, 2);
+        assert!(new.join("REQ-001_x.md").exists());
+        assert!(new.join("REQ-001_x.response.md").exists());
+        assert!(legacy.join("registry.md").exists());
+        assert!(legacy.join("README.md").exists());
+        assert!(legacy.is_dir(), "residue keeps the archive dir alive");
+    }
+
+    #[test]
+    fn test_migrate_req_pair_dedups_identical_target() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let new = tmp.path().join("new");
+        seed_pair(&legacy, "REQ-001_x.md");
+        fs::create_dir_all(&new).unwrap();
+        fs::write(new.join("REQ-001_x.md"), "req body").unwrap();
+        // Same bytes on both sides: dedup — source deleted, target kept.
+
+        let mut w = Vec::new();
+        let o = migrate_req_pair(&[(legacy.as_path(), new.as_path())], &mut w).unwrap();
+        assert!(o.channel_ready);
+        assert_eq!(o.migrated, 2); // body dedup + response move
+        assert!(w.is_empty());
+        assert!(new.join("REQ-001_x.md").exists());
+        assert!(!legacy.join("REQ-001_x.md").exists());
+    }
+
+    #[test]
+    fn test_migrate_req_pair_conflict_keeps_both_versions() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let new = tmp.path().join("new");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("REQ-001_x.md"), "legacy bytes").unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(new.join("REQ-001_x.md"), "new bytes").unwrap();
+
+        let mut w = Vec::new();
+        let o = migrate_req_pair(&[(legacy.as_path(), new.as_path())], &mut w).unwrap();
+        assert!(o.channel_ready);
+        assert_eq!(o.migrated, 0, "a diverged pair moves nothing");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].code, crate::models::SyncIssueCode::MigrationDiverged);
+        // Both versions survive — no overwrite, no guess.
+        assert_eq!(fs::read(new.join("REQ-001_x.md")).unwrap(), b"new bytes");
+        assert_eq!(
+            fs::read(legacy.join("REQ-001_x.md")).unwrap(),
+            b"legacy bytes"
+        );
+        assert!(legacy.is_dir(), "the diverged file keeps the dir alive");
+    }
+
+    #[test]
+    fn test_migrate_req_pair_idempotent_second_pass() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let new = tmp.path().join("new");
+        seed_pair(&legacy, "REQ-001_x.md");
+
+        let mut w = Vec::new();
+        migrate_req_pair(&[(legacy.as_path(), new.as_path())], &mut w).unwrap();
+        let mut w2 = Vec::new();
+        let o2 = migrate_req_pair(&[(legacy.as_path(), new.as_path())], &mut w2).unwrap();
+        assert!(o2.channel_ready);
+        assert_eq!(o2.migrated, 0);
+        assert!(w2.is_empty());
+    }
+
+    #[test]
+    fn test_migrate_req_pair_rolls_back_earlier_sides_on_failure() {
+        let tmp = TempDir::new().unwrap();
+        let a_src = tmp.path().join("a-legacy");
+        let a_dst = tmp.path().join("a-new");
+        let b_src = tmp.path().join("b-legacy");
+        // Side B's destination is blocked by a FILE: create_dir_all fails and
+        // side A — already applied — must be put back.
+        let blocker = tmp.path().join("blocker");
+        seed_pair(&a_src, "REQ-001_x.md");
+        seed_pair(&b_src, "REQ-002_y.md");
+        fs::write(&blocker, "not a dir").unwrap();
+        let b_dst = blocker.join("sub");
+
+        let mut w = Vec::new();
+        let o = migrate_req_pair(
+            &[
+                (a_src.as_path(), a_dst.as_path()),
+                (b_src.as_path(), b_dst.as_path()),
+            ],
+            &mut w,
+        )
+        .unwrap();
+        assert!(!o.channel_ready, "the failed pair stays on the old layout");
+        // Side A's files are back where they started.
+        assert!(a_src.join("REQ-001_x.md").exists());
+        assert!(a_src.join("REQ-001_x.response.md").exists());
+        assert!(!a_dst.join("REQ-001_x.md").exists());
+        // Side B never moved.
+        assert!(b_src.join("REQ-002_y.md").exists());
+    }
+
+    #[test]
+    fn test_confirm_pair_on_the_inoutbox_layout() {
+        let tmp = TempDir::new().unwrap();
+        let client_base = tmp.path().join("client");
+        let server_base = tmp.path().join("server");
+        let client = mk_repo(1, "owner/web-client", "client", &client_base);
+        let server = mk_repo(2, "owner/backend", "server", &server_base);
+
+        // T-000190 paths: sender outbox/<server>, recipient inbox/<client>.
+        let out = crate::sync::outbox_dir(&client_base, "backend");
+        let inb = crate::sync::inbox_dir(&server_base, "web-client");
+        seed_triple(&out, "REQ-002_y.md");
+        seed_triple(&inb, "REQ-002_y.md");
+
+        confirm_pair(&client, &server, "REQ-002_y.md").unwrap();
+        for d in [&out, &inb] {
+            assert!(!d.join("REQ-002_y.md").exists());
+            assert!(!d.join("REQ-002_y.response.md").exists());
+            assert!(!d.join("REQ-002_y.impl.md").exists());
+        }
+    }
+
+    #[test]
+    fn test_confirm_pair_spans_migration_residue_and_new_layout() {
+        // A pair that half-migrated (body moved, response still legacy) still
+        // closes cleanly — every candidate dir is swept.
+        let tmp = TempDir::new().unwrap();
+        let client_base = tmp.path().join("client");
+        let server_base = tmp.path().join("server");
+        let client = mk_repo(1, "owner/web-client", "client", &client_base);
+        let server = mk_repo(2, "owner/backend", "server", &server_base);
+
+        let out = crate::sync::outbox_dir(&client_base, "backend");
+        let legacy_sender = client_base.join("docs/backend-requirements");
+        let inb = crate::sync::inbox_dir(&server_base, "web-client");
+        let legacy_recipient = server_base.join("docs/client-requirements/web-client");
+        seed_pair(&out, "REQ-003_z.md");
+        fs::create_dir_all(&legacy_sender).unwrap();
+        fs::write(legacy_sender.join("REQ-003_z.impl.md"), "").unwrap();
+        seed_pair(&inb, "REQ-003_z.md");
+        fs::create_dir_all(&legacy_recipient).unwrap();
+        fs::write(legacy_recipient.join("REQ-003_z.md"), "leftover").unwrap();
+
+        confirm_pair(&client, &server, "REQ-003_z.md").unwrap();
+        for d in [&out, &legacy_sender, &inb, &legacy_recipient] {
+            for f in ["REQ-003_z.md", "REQ-003_z.response.md", "REQ-003_z.impl.md"] {
+                assert!(!d.join(f).exists(), "{} still holds {}", d.display(), f);
+            }
+        }
     }
 }

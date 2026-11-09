@@ -638,15 +638,7 @@ pub fn shared_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String
         .chain(MANAGED_ROOT_FILES.iter())
         .map(|s| s.to_string())
         .collect();
-    v.extend(
-        [
-            "docs/todo.md",
-            "docs/done.md",
-            "docs/bug-reports.md",
-            "docs/InOutBox",
-        ]
-        .map(String::from),
-    );
+    v.extend(["docs/todo.md", "docs/done.md", "docs/bug-reports.md"].map(String::from));
     if role == Role::Main {
         v.push(STRUCTURE_REL_PATH.to_string());
         v.push(REQUESTS_REL_DIR.to_string());

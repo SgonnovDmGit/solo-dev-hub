@@ -2,10 +2,30 @@ use crate::db::AppDb;
 use crate::models::*;
 use crate::sync;
 use chrono;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tauri::State;
 
 // ── Requirements sync commands ───────────────────────────────────────────────
+
+/// T-000190: REQ bodies across a pair's possible dirs — the InOutBox lane
+/// first, then the legacy path (migration residue still counts as live).
+fn scan_pair(dirs: &[PathBuf]) -> Vec<String> {
+    let mut out = Vec::new();
+    for d in dirs {
+        for f in sync::scan_requirements(d) {
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `name` exists in any of the side's dirs (new lane or legacy residue).
+fn exists_in(dirs: &[PathBuf], name: &str) -> bool {
+    dirs.iter().any(|d| d.join(name).exists())
+}
 
 #[derive(serde::Serialize)]
 pub struct SyncGlobalClaudeResult {
@@ -259,22 +279,29 @@ pub fn list_project_requirements(
             for client in &clients {
                 if let Some(ref client_path) = client.local_path {
                     let client_base = Path::new(client_path);
-                    let client_req_dir = client_base.join("docs").join("backend-requirements");
                     // F-033: canonical_folder_name() is the single source of truth.
                     let client_name = client.canonical_folder_name();
-                    let srv_client_dir = srv_base
-                        .join("docs")
-                        .join("client-requirements")
-                        .join(&client_name);
+                    // T-000190: the new lane first, legacy dir for residue.
+                    let client_dirs = vec![
+                        sync::outbox_dir(client_base, &srv.canonical_folder_name()),
+                        client_base.join("docs").join("backend-requirements"),
+                    ];
+                    let srv_dirs = vec![
+                        sync::inbox_dir(srv_base, &client_name),
+                        srv_base
+                            .join("docs")
+                            .join("client-requirements")
+                            .join(&client_name),
+                    ];
 
-                    for req_file in sync::scan_requirements(&client_req_dir) {
-                        let on_server = srv_client_dir.join(&req_file).exists();
+                    for req_file in scan_pair(&client_dirs) {
+                        let on_server = exists_in(&srv_dirs, &req_file);
                         let response_name = req_file.replace(".md", ".response.md");
-                        let has_response = srv_client_dir.join(&response_name).exists()
-                            || client_req_dir.join(&response_name).exists();
+                        let has_response = exists_in(&srv_dirs, &response_name)
+                            || exists_in(&client_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (client) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = client_req_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&client_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -330,18 +357,18 @@ pub fn list_project_requirements(
                     }
 
                     // Also check server side for reqs that may only exist there
-                    for req_file in sync::scan_requirements(&srv_client_dir) {
+                    for req_file in scan_pair(&srv_dirs) {
                         if result.iter().any(|r| {
                             r.filename == req_file && r.source_repo == client.display_name()
                         }) {
                             continue;
                         }
                         let response_name = req_file.replace(".md", ".response.md");
-                        let has_response = srv_client_dir.join(&response_name).exists()
-                            || client_req_dir.join(&response_name).exists();
+                        let has_response = exists_in(&srv_dirs, &response_name)
+                            || exists_in(&client_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (client) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = client_req_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&client_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -369,23 +396,30 @@ pub fn list_project_requirements(
                     // F-033: REQ folders use canonical repo names; nested per parent on ms side.
                     let ms_canonical = ms_server_repo.canonical_folder_name();
                     let parent_folder = srv.canonical_folder_name();
-                    let srv_ms_dir = srv_base
-                        .join("docs")
-                        .join("microservice-requirements")
-                        .join(&ms_canonical);
-                    let ms_srv_dir = ms_base
-                        .join("docs")
-                        .join("server-requirements")
-                        .join(&parent_folder);
+                    // T-000190: new lane + legacy residue, on both sides.
+                    let srv_dirs = vec![
+                        sync::outbox_dir(srv_base, &ms_canonical),
+                        srv_base
+                            .join("docs")
+                            .join("microservice-requirements")
+                            .join(&ms_canonical),
+                    ];
+                    let ms_dirs = vec![
+                        sync::inbox_dir(ms_base, &parent_folder),
+                        ms_base
+                            .join("docs")
+                            .join("server-requirements")
+                            .join(&parent_folder),
+                    ];
 
-                    for req_file in sync::scan_requirements(&srv_ms_dir) {
-                        let on_ms = ms_srv_dir.join(&req_file).exists();
+                    for req_file in scan_pair(&srv_dirs) {
+                        let on_ms = exists_in(&ms_dirs, &req_file);
                         let response_name = req_file.replace(".md", ".response.md");
-                        let has_response = ms_srv_dir.join(&response_name).exists()
-                            || srv_ms_dir.join(&response_name).exists();
+                        let has_response = exists_in(&ms_dirs, &response_name)
+                            || exists_in(&srv_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (server) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = srv_ms_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&srv_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -407,18 +441,18 @@ pub fn list_project_requirements(
                     }
 
                     // Also check ms side
-                    for req_file in sync::scan_requirements(&ms_srv_dir) {
+                    for req_file in scan_pair(&ms_dirs) {
                         if result.iter().any(|r| {
                             r.filename == req_file && r.target_repo == ms_server_repo.display_name()
                         }) {
                             continue;
                         }
                         let response_name = req_file.replace(".md", ".response.md");
-                        let has_response = ms_srv_dir.join(&response_name).exists()
-                            || srv_ms_dir.join(&response_name).exists();
+                        let has_response = exists_in(&ms_dirs, &response_name)
+                            || exists_in(&srv_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (server) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = srv_ms_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&srv_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -506,24 +540,31 @@ pub fn list_project_requirements(
                     let parent_base = Path::new(parent_local);
                     let parent_canonical = parent_server.canonical_folder_name();
 
-                    let parent_ms_dir = parent_base
-                        .join("docs")
-                        .join("microservice-requirements")
-                        .join(&ms_canonical);
-                    let ms_parent_dir = ms_base
-                        .join("docs")
-                        .join("server-requirements")
-                        .join(&parent_canonical);
+                    // T-000190: new lane + legacy residue, on both sides.
+                    let parent_dirs = vec![
+                        sync::outbox_dir(parent_base, &ms_canonical),
+                        parent_base
+                            .join("docs")
+                            .join("microservice-requirements")
+                            .join(&ms_canonical),
+                    ];
+                    let ms_dirs = vec![
+                        sync::inbox_dir(ms_base, &parent_canonical),
+                        ms_base
+                            .join("docs")
+                            .join("server-requirements")
+                            .join(&parent_canonical),
+                    ];
 
                     // REQ files parent → this ms (server_to_microservice direction)
-                    for req_file in sync::scan_requirements(&parent_ms_dir) {
+                    for req_file in scan_pair(&parent_dirs) {
                         let response_name = req_file.replace(".md", ".response.md");
-                        let on_ms = ms_parent_dir.join(&req_file).exists();
-                        let has_response = ms_parent_dir.join(&response_name).exists()
-                            || parent_ms_dir.join(&response_name).exists();
+                        let on_ms = exists_in(&ms_dirs, &req_file);
+                        let has_response = exists_in(&ms_dirs, &response_name)
+                            || exists_in(&parent_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (parent server) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = parent_ms_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&parent_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -545,7 +586,7 @@ pub fn list_project_requirements(
                     }
 
                     // ms-side files без зеркала на parent (например ms ответил, до next sync)
-                    for req_file in sync::scan_requirements(&ms_parent_dir) {
+                    for req_file in scan_pair(&ms_dirs) {
                         if result.iter().any(|r| {
                             r.filename == req_file
                                 && r.direction == "server_to_microservice"
@@ -555,11 +596,11 @@ pub fn list_project_requirements(
                             continue;
                         }
                         let response_name = req_file.replace(".md", ".response.md");
-                        let has_response = ms_parent_dir.join(&response_name).exists()
-                            || parent_ms_dir.join(&response_name).exists();
+                        let has_response = exists_in(&ms_dirs, &response_name)
+                            || exists_in(&parent_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (parent server) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = parent_ms_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&parent_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -681,7 +722,9 @@ fn peer_channels_for(db: &AppDb, project_id: i64) -> Result<Vec<PeerChannelInfo>
                 info.inbox_count = sync::scan_bodies(&my_in).len();
                 info.pact_count = sync::scan_bodies(&my_pact).len();
 
-                info.registry_present = sync::registry_path(my_base).is_file();
+                // T-000190: per-pair `registry/<peer>.md` plus the frozen
+                // legacy ledger aliases — presence only, the agent owns bytes.
+                info.registry_present = sync::registry_present(my_base, &peer_name);
 
                 if my_base.is_dir() && peer_base.is_dir() {
                     let synced = sync::dirs_equal(&my_out, &peer_in)

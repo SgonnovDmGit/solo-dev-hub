@@ -4,20 +4,21 @@
 use std::path::{Path, PathBuf};
 
 use crate::git_ops::{
-    commit_paths, commit_paths_index_only, is_ignored_for_add, list_markers_in_rev, rev_exists,
-    CommitOutcome, GitBinary,
+    commit_paths, commit_paths_index_only, is_ignored_for_add, list_markers_in_rev, path_in_index,
+    rev_exists, CommitOutcome, GitBinary,
 };
 
 /// Doc subfolders that hold cross-repo synced content (REQ pairs, API contracts,
-/// announcements). Auto-commit is scoped (git pathspec) to these (plus the
-/// managed root files below) — the dev's own WIP anywhere else (including docs/
-/// root files like the sender's own api.md, or the skeleton CLAUDE.md /
-/// docs/project.md) is never swept in.
+/// announcements, and — T-000190 — the unified InOutBox channel). Auto-commit is
+/// scoped (git pathspec) to these (plus the managed root files below) — the
+/// dev's own WIP anywhere else (including docs/ root files like the sender's
+/// own api.md, or the skeleton CLAUDE.md / docs/project.md) is never swept in.
 pub const CROSS_REPO_DIRS: &[&str] = &[
     "docs/backend-requirements",
     "docs/client-requirements",
     "docs/microservice-requirements",
     "docs/server-requirements",
+    "docs/InOutBox",
     "docs/server-api",
     "docs/microservice-api",
     "docs/server-announcements",
@@ -59,10 +60,24 @@ pub fn autocommit_repo(
     // git won't add it, and forcing it in would fight that choice — so skip it.
     // Skipping also fixes the crash where `git add` on an ignored path exits 1
     // and aborted the whole commit for the tracked folders alongside it.
+    // T-000190: a folder GONE from disk but still present in the index is
+    // included too — a migration's old-dir deletion must travel in the same
+    // commit as the new-layout files, otherwise the archive resurrects on the
+    // next pull. The check reads the INDEX, not HEAD: index entries mean the
+    // deletions are unstaged and `git add -A` can still match the pathspec —
+    // a dir the user already `git rm`'d is left to their own commit rather
+    // than erroring out on an unmatched spec.
     let mut tracked: Vec<PathBuf> = Vec::new();
     for d in CROSS_REPO_DIRS {
         let rel = PathBuf::from(d);
         if !repo_root.join(&rel).exists() {
+            if !path_in_index(git, repo_root, &rel)? {
+                continue;
+            }
+            // The dir is gone but tracked: the pathspec stages its deletion.
+            // Never force-add — an ignored path spec stays ignored, only the
+            // tracked entries' deletions are picked up.
+            tracked.push(rel);
             continue;
         }
         if is_ignored_for_add(git, repo_root, &rel)? {
@@ -482,6 +497,101 @@ mod tests {
             !hf.contains(&".gitattributes".to_string()),
             "gitignored .gitattributes must NOT be committed, got {:?}",
             hf
+        );
+    }
+
+    // ── T-000190: a migrated dir's deletion travels in the sync commit ───────
+
+    #[test]
+    fn test_autocommit_commits_tracked_dir_deletion() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        // A tracked legacy dir, then deleted from the worktree only (as the
+        // InOutBox migration leaves it) — plus a synced file to commit.
+        write_file(
+            tmp.path(),
+            "docs/backend-requirements/REQ-001_x.md",
+            "# r\n",
+        );
+        run_git(
+            tmp.path(),
+            &["add", "docs/backend-requirements/REQ-001_x.md"],
+        );
+        run_git(tmp.path(), &["commit", "-q", "-m", "track legacy dir"]);
+        fs::remove_dir_all(tmp.path().join("docs/backend-requirements")).unwrap();
+        // Different bytes — identical content would collapse to a rename and
+        // the file count would read 1 although the deletion still lands.
+        write_file(
+            tmp.path(),
+            "docs/InOutBox/outbox/backend/REQ-001_x.md",
+            "# migrated\n",
+        );
+        // The dev's own staged WIP must survive, not be swept in.
+        write_file(tmp.path(), "src/keep.rs", "wip\n");
+        run_git(tmp.path(), &["add", "src/keep.rs"]);
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+
+        // HEAD now holds the InOutBox file and NOT the legacy one.
+        let out = Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            head.contains("docs/InOutBox/outbox/backend/REQ-001_x.md"),
+            "{:?}",
+            head
+        );
+        assert!(
+            !head.contains("docs/backend-requirements/REQ-001_x.md"),
+            "the legacy file must be deleted in the same commit: {:?}",
+            head
+        );
+        // The unrelated staged WIP is untouched.
+        assert!(
+            staged_files(tmp.path()).contains(&"src/keep.rs".to_string()),
+            "src/keep.rs must remain staged"
+        );
+    }
+
+    #[test]
+    fn test_autocommit_leaves_user_staged_deletion_alone() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        // The user themselves `git rm`'d the legacy dir — index already holds
+        // the deletion; the scoped commit must neither fail nor claim it.
+        write_file(
+            tmp.path(),
+            "docs/backend-requirements/REQ-001_x.md",
+            "# r\n",
+        );
+        run_git(
+            tmp.path(),
+            &["add", "docs/backend-requirements/REQ-001_x.md"],
+        );
+        run_git(tmp.path(), &["commit", "-q", "-m", "track legacy dir"]);
+        run_git(tmp.path(), &["rm", "-r", "-q", "docs/backend-requirements"]);
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        // The staged deletion is still staged — the user's own change.
+        let out = Command::new("git")
+            .args(["diff", "--cached", "--name-status"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let staged = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            staged.contains("D\tdocs/backend-requirements/REQ-001_x.md"),
+            "user-staged deletion must survive: {:?}",
+            staged
         );
     }
 

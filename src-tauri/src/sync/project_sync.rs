@@ -361,6 +361,75 @@ fn write_repo_skeletons(
     }
 }
 
+/// T-000190: replay `renamed`'s repo renames on this side's InOutBox parents —
+/// `outbox/<peer>/`, `inbox/<peer>/` and `pact/<peer>/` are all keyed by the
+/// counterparty's canonical name, exactly like the legacy folders were.
+/// Registry files are agent-owned and never moved here.
+fn replay_inoutbox_renames(db: &AppDb, base: &Path, renamed: &Repository, c: &mut SyncCounters) {
+    let Ok(renames) = db.list_renames_for_repo(renamed.id) else {
+        return; // a failed lookup keeps the dirs as they are — never a guess
+    };
+    let root = base.join("docs").join("InOutBox");
+    for lane in ["outbox", "inbox", "pact"] {
+        let parent = root.join(lane);
+        for r in &renames {
+            match sync::replay_rename_in_dir(&parent, &r.old_canonical, &r.new_canonical) {
+                Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
+                Ok(sync::RenameOutcome::NoOp) => {}
+                Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
+                    &r.old_canonical,
+                    &r.new_canonical,
+                    &parent,
+                )),
+                Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
+            }
+        }
+    }
+}
+
+/// Fold a unified channel pass into the project counters — the same mapping
+/// `run_peer_channels` already uses (prunes and teardowns are structural).
+fn fold_channel(o: sync::PeerChannelOutcome, c: &mut SyncCounters) {
+    c.copied += o.copied;
+    c.migrated += o.pruned;
+    c.auto_closed.extend(o.closed);
+    c.extend(o.errors);
+}
+
+/// The pre-T-000190 REQ copy on the legacy role-named dirs — the fallback a
+/// rolled-back pair migration leaves running for one more pass. Same contract
+/// as before: `.impl.md` auto-close, REQ bodies sender→recipient, responses back.
+fn sync_req_pair_legacy(
+    sender_dir: &Path,
+    recipient_dir: &Path,
+    sender_label: &str,
+    recipient_label: &str,
+    c: &mut SyncCounters,
+) {
+    match sync::auto_close_impl_pairs(sender_dir, recipient_dir) {
+        Ok(closed) => c.auto_closed.extend(closed),
+        Err(e) => c.push(auto_close_failed(sender_label, e)),
+    }
+    for req_file in sync::scan_requirements(sender_dir) {
+        let src = sender_dir.join(&req_file);
+        let dst = recipient_dir.join(&req_file);
+        match sync::copy_file_if_changed(&src, &dst) {
+            Ok(true) => c.copied += 1,
+            Ok(false) => {}
+            Err(e) => c.push(copy_failed(&req_file, recipient_label, e)),
+        }
+    }
+    for resp_file in sync::scan_responses(recipient_dir) {
+        let src = recipient_dir.join(&resp_file);
+        let dst = sender_dir.join(&resp_file);
+        match sync::copy_file_if_changed(&src, &dst) {
+            Ok(true) => c.responses += 1,
+            Ok(false) => {}
+            Err(e) => c.push(copy_failed(&resp_file, sender_label, e)),
+        }
+    }
+}
+
 /// Client → Server REQ sync + Server → Client response copy-back + api.md /
 /// handlers.md propagation. `srv_base` is the server repo root.
 fn sync_client_to_server(
@@ -408,35 +477,48 @@ fn sync_client_to_server(
             }
             let srv_client_dir = client_requirements_parent.join(&client_name);
 
-            // F-000039: auto-close pairs the client (sender) acknowledged via .impl.md.
-            match sync::auto_close_impl_pairs(&client_req_dir, &srv_client_dir) {
-                Ok(closed) => c.auto_closed.extend(closed),
-                Err(e) => c.push(auto_close_failed(&client_label, e)),
-            }
+            // T-000190: replay renames on the InOutBox lanes too — the peer-named
+            // dirs under outbox/, inbox/ and pact/ follow the counterparty's
+            // canonical name exactly like the legacy folder did.
+            replay_inoutbox_renames(db, client_base, srv, c);
+            replay_inoutbox_renames(db, srv_base, client, c);
 
-            // Copy REQ-*.md from client (source of truth) to server.
-            // Overwrite on change so sender edits propagate to the recipient.
-            for req_file in sync::scan_requirements(&client_req_dir) {
-                let src = client_req_dir.join(&req_file);
-                let dst = srv_client_dir.join(&req_file);
-                match sync::copy_file_if_changed(&src, &dst) {
-                    Ok(true) => c.copied += 1,
-                    Ok(false) => {}
-                    Err(e) => c.push(copy_failed(&req_file, &srv_name, e)),
+            // T-000190: move the pair's legacy dirs onto the InOutBox layout —
+            // sender backend-requirements -> outbox/<server>, recipient
+            // client-requirements/<client> -> inbox/<client> — then run the
+            // unified kind-aware pass for this pair in both directions. A
+            // rolled-back migration leaves the legacy pair working one more
+            // pass (channel never runs half old, half new).
+            let srv_canonical = srv.canonical_folder_name();
+            let client_out = sync::outbox_dir(client_base, &srv_canonical);
+            let srv_in = sync::inbox_dir(srv_base, &client_name);
+            let mut mig_warnings = Vec::new();
+            match sync::migrate_req_pair(
+                &[
+                    (client_req_dir.as_path(), client_out.as_path()),
+                    (srv_client_dir.as_path(), srv_in.as_path()),
+                ],
+                &mut mig_warnings,
+            ) {
+                Ok(o) => {
+                    c.migrated += o.migrated;
+                    if o.channel_ready {
+                        fold_channel(sync::sync_peer_pair(client, srv), c);
+                    } else {
+                        // Migration rolled back — the legacy dirs are intact;
+                        // keep the REQ channel alive on the old layout this pass.
+                        sync_req_pair_legacy(
+                            &client_req_dir,
+                            &srv_client_dir,
+                            &client_label,
+                            &srv_name,
+                            c,
+                        );
+                    }
                 }
+                Err(e) => c.push(migration_issue(&client_label, e)),
             }
-
-            // Copy *.response.md from server (source of truth) back to client.
-            // Overwrite on change so recipient edits propagate to the sender.
-            for resp_file in sync::scan_responses(&srv_client_dir) {
-                let src = srv_client_dir.join(&resp_file);
-                let dst = client_req_dir.join(&resp_file);
-                match sync::copy_file_if_changed(&src, &dst) {
-                    Ok(true) => c.responses += 1,
-                    Ok(false) => {}
-                    Err(e) => c.push(copy_failed(&resp_file, &client_label, e)),
-                }
-            }
+            c.extend(mig_warnings);
 
             // 0.9.0: api.md + handlers.md target moved to docs/server-api/
             // Auto-migrate old docs/api.md to docs/server-api/api.md.
@@ -677,35 +759,35 @@ fn sync_server_to_microservice(
         // F-033: nested per parent-server so multi-parent microservices don't collide.
         let ms_srv_dir = ms_srv_parent.join(&parent_folder);
 
-        // F-000039: auto-close pairs the server (sender) acknowledged via .impl.md.
-        match sync::auto_close_impl_pairs(&srv_ms_dir, &ms_srv_dir) {
-            Ok(closed) => c.auto_closed.extend(closed),
-            Err(e) => c.push(auto_close_failed(&ms_label, e)),
-        }
+        // T-000190: renames replay on the InOutBox lanes too (peer-named dirs).
+        replay_inoutbox_renames(db, srv_base, &ms_server_repo, c);
+        replay_inoutbox_renames(db, ms_base, srv, c);
 
-        // Copy REQ-*.md from server (source of truth) to microservice server-repo.
-        // Overwrite on change so sender edits propagate to the recipient.
-        for req_file in sync::scan_requirements(&srv_ms_dir) {
-            let src = srv_ms_dir.join(&req_file);
-            let dst = ms_srv_dir.join(&req_file);
-            match sync::copy_file_if_changed(&src, &dst) {
-                Ok(true) => c.copied += 1,
-                Ok(false) => {}
-                Err(e) => c.push(copy_failed(&req_file, &ms_label, e)),
+        // T-000190: server microservice-requirements/<ms> -> outbox/<ms>,
+        // microservice server-requirements/<parent> -> inbox/<parent>; then the
+        // unified kind-aware pass for this pair in both directions.
+        let srv_out = sync::outbox_dir(srv_base, &ms_canonical);
+        let ms_in = sync::inbox_dir(ms_base, &parent_folder);
+        let mut mig_warnings = Vec::new();
+        match sync::migrate_req_pair(
+            &[
+                (srv_ms_dir.as_path(), srv_out.as_path()),
+                (ms_srv_dir.as_path(), ms_in.as_path()),
+            ],
+            &mut mig_warnings,
+        ) {
+            Ok(o) => {
+                c.migrated += o.migrated;
+                if o.channel_ready {
+                    fold_channel(sync::sync_peer_pair(srv, &ms_server_repo), c);
+                } else {
+                    let srv_label = srv.display_name();
+                    sync_req_pair_legacy(&srv_ms_dir, &ms_srv_dir, &srv_label, &ms_label, c);
+                }
             }
+            Err(e) => c.push(migration_issue(&ms_label, e)),
         }
-
-        // Copy *.response.md from microservice (source of truth) back to server.
-        // Overwrite on change so recipient edits propagate to the sender.
-        for resp_file in sync::scan_responses(&ms_srv_dir) {
-            let src = ms_srv_dir.join(&resp_file);
-            let dst = srv_ms_dir.join(&resp_file);
-            match sync::copy_file_if_changed(&src, &dst) {
-                Ok(true) => c.responses += 1,
-                Ok(false) => {}
-                Err(e) => c.push(copy_failed(&resp_file, &srv.display_name(), e)),
-            }
-        }
+        c.extend(mig_warnings);
 
         // 0.9.0: Microservice → Parent server — api.md + handlers.md + my_api.
         // Target on parent: docs/microservice-api/<ms-project-name>/{api,handlers}.md.
@@ -873,32 +955,39 @@ fn sync_microservice_to_parents(
                     .join("server-requirements")
                     .join(&parent_canonical);
 
-                // F-000039: auto-close pairs the parent server (sender) acknowledged via .impl.md.
-                match sync::auto_close_impl_pairs(&parent_ms_dir, &ms_parent_dir) {
-                    Ok(closed) => c.auto_closed.extend(closed),
-                    Err(e) => c.push(auto_close_failed(&parent_label, e)),
-                }
-
-                for req_file in sync::scan_requirements(&parent_ms_dir) {
-                    let src = parent_ms_dir.join(&req_file);
-                    let dst = ms_parent_dir.join(&req_file);
-                    match sync::copy_file_if_changed(&src, &dst) {
-                        Ok(true) => c.copied += 1,
-                        Ok(false) => {}
-                        Err(e) => c.push(copy_failed(&req_file, &ms_server.display_name(), e)),
+                // T-000190: same pair migration + unified pass as the
+                // parent-driven side — an MS-initiated sync is no longer a
+                // lesser pass; idempotent when the parent already migrated.
+                replay_inoutbox_renames(db, parent_base, ms_server, c);
+                replay_inoutbox_renames(db, ms_base, parent_server, c);
+                let parent_out = sync::outbox_dir(parent_base, &ms_canonical);
+                let ms_in = sync::inbox_dir(ms_base, &parent_canonical);
+                let mut mig_warnings = Vec::new();
+                match sync::migrate_req_pair(
+                    &[
+                        (parent_ms_dir.as_path(), parent_out.as_path()),
+                        (ms_parent_dir.as_path(), ms_in.as_path()),
+                    ],
+                    &mut mig_warnings,
+                ) {
+                    Ok(o) => {
+                        c.migrated += o.migrated;
+                        if o.channel_ready {
+                            fold_channel(sync::sync_peer_pair(parent_server, ms_server), c);
+                        } else {
+                            let ms_label = ms_server.display_name();
+                            sync_req_pair_legacy(
+                                &parent_ms_dir,
+                                &ms_parent_dir,
+                                &parent_label,
+                                &ms_label,
+                                c,
+                            );
+                        }
                     }
+                    Err(e) => c.push(migration_issue(&parent_label, e)),
                 }
-
-                // MS → parent: *.response.md (source of truth on MS side)
-                for resp_file in sync::scan_responses(&ms_parent_dir) {
-                    let src = ms_parent_dir.join(&resp_file);
-                    let dst = parent_ms_dir.join(&resp_file);
-                    match sync::copy_file_if_changed(&src, &dst) {
-                        Ok(true) => c.responses += 1,
-                        Ok(false) => {}
-                        Err(e) => c.push(copy_failed(&resp_file, &parent_label, e)),
-                    }
-                }
+                c.extend(mig_warnings);
             }
         }
     }
@@ -1005,33 +1094,40 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
         Err(e) => c.push(renames_lookup(&sender.display_name(), e)),
     }
 
-    // F-000039: auto-close pairs the consumer (sender) acknowledged via .impl.md.
-    match sync::auto_close_impl_pairs(&sender_dir, &recipient_dir) {
-        Ok(closed) => c.auto_closed.extend(closed),
-        Err(e) => c.push(auto_close_failed(&recipient.display_name(), e)),
-    }
-
-    // Copy REQ-*.md from consumer (source of truth) to codex.
-    for req_file in sync::scan_requirements(&sender_dir) {
-        let src = sender_dir.join(&req_file);
-        let dst = recipient_dir.join(&req_file);
-        match sync::copy_file_if_changed(&src, &dst) {
-            Ok(true) => c.copied += 1,
-            Ok(false) => {}
-            Err(e) => c.push(copy_failed(&req_file, &recipient.display_name(), e)),
+    // T-000190: same pair migration + unified pass — consumer
+    // microservice-requirements/<codex> -> outbox/<codex>, codex
+    // server-requirements/<consumer> -> inbox/<consumer>.
+    replay_inoutbox_renames(db, sender_base, recipient, c);
+    replay_inoutbox_renames(db, recipient_base, sender, c);
+    let sender_out = sync::outbox_dir(sender_base, &recipient.canonical_folder_name());
+    let recipient_in = sync::inbox_dir(recipient_base, &sender.canonical_folder_name());
+    let mut mig_warnings = Vec::new();
+    match sync::migrate_req_pair(
+        &[
+            (sender_dir.as_path(), sender_out.as_path()),
+            (recipient_dir.as_path(), recipient_in.as_path()),
+        ],
+        &mut mig_warnings,
+    ) {
+        Ok(o) => {
+            c.migrated += o.migrated;
+            if o.channel_ready {
+                fold_channel(sync::sync_peer_pair(sender, recipient), c);
+            } else {
+                let sender_label = sender.display_name();
+                let recipient_label = recipient.display_name();
+                sync_req_pair_legacy(
+                    &sender_dir,
+                    &recipient_dir,
+                    &sender_label,
+                    &recipient_label,
+                    c,
+                );
+            }
         }
+        Err(e) => c.push(migration_issue(&sender.display_name(), e)),
     }
-
-    // Copy *.response.md from codex (source of truth) back to consumer.
-    for resp_file in sync::scan_responses(&recipient_dir) {
-        let src = recipient_dir.join(&resp_file);
-        let dst = sender_dir.join(&resp_file);
-        match sync::copy_file_if_changed(&src, &dst) {
-            Ok(true) => c.responses += 1,
-            Ok(false) => {}
-            Err(e) => c.push(copy_failed(&resp_file, &sender.display_name(), e)),
-        }
-    }
+    c.extend(mig_warnings);
 }
 
 /// T-000175: codex REQ channels, per-lane. Unlike the broadcast (svod content),
@@ -2226,15 +2322,17 @@ mod tests {
 
         run_project_sync(&db, consumer.id).unwrap();
 
-        // REQ landed on the codex side under server-requirements/<consumer-canonical>/.
+        // T-000190: REQ landed on the codex side under InOutBox/inbox/<consumer>/ —
+        // the legacy seed above proves the pair migrates along the way.
         let codex_req = codex_base
             .join("docs")
-            .join("server-requirements")
+            .join("InOutBox")
+            .join("inbox")
             .join("consumer-backend")
             .join("REQ-001_add-retry-rule.md");
         assert!(
             codex_req.exists(),
-            "consumer's REQ must be delivered to the codex's server-requirements"
+            "consumer's REQ must be delivered to the codex's InOutBox inbox"
         );
 
         // api-contract was NOT propagated — no microservice-api inbox for the codex.
@@ -2248,11 +2346,13 @@ mod tests {
             "a codex must not push an api.md to the consumer"
         );
 
-        // The codex answers with a response; next sync brings it back to the consumer.
+        // The codex answers in its inbox; next sync brings the response back
+        // into the consumer's outbox.
         fs::write(
             codex_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-backend")
                 .join("REQ-001_add-retry-rule.response.md"),
             "Added rules/retry.md — idempotency key now required.",
@@ -2261,7 +2361,12 @@ mod tests {
 
         run_project_sync(&db, consumer.id).unwrap();
 
-        let consumer_response = consumer_req_dir.join("REQ-001_add-retry-rule.response.md");
+        let consumer_response = consumer_base
+            .join("docs")
+            .join("InOutBox")
+            .join("outbox")
+            .join("practices-server")
+            .join("REQ-001_add-retry-rule.response.md");
         assert!(
             consumer_response.exists(),
             "the codex's response must be copied back to the consumer"
@@ -2311,10 +2416,11 @@ mod tests {
 
         run_project_sync(&db, consumer.id).unwrap();
 
-        // REQ landed on the codex's admin repo under server-requirements/<consumer-admin>/.
+        // REQ landed on the codex's admin repo under InOutBox/inbox/<consumer>/.
         let codex_req = codex_base
             .join("docs")
-            .join("server-requirements")
+            .join("InOutBox")
+            .join("inbox")
             .join("consumer-admin")
             .join("REQ-001_admin-rule.md");
         assert!(
@@ -2322,11 +2428,12 @@ mod tests {
             "consumer's admin-lane REQ must be delivered to the codex's admin repo"
         );
 
-        // Codex answers; next sync brings it back.
+        // Codex answers in its inbox; next sync brings it back.
         fs::write(
             codex_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-admin")
                 .join("REQ-001_admin-rule.response.md"),
             "Added rules/admin-a11y.md.",
@@ -2335,7 +2442,12 @@ mod tests {
 
         run_project_sync(&db, consumer.id).unwrap();
 
-        let consumer_response = consumer_req_dir.join("REQ-001_admin-rule.response.md");
+        let consumer_response = consumer_base
+            .join("docs")
+            .join("InOutBox")
+            .join("outbox")
+            .join("practices-admin")
+            .join("REQ-001_admin-rule.response.md");
         assert!(
             consumer_response.exists(),
             "the codex's admin-lane response must be copied back to the consumer"
@@ -2398,7 +2510,8 @@ mod tests {
         assert!(
             codex_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-admin")
                 .join("REQ-010_admin-rule.md")
                 .exists(),
@@ -2488,11 +2601,12 @@ mod tests {
 
         run_project_sync(&db, consumer.id).unwrap();
 
-        // Each REQ landed only in its own lane's folder.
+        // Each REQ landed only in its own lane's inbox.
         assert!(
             codex_srv_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-backend")
                 .join("REQ-100_server-rule.md")
                 .exists(),
@@ -2501,7 +2615,8 @@ mod tests {
         assert!(
             codex_adm_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-admin")
                 .join("REQ-200_admin-rule.md")
                 .exists(),
@@ -2512,7 +2627,8 @@ mod tests {
         assert!(
             !codex_adm_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-backend")
                 .join("REQ-100_server-rule.md")
                 .exists(),
@@ -2521,7 +2637,8 @@ mod tests {
         assert!(
             !codex_srv_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-admin")
                 .join("REQ-200_admin-rule.md")
                 .exists(),

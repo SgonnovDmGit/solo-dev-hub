@@ -511,6 +511,29 @@ pub fn list_markers_in_rev(
         .collect())
 }
 
+/// Is `path` (a file or a dir prefix) still present in the git INDEX? An entry
+/// surviving in the index while its worktree file is gone is a pending
+/// deletion a scoped `git add -A` can stage — and the pathspec is then
+/// guaranteed to match, unlike a HEAD check which would also hit
+/// already-staged deletions and make `git add` fail on an unmatched spec
+/// (T-000190: legacy channel dirs deleted by a migration's fs moves).
+pub fn path_in_index(git: &GitBinary, local_path: &Path, path: &Path) -> Result<bool, String> {
+    let out = spawn_cmd(&git.0)
+        .args(["ls-files", "--"])
+        .arg(path)
+        .current_dir(local_path)
+        .output()
+        .map_err(|e| format!("git ls-files failed to start: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(!out.stdout.is_empty())
+}
+
 /// A throw-away index file, removed together with its lock on every exit path.
 struct TempIndex(PathBuf);
 

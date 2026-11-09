@@ -70,32 +70,33 @@ Parent standard project "web-app"
 
 1. `server_repo_of_microservice(ms_project_id)` → получает server-репо (или Err)
 2. Если Err (`0 servers` или `2+ servers`) — запись в errors, пропуск микросервиса
-3. Копирует REQ-*.md из `web-app-backend/docs/microservice-requirements/<ms-project-name>/` в `ms-server-repo/docs/server-requirements/`
-4. Копирует .response.md обратно из `ms-server-repo/docs/server-requirements/` в `web-app-backend/docs/microservice-requirements/<ms-project-name>/`
-5. Имя папки subfolder — **`ms-project.name`** (не github_name!), т.к. микросервис теперь проект, а не репо
+3. Зеркалит `web-app-backend/docs/InOutBox/outbox/<ms>/` в `ms-server-repo/docs/InOutBox/inbox/<parent>/` (T-000190; legacy `microservice-requirements/` → `server-requirements/` мигрируется той же парой)
+4. Копирует `.response.md` обратно из `ms-server-repo`'s inbox в `web-app-backend`'s outbox
+5. Имя папки `<peer>` — **`ms_server_repo.canonical_folder_name()`** (F-033 Case B: переезд `<ms-project.name>` → canonical выполнен миграцией)
 
 ### Пример файловой структуры
 
 У сервера parent-проекта:
 ```
-web-app-backend/docs/
-├─ microservice-requirements/
-│  ├─ auth-service/                      ← имя microservice-проекта
-│  │  ├─ REQ-001_login-api.md
-│  │  └─ REQ-001_login-api.response.md  ← пришёл от auth-backend
-│  └─ billing-service/
-│     └─ REQ-002_payment-api.md
+web-app-backend/docs/InOutBox/
+└─ outbox/
+   ├─ auth-backend/                        ← canonical server-репо микросервиса
+   │  ├─ REQ-001_login-api.md
+   │  └─ REQ-001_login-api.response.md    ← пришёл от auth-backend
+   └─ billing-backend/
+      └─ REQ-002_payment-api.md
 ```
 
 У server-репо микросервиса (`auth-backend`):
 ```
-auth-backend/docs/
-└─ server-requirements/
-   ├─ REQ-001_login-api.md          ← пришёл от web-app-backend
-   └─ REQ-001_login-api.response.md ← ответ перед возвратом
+auth-backend/docs/InOutBox/
+└─ inbox/
+   └─ web-app-backend/
+      ├─ REQ-001_login-api.md          ← пришёл от web-app-backend
+      └─ REQ-001_login-api.response.md ← ответ перед возвратом
 ```
 
-**Flat на стороне микросервиса**: у микросервиса обычно один parent-сервер (а если несколько — приходят в одну папку, по именам REQ не конфликтуют т.к. источник один).
+**Per-parent на стороне микросервиса**: `inbox/<parent>` на каждого parent-сервера — ms с несколькими родителями не конфликтует. Legacy `server-requirements/` заморожен архивом (REQ-* мигрированы, реестры и прочее остались на месте).
 
 ## Triangular flow (client → server → microservice)
 
@@ -112,17 +113,17 @@ Client пишет REQ серверу. Server-LLM при процессинге �
 
 ### Lifecycle (MS-only пример)
 
-1. **Client → Server.** Client пишет `REQ-005_avatar-storage.md` в собственный `docs/backend-requirements/`. На sync Solo Dev Hub копирует на server-сторону в `docs/client-requirements/<client-repo>/REQ-005_avatar-storage.md`.
+1. **Client → Server.** Client пишет `REQ-005_avatar-storage.md` в собственный `docs/InOutBox/outbox/<server>/`. На sync Solo Dev Hub зеркалит его в server-side `docs/InOutBox/inbox/<client-repo>/`.
 
-2. **Server forward'ит вниз.** Server-LLM открывает REQ, классифицирует scope как MS-only. Создаёт `docs/microservice-requirements/ms-storage/REQ-001_blob-storage.md` с reformulated body (server↔MS контракт без упоминания "client") и `**Forwarded-from:** <client-repo>/REQ-005` header сразу после H1. **Не пишет client receipt.**
+2. **Server forward'ит вниз.** Server-LLM открывает REQ, классифицирует scope как MS-only. Создаёт `docs/InOutBox/outbox/<ms>/REQ-001_blob-storage.md` с reformulated body (server↔MS контракт без упоминания "client") и `**Forwarded-from:** <client-repo>/REQ-005` header сразу после H1. **Не пишет client receipt.**
 
-3. **Sync пропагирует downstream.** Solo Dev Hub копирует новый downstream REQ в `ms-storage-server/docs/server-requirements/REQ-001_blob-storage.md`. `Forwarded-from:` header едет вместе с телом REQ.
+3. **Sync пропагирует downstream.** Solo Dev Hub зеркалит новый downstream REQ в `ms-storage-server/docs/InOutBox/inbox/<parent>/REQ-001_blob-storage.md`. `Forwarded-from:` header едет вместе с телом REQ.
 
-4. **MS обрабатывает.** MS-LLM открывает REQ, **игнорирует `Forwarded-from:` header** (правило Rule 2.1 — это metadata для server-side chain-tracing). Делает работу, пишет `REQ-001_blob-storage.response.md` со `## Status: implemented`.
+4. **MS обрабатывает.** MS-LLM открывает REQ, **игнорирует `Forwarded-from:` header** (правило Rule 2.1 — это metadata для server-side chain-tracing). Делает работу, пишет `REQ-001_blob-storage.response.md` в своём inbox со `## Status: implemented`.
 
-5. **Sync пропагирует receipt вверх.** Solo Dev Hub копирует receipt обратно в server'ский `docs/microservice-requirements/ms-storage/REQ-001_blob-storage.response.md`.
+5. **Sync пропагирует receipt вверх.** Solo Dev Hub копирует receipt обратно в server'ский `docs/InOutBox/outbox/<ms>/REQ-001_blob-storage.response.md`.
 
-6. **Server консолидирует.** Server-LLM (возможно в новой сессии) при scan'е обнаруживает MS receipt. По `Forwarded-from:` header в downstream REQ восстанавливает link к client REQ. Пишет consolidated client receipt `docs/client-requirements/<client-repo>/REQ-005_avatar-storage.response.md` со `## Status: implemented` и `## Comment:` про функциональный исход. **Receipt не упоминает microservice** — server's implementation strategy opaque to client.
+6. **Server консолидирует.** Server-LLM (возможно в новой сессии) при scan'е обнаруживает MS receipt. По `Forwarded-from:` header в downstream REQ восстанавливает link к client REQ. Пишет consolidated client receipt `docs/InOutBox/inbox/<client-repo>/REQ-005_avatar-storage.response.md` со `## Status: implemented` и `## Comment:` про функциональный исход. **Receipt не упоминает microservice** — server's implementation strategy opaque to client.
 
 7. **Confirm.** Sync пропагирует receipt клиенту. Client видит → confirms через app's ✓ → атомарное удаление пары на обеих сторонах. Downstream REQ-001 / response.md на server↔MS оси confirm'ится отдельно когда server считает нужным.
 
@@ -130,8 +131,8 @@ Client пишет REQ серверу. Server-LLM при процессинге �
 
 Chain может span'ить несколько сессий. При открытии новой сессии server-LLM:
 
-1. Сканирует `docs/client-requirements/*/REQ-*.md` без `.response.md` — открытые client REQ'ы.
-2. Для каждого: grep `docs/microservice-requirements/*/REQ-*.md` на `Forwarded-from: <client-repo>/REQ-NNN` header.
+1. Сканирует `docs/InOutBox/inbox/*/REQ-*.md` без `.response.md` — открытые client REQ'ы.
+2. Для каждого: grep `docs/InOutBox/outbox/*/REQ-*.md` на `Forwarded-from: <client-repo>/REQ-NNN` header.
 3. **Найден downstream с response.md** → шаг 6 lifecycle (consolidated client receipt).
 4. **Найден без response.md** → chain in-flight, ждать.
 5. **Не найден** → forward'ы ещё не созданы, классифицировать scope и действовать.
@@ -141,8 +142,8 @@ Chain может span'ить несколько сессий. При откры�
 ### Multi-MS forwarding
 
 Если client REQ требует работы нескольких микросервисов:
-- Server создаёт **N** downstream REQ — по одному в каждый `docs/microservice-requirements/<ms>/`.
-- В каждом — собственный `REQ-NNN` (отдельный per-folder counter, не shared между папками).
+- Server создаёт **N** downstream REQ — по одному в каждый `docs/InOutBox/outbox/<ms>/`.
+- В каждом — собственный `REQ-NNN` из **глобального** счётчика репо (T-000190: max по всем `docs/InOutBox/registry/*.md` + замороженным legacy-реестрам, не per-folder).
 - `Forwarded-from:` header — **одинаковое** значение во всех (одна client-REQ-ID, разные MS-REQ файлы).
 - Server ждёт **все** receipt'ы перед consolidated client receipt'ом.
 - Consolidated receipt описывает исход per microservice ("реализованы оба компонента: ... и ...").
@@ -171,9 +172,10 @@ Receipts мутабельны на recipient-стороне; sender никогд
 | `Forwarded-from:` header | — | ✓ |
 | Scan / grep in-flight chains | — | ✓ (в начале сессии) |
 | Consolidation client receipt | — | ✓ |
-| Validation receipt format | — | пока ✓ (planned F-000039 будет parse'ить `## Status:`) |
+| Validation receipt format | — | ✓ (`## Status:` не парсится — convention) |
+| Auto-close pair по `.impl.md` | ✓ | sender дропает маркер (F-000039, v1.7.0) |
 
-В будущем (F-000039, v2.0.0) приложение начнёт parse'ить `## Status:` line и автоматически confirm'ить `implemented` receipt'ы. Сейчас все правила — convention для LLM/человека, без runtime-enforcement.
+`## Status:` в receipt'е приложение не parse'ит. Auto-close идёт через `.impl.md`-маркер отправителя (F-000039, v1.7.0): sync сносит `.md` + `.response.md` + `.impl.md` на обеих сторонах. Формат receipt'а — convention для LLM/человека, без runtime-enforcement.
 
 ### Cross-reference
 

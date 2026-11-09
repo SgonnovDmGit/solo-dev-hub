@@ -1,5 +1,8 @@
 // T-000192: the InOutBox channel between equals (client<->client,
 // server<->server, microservice<->microservice).
+// T-000190: the same layout now carries the hierarchical pairs too — a REQ
+// exchange (client->server, server->microservice, consumer->codex) is just
+// another kind of file in the same outbox/inbox lanes.
 //
 // Layout, per repo:
 //
@@ -7,23 +10,32 @@
 //   docs/InOutBox/inbox/<peer>/    what this peer sent me     — the app writes
 //   docs/InOutBox/pact/<peer>/     two-sided agreements       — both write, one
 //                                                               file per writer
-//   docs/InOutBox/registry.md      append-only number ledger  — nobody but the
-//                                                               agent ever touches
+//   docs/InOutBox/registry/<peer>.md  per-pair append-only number ledger
+//                                   (split of the legacy single registry.md —
+//                                   nobody but the agent ever touches)
 //
 // The folder names state a DIRECTION, not a role: equals have no roles, but an
-// exchange always has a direction. That is what distinguishes this channel from
-// the hierarchical ones, whose folder names encode who owes whom.
+// exchange always has a direction.
 //
-// Copying semantics differ per folder, deliberately:
+// Copying semantics differ per folder AND per file kind, deliberately:
 //
-//   outbox -> peer's inbox   MIRROR WITH PRUNE. The inbox is a read-only replica
-//                            and must follow the author's copy, deletions included.
+//   outbox -> peer's inbox   MIRROR WITH PRUNE, kind-aware. The inbox is a
+//                            replica of the outbox EXCEPT the files the
+//                            recipient itself authors there:
+//                            `*.response.md` (the REQ answer) and the
+//                            `*.ack/` marker dirs (T-000245) — those are never
+//                            copied INTO the inbox and never pruned from it.
+//                            Responses flow the other way: inbox -> outbox.
 //   pact  <-> peer's pact    UNION WITHOUT PRUNE. Both sides put files in the same
 //                            folder, so a mirror would eat the other side's files.
 //
-// `registry.md` sits in the channel ROOT, outside every mirrored subfolder, so no
-// prune can reach it. That is the whole point: tearing an exchange down removes
-// the files but never the numbers, and a number is therefore never reissued.
+// Closing markers are kind-guarded: `.done.md` closes only NOTE-*/HANDOFF-*
+// bodies, `.impl.md` in outbox/inbox closes only REQ-* triples (in pact/ it
+// closes a PACT) — a stray marker must never tear down a different kind.
+//
+// The registry sits in the channel ROOT, outside every mirrored subfolder, so
+// no prune can reach it. That is the whole point: tearing an exchange down
+// removes the files but never the numbers, and a number is never reissued.
 
 use std::path::{Path, PathBuf};
 
@@ -62,6 +74,36 @@ pub fn registry_path(base: &Path) -> PathBuf {
     channel_root(base).join(REGISTRY_FILE)
 }
 
+/// T-000190: the new canonical per-pair ledger `registry/<peer>.md`.
+pub fn registry_peer_path(base: &Path, peer: &str) -> PathBuf {
+    channel_root(base)
+        .join("registry")
+        .join(format!("{}.md", peer))
+}
+
+/// T-000190: does this repo hold ANY ledger material for `peer`? Presence —
+/// not content — is all the app reports: the agent owns the bytes and does the
+/// split. Counts the new `registry/<peer>.md`, the legacy unified
+/// `registry.md`, and the frozen `*-requirements/**/registry.md` archives
+/// (flat and per-peer variants; the agent keeps them byte-identical).
+pub fn registry_present(base: &Path, peer: &str) -> bool {
+    if registry_peer_path(base, peer).is_file() || registry_path(base).is_file() {
+        return true;
+    }
+    for parent in [
+        "backend-requirements",
+        "client-requirements",
+        "microservice-requirements",
+        "server-requirements",
+    ] {
+        let dir = base.join("docs").join(parent);
+        if dir.join(REGISTRY_FILE).is_file() || dir.join(peer).join(REGISTRY_FILE).is_file() {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn outbox_dir(base: &Path, peer: &str) -> PathBuf {
     channel_root(base).join("outbox").join(peer)
 }
@@ -74,13 +116,17 @@ pub fn pact_dir(base: &Path, peer: &str) -> PathBuf {
     channel_root(base).join("pact").join(peer)
 }
 
-/// Top-level `*.md` files in `dir` that are not markers or acknowledgements —
-/// i.e. the exchange bodies. Subdirectories are ignored: the channel is flat by
-/// design, one folder per counterpart. Used by the sync screen to count what is
-/// open in a folder.
+/// Top-level `*.md` files in `dir` that are not markers, acknowledgements or
+/// receipts — i.e. the exchange bodies. Subdirectories are ignored: the
+/// channel is flat by design, one folder per counterpart. Used by the sync
+/// screen to count what is open in a folder. T-000190: a REQ `.response.md`
+/// is the recipient's receipt, not a new message — same for `.ack.md`.
 pub fn scan_bodies(dir: &Path) -> Vec<String> {
     scan_md(dir, |name| {
-        !name.ends_with(".ack.md") && !name.ends_with(".impl.md") && !name.ends_with(".done.md")
+        !name.ends_with(".ack.md")
+            && !name.ends_with(".impl.md")
+            && !name.ends_with(".done.md")
+            && !name.ends_with(".response.md")
     })
 }
 
@@ -152,24 +198,70 @@ fn peer_issue(subject: impl Into<String>, e: impl std::fmt::Display) -> SyncIssu
     SyncIssue::new(Code::PeerChannelFailed, subject).detail(e)
 }
 
+/// The channel kind of an exchange body, by filename prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyKind {
+    Req,
+    Announce,
+    Note,
+    Handoff,
+    Pact,
+    /// An `*.md` body without a channel prefix — mirrored like any authored
+    /// file but never torn down by a kind-guarded marker.
+    Other,
+}
+
+fn body_kind(stem: &str) -> BodyKind {
+    if stem.starts_with("REQ-") {
+        BodyKind::Req
+    } else if stem.starts_with("ANNOUNCE-") {
+        BodyKind::Announce
+    } else if stem.starts_with("NOTE-") {
+        BodyKind::Note
+    } else if stem.starts_with("HANDOFF-") {
+        BodyKind::Handoff
+    } else if stem.starts_with("PACT-") {
+        BodyKind::Pact
+    } else {
+        BodyKind::Other
+    }
+}
+
+/// True when `name` is a file the RECIPIENT of this inbox dir authors — the
+/// REQ answer `.response.md` — or a marker directory it authors — `*.ack/`
+/// (T-000245). The outbox->inbox mirror neither copies over nor prunes these;
+/// responses flow the other way, ack dirs get their own delivery.
+fn is_recipient_authored(name: &std::ffi::OsStr) -> bool {
+    let s = name.to_string_lossy();
+    s.ends_with(".response.md") || s.ends_with(".ack")
+}
+
 /// Remove every exchange whose author dropped a closing marker, from ALL the
 /// directories that hold a copy of it.
 ///
-/// `marker` is the closing suffix (`.impl.md` for a PACT, `.done.md` for a
-/// HANDOFF / NOTE); `companions` are the suffixes making up the exchange,
-/// marker included. Returns the base filenames closed.
+/// `marker` is the closing suffix (`.impl.md` for a PACT or a REQ, `.done.md`
+/// for a HANDOFF / NOTE); `companions` are the suffixes making up the exchange,
+/// marker included; `closable` gates which body kinds this marker may tear
+/// down — a `.done.md` must never close a REQ or an ANNOUNCE, an outbox
+/// `.impl.md` closes only a REQ triple. Returns the base filenames closed.
 ///
 /// Deletion happens across every side before any copying runs. The pact union
 /// has no prune, so removing the triple on one side only would let the peer's
 /// surviving replica resurrect it on the next pass — the same failure mode that
 /// bit the REQ channel in v1.9.5. Idempotent: a missing file is a no-op, so a
 /// pair seen from both project syncs closes twice harmlessly.
-fn close_marked(dirs: &[PathBuf], marker: &str, companions: &[&str], out: &mut PeerChannelOutcome) {
+fn close_marked_if(
+    dirs: &[PathBuf],
+    marker: &str,
+    companions: &[&str],
+    closable: impl Fn(&str) -> bool,
+    out: &mut PeerChannelOutcome,
+) {
     let mut stems: Vec<String> = Vec::new();
     for dir in dirs {
         for name in scan_with_suffix(dir, marker) {
             if let Some(stem) = name.strip_suffix(marker) {
-                if !stems.iter().any(|s| s == stem) {
+                if closable(stem) && !stems.iter().any(|s| s == stem) {
                     stems.push(stem.to_string());
                 }
             }
@@ -191,17 +283,108 @@ fn close_marked(dirs: &[PathBuf], marker: &str, companions: &[&str], out: &mut P
     }
 }
 
-/// Mirror an author's outbox onto the peer's inbox: copy changed files, prune
-/// whatever the author removed. The inbox is a replica, never an authored
-/// folder, so following the source exactly is correct here.
+/// Mirror an author's outbox onto the peer's inbox, kind-aware (T-000190):
+/// copy changed files, prune whatever the author removed — but skip the files
+/// and dirs the RECIPIENT authors in its own inbox (`*.response.md`, `*.ack/`).
+/// Mirroring over them would overwrite the recipient's receipt with the
+/// sender's stale replica; pruning them would delete the recipient's own work.
 fn mirror_outbox(src: &Path, dst: &Path, out: &mut PeerChannelOutcome) {
-    match sync::mirror_dir(src, dst) {
-        Ok(o) => {
-            out.copied += o.copied;
-            out.pruned += o.pruned;
-        }
-        Err(e) => out.errors.push(peer_issue(dst.display().to_string(), e)),
+    if !src.exists() {
+        return; // no authored outbox — nothing to deliver, nothing to prune
     }
+    if let Err(e) = std::fs::create_dir_all(dst) {
+        out.errors.push(peer_issue(dst.display().to_string(), e));
+        return;
+    }
+    // Copy pass: every source entry except recipient-authored names.
+    if let Err(e) = copy_channel_tree(src, dst, &mut out.copied) {
+        out.errors.push(peer_issue(dst.display().to_string(), e));
+    }
+    // Prune pass: dst entries absent from src, except recipient-authored names.
+    if let Err(e) = prune_channel_tree(src, dst, &mut out.pruned) {
+        out.errors.push(peer_issue(dst.display().to_string(), e));
+    }
+}
+
+fn copy_channel_tree(src: &Path, dst: &Path, copied: &mut usize) -> Result<(), String> {
+    let entries = std::fs::read_dir(src).map_err(|e| e.to_string())?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        if is_recipient_authored(&entry.file_name()) {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_channel_tree(&src_path, &dst_path, copied)?;
+        } else if src_path.is_file() && sync::copy_file_if_changed(&src_path, &dst_path)? {
+            *copied += 1;
+        }
+    }
+    Ok(())
+}
+
+fn prune_channel_tree(src: &Path, dst: &Path, pruned: &mut usize) -> Result<(), String> {
+    let entries = std::fs::read_dir(dst).map_err(|e| e.to_string())?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        if is_recipient_authored(&entry.file_name()) {
+            continue;
+        }
+        let dst_path = entry.path();
+        let src_path = src.join(entry.file_name());
+        if dst_path.is_dir() {
+            if src_path.is_dir() {
+                prune_channel_tree(&src_path, &dst_path, pruned)?;
+            } else {
+                std::fs::remove_dir_all(&dst_path).map_err(|e| e.to_string())?;
+                *pruned += 1;
+            }
+        } else if !src_path.exists() {
+            std::fs::remove_file(&dst_path).map_err(|e| e.to_string())?;
+            *pruned += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The recipient's `*.response.md` files flow back to the sender's outbox —
+/// the one place where an inbox is the source of truth (T-000190: the response
+/// is written by the recipient next to the body it answers).
+fn copy_responses_back(inbox: &Path, outbox: &Path, out: &mut PeerChannelOutcome) {
+    for name in scan_with_suffix(inbox, ".response.md") {
+        let src = inbox.join(&name);
+        let dst = outbox.join(&name);
+        match sync::copy_file_if_changed(&src, &dst) {
+            Ok(true) => out.copied += 1,
+            Ok(false) => {}
+            Err(e) => out.errors.push(peer_issue(dst.display().to_string(), e)),
+        }
+    }
+}
+
+/// One direction of a pair: `a_out` (author) -> `b_in` (replica + receipts).
+/// Teardowns first — re-seeding a file that was just removed is the classic
+/// resurrection bug. Then the receipt backflow, then the mirror.
+fn sync_one_direction(a_out: &Path, b_in: &Path, out: &mut PeerChannelOutcome) {
+    // A `.done.md` closes only NOTE-*/HANDOFF-* bodies — never a REQ or an
+    // ANNOUNCE that happens to share the folder.
+    close_marked_if(
+        &[a_out.to_path_buf(), b_in.to_path_buf()],
+        ".done.md",
+        &[".md", ".done.md"],
+        |stem| matches!(body_kind(stem), BodyKind::Note | BodyKind::Handoff),
+        out,
+    );
+    // A `.impl.md` in outbox/inbox closes only a REQ triple (body + response +
+    // marker); the PACT flavour lives in pact/ and is handled separately.
+    close_marked_if(
+        &[a_out.to_path_buf(), b_in.to_path_buf()],
+        ".impl.md",
+        &[".md", ".response.md", ".impl.md"],
+        |stem| body_kind(stem) == BodyKind::Req,
+        out,
+    );
+    copy_responses_back(b_in, a_out, out);
+    mirror_outbox(a_out, b_in, out);
 }
 
 /// Union two `pact/` folders without pruning either.
@@ -310,36 +493,58 @@ pub fn sync_peer_pair(a: &Repository, b: &Repository) -> PeerChannelOutcome {
     let b_pact = pact_dir(b_base, &a_name);
 
     // 1. Teardown, everywhere, before anything is copied.
-    //    A PACT closes on the initiator's `.impl.md` and takes the whole triple.
-    close_marked(
+    //    A PACT closes on the initiator's `.impl.md` and takes the whole
+    //    triple — and ONLY a PACT: a stray `.impl.md` must not tear down a
+    //    different kind that ended up in pact/.
+    close_marked_if(
         &[a_pact.clone(), b_pact.clone()],
         ".impl.md",
         &[".md", ".ack.md", ".impl.md"],
+        |stem| body_kind(stem) == BodyKind::Pact,
         &mut out,
     );
-    //    A HANDOFF / NOTE closes on the sender's `.done.md`; there is no reply
-    //    file, so the pair is just body + marker. Each direction is torn down
-    //    across the sender's outbox and the recipient's inbox replica.
-    close_marked(
-        &[a_out.clone(), b_in.clone()],
-        ".done.md",
-        &[".md", ".done.md"],
-        &mut out,
-    );
-    close_marked(
-        &[b_out.clone(), a_in.clone()],
-        ".done.md",
-        &[".md", ".done.md"],
-        &mut out,
-    );
-
-    // 2. Copies.
-    mirror_outbox(&a_out, &b_in, &mut out);
-    mirror_outbox(&b_out, &a_in, &mut out);
+    // 2. Both directions, each kind-aware: a `.done.md` closes only NOTE /
+    //    HANDOFF, an outbox `.impl.md` only a REQ triple; responses flow back;
+    //    then the outbox mirrors into the inbox without touching receipts.
+    sync_one_direction(&a_out, &b_in, &mut out);
+    sync_one_direction(&b_out, &a_in, &mut out);
     let sides = format!("{}, {}", a.display_name(), b.display_name());
     union_pacts(&a_pact, &b_pact, &sides, &mut out);
 
     out
+}
+
+/// T-000190: replay `renamed`'s repo renames on `host`'s peer-named dirs —
+/// `outbox/<peer>/`, `inbox/<peer>/`, `pact/<peer>/` all follow the
+/// counterparty's canonical name. Registry files are agent-owned and never
+/// moved by the app; a failed lookup leaves the dirs alone rather than guess.
+fn replay_peer_renames(
+    db: &AppDb,
+    host: &Repository,
+    renamed: &Repository,
+    out: &mut PeerChannelOutcome,
+) {
+    let (Some(hp), Ok(renames)) = (
+        host.local_path.as_deref(),
+        db.list_renames_for_repo(renamed.id),
+    ) else {
+        return;
+    };
+    let root = Path::new(hp).join("docs").join(INOUTBOX_DIR);
+    for lane in ["outbox", "inbox", "pact"] {
+        let parent = root.join(lane);
+        for r in &renames {
+            match sync::replay_rename_in_dir(&parent, &r.old_canonical, &r.new_canonical) {
+                Ok(sync::RenameOutcome::Renamed) => {}
+                Ok(sync::RenameOutcome::Collision) => out.errors.push(peer_issue(
+                    &r.old_canonical,
+                    format!("rename to {} collides", r.new_canonical),
+                )),
+                Ok(sync::RenameOutcome::NoOp) => {}
+                Err(e) => out.errors.push(peer_issue(&r.old_canonical, e)),
+            }
+        }
+    }
 }
 
 /// Run every peer channel touching `project_id`: for each repo of the project,
@@ -376,6 +581,11 @@ pub fn run_peer_channels(db: &AppDb, project_id: i64) -> PeerChannelOutcome {
                 continue;
             }
             done.push(key);
+            // T-000190: replay renames on the peer-named dirs first — each
+            // side's outbox/inbox/pact/<peer> follows the counterparty's
+            // canonical name, so a rename of one repo lands on the other's fs.
+            replay_peer_renames(db, repo, &peer, &mut out);
+            replay_peer_renames(db, &peer, repo, &mut out);
             let o = sync_peer_pair(repo, &peer);
             out.copied += o.copied;
             out.pruned += o.pruned;
@@ -598,10 +808,142 @@ mod tests {
             "PACT-001_x.ack.md",
             "PACT-001_x.impl.md",
             "NOTE-003_y.done.md",
+            "REQ-004_x.response.md",
             "notes.txt",
         ] {
             fs::write(d.join(n), "x").unwrap();
         }
         assert_eq!(scan_bodies(&d), vec!["PACT-001_x.md".to_string()]);
+    }
+
+    // ── T-000190: kind-aware channel semantics ───────────────────────────────
+
+    #[test]
+    fn req_triple_flows_through_the_unified_channel() {
+        let (_td, a, b) = pair();
+        sync_peer_pair(&a, &b);
+        let a_out = outbox_dir(&base(&a), &b.canonical_folder_name());
+        let b_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+
+        // Sender publishes the body; it mirrors into the recipient's inbox.
+        fs::write(a_out.join("REQ-001_x.md"), "please add a field").unwrap();
+        let out = sync_peer_pair(&a, &b);
+        assert!(b_in.join("REQ-001_x.md").exists());
+        assert_eq!(out.copied, 1);
+
+        // The recipient answers in place — the response flows BACK to the
+        // sender's outbox and is never treated as a new body.
+        fs::write(b_in.join("REQ-001_x.response.md"), "done — see REQ receipt").unwrap();
+        let out = sync_peer_pair(&a, &b);
+        assert!(a_out.join("REQ-001_x.response.md").exists());
+        assert_eq!(out.copied, 1);
+        assert!(scan_bodies(&b_in).contains(&"REQ-001_x.md".to_string()));
+        assert!(!scan_bodies(&b_in).iter().any(|n| n.contains("response")));
+
+        // The sender acknowledges with .impl.md — the whole triple (body,
+        // response, marker) closes on BOTH sides.
+        fs::write(a_out.join("REQ-001_x.impl.md"), "confirmed").unwrap();
+        let out = sync_peer_pair(&a, &b);
+        assert_eq!(out.closed, vec!["REQ-001_x.md".to_string()]);
+        for d in [&a_out, &b_in] {
+            assert!(!d.join("REQ-001_x.md").exists(), "{}", d.display());
+            assert!(!d.join("REQ-001_x.response.md").exists(), "{}", d.display());
+            assert!(!d.join("REQ-001_x.impl.md").exists(), "{}", d.display());
+        }
+    }
+
+    #[test]
+    fn a_done_marker_never_closes_a_req_or_an_announce() {
+        let (_td, a, b) = pair();
+        sync_peer_pair(&a, &b);
+        let a_out = outbox_dir(&base(&a), &b.canonical_folder_name());
+        let b_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+
+        fs::write(a_out.join("REQ-001_x.md"), "body").unwrap();
+        fs::write(a_out.join("ANNOUNCE-002_y.md"), "news").unwrap();
+        // A stray .done.md next to them — it mirrors like any file but must
+        // tear nothing down: it is not their kind's marker.
+        fs::write(a_out.join("REQ-001_x.done.md"), "stray").unwrap();
+        let out = sync_peer_pair(&a, &b);
+        assert!(out.closed.is_empty(), "{:?}", out.closed);
+        assert!(a_out.join("REQ-001_x.md").exists());
+        assert!(b_in.join("REQ-001_x.md").exists());
+        assert!(b_in.join("ANNOUNCE-002_y.md").exists());
+    }
+
+    #[test]
+    fn an_outbox_impl_marker_never_closes_a_note() {
+        let (_td, a, b) = pair();
+        sync_peer_pair(&a, &b);
+        let a_out = outbox_dir(&base(&a), &b.canonical_folder_name());
+        let b_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+
+        // .impl.md is the REQ/PACT marker; a NOTE must survive it.
+        fs::write(a_out.join("NOTE-003_z.md"), "fyi").unwrap();
+        fs::write(a_out.join("NOTE-003_z.impl.md"), "stray").unwrap();
+        let out = sync_peer_pair(&a, &b);
+        assert!(out.closed.is_empty(), "{:?}", out.closed);
+        assert!(a_out.join("NOTE-003_z.md").exists());
+        assert!(b_in.join("NOTE-003_z.md").exists());
+    }
+
+    #[test]
+    fn recipient_authored_files_survive_mirror_and_prune() {
+        let (_td, a, b) = pair();
+        sync_peer_pair(&a, &b);
+        let a_out = outbox_dir(&base(&a), &b.canonical_folder_name());
+        let b_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+
+        // The recipient's own writings in its inbox — a REQ response and a
+        // T-000245 ack marker dir — are never overwritten nor pruned by the
+        // sender's mirror.
+        fs::write(b_in.join("REQ-001_x.response.md"), "receipt").unwrap();
+        let ack = b_in.join("ANNOUNCE-002_y.md.ack");
+        fs::create_dir_all(&ack).unwrap();
+        fs::write(ack.join("beta"), "").unwrap();
+
+        let out = sync_peer_pair(&a, &b);
+        assert_eq!(out.pruned, 0, "recipient-authored entries are not pruned");
+        assert!(b_in.join("REQ-001_x.response.md").exists());
+        assert!(ack.join("beta").exists());
+        // And an .ack dir sitting in the outbox never mirrors into the inbox.
+        let out_ack = a_out.join("REQ-009_z.md.ack");
+        fs::create_dir_all(&out_ack).unwrap();
+        fs::write(out_ack.join("alpha"), "").unwrap();
+        sync_peer_pair(&a, &b);
+        assert!(!b_in.join("REQ-009_z.md.ack").exists());
+    }
+
+    #[test]
+    fn registry_present_sees_new_and_legacy_ledgers() {
+        let (_td, a, b) = pair();
+        let a_base = base(&a);
+        let peer = b.canonical_folder_name();
+        assert!(!registry_present(&a_base, &peer));
+
+        // The new per-pair ledger.
+        let reg_dir = a_base.join("docs/InOutBox/registry");
+        fs::create_dir_all(&reg_dir).unwrap();
+        fs::write(reg_dir.join(format!("{}.md", peer)), "- REQ-001 | out\n").unwrap();
+        assert!(registry_present(&a_base, &peer));
+        fs::remove_dir_all(&reg_dir).unwrap();
+        assert!(!registry_present(&a_base, &peer));
+
+        // The legacy unified ledger.
+        fs::write(registry_path(&a_base), "- REQ-001 | out\n").unwrap();
+        assert!(registry_present(&a_base, &peer));
+        fs::remove_file(registry_path(&a_base)).unwrap();
+
+        // Frozen archives — flat and per-peer.
+        let flat = a_base.join("docs/backend-requirements");
+        fs::create_dir_all(&flat).unwrap();
+        fs::write(flat.join("registry.md"), "- REQ-001 | out\n").unwrap();
+        assert!(registry_present(&a_base, &peer));
+        fs::remove_file(flat.join("registry.md")).unwrap();
+
+        let nested = a_base.join("docs/client-requirements").join(&peer);
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("registry.md"), "- REQ-001 | out\n").unwrap();
+        assert!(registry_present(&a_base, &peer));
     }
 }
