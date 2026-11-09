@@ -158,6 +158,17 @@ pub fn adopt_main_canon(
     let _guard = rules_guard();
     let known: BTreeMap<String, String> = list_skill_templates(db)?.into_iter().collect();
     let mut followed = followed_rules(db);
+    // T-000241 R3: this install's OWN effective-open proposals on this repo
+    // shield the canon — the contributor's pending text wins over the owner's
+    // current copy until the owner decides. The `followed` metadata still
+    // updates below; only the canon upsert is skipped.
+    let protected: std::collections::HashSet<String> = db
+        .list_rule_proposals(repo.id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.status == crate::models::proposal_status::OPEN && p.resolved_rev.is_none())
+        .map(|p| p.rule)
+        .collect();
     let label = rule_copy_label(repo);
     let prefix = format!("{}/", SKILLS_DIR);
     let mut dirty = false;
@@ -185,7 +196,7 @@ pub fn adopt_main_canon(
                 continue;
             }
         };
-        let differs = text != *current;
+        let differs = text != *current && !protected.contains(name);
         if differs {
             let file_name = format!("skill.{}.md.tmpl", name);
             if let Err(e) = db.upsert_template_file("_global", &file_name, &text, true) {

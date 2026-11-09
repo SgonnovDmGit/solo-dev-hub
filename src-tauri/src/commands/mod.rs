@@ -4,6 +4,7 @@ pub mod deploy;
 pub mod misc;
 pub mod project;
 pub mod repo;
+pub mod rule_proposals;
 pub mod shared;
 pub mod sync;
 pub mod templates;

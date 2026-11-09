@@ -261,13 +261,11 @@ impl AppDb {
 
     /// T-000241 R1: create (or re-propose) a proposal AND apply its text as
     /// the local canon, atomically — seq bump, proposal row (pending_apply →
-    /// applied), the template upsert and the `proposed` history event live or
+    /// applied), the template upsert and the `taken` history event live or
     /// die together, so a crash cannot leave a canon with no proposal or a
-    /// proposal that never landed.
-    ///
-    /// `re_proposal` names the row being superseded — a re-edit reuses the
-    /// file name with a fresh seq; `None` for the first version. Returns the
-    /// assigned seq.
+    /// proposal that never landed. The event's note is formatted inside —
+    /// `proposal to main <login> repo <id> seq <n>` — because the seq only
+    /// exists after the bump. Returns the assigned seq.
     pub fn create_rule_proposal_txn(
         &self,
         repo_id: i64,
@@ -277,7 +275,7 @@ impl AppDb {
         text: &str,
         at: &str,
         event_repo: Option<&str>,
-        event_note: Option<&str>,
+        main_login: &str,
     ) -> SqlResult<i64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -311,16 +309,18 @@ impl AppDb {
                  updated_at = excluded.updated_at",
             rusqlite::params![format!("skill.{}.md.tmpl", rule), text, utc_now_rfc3339()],
         )?;
+        // `taken`, not `proposed`: the event is this install's new edit
+        // origin — `proposed` is the OWNER's record that he saw an open
+        // version on dev. The note carries the seq, which the bump just
+        // assigned.
+        let note = format!(
+            "proposal to main {} repo {} seq {}",
+            main_login, repo_id, seq
+        );
         tx.execute(
             "INSERT INTO rule_events (rule, kind, repo, note, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                rule,
-                rule_event::PROPOSED,
-                event_repo,
-                event_note,
-                utc_now_rfc3339()
-            ],
+            rusqlite::params![rule, rule_event::TAKEN, event_repo, note, utc_now_rfc3339()],
         )?;
         tx.execute(
             "UPDATE rule_proposals SET local_state = 'applied'

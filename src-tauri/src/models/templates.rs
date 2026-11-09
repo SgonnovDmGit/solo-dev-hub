@@ -63,6 +63,10 @@ pub struct RulesRefresh {
     /// copies — so a conflict no longer fires a toast on every sync.
     #[serde(default)]
     pub quiet_conflicts: Vec<String>,
+    /// T-000241: skills whose edit was proposed to a shared repo's owner
+    /// (contributor side of the rule-proposal channel).
+    #[serde(default)]
+    pub proposed: Vec<String>,
     /// The deferred per-repo render plan, consumed by
     /// `sync::skills::render_pending_repo_skills` — which MUST run after
     /// `rules_guard` is released, because each repo render serializes on

@@ -1550,7 +1550,7 @@ mod tests {
             let version: i32 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 35);
+            assert_eq!(version, 36);
         }
 
         // Upgrade path: a v34-shaped DB keeps its rows and they default to 1.
@@ -1969,7 +1969,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
 
         drop(conn);
         let _ = repo;
@@ -2036,7 +2036,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
     }
 
     #[test]

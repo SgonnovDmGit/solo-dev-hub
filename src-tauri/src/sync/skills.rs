@@ -473,6 +473,8 @@ struct Collected {
     errors: Vec<SyncIssue>,
     /// T-000206: see `RulesRefresh::quiet_conflicts`.
     quiet_conflicts: Vec<String>,
+    /// T-000241: skills whose edit was proposed to a shared repo's owner.
+    proposed: Vec<String>,
 }
 
 /// One repo's handed-back copy of a skill, as found beside its marker.
@@ -493,6 +495,9 @@ struct Found {
     /// Skill -> its handed-back copies; sorted by skill, copies by label, so
     /// reports and reason files read the same on every pass.
     handed: Vec<(String, Vec<HandedCopy>)>,
+    /// T-000241: skill -> the proposal candidates of contributor-role repos —
+    /// same grouping and conflict settlement as `handed`, a different apply.
+    proposals: Vec<(String, Vec<HandedCopy>)>,
     /// Repos whose `docs/sdh_skills/` was read this pass.
     read: HashSet<i64>,
     /// `(skill, repo id)`: a flagged copy that could not be read.
@@ -620,9 +625,14 @@ fn classify(
 ) -> Found {
     let mut found = Found::default();
     let mut handed: HashMap<String, Vec<HandedCopy>> = HashMap::new();
+    let mut proposals: HashMap<String, Vec<HandedCopy>> = HashMap::new();
     for scan in scans {
         found.read.insert(scan.repo_id);
         let label = scan.label.as_str();
+        // T-000241: a contributor-role repo's markers are proposals to its
+        // owner, never hand-backs and never superseded-by-followed — the
+        // followed rule is exactly what the contributor proposes to change.
+        let contributor = is_contributor_repo(db, scan.repo_id);
         for marker in &scan.markers {
             let name = marker.name.as_str();
             let Some(current) = known.get(name) else {
@@ -633,7 +643,8 @@ fn classify(
                 continue;
             };
             // A rule that follows an owner (shared_canon) has its text from his
-            // repo; a hand-back of it is set aside like the owner's own edit.
+            // repo; a hand-back of it is set aside like the owner's own edit —
+            // on a contributor repo the same flag proposes a change instead.
             // T-000214: the same for a marker older than the owner's last save or
             // reset of the rule, which the owner made while this checkout could
             // not be read (so no pass superseded it then).
@@ -643,7 +654,7 @@ fn classify(
             if stale {
                 out.owner_superseded.insert(name.to_string());
             }
-            if settings_edit == Some(name) || followed.contains(name) || stale {
+            if settings_edit == Some(name) || (!contributor && (followed.contains(name) || stale)) {
                 match remove_if_present(&marker.path) {
                     Ok(()) => {
                         out.superseded.push(format!("{} ({})", name, label));
@@ -676,16 +687,18 @@ fn classify(
                     if let Some(note) = &note {
                         eprintln!("[skills] {} hands back {}: {}", label, name, note);
                     }
-                    handed
-                        .entry(name.to_string())
-                        .or_default()
-                        .push(HandedCopy {
-                            repo_id: scan.repo_id,
-                            label: label.to_string(),
-                            content,
-                            marker: marker.path.clone(),
-                            note,
-                        });
+                    let copy = HandedCopy {
+                        repo_id: scan.repo_id,
+                        label: label.to_string(),
+                        content,
+                        marker: marker.path.clone(),
+                        note,
+                    };
+                    if contributor {
+                        proposals.entry(name.to_string()).or_default().push(copy);
+                    } else {
+                        handed.entry(name.to_string()).or_default().push(copy);
+                    }
                 }
                 Err(e) => {
                     found.unread.insert((name.to_string(), scan.repo_id));
@@ -700,7 +713,43 @@ fn classify(
         copies.sort_by(|a, b| a.label.cmp(&b.label));
     }
     found.handed = handed;
+    let mut proposals: Vec<(String, Vec<HandedCopy>)> = proposals.into_iter().collect();
+    proposals.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, copies) in &mut proposals {
+        copies.sort_by(|a, b| a.label.cmp(&b.label));
+    }
+    found.proposals = proposals;
     found
+}
+
+/// T-000241: `repo_id` is a contributor-role shared repo — its markers are
+/// proposals to its owner, not hand-backs.
+fn is_contributor_repo(db: &AppDb, repo_id: i64) -> bool {
+    db.get_shared_state(repo_id)
+        .map(|s| s.shared_role.as_deref() == Some("contributor"))
+        .unwrap_or(false)
+}
+
+/// The owner (main) login of the shared repo `repo_id`: a followed rule's
+/// entry names it directly; when nothing is followed yet, the structure file
+/// in the checkout does.
+fn owner_login_of(db: &AppDb, repo_id: i64, repo: Option<&Repository>) -> String {
+    for f in crate::sync::shared_canon::followed_rules(db).into_values() {
+        if f.repo_id == repo_id {
+            return f.login;
+        }
+    }
+    repo.and_then(|r| r.local_path.as_deref())
+        .map(std::path::Path::new)
+        .and_then(|root| {
+            std::fs::read_to_string(root.join(crate::sync::shared_structure::STRUCTURE_REL_PATH))
+                .ok()
+        })
+        .and_then(|json| {
+            serde_json::from_str::<crate::sync::shared_structure::ProjectStructure>(&json).ok()
+        })
+        .map(|s| s.main.login)
+        .unwrap_or_default()
 }
 
 /// T-000206: decide every conflict that was open before this pass and is not
@@ -981,6 +1030,66 @@ fn take_up(db: &AppDb, name: String, copies: &[HandedCopy], out: &mut Collected)
     out.taken.push(name);
 }
 
+/// T-000241 R1: apply the agreed proposal text as the local canon AND record
+/// the proposal to every contributing repo's owner — one DB transaction per
+/// repo (`create_rule_proposal_txn`), so a crash cannot leave a canon with no
+/// proposal or a proposal that never landed. A re-collected marker of the
+/// same open proposal is idempotent: the row's text already matches, so the
+/// seq is not bumped again. The markers are cleared after the write, the
+/// same way `take_up` clears them.
+fn propose_up(
+    db: &AppDb,
+    repos: &[Repository],
+    name: String,
+    copies: &[HandedCopy],
+    out: &mut Collected,
+) {
+    let login = db.github_login().unwrap_or_default();
+    for copy in copies {
+        let file_name = crate::sync::rule_proposals::proposal_file_name(&name, &login);
+        // A real re-edit reuses the file name with a fresh seq; the same
+        // proposal collected again bumps nothing.
+        let same_open = db
+            .get_rule_proposal(copy.repo_id, &file_name)
+            .ok()
+            .flatten()
+            .is_some_and(|p| {
+                p.status == crate::models::proposal_status::OPEN && p.text == copy.content
+            });
+        if same_open {
+            if let Err(e) = remove_if_present(&copy.marker) {
+                out.rule_failed(&name, copy.marker.display().to_string(), e);
+            }
+            continue;
+        }
+        let repo = repos.iter().find(|r| r.id == copy.repo_id);
+        let main_login = owner_login_of(db, copy.repo_id, repo);
+        match db.create_rule_proposal_txn(
+            copy.repo_id,
+            &file_name,
+            &login,
+            &name,
+            &copy.content,
+            &crate::db::utc_now_rfc3339(),
+            Some(&copy.label),
+            &main_login,
+        ) {
+            Ok(_) => {
+                if let Err(e) = crate::sync::rule_canon::acknowledge(db, &name) {
+                    out.rule_failed(&name, crate::sync::rule_canon::RULE_FORK_CANON_KEY, e);
+                }
+                if let Err(e) = remove_if_present(&copy.marker) {
+                    // The text is already the rule; a surviving marker now sits
+                    // beside a copy equal to the canon and reads as lost.
+                    out.rule_failed(&name, copy.marker.display().to_string(), e);
+                }
+            }
+            Err(e) => out.rule_failed(&name, &file_name, e.to_string()),
+        }
+    }
+    out.proposed.push(name);
+}
+
 /// T-000205: take an approved rule edit back out of a repo's own copy.
 ///
 /// The copies under `docs/sdh_skills/` are normally outputs, rewritten on every
@@ -1050,6 +1159,16 @@ fn collect_approved_skill_edits(
             record_conflict(db, repos, &name, &copies, open.get(&name), &mut out);
         } else if !undecided.contains(&name) {
             take_up(db, name, &copies, &mut out);
+        }
+    }
+    // T-000241: contributor proposals get the same grouping and conflict
+    // settlement — two contributor repos proposing different texts of one
+    // skill conflict like two hand-backs would.
+    for (name, copies) in found.proposals {
+        if in_conflict(&copies) {
+            record_conflict(db, repos, &name, &copies, open.get(&name), &mut out);
+        } else if !undecided.contains(&name) {
+            propose_up(db, repos, name, &copies, &mut out);
         }
     }
     out.sorted()
@@ -1279,9 +1398,32 @@ pub fn resolve_conflict(
     };
 
     if let Some(side) = accepted {
-        let file_name = format!("{}{}{}", SKILL_PREFIX, rule, SKILL_SUFFIX);
-        db.upsert_template_file("_global", &file_name, &side.content, true)
+        // T-000241: an accepted contributor side is a proposal to its repo's
+        // owner — the same transaction as `propose_up`, which applies the
+        // text and writes the row atomically.
+        let contributor_side = repos
+            .iter()
+            .find(|r| rule_copy_label(r) == side.repo && is_contributor_repo(db, r.id));
+        if let Some(repo) = contributor_side {
+            let login = db.github_login().unwrap_or_default();
+            let file_name = crate::sync::rule_proposals::proposal_file_name(rule, &login);
+            let main_login = owner_login_of(db, repo.id, Some(repo));
+            db.create_rule_proposal_txn(
+                repo.id,
+                &file_name,
+                &login,
+                rule,
+                &side.content,
+                &crate::db::utc_now_rfc3339(),
+                Some(&side.repo),
+                &main_login,
+            )
             .map_err(|e| e.to_string())?;
+        } else {
+            let file_name = format!("{}{}{}", SKILL_PREFIX, rule, SKILL_SUFFIX);
+            db.upsert_template_file("_global", &file_name, &side.content, true)
+                .map_err(|e| e.to_string())?;
+        }
     }
     let mut out = Collected::default();
     if accepted.is_some() {
@@ -1385,6 +1527,26 @@ pub(crate) fn refresh_rules_locked(
     let everywhere = !report.taken.is_empty();
     render_scope(db, claude_dir, scope, everywhere, &mut report);
     reconcile_fork_canon(db, &mut report);
+    report
+}
+
+/// T-000241 (decision machine, DELIVERY step): render the CURRENT DB canon
+/// to every eligible target — `~/.claude/skills/` plus each repo's
+/// `docs/sdh_skills/` — WITHOUT the collection half of `refresh_rules`: no
+/// hand-back collect, no uptake, no marker cleanup, no owner-save supersede.
+/// Flagged copies keep their markers for a later collection; a held copy is
+/// not a failure (its issue lands in `errors`, like everywhere else).
+pub fn deliver_rules_only(db: &AppDb, claude_dir: Option<&Path>) -> RulesRefresh {
+    let mut report = {
+        let _guard = rules_guard();
+        let mut report = RulesRefresh::default();
+        render_scope(db, claude_dir, RenderScope::Everywhere, true, &mut report);
+        reconcile_fork_canon(db, &mut report);
+        report
+    };
+    // Same defer as `refresh_rules`: the per-repo renders serialize on each
+    // repo's policy guard after the rules lock is released.
+    render_pending_repo_skills(db, &mut report);
     report
 }
 
@@ -1639,6 +1801,7 @@ impl RulesRefresh {
         self.lost = collected.lost;
         self.superseded = collected.superseded;
         self.quiet_conflicts = collected.quiet_conflicts;
+        self.proposed = collected.proposed;
         self.errors.extend(collected.errors);
     }
 }

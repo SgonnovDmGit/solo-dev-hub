@@ -99,7 +99,7 @@ pub mod acceptance_pub_state {
 
 /// A `rule_proposals` row — this install's own proposal plus the receipt
 /// resolution overlay (`resolved_*`, never serialized onto the wire).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RuleProposal {
     pub repo_id: i64,
     /// `<rule>.<login>.json` — the proposal file name on dev.
@@ -128,7 +128,7 @@ pub struct RuleProposal {
 
 /// A `rule_acceptances` row — one immutable owner decision plus its local
 /// work pipeline and publication state.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RuleAcceptance {
     pub repo_id: i64,
     pub rule: String,

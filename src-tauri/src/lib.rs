@@ -258,6 +258,10 @@ pub fn run() {
             commands::templates::list_rule_events,
             commands::templates::get_rule_conflict,
             commands::templates::resolve_rule_conflict,
+            commands::rule_proposals::list_rule_proposals,
+            commands::rule_proposals::list_rule_acceptances,
+            commands::rule_proposals::withdraw_rule_proposal,
+            commands::rule_proposals::decide_rule_proposal,
             // Deploy (0.7.0 / v0.18.0 multi-env)
             commands::deploy::set_deploy_target,
             commands::deploy::get_repo_deploy_config,
