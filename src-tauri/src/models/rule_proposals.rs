@@ -126,6 +126,44 @@ pub struct RuleProposal {
     pub updated_at: String,
 }
 
+/// One proposal as the UI sees it — the same shape on both sides: the
+/// owner's view is read from the local dev tip (unpushed content
+/// included), the contributor's from its own `rule_proposals` rows joined
+/// with what the dev tip and the last-seen origin snapshot carry.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RuleProposalView {
+    /// `<rule>.<login>.json`.
+    pub file_name: String,
+    pub rule: String,
+    pub login: String,
+    pub seq: i64,
+    /// Wire status: `open` | `withdrawn`.
+    pub status: String,
+    /// The proposed rule text.
+    pub text: String,
+    /// RFC 3339 timestamp of this version.
+    pub at: String,
+    /// The blob sha of THIS version — the CAS token a decision is taken
+    /// against (owner), or what this install's version hashes to
+    /// (contributor). `None` only when it could not be computed.
+    pub rev: Option<String>,
+    /// The local dev tip carries this exact version.
+    pub on_dev: bool,
+    /// The last-seen origin snapshot carries this exact version.
+    pub on_origin: bool,
+    /// Contributor only: `pending_apply` | `applied` — the local canon write.
+    pub local_state: Option<String>,
+    /// Resolution overlay: the receipt matching THIS version, if any.
+    pub resolved_action: Option<String>,
+    pub resolved_by: Option<String>,
+    pub resolved_at: Option<String>,
+    /// Owner only: the in-flight acceptance for this version — a decision
+    /// already taken whose receipt still owes dev (`queued`).
+    pub acceptance_status: Option<String>,
+    pub acceptance_pub_state: Option<String>,
+    pub acceptance_action: Option<String>,
+}
+
 /// A `rule_acceptances` row — one immutable owner decision plus its local
 /// work pipeline and publication state.
 #[derive(Debug, Clone, PartialEq, Serialize)]

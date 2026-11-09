@@ -2762,6 +2762,9 @@ fn drop_stale_structure(
             }
             fresh.pinned_dev_branch = None;
             if ss::write_shared_import(db, repo.id, &fresh).is_ok() {
+                // T-000241: the repo left the share — its proposal rows
+                // and seq marks have nothing left to describe.
+                let _ = db.delete_rule_proposal_state(repo.id);
                 bump_lifecycle_generation(repo.id, root);
                 return 1;
             }
@@ -2771,7 +2774,7 @@ fn drop_stale_structure(
     let Some(own) = own_branch_of(db, repo.id) else {
         return finish(db, &mut imp);
     };
-    let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
+    let sdh = sdh_tracked_paths();
     let login = db.github_login().unwrap_or_default();
     let remote = remote_ref(&own);
     let cur = current_branch(git, root).ok().flatten();
@@ -2869,7 +2872,7 @@ fn retry_disabling(
     let mut branches: Vec<String> = vec![dev.clone()];
     branches.extend(imp_now.disabling_branches.iter().cloned());
     let branches = clean_recipients(branches);
-    let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
+    let sdh = sdh_tracked_paths();
     let login = db.github_login().unwrap_or_default();
     let mut to_push: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
@@ -3304,7 +3307,7 @@ use crate::sync::rule_proposals as rp;
 /// Read both catalogs at `rev`, bounded and symlink-free: file name ->
 /// (blob sha, parsed artifact). Malformed files are reported as issues and
 /// skipped — a bad artifact stops nothing else.
-fn read_proposal_catalogs(
+pub(crate) fn read_proposal_catalogs(
     git: &GitBinary,
     root: &Path,
     rev: &str,
@@ -3708,6 +3711,66 @@ fn main_decisions_transport(
     dev_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
     origin_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
 ) {
+    publish_pending_receipts(
+        db,
+        git,
+        pass,
+        dev_branch,
+        dev_proposals,
+        dev_decisions,
+        origin_decisions,
+    );
+    // Owner-side `proposed` history: once per newly seen OPEN version —
+    // note `(<file> seq <n>)` is the dedup key.
+    let mut seen: HashSet<String> = HashSet::new();
+    for (file_name, (_, d)) in dev_proposals {
+        if d.status != proposal_status::OPEN {
+            continue;
+        }
+        let note = format!("{} seq {}", file_name, d.seq);
+        if seen.contains(&note) {
+            continue;
+        }
+        let already = db
+            .list_rule_events(&d.rule)
+            .unwrap_or_default()
+            .iter()
+            .any(|e| {
+                e.kind == crate::db::rule_event::PROPOSED
+                    && e.note.as_deref() == Some(note.as_str())
+            });
+        if already {
+            continue;
+        }
+        seen.insert(note.clone());
+        let label = rule_copy_label_repo(&pass.repo);
+        let _ = db.insert_rule_event(
+            &d.rule,
+            crate::db::rule_event::PROPOSED,
+            Some(&label),
+            Some(&note),
+        );
+    }
+}
+
+/// The publish half of the main-side transport — also the publication
+/// sweep's body: write the missing receipts to dev (an identical existing
+/// one is reused — retry is idempotent by construction; a conflicting one
+/// is an explicit issue, never overwritten), confirm `pub_state` from the
+/// origin snapshot only, and mark `overtaken` the rows whose decided
+/// revision is no longer the open version on dev — a re-proposal passed
+/// them; the immutable receipt still stands where it was committed.
+#[allow(clippy::too_many_arguments)]
+fn publish_pending_receipts(
+    db: &AppDb,
+    git: &GitBinary,
+    pass: &mut RepoPass,
+    dev_branch: &str,
+    dev_proposals: &BTreeMap<String, (String, RuleProposalFile)>,
+    dev_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+    origin_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+) {
+    use crate::models::acceptance_pub_state as ps;
     let mut writes: Vec<FileChange> = Vec::new();
     for a in db.list_publishable_rule_acceptances().unwrap_or_default() {
         if a.repo_id != pass.repo.id {
@@ -3745,43 +3808,97 @@ fn main_decisions_transport(
                     &a.rule,
                     &a.proposer_login,
                     &a.decided_rev,
-                    crate::models::acceptance_pub_state::PUBLISHED,
+                    ps::PUBLISHED,
                 );
             }
         }
     }
     commit_to_dev(git, pass, dev_branch, &writes, DECISION_SUBJECT);
-    // Owner-side `proposed` history: once per newly seen OPEN version —
-    // note `(<file> seq <n>)` is the dedup key.
-    let mut seen: HashSet<String> = HashSet::new();
-    for (file_name, (_, d)) in dev_proposals {
-        if d.status != proposal_status::OPEN {
+    // A receipt whose decided revision is no longer the open version on
+    // dev was overtaken by a re-proposal: it stops chasing publication.
+    // The check covers every decided row, published included — `overtaken`
+    // is the receipt's standing, orthogonal to whether origin saw it.
+    for a in db.list_rule_acceptances(pass.repo.id).unwrap_or_default() {
+        if a.pub_state == ps::OVERTAKEN
+            || !matches!(
+                a.status.as_str(),
+                s if s == crate::models::acceptance_status::DECIDED
+                    || s == crate::models::acceptance_status::APPLIED
+                    || s == crate::models::acceptance_status::RENDERED
+                    || s == crate::models::acceptance_status::CONFLICTED
+                    || s == crate::models::acceptance_status::SUPERSEDED
+            )
+        {
             continue;
         }
-        let note = format!("{} seq {}", file_name, d.seq);
-        if seen.contains(&note) {
-            continue;
+        let pname = rp::proposal_file_name(&a.rule, &a.proposer_login);
+        if dev_proposals
+            .get(&pname)
+            .is_some_and(|(sha, _)| sha != &a.decided_rev)
+        {
+            let _ = db.set_rule_acceptance_pub_state(
+                pass.repo.id,
+                &a.rule,
+                &a.proposer_login,
+                &a.decided_rev,
+                ps::OVERTAKEN,
+            );
         }
-        let already = db
-            .list_rule_events(&d.rule)
-            .unwrap_or_default()
-            .iter()
-            .any(|e| {
-                e.kind == crate::db::rule_event::PROPOSED
-                    && e.note.as_deref() == Some(note.as_str())
-            });
-        if already {
-            continue;
-        }
-        seen.insert(note.clone());
-        let label = rule_copy_label_repo(&pass.repo);
-        let _ = db.insert_rule_event(
-            &d.rule,
-            crate::db::rule_event::PROPOSED,
-            Some(&label),
-            Some(&note),
-        );
     }
+}
+
+/// T-000241: the publication sweep outside a sync pass (startup + list) —
+/// retries this repo's pending/blocked receipts against the CURRENT local
+/// dev tip and the last-seen origin snapshot. No fetch: the next real sync
+/// confirms whatever this sweep could not. Serialized on the policy guard
+/// like every other dev writer. Returns the issues it ran into.
+pub(crate) fn sweep_rule_publications(
+    db: &AppDb,
+    git: &GitBinary,
+    repo: &Repository,
+    root: &Path,
+    dev_branch: &str,
+) -> Vec<String> {
+    let guard = specs_policy_guard(repo.id);
+    let _g = guard.lock().unwrap();
+    let login = db.github_login().unwrap_or_default();
+    let mut pass = new_pass(repo, root, &login);
+    pass.role = Some(Role::Main);
+    let Some(dev_tip) = git_sync::rev_parse(git, root, &local_ref(dev_branch))
+        .ok()
+        .flatten()
+    else {
+        return Vec::new();
+    };
+    let known: HashSet<String> = crate::sync::skills::list_skill_templates(db)
+        .map(|v| v.into_iter().map(|(name, _)| name).collect())
+        .unwrap_or_default();
+    let known_fn = |r: &str| known.contains(r);
+    let mut issues = Vec::new();
+    let (dev_proposals, dev_decisions) =
+        read_proposal_catalogs(git, root, &dev_tip, &known_fn, &mut issues);
+    let origin = remote_ref(dev_branch);
+    let (_, origin_decisions) = if matches!(git_sync::rev_parse(git, root, &origin), Ok(Some(_))) {
+        let mut skip = Vec::new();
+        read_proposal_catalogs(git, root, &origin, &known_fn, &mut skip)
+    } else {
+        (BTreeMap::new(), BTreeMap::new())
+    };
+    publish_pending_receipts(
+        db,
+        git,
+        &mut pass,
+        dev_branch,
+        &dev_proposals,
+        &dev_decisions,
+        &origin_decisions,
+    );
+    issues.extend(
+        pass.issues
+            .iter()
+            .map(|i| i.detail.clone().unwrap_or_else(|| format!("{:?}", i.code))),
+    );
+    issues
 }
 
 /// `rule_copy_label` — pub(crate) re-use without duplicating the impl.
@@ -4459,7 +4576,7 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     }
 
     if pass.net_ok {
-        push_recipients(git, pass, cur.as_deref());
+        push_recipients(db, git, pass, cur.as_deref());
     }
 }
 
@@ -4494,7 +4611,7 @@ fn prune_approved_requests(root: &Path, s: &ProjectStructure) {
 
 /// Push the recipient branches whose tip origin does not have. A non-current
 /// branch that holds anything but our own sync commits is never pushed.
-fn push_recipients(git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
+fn push_recipients(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
     let root = pass.root.clone();
     let mut to_push: Vec<String> = Vec::new();
     for b in pass.recipients.clone() {
@@ -4535,11 +4652,30 @@ fn push_recipients(git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
                         let current = cur.is_some_and(|c| same_branch(c, &branch));
                         pass.note_diverged(&branch, current)
                     }
-                    PushOutcome::RejectedProtected(m) => pass.note_push_rejected(&branch, m),
-                    PushOutcome::RejectedOther(m) => pass.note(SharedStatus::PushFailed, m),
+                    PushOutcome::RejectedProtected(m) => {
+                        pass.note_push_rejected(&branch, m);
+                        mark_receipts_blocked(db, pass, &branch);
+                    }
+                    PushOutcome::RejectedOther(m) => {
+                        pass.note(SharedStatus::PushFailed, m);
+                        mark_receipts_blocked(db, pass, &branch);
+                    }
                 }
             }
         }
+    }
+}
+
+/// T-000241: a permanent refusal of the shared dev branch keeps this repo's
+/// committed receipts from reaching origin — mark their `pub_state`
+/// `blocked` so the UI shows it. They stay in the retry queue (`pending` +
+/// `blocked` are both publishable); an origin-confirmed receipt still
+/// settles `published`. A non-fast-forward is a fixable divergence, not a
+/// refusal, and never lands here.
+fn mark_receipts_blocked(db: &AppDb, pass: &RepoPass, branch: &str) {
+    let dev = pass.structure.as_ref().map(|s| s.main.dev_branch.as_str());
+    if dev.is_some_and(|d| same_branch(d, branch)) {
+        let _ = db.block_pending_rule_acceptances(pass.repo.id);
     }
 }
 
@@ -4920,16 +5056,33 @@ pub(super) fn ls_files_tracked(
     )?))
 }
 
+/// Every `.sdh/` path a disable removes: the structure, the join-request
+/// queue and the T-000241 proposal channel's two catalogs.
+fn sdh_tracked_paths() -> Vec<String> {
+    vec![
+        STRUCTURE_REL_PATH.to_string(),
+        REQUESTS_REL_DIR.to_string(),
+        rp::RULE_PROPOSALS_REL_DIR.to_string(),
+        rp::RULE_DECISIONS_REL_DIR.to_string(),
+    ]
+}
+
 fn remove_sdh_files(root: &Path) {
     let _ = std::fs::remove_file(root.join(STRUCTURE_REL_PATH));
-    if let Ok(entries) = std::fs::read_dir(root.join(REQUESTS_REL_DIR)) {
-        for e in entries.flatten() {
-            if matches!(e.file_type(), Ok(t) if t.is_file()) {
-                let _ = std::fs::remove_file(e.path());
+    for dir in [
+        REQUESTS_REL_DIR,
+        rp::RULE_PROPOSALS_REL_DIR,
+        rp::RULE_DECISIONS_REL_DIR,
+    ] {
+        if let Ok(entries) = std::fs::read_dir(root.join(dir)) {
+            for e in entries.flatten() {
+                if matches!(e.file_type(), Ok(t) if t.is_file()) {
+                    let _ = std::fs::remove_file(e.path());
+                }
             }
         }
+        let _ = std::fs::remove_dir(root.join(dir));
     }
-    let _ = std::fs::remove_dir(root.join(REQUESTS_REL_DIR));
     let _ = std::fs::remove_dir(root.join(".sdh"));
 }
 
@@ -4971,7 +5124,7 @@ pub fn disable_shared_mode(
     if !state.shared_mode || state.shared_role.as_deref().is_some_and(|r| r != "main") {
         return Err("shared mode can only be switched off by the owner of the repo".into());
     }
-    let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
+    let sdh = sdh_tracked_paths();
     let tracked = ls_files_tracked(git, &root, &sdh)?;
     // The participants' branches carry `.sdh/` too (the sync plumbed it there):
     // read them before the file is gone.
@@ -5069,6 +5222,10 @@ pub fn disable_shared_mode(
         .map_err(|e| e.to_string())?;
     db.set_shared_status(repo_id, None)
         .map_err(|e| e.to_string())?;
+    // T-000241: the proposal channel's local state dies with the share —
+    // the catalogs are deleted on dev by the commit above, the tables
+    // (proposals, acceptances, seq) are cleaned here.
+    let _ = db.delete_rule_proposal_state(repo_id);
     // T-000243 review (sixth pass): the lifecycle moved — passes sealed
     // under the pre-disable generation settle no status (this covers the
     // `disabling` marker write below as well: same transition).
@@ -10583,5 +10740,483 @@ mod tests {
         let again = fx.sync_main();
         assert!(again.issues.is_empty(), "{:?}", again.issues);
         assert_eq!(fx.remote_rev("dev").unwrap(), before);
+    }
+
+    // ----- T-000241: the rule-proposal channel -------------------------------
+
+    /// A rule both installs know — proposal validation refuses unknown
+    /// `sdh-*` names.
+    fn seed_rule(db: &AppDb) {
+        db.upsert_template_file("_global", "skill.sdh-alpha.md.tmpl", "CANON", false)
+            .unwrap();
+    }
+
+    /// The contributor's atomic create+apply — what `propose_up` commits.
+    fn propose(fx: &TwoInstalls, text: &str) {
+        fx.helper_db
+            .create_rule_proposal_txn(
+                fx.helper_repo,
+                "sdh-alpha.helper.json",
+                "helper",
+                "sdh-alpha",
+                text,
+                "2026-11-08T00:00:00Z",
+                None,
+                "Owner",
+            )
+            .unwrap();
+    }
+
+    fn proposal_dev_sha(dir: &Path) -> String {
+        git_sync::blob_sha_at(
+            &gb(),
+            dir,
+            "refs/heads/dev",
+            ".sdh/rule-proposals/sdh-alpha.helper.json",
+        )
+        .unwrap()
+        .expect("the proposal file is on dev")
+    }
+
+    fn dev_text(dir: &Path, path: &str) -> Option<String> {
+        git_sync::show_file(&gb(), dir, "refs/heads/dev", path)
+            .unwrap()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    fn receipt_path(rev: &str) -> String {
+        format!(".sdh/rule-decisions/sdh-alpha.helper.{}.json", rev)
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_contributor_proposal_reaches_dev_and_the_owner_lists_it() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        // The upload rode the dev branch to origin.
+        let remote = fx
+            .remote_file("dev", ".sdh/rule-proposals/sdh-alpha.helper.json")
+            .expect("the proposal reached origin/dev");
+        let wire: crate::models::RuleProposalFile = serde_json::from_str(&remote).unwrap();
+        assert_eq!(wire.status, "open");
+        assert_eq!(wire.text, "PROPOSED");
+        assert_eq!(wire.seq, 1);
+        fx.sync_main();
+        // The owner records the open version once.
+        assert!(fx
+            .main_db
+            .list_rule_events("sdh-alpha")
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == crate::db::rule_event::PROPOSED));
+        // The owner-side list reads it off the local dev tip with its CAS.
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        let list =
+            crate::commands::rule_proposals::list_owner_proposals(&fx.main_db, Some(&gb()), &repo)
+                .unwrap();
+        let p = list
+            .iter()
+            .find(|v| v.file_name == "sdh-alpha.helper.json")
+            .expect("listed");
+        assert_eq!(p.status, "open");
+        assert_eq!(
+            p.rev.as_deref(),
+            Some(proposal_dev_sha(&fx.main_dir).as_str())
+        );
+        assert!(p.resolved_action.is_none());
+        // The contributor's list flags the version as on dev AND origin.
+        let repo = fx.helper_db.get_repository(fx.helper_repo).unwrap();
+        let list = crate::commands::rule_proposals::list_contributor_proposals(
+            &fx.helper_db,
+            Some(&gb()),
+            &repo,
+        )
+        .unwrap();
+        let p = &list[0];
+        assert!(p.on_dev, "{:?}", p);
+        assert!(p.on_origin, "{:?}", p);
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_accepted_proposal_applies_the_canon_and_the_receipt_reaches_the_contributor() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        let a = crate::commands::rule_proposals::decide(
+            &fx.main_db,
+            fx.main_repo,
+            "sdh-alpha",
+            "helper",
+            &rev,
+            "accept",
+        )
+        .unwrap();
+        assert_eq!(a.status, "rendered", "{:?}", a);
+        // Canon applied from the immutable snapshot, receipt on dev.
+        assert_eq!(
+            fx.main_db
+                .get_template_file("_global", "skill.sdh-alpha.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            "PROPOSED"
+        );
+        let receipt = dev_text(&fx.main_dir, &receipt_path(&rev)).expect("receipt on dev");
+        let d: crate::models::RuleDecisionFile = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(d.action, "accept");
+        assert_eq!(d.decided_rev, rev);
+        // Publish + fetch: pub_state confirms from origin — the pass that
+        // pushed read origin BEFORE its own push, so the confirmation lands
+        // on the next look at `refs/remotes/origin/dev` (the sweep reads the
+        // same remote-tracking ref the push just updated).
+        fx.sync_main();
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        sweep_rule_publications(&fx.main_db, &gb(), &repo, &fx.main_dir, "dev");
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.pub_state, "published", "{:?}", a);
+        fx.sync_helper();
+        let p = fx
+            .helper_db
+            .get_rule_proposal(fx.helper_repo, "sdh-alpha.helper.json")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.resolved_action.as_deref(), Some("accept"));
+        assert_eq!(p.resolved_by.as_deref(), Some("owner"));
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_prepared_row_resumes_decided_when_the_receipt_is_already_there() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        // Crash-sim: the receipt reached dev but the row still says
+        // `prepared` — the resume must find the identical receipt and
+        // continue at `decided`, never re-commit it.
+        let receipt = serde_json::to_string(&crate::models::RuleDecisionFile {
+            format: 1,
+            action: "accept".into(),
+            login: "helper".into(),
+            rule: "sdh-alpha".into(),
+            decided_by: "owner".into(),
+            decided_at: "2026-11-08T00:00:00Z".into(),
+            decided_rev: rev.clone(),
+            seq: 1,
+        })
+        .unwrap();
+        write(&fx.main_dir, &receipt_path(&rev), &receipt);
+        g(&fx.main_dir, &["add", ".sdh/rule-decisions"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "receipt"]);
+        fx.main_db
+            .insert_rule_acceptance(&crate::models::RuleAcceptance {
+                repo_id: fx.main_repo,
+                rule: "sdh-alpha".into(),
+                proposer_login: "helper".into(),
+                decided_rev: rev.clone(),
+                action: "accept".into(),
+                receipt_json: receipt.clone(),
+                proposal_text: "PROPOSED".into(),
+                status: "prepared".into(),
+                pub_state: "pending".into(),
+                base_canon_hash: rp::sha256_hex(b"CANON"),
+                canon_hash: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+        let (resumed, issues) = crate::commands::rule_proposals::sweep_acceptances(
+            &fx.main_db,
+            &gb(),
+            &fx.main_dir,
+            fx.main_repo,
+            "dev",
+            None,
+        );
+        assert!(issues.is_empty(), "{:?}", issues);
+        assert_eq!(resumed, 1);
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        // Identical receipt → decided → canon applied → rendered, all in
+        // one resume.
+        assert_eq!(a.status, "rendered", "{:?}", a);
+        assert_eq!(
+            fx.main_db
+                .get_template_file("_global", "skill.sdh-alpha.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            "PROPOSED"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_prepared_row_expires_only_when_no_receipt_exists() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        // The proposal moved past the rev this row decided on — with no
+        // receipt at its path, `prepared` expires and stays out of the
+        // publication queue forever.
+        let stale = "0".repeat(40);
+        let receipt = serde_json::to_string(&crate::models::RuleDecisionFile {
+            format: 1,
+            action: "accept".into(),
+            login: "helper".into(),
+            rule: "sdh-alpha".into(),
+            decided_by: "owner".into(),
+            decided_at: "2026-11-08T00:00:00Z".into(),
+            decided_rev: stale.clone(),
+            seq: 1,
+        })
+        .unwrap();
+        fx.main_db
+            .insert_rule_acceptance(&crate::models::RuleAcceptance {
+                repo_id: fx.main_repo,
+                rule: "sdh-alpha".into(),
+                proposer_login: "helper".into(),
+                decided_rev: stale.clone(),
+                action: "accept".into(),
+                receipt_json: receipt,
+                proposal_text: "PROPOSED".into(),
+                status: "prepared".into(),
+                pub_state: "pending".into(),
+                base_canon_hash: "x".into(),
+                canon_hash: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        let out = crate::commands::rule_proposals::sweep_repo_rule_channel(
+            &fx.main_db,
+            Some(&gb()),
+            fx.main_repo,
+            None,
+        );
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &stale)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.status, "expired", "{:?} {:?}", a, out.issues);
+        assert!(fx
+            .main_db
+            .list_publishable_rule_acceptances()
+            .unwrap()
+            .iter()
+            .all(|x| x.decided_rev != stale));
+        let _ = repo;
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_receipt_erased_by_a_divergence_reset_is_republished_from_the_row() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        crate::commands::rule_proposals::decide(
+            &fx.main_db,
+            fx.main_repo,
+            "sdh-alpha",
+            "helper",
+            &rev,
+            "accept",
+        )
+        .unwrap();
+        // The receipt was committed but lost to a reset — the file is gone
+        // from dev while the row says decided+pending.
+        let rel = receipt_path(&rev);
+        g(&fx.main_dir, &["rm", "-q", &rel]);
+        g(
+            &fx.main_dir,
+            &["commit", "-q", "-m", "reset the receipt away"],
+        );
+        assert!(dev_text(&fx.main_dir, &rel).is_none());
+        // The publication sweep recreates the commit from `receipt_json`
+        // without rolling the row back.
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        let issues = sweep_rule_publications(&fx.main_db, &gb(), &repo, &fx.main_dir, "dev");
+        assert!(issues.is_empty(), "{:?}", issues);
+        assert!(dev_text(&fx.main_dir, &rel).is_some());
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.status, "rendered");
+        assert_eq!(a.pub_state, "pending");
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_permanent_push_refusal_marks_the_receipt_blocked() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        crate::commands::rule_proposals::decide(
+            &fx.main_db,
+            fx.main_repo,
+            "sdh-alpha",
+            "helper",
+            &rev,
+            "accept",
+        )
+        .unwrap();
+        // A permanent refusal on refs/heads/dev — the protected-branch
+        // shape — marks every pending receipt of this repo `blocked`.
+        let hook = fx.origin.join("hooks/update");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nif [ \"$1\" = \"refs/heads/dev\" ]; then\n  echo \"error: GH006: Protected branch update failed for $1\" >&2\n  exit 1\nfi\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fx.sync_main();
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.pub_state, "blocked", "{:?}", a);
+        // The queue keeps it — `blocked` is retryable, not terminal.
+        assert!(fx
+            .main_db
+            .list_publishable_rule_acceptances()
+            .unwrap()
+            .iter()
+            .any(|x| x.decided_rev == rev));
+        // The refusal lifted: the next push carries dev, the next sync's
+        // origin check settles `published`.
+        fs::remove_file(&hook).unwrap();
+        fx.sync_main();
+        fx.sync_main();
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.pub_state, "published", "{:?}", a);
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn disable_removes_the_catalogs_from_dev_and_cleans_the_tables() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        crate::commands::rule_proposals::decide(
+            &fx.main_db,
+            fx.main_repo,
+            "sdh-alpha",
+            "helper",
+            &rev,
+            "accept",
+        )
+        .unwrap();
+        fx.sync_main();
+        assert!(dev_text(&fx.main_dir, &receipt_path(&rev)).is_some());
+        assert!(!fx
+            .main_db
+            .list_rule_acceptances(fx.main_repo)
+            .unwrap()
+            .is_empty());
+        disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        // Both catalogs left dev with the rest of `.sdh/`…
+        assert_eq!(fx.remote_file("dev", &receipt_path(&rev)), None);
+        assert_eq!(
+            fx.remote_file("dev", ".sdh/rule-proposals/sdh-alpha.helper.json"),
+            None
+        );
+        // …and the local state died with the share.
+        assert!(fx
+            .main_db
+            .list_rule_acceptances(fx.main_repo)
+            .unwrap()
+            .is_empty());
+        assert!(fx
+            .main_db
+            .list_rule_proposals(fx.main_repo)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_withdrawn_proposal_uploads_and_the_owner_sees_the_terminal_state() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        // The contributor withdraws — its own file, a terminal version at
+        // the SAME seq.
+        fx.helper_db
+            .set_rule_proposal_status(fx.helper_repo, "sdh-alpha.helper.json", "withdrawn")
+            .unwrap();
+        fx.sync_helper();
+        let remote = fx
+            .remote_file("dev", ".sdh/rule-proposals/sdh-alpha.helper.json")
+            .expect("the withdrawn version reached origin/dev");
+        let wire: crate::models::RuleProposalFile = serde_json::from_str(&remote).unwrap();
+        assert_eq!(wire.status, "withdrawn");
+        assert_eq!(wire.seq, 1);
+        fx.sync_main();
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        let list =
+            crate::commands::rule_proposals::list_owner_proposals(&fx.main_db, Some(&gb()), &repo)
+                .unwrap();
+        let p = list
+            .iter()
+            .find(|v| v.file_name == "sdh-alpha.helper.json")
+            .expect("listed");
+        assert_eq!(p.status, "withdrawn");
     }
 }

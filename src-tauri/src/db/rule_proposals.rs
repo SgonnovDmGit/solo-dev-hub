@@ -77,22 +77,6 @@ impl AppDb {
         rows.collect()
     }
 
-    /// This install's proposals for one repo and rule, file name order.
-    pub fn list_rule_proposals_for_rule(
-        &self,
-        repo_id: i64,
-        rule: &str,
-    ) -> SqlResult<Vec<RuleProposal>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM rule_proposals
-             WHERE repo_id = ?1 AND rule = ?2 ORDER BY file_name",
-            PROPOSAL_COLS
-        ))?;
-        let rows = stmt.query_map(rusqlite::params![repo_id, rule], proposal_from_row)?;
-        rows.collect()
-    }
-
     /// One proposal row by its file name.
     pub fn get_rule_proposal(
         &self,
@@ -226,6 +210,9 @@ impl AppDb {
     // ---- rule_proposal_seq -------------------------------------------------
 
     /// The seq high-water for a proposal file — 0 when never used.
+    /// Read-side of `bump_rule_proposal_seq`'s write; surfaced for the tests
+    /// that prove GC keeps the water high.
+    #[allow(dead_code)]
     pub fn rule_proposal_max_seq(&self, repo_id: i64, file_name: &str) -> SqlResult<i64> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -323,9 +310,13 @@ impl AppDb {
             rusqlite::params![rule, rule_event::TAKEN, event_repo, note, utc_now_rfc3339()],
         )?;
         tx.execute(
-            "UPDATE rule_proposals SET local_state = 'applied'
+            "UPDATE rule_proposals SET local_state = ?3
              WHERE repo_id = ?1 AND file_name = ?2",
-            rusqlite::params![repo_id, file_name],
+            rusqlite::params![
+                repo_id,
+                file_name,
+                crate::models::proposal_local_state::APPLIED
+            ],
         )?;
         tx.commit()?;
         Ok(seq)
@@ -392,9 +383,14 @@ impl AppDb {
     pub fn mark_rule_proposal_applied(&self, repo_id: i64, file_name: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE rule_proposals SET local_state = 'applied', updated_at = ?3
+            "UPDATE rule_proposals SET local_state = ?4, updated_at = ?3
              WHERE repo_id = ?1 AND file_name = ?2",
-            rusqlite::params![repo_id, file_name, utc_now_rfc3339()],
+            rusqlite::params![
+                repo_id,
+                file_name,
+                utc_now_rfc3339(),
+                crate::models::proposal_local_state::APPLIED
+            ],
         )?;
         Ok(())
     }
@@ -480,6 +476,24 @@ impl AppDb {
         Ok(())
     }
 
+    /// A permanent push refusal of the dev branch: every receipt of this
+    /// repo still waiting to reach origin is marked `blocked` — visible in
+    /// the UI, and still in the retry queue (`pending` + `blocked` are
+    /// both publishable). Returns how many rows moved.
+    pub fn block_pending_rule_acceptances(&self, repo_id: i64) -> SqlResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE rule_acceptances SET pub_state = ?3, updated_at = ?2
+             WHERE repo_id = ?1 AND pub_state = ?4",
+            rusqlite::params![
+                repo_id,
+                utc_now_rfc3339(),
+                crate::models::acceptance_pub_state::BLOCKED,
+                crate::models::acceptance_pub_state::PENDING
+            ],
+        )
+    }
+
     /// Move the receipt's publication state. Never touches `status`.
     pub fn set_rule_acceptance_pub_state(
         &self,
@@ -525,7 +539,7 @@ impl AppDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM rule_acceptances
-             WHERE status IN ('prepared','decided','applied')
+             WHERE status IN ('prepared','decided','applied','rendered')
              ORDER BY repo_id, rowid",
             ACCEPTANCE_COLS
         ))?;
@@ -548,5 +562,277 @@ impl AppDb {
         ))?;
         let rows = stmt.query_map([], acceptance_from_row)?;
         rows.collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{decision_action, proposal_status};
+
+    /// A fresh database with the two repositories the tests' rows belong
+    /// to (the tables reference `repositories(id)`).
+    fn db() -> AppDb {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        db.upsert_repository("Owner/web", None, None, None, None, None)
+            .unwrap();
+        db
+    }
+
+    fn acceptance(
+        repo_id: i64,
+        rule: &str,
+        login: &str,
+        rev: &str,
+        action: &str,
+        status: &str,
+        pub_state: &str,
+    ) -> RuleAcceptance {
+        RuleAcceptance {
+            repo_id,
+            rule: rule.into(),
+            proposer_login: login.into(),
+            decided_rev: rev.into(),
+            action: action.into(),
+            receipt_json: "{}".into(),
+            proposal_text: "TEXT".into(),
+            status: status.into(),
+            pub_state: pub_state.into(),
+            base_canon_hash: "h".into(),
+            canon_hash: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_publishable_queue_retries_every_decided_state_but_never_prepared_or_expired() {
+        let db = db();
+        let rev = |n: usize| n.to_string().repeat(40);
+        // Publishable: pub pending/blocked x decided..superseded.
+        for (i, status) in ["decided", "applied", "rendered", "conflicted", "superseded"]
+            .iter()
+            .enumerate()
+        {
+            db.insert_rule_acceptance(&acceptance(
+                1,
+                "sdh-a",
+                "p",
+                &rev(i + 1),
+                decision_action::ACCEPT,
+                status,
+                "pending",
+            ))
+            .unwrap();
+        }
+        db.insert_rule_acceptance(&acceptance(
+            1,
+            "sdh-a",
+            "p",
+            &rev(9),
+            decision_action::ACCEPT,
+            "decided",
+            "blocked",
+        ))
+        .unwrap();
+        // Excluded: prepared (Step 2 must run first), expired (cancelled),
+        // and any settled pub state.
+        for (i, status) in ["prepared", "expired"].iter().enumerate() {
+            db.insert_rule_acceptance(&acceptance(
+                1,
+                "sdh-a",
+                "p",
+                &rev(20 + i),
+                decision_action::ACCEPT,
+                status,
+                "pending",
+            ))
+            .unwrap();
+        }
+        for (i, ps) in ["published", "overtaken"].iter().enumerate() {
+            db.insert_rule_acceptance(&acceptance(
+                1,
+                "sdh-a",
+                "p",
+                &rev(30 + i),
+                decision_action::ACCEPT,
+                "decided",
+                ps,
+            ))
+            .unwrap();
+        }
+        let queue = db.list_publishable_rule_acceptances().unwrap();
+        assert_eq!(
+            queue.len(),
+            6,
+            "{:?}",
+            queue
+                .iter()
+                .map(|a| (a.status.clone(), a.pub_state.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(queue.iter().all(|a| matches!(
+            a.status.as_str(),
+            "decided" | "applied" | "rendered" | "conflicted" | "superseded"
+        )));
+    }
+
+    #[test]
+    fn the_local_work_queue_resumes_the_whole_pipeline() {
+        let db = db();
+        let rev = |n: usize| n.to_string().repeat(40);
+        for (i, status) in ["prepared", "decided", "applied", "rendered"]
+            .iter()
+            .enumerate()
+        {
+            db.insert_rule_acceptance(&acceptance(
+                1,
+                "sdh-a",
+                "p",
+                &rev(i + 1),
+                decision_action::ACCEPT,
+                status,
+                "pending",
+            ))
+            .unwrap();
+        }
+        for (i, status) in ["conflicted", "expired", "superseded"].iter().enumerate() {
+            db.insert_rule_acceptance(&acceptance(
+                1,
+                "sdh-a",
+                "p",
+                &rev(10 + i),
+                decision_action::ACCEPT,
+                status,
+                "pending",
+            ))
+            .unwrap();
+        }
+        let queue = db.list_unfinished_rule_acceptances().unwrap();
+        assert_eq!(queue.len(), 4);
+        assert!(queue.iter().all(|a| matches!(
+            a.status.as_str(),
+            "prepared" | "decided" | "applied" | "rendered"
+        )));
+    }
+
+    #[test]
+    fn a_permanent_refusal_blocks_only_the_still_pending_receipts() {
+        let db = db();
+        let rev = |n: usize| n.to_string().repeat(40);
+        for (i, ps) in ["pending", "blocked", "published", "overtaken"]
+            .iter()
+            .enumerate()
+        {
+            db.insert_rule_acceptance(&acceptance(
+                1,
+                "sdh-a",
+                "p",
+                &rev(i + 1),
+                decision_action::ACCEPT,
+                "decided",
+                ps,
+            ))
+            .unwrap();
+        }
+        // Another repo's pending row is untouched.
+        db.insert_rule_acceptance(&acceptance(
+            2,
+            "sdh-a",
+            "p",
+            &rev(9),
+            decision_action::ACCEPT,
+            "decided",
+            "pending",
+        ))
+        .unwrap();
+        assert_eq!(db.block_pending_rule_acceptances(1).unwrap(), 1);
+        let rows = db.list_rule_acceptances(1).unwrap();
+        let by_rev = |r: &str| rows.iter().find(|a| a.decided_rev == r).unwrap();
+        assert_eq!(by_rev(&rev(1)).pub_state, "blocked");
+        assert_eq!(by_rev(&rev(2)).pub_state, "blocked");
+        assert_eq!(by_rev(&rev(3)).pub_state, "published");
+        assert_eq!(by_rev(&rev(4)).pub_state, "overtaken");
+        let other = db.list_rule_acceptances(2).unwrap();
+        assert_eq!(other[0].pub_state, "pending");
+    }
+
+    #[test]
+    fn disable_cleanup_drops_proposals_acceptances_and_seq_marks() {
+        let db = db();
+        db.create_rule_proposal_txn(
+            1,
+            "sdh-a.p.json",
+            "p",
+            "sdh-a",
+            "TEXT",
+            "2026-11-08T00:00:00Z",
+            None,
+            "owner",
+        )
+        .unwrap();
+        db.insert_rule_acceptance(&acceptance(
+            1,
+            "sdh-a",
+            "p",
+            &"1".repeat(40),
+            decision_action::ACCEPT,
+            "decided",
+            "pending",
+        ))
+        .unwrap();
+        db.delete_rule_proposal_state(1).unwrap();
+        assert!(db.list_rule_proposals(1).unwrap().is_empty());
+        assert!(db.list_rule_acceptances(1).unwrap().is_empty());
+        assert_eq!(db.rule_proposal_max_seq(1, "sdh-a.p.json").unwrap(), 0);
+    }
+
+    #[test]
+    fn a_pull_never_overwrites_a_concurrent_local_edit() {
+        let db = db();
+        db.create_rule_proposal_txn(
+            1,
+            "sdh-a.p.json",
+            "p",
+            "sdh-a",
+            "V1",
+            "2026-11-08T00:00:00Z",
+            None,
+            "owner",
+        )
+        .unwrap();
+        let row = db.get_rule_proposal(1, "sdh-a.p.json").unwrap().unwrap();
+        // A stale pull (old seq/updated_at) does not land.
+        assert!(!db
+            .pull_rule_proposal(
+                1,
+                "sdh-a.p.json",
+                0,
+                "stale",
+                2,
+                "open",
+                "V2",
+                "2026-11-09T00:00:00Z"
+            )
+            .unwrap());
+        // A pull naming the row it read lands and clears the overlay.
+        assert!(db
+            .pull_rule_proposal(
+                1,
+                "sdh-a.p.json",
+                row.seq,
+                &row.updated_at,
+                2,
+                proposal_status::WITHDRAWN,
+                "V2",
+                "2026-11-09T00:00:00Z"
+            )
+            .unwrap());
+        let after = db.get_rule_proposal(1, "sdh-a.p.json").unwrap().unwrap();
+        assert_eq!(after.seq, 2);
+        assert_eq!(after.status, proposal_status::WITHDRAWN);
+        assert_eq!(after.text, "V2");
     }
 }

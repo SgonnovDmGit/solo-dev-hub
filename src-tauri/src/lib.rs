@@ -93,6 +93,11 @@ pub fn run() {
             Some(report).filter(|r| !r.is_quiet())
         });
 
+    // T-000241: the rule-proposal channel's startup sweep — unfinished
+    // decisions resume, owed receipts retry, terminal proposal rows are
+    // GC'd. Per-repo, best effort; failures only delay a retry.
+    commands::rule_proposals::sweep_rule_channels_at_startup(&db);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -262,6 +267,7 @@ pub fn run() {
             commands::rule_proposals::list_rule_acceptances,
             commands::rule_proposals::withdraw_rule_proposal,
             commands::rule_proposals::decide_rule_proposal,
+            commands::rule_proposals::resolve_rule_acceptance_conflict,
             // Deploy (0.7.0 / v0.18.0 multi-env)
             commands::deploy::set_deploy_target,
             commands::deploy::get_repo_deploy_config,
