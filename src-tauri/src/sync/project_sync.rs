@@ -252,19 +252,6 @@ fn write_repo_skeletons(
     ) {
         c.push(file_issue("CLAUDE.md", e));
     }
-    // Runs only after `refresh_rules` collected across the portfolio (see
-    // `run_project_sync_in`); a copy still flagged after that is held, not written.
-    // After an uptake the refresh has already rendered and reported this repo;
-    // `push` keeps each held copy to one line. T-000206: copies of a conflict
-    // already reported by an earlier pass stay quiet here too.
-    // Р16: not in a repo where this install is a contributor or a pending
-    // helper -- the owner's copies are the ones git carries there.
-    if !sync::skips_rule_copies(db, repo.id) {
-        match sync::render_skills_to_repo(db, base) {
-            Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
-            Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
-        }
-    }
     // F-000044: a shared repo (any role) renders the blocks without the shared
     // paths; the same text for the owner and for contributors, so it never churns.
     // T-000243: the render drops `docs/superpowers/` only while the effective
@@ -343,6 +330,22 @@ fn write_repo_skeletons(
         sync::shared::render_write_probe(repo.id, base);
     }
     if binding_fresh {
+        // T-000243 review (seventeenth pass): the skill-copy render moved
+        // inside this hold — `skips_rule_copies` is lifecycle state, and an
+        // unguarded render could overwrite owner copies a concurrent shared
+        // sync had just fast-forwarded in. `refresh_rules` stays outside:
+        // it holds `rules_guard`, which must never nest inside this one.
+        // A copy still flagged after the portfolio collection is held, not
+        // written; after an uptake the refresh already rendered and
+        // reported this repo, so `push` keeps each held copy to one line.
+        // Р16: not in a repo where this install is a contributor or a
+        // pending helper -- the owner's copies are the ones git carries.
+        if !sync::skips_rule_copies(db, repo.id) {
+            match sync::render_skills_to_repo(db, base) {
+                Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
+                Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
+            }
+        }
         let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
         if let Err(e) = sync::sync_gitattributes_section(&gitattributes, base) {
             c.push(file_issue(".gitattributes", e));

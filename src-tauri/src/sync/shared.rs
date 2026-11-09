@@ -252,6 +252,13 @@ fn pass_role_transition(pass: &mut RepoPass, db: &AppDb, role: Option<&str>, exp
 fn foreign_state_cleanup(db: &AppDb, repo_id: i64, root: &Path, expected: u64) -> u64 {
     let guard = specs_policy_guard(repo_id);
     let _g = guard.lock().unwrap();
+    foreign_state_cleanup_locked(db, repo_id, root, expected)
+}
+
+/// Caller holds `specs_policy_guard(repo_id)` — lets a caller pair the
+/// freshness check with its own revalidation under ONE hold (T-000243
+/// review, seventeenth pass).
+fn foreign_state_cleanup_locked(db: &AppDb, repo_id: i64, root: &Path, expected: u64) -> u64 {
     if !lifecycle_is_current(repo_id, root, expected) {
         return 0;
     }
@@ -1912,12 +1919,18 @@ fn unix_now() -> i64 {
 }
 
 /// Is a role-less foreign repo due for a probe? Takes the slot (persisted in
-/// `SharedImport`) when it is.
-fn probe_due(db: &AppDb, repo_id: i64, now: i64) -> bool {
+/// `SharedImport`) when it is. `root`/`expected` are the caller's captured
+/// binding and generation: a repathed pass must not consume the NEW
+/// checkout's probe slot for a probe it will not finish (T-000243 review,
+/// seventeenth pass).
+fn probe_due(db: &AppDb, repo_id: i64, root: &Path, expected: u64, now: i64) -> bool {
     // Whole-JSON read-modify-write: hold the guard so a concurrent lifecycle
     // writer (pin, disabling marker) cannot be clobbered by this snapshot.
     let guard = specs_policy_guard(repo_id);
     let _g = guard.lock().unwrap();
+    if !lifecycle_is_current(repo_id, root, expected) {
+        return false;
+    }
     let mut imp = ss::read_shared_import(db, repo_id);
     if let Some(t) = imp.last_probe_unix {
         if now - t < PROBE_INTERVAL.as_secs() as i64 {
@@ -2250,7 +2263,7 @@ fn run_phase_a_with(
         // A role-less repo is probed at most every 10 minutes (persisted); one
         // that was refused as untrusted is looked at again on every sync.
         if !known && state.shared_status.is_none() {
-            let due = probe_due(db, repo.id, now);
+            let due = probe_due(db, repo.id, &root, lifecycle_gen, now);
             if !due && !force_probe {
                 continue;
             }
@@ -2344,7 +2357,8 @@ fn phase_a_main(
     let gh = repo.github_name.clone().unwrap_or_default();
     pass.role = Some(Role::Main);
     pass_role_transition(&mut pass, db, Some("main"), gen0);
-    register_driver(git, &mut pass);
+    let expected = gen0 + u64::from(pass.own_bumps);
+    register_driver(git, &mut pass, expected);
     fetch_into(git, &mut pass, FetchMode::Always);
     let admins = ss::AdminVerified::load(db);
     // The main's own trust may rest on an administrator verification (an
@@ -2418,11 +2432,24 @@ fn phase_a_foreign(
             if st.is_some_and(|s| s.shared_role.is_some() || s.shared_status.is_some()) {
                 // Repo is ordinary again (spec R15). The clear belongs to no
                 // pass — but it IS a lifecycle transition gated on THIS
-                // pass's generation: if a newer lifecycle landed after the
-                // NotFound observation (a republish + accept), the cleanup
-                // is obsolete and skipped. Its bumps carry forward so the
-                // pin cleanup below is gated on the RESULT, not the input.
-                expected += foreign_state_cleanup(db, repo.id, root, expected);
+                // pass's generation AND on the NotFound still being true:
+                // a republish accepted meanwhile leaves the generation
+                // unchanged (pin and role already matched), so the
+                // observation itself is re-checked under the same hold —
+                // clearing on a stale NotFound would erase a live role
+                // (T-000243 review, seventeenth pass). Its bumps carry
+                // forward so the pin cleanup below is gated on the RESULT,
+                // not the input.
+                let guard = specs_policy_guard(repo.id);
+                let _g = guard.lock().unwrap();
+                if lifecycle_is_current(repo.id, root, expected)
+                    && matches!(
+                        ss::discover_structure(git, root, gh, pinned.as_deref(), &admins),
+                        Ok(DiscoverOutcome::NotFound)
+                    )
+                {
+                    expected += foreign_state_cleanup_locked(db, repo.id, root, expected);
+                }
             }
             // Facts decide whether anything is left to clean up (nothing, for a repo
             // that never carried a structure). No pass survives this branch,
@@ -2458,10 +2485,22 @@ fn phase_a_foreign(
             // write them. Guarded and freshness-checked like every other
             // lifecycle mutation; a skipped apply simply lets the newer
             // lifecycle's own pass do it.
+            // T-000243 review (seventeenth pass): generation equality alone
+            // does not prove the OBSERVED structure is still current — a
+            // republish accepted meanwhile can leave pin and role (and so
+            // the generation) unchanged. Re-run the authoritative discovery
+            // under the same hold and apply only while it still yields the
+            // very structure this pass discovered.
             {
                 let guard = specs_policy_guard(repo.id);
                 let _g = guard.lock().unwrap();
-                if lifecycle_is_current(repo.id, root, gen0 + u64::from(pass.own_bumps)) {
+                let observation_current =
+                    lifecycle_is_current(repo.id, root, gen0 + u64::from(pass.own_bumps))
+                        && matches!(
+                            ss::discover_structure(git, root, gh, pinned.as_deref(), &admins),
+                            Ok(DiscoverOutcome::Found(ref s2, _)) if *s2 == s
+                        );
+                if observation_current {
                     if let Err(e) = ss::apply_structure_locally(db, repo.id, &s) {
                         pass.issue(
                             repo_issue(Code::ManagedFileFailed, repo)
@@ -2491,7 +2530,8 @@ fn phase_a_foreign(
             let expected = gen0 + u64::from(pass.own_bumps);
             pass_role_transition(&mut pass, db, Some(role.as_str()), expected);
             pass.role = Some(role);
-            register_driver(git, &mut pass);
+            let expected = gen0 + u64::from(pass.own_bumps);
+            register_driver(git, &mut pass, expected);
             pass.own_branch = own_branch_of(db, repo.id)
                 .filter(|b| !same_branch(b, &s.main.dev_branch) || role != Role::Pending);
             let main_dev = s.main.dev_branch.clone();
@@ -2877,7 +2917,15 @@ fn clear_disabling(db: &AppDb, repo_id: i64, root: &Path, gen0: u64) -> Result<b
     Ok(true)
 }
 
-fn register_driver(git: &GitBinary, pass: &mut RepoPass) {
+/// Writes the merge-driver config into the checkout — a mutation, so it is
+/// gated on the pass's freshness under the policy guard like every other
+/// phase-A side effect (T-000243 review, seventeenth pass).
+fn register_driver(git: &GitBinary, pass: &mut RepoPass, expected: u64) {
+    let guard = specs_policy_guard(pass.repo.id);
+    let _g = guard.lock().unwrap();
+    if !lifecycle_is_current(pass.repo.id, &pass.root, expected) {
+        return;
+    }
     if let Err(e) = register_merge_driver(git, &pass.root) {
         let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
             .target(".git/config")
