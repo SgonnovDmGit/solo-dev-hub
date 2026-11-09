@@ -111,10 +111,15 @@ fn init_docs_for_repo_in(
     // an OFF save or overwrite a newer OFF render), and a refused structure
     // errors the command instead of writing a guessed-on `.gitignore`. A repo
     // that is not shared resolves no policy at all.
+    // T-000243 review (fifteenth pass): the guard precedes the membership
+    // read for EVERY repo — `is_shared_repo` is lifecycle state a disable /
+    // enable moves under the same guard, so reading it first let a stale
+    // render keep `shared = true` after the repo left shared mode. Both
+    // managed-block writes stay inside the one hold.
+    let policy = sync::shared::specs_policy_guard(repo_id);
+    let _policy = policy.lock().unwrap();
     let shared = sync::shared::is_shared_repo(db, repo_id);
     if shared {
-        let policy = sync::shared::specs_policy_guard(repo_id);
-        let _policy = policy.lock().unwrap();
         // No git binary on the machine: no discovery is possible. The
         // owner's policy needs none (its database row answers); a helper's
         // render is REFUSED rather than answered from a work-tree copy that
@@ -141,6 +146,8 @@ fn init_docs_for_repo_in(
     if sync::sync_gitattributes_section(&gitattributes_template, base)? {
         updated.push(".gitattributes (section)".to_string());
     }
+    drop(_policy);
+    drop(policy);
     // App-owned files (project.md + CLAUDE.md section) — always overwritten when
     // the repo is attached to a project. Orphan repos (project_id=None) skip this
     // since project-context wouldn't render meaningfully.

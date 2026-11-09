@@ -2447,12 +2447,23 @@ fn phase_a_foreign(
             if ss::derive_role(Some(&s), Some(login)) == Some(Role::Main) {
                 return None;
             }
-            if let Err(e) = ss::apply_structure_locally(db, repo.id, &s) {
-                pass.issue(
-                    repo_issue(Code::ManagedFileFailed, repo)
-                        .target(STRUCTURE_REL_PATH)
-                        .detail(e),
-                );
+            // T-000243 review (fifteenth pass): applying the discovered
+            // structure mutates project assignments — a stale pass must not
+            // write them. Guarded and freshness-checked like every other
+            // lifecycle mutation; a skipped apply simply lets the newer
+            // lifecycle's own pass do it.
+            {
+                let guard = specs_policy_guard(repo.id);
+                let _g = guard.lock().unwrap();
+                if lifecycle_is_current(repo.id, root, gen0 + u64::from(pass.own_bumps)) {
+                    if let Err(e) = ss::apply_structure_locally(db, repo.id, &s) {
+                        pass.issue(
+                            repo_issue(Code::ManagedFileFailed, repo)
+                                .target(STRUCTURE_REL_PATH)
+                                .detail(e),
+                        );
+                    }
+                }
             }
             if pinned.is_none() {
                 // Pinning is this pass's own lifecycle transition: guarded,
@@ -2497,7 +2508,7 @@ fn phase_a_foreign(
             // earlier version (or the time before the join) left untracked
             // would stop the owner's from being fast-forwarded in.
             if role != Role::Main {
-                drop_untracked_rule_copies(git, root);
+                drop_untracked_rule_copies(git, repo.id, root);
             }
             // T-000243: the helper takes the specs policy from the very
             // structure that gave it the role, before any path is computed.
@@ -2880,13 +2891,19 @@ fn clean_recipients(list: Vec<String>) -> Vec<String> {
 }
 
 /// A pending helper's own request file is no longer wanted once the helper is a
-/// contributor; remove it when git does not track it.
+/// contributor; remove it when git does not track it. The tracked check and
+/// the delete run under the policy guard: a concurrent pass's fast-forward
+/// may have made the file tracked since this pass last looked, and deleting
+/// a tracked file would publish its removal (T-000243 review, fifteenth
+/// pass — same check-then-delete race as `drop_untracked_rule_copies`).
 fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass) {
     let rel = request_rel_path(&pass.login);
     let abs = pass.root.join(&rel);
     if !abs.is_file() {
         return;
     }
+    let guard = specs_policy_guard(pass.repo.id);
+    let _g = guard.lock().unwrap();
     let tracked = spawn_cmd(&git.0)
         .args(["ls-files", "--error-unmatch", "--", &rel])
         .current_dir(&pass.root)
@@ -2903,7 +2920,13 @@ fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass) {
 /// install renders none there any more, and the owner's committed ones cannot
 /// be fast-forwarded over untracked files. Approval markers, reason files and
 /// anything else are left alone. Skipped when git cannot say what is tracked.
-fn drop_untracked_rule_copies(git: &GitBinary, root: &Path) {
+/// The tracked set and the deletes run under the policy guard: a concurrent
+/// pass's fast-forward may have made a copy tracked since this pass last
+/// looked, and deleting a tracked file would publish its removal on the next
+/// commit (T-000243 review, fifteenth pass).
+fn drop_untracked_rule_copies(git: &GitBinary, repo_id: i64, root: &Path) {
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
     let dir = root.join(SKILLS_DIR);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
@@ -3386,6 +3409,19 @@ fn retry_post_fetch_probe(repo_id: i64, root: &Path) {
 struct AfterFetchProbe {
     entered: std::sync::mpsc::Sender<i64>,
     release: std::sync::mpsc::Receiver<i64>,
+}
+
+/// Sends the rendezvous release on drop: a panicking interleave inside
+/// `thread::scope` must still free the parked worker, or the scope's join
+/// hangs forever (T-000243 review, fifteenth pass).
+#[cfg(test)]
+struct ReleaseOnDrop(std::sync::mpsc::Sender<i64>);
+
+#[cfg(test)]
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(1);
+    }
 }
 
 #[cfg(test)]
@@ -6191,7 +6227,11 @@ mod tests {
         let mut deletion = String::new();
         std::thread::scope(|s| {
             // Phase A runs to `after_fetch` and parks before its guarded
-            // branch section.
+            // branch section. `_release` frees the worker even when an
+            // assertion below panics — `thread::scope` would otherwise
+            // wait forever on a still-parked worker (T-000243 review,
+            // fifteenth pass).
+            let _release = ReleaseOnDrop(release_tx);
             let sync = s.spawn(|| run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id)));
             let in_window = entered_rx
                 .recv_timeout(Duration::from_secs(60))
@@ -6220,7 +6260,7 @@ mod tests {
                 &["push", "-q", "origin", &format!("{}:dev", c)],
             );
             g(&fx.main_dir, &["fetch", "-q", "origin"]);
-            release_tx.send(1).unwrap();
+            drop(_release);
             sync.join().unwrap();
         });
 
@@ -6325,6 +6365,7 @@ mod tests {
             .into_iter()
             .find_map(|r| r.project_id);
         std::thread::scope(|s| {
+            let _release = ReleaseOnDrop(release_tx);
             let sync = s.spawn(|| run_phase_a(&fx.main_db, Some(&gb()), project));
             let in_window = entered_rx
                 .recv_timeout(Duration::from_secs(60))
@@ -6338,7 +6379,7 @@ mod tests {
                 Some(fx.helper_dir.to_str().unwrap()),
             )
             .unwrap();
-            release_tx.send(1).unwrap();
+            drop(_release);
             sync.join().unwrap();
         });
 

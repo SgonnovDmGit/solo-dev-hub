@@ -272,9 +272,7 @@ fn write_repo_skeletons(
     // T-000243 review (second pass): the guard spans the policy read AND the
     // `.gitignore` WRITE below — binding it inside the `else` let it drop
     // before the write, so an old-ON render could land after an OFF save or
-    // overwrite a newer OFF render. `Option<MutexGuard>` holds nothing for a
-    // repo that is not shared (a leftover `.sdh/` file of an ordinary repo
-    // must not break its render or serialize anything).
+    // overwrite a newer OFF render.
     // The structure state comes from phase A's discovery as a TRI-STATE: a
     // REFUSED structure (malformed / untrusted authoritative copy) skips the
     // render with an issue instead of re-reading the work tree, whose stale
@@ -284,10 +282,16 @@ fn write_repo_skeletons(
     // another project) is discovered HERE, under the render guard, the same
     // authoritative way phase A would have; the work-tree file alone may be a
     // stale copy whose policy the fetched origin ref has replaced or refused.
-    // A repo that is not shared never resolves a policy at all.
+    // T-000243 review (fifteenth pass): the guard is taken for EVERY repo,
+    // before the membership read — `is_shared_repo` is lifecycle state a
+    // disable / enable / repath moves under the same guard, so reading it
+    // first let a stale render keep `shared = true` after the repo left
+    // shared mode and write the shared-mode blocks anyway. The fresh
+    // membership decision and BOTH managed-block writes (.gitignore AND
+    // .gitattributes) stay inside the one hold.
+    let policy_guard = sync::shared::specs_policy_guard(repo.id);
+    let _policy = policy_guard.lock().unwrap();
     let shared = sync::shared::is_shared_repo(db, repo.id);
-    let policy_guard = shared.then(|| sync::shared::specs_policy_guard(repo.id));
-    let _policy = policy_guard.as_ref().map(|g| g.lock().unwrap());
     let gitignore = if !shared {
         Some(sync::shared::gitignore_template_for(
             &tpl.gitignore,
@@ -328,12 +332,12 @@ fn write_repo_skeletons(
         #[cfg(test)]
         sync::shared::render_write_probe(repo.id, base);
     }
-    drop(_policy);
-    drop(policy_guard);
     let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
     if let Err(e) = sync::sync_gitattributes_section(&gitattributes, base) {
         c.push(file_issue(".gitattributes", e));
     }
+    drop(_policy);
+    drop(policy_guard);
     if let Err(e) = sync::copy_doc_skeleton_if_missing(&tpl.todo, base, "todo.md") {
         c.push(file_issue("docs/todo.md", e));
     }
@@ -2093,19 +2097,24 @@ mod tests {
                 autocommit_portfolio_repos(&db, &git, &std::collections::HashSet::new(), &mut c);
                 c
             });
-            let in_window = entered_rx
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .expect("the autocommit probe never fired");
-            assert_eq!(in_window, repo_id);
-            // Record first, release and join, THEN assert — a failed
-            // assertion while the worker still waits on `release_rx` would
-            // deadlock `thread::scope` (T-000243 review, fourteenth pass).
-            let held = sync::shared::specs_policy_guard(repo_id)
-                .try_lock()
-                .is_err();
+            // Record first, release and join, THEN assert — a panic inside
+            // the scope (a timed-out rendezvous included) would leave the
+            // worker parked on `release_rx` and `thread::scope` would never
+            // join it (T-000243 review, fifteenth pass).
+            let reached = entered_rx.recv_timeout(std::time::Duration::from_secs(30));
+            let held = reached.is_ok().then(|| {
+                sync::shared::specs_policy_guard(repo_id)
+                    .try_lock()
+                    .is_err()
+            });
             let _ = release_tx.send(1);
             let c = worker.join().unwrap();
-            assert!(held, "the guard must be held across the whole commit");
+            let in_window = reached.expect("the autocommit probe never fired");
+            assert_eq!(in_window, repo_id);
+            assert!(
+                held.expect("the probe never fired"),
+                "the guard must be held across the whole commit"
+            );
             c
         });
         assert_eq!(c.committed.len(), 1, "{:?}", c.committed);
