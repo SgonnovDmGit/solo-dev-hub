@@ -376,11 +376,28 @@ fn replay_inoutbox_renames(db: &AppDb, base: &Path, renamed: &Repository, c: &mu
             match sync::replay_rename_in_dir(&parent, &r.old_canonical, &r.new_canonical) {
                 Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                 Ok(sync::RenameOutcome::NoOp) => {}
-                Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                    &r.old_canonical,
-                    &r.new_canonical,
-                    &parent,
-                )),
+                Ok(sync::RenameOutcome::Collision) => {
+                    c.push(rename_collision(
+                        &r.old_canonical,
+                        &r.new_canonical,
+                        &parent,
+                    ));
+                    // The new-named lane dir is live and never empties, so
+                    // the collision would never resolve itself — merge the
+                    // old dir's files into the live dir for the same peer.
+                    let mut w = Vec::new();
+                    match sync::merge_channel_dir(
+                        &parent.join(&r.old_canonical),
+                        &parent.join(&r.new_canonical),
+                        &mut w,
+                    ) {
+                        Ok(n) => c.migrated += n,
+                        Err(e) => {
+                            c.push(migration_issue(&r.old_canonical, e));
+                        }
+                    }
+                    c.extend(w);
+                }
                 Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
             }
         }
@@ -625,6 +642,10 @@ fn sync_client_to_server(
             let client_name = client.canonical_folder_name();
             let client_requirements_parent = srv_base.join("docs").join("client-requirements");
             // F-033 Stage 1e: replay client renames on server side before sync.
+            // T-000190: a COLLISION leaves the old-named dir in place — its
+            // files still belong to this pair, so it joins the migration as
+            // an extra side instead of waiting for the blocking dir to retire.
+            let mut req_collided: Vec<PathBuf> = Vec::new();
             match db.list_renames_for_repo(client.id) {
                 Ok(renames) => {
                     for r in renames {
@@ -635,11 +656,15 @@ fn sync_client_to_server(
                         ) {
                             Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                             Ok(sync::RenameOutcome::NoOp) => {}
-                            Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                                &r.old_canonical,
-                                &r.new_canonical,
-                                &client_requirements_parent,
-                            )),
+                            Ok(sync::RenameOutcome::Collision) => {
+                                req_collided
+                                    .push(client_requirements_parent.join(&r.old_canonical));
+                                c.push(rename_collision(
+                                    &r.old_canonical,
+                                    &r.new_canonical,
+                                    &client_requirements_parent,
+                                ));
+                            }
                             Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                         }
                     }
@@ -663,14 +688,15 @@ fn sync_client_to_server(
             let srv_canonical = srv.canonical_folder_name();
             let client_out = sync::outbox_dir(client_base, &srv_canonical);
             let srv_in = sync::inbox_dir(srv_base, &client_name);
+            let mut sides: Vec<(&Path, &Path)> = vec![
+                (client_req_dir.as_path(), client_out.as_path()),
+                (srv_client_dir.as_path(), srv_in.as_path()),
+            ];
+            for dir in &req_collided {
+                sides.push((dir.as_path(), srv_in.as_path()));
+            }
             let mut mig_warnings = Vec::new();
-            match sync::migrate_req_pair(
-                &[
-                    (client_req_dir.as_path(), client_out.as_path()),
-                    (srv_client_dir.as_path(), srv_in.as_path()),
-                ],
-                &mut mig_warnings,
-            ) {
+            match sync::migrate_req_pair(&sides, &mut mig_warnings) {
                 Ok(o) => {
                     c.migrated += o.migrated;
                     if o.channel_ready {
@@ -695,6 +721,10 @@ fn sync_client_to_server(
             // same pair — the folder name follows the SENDER's canonical, so
             // server renames replay on it first.
             let ann_parent = client_base.join("docs").join("server-announcements");
+            // T-000190: a rename COLLISION leaves the old-named folder beside
+            // the new one — its files belong to this same lane and migrate in
+            // this pass rather than on some later sync.
+            let mut ann_collided: Vec<PathBuf> = Vec::new();
             if let Ok(renames) = db.list_renames_for_repo(srv.id) {
                 for r in renames {
                     match sync::replay_rename_in_dir(
@@ -704,17 +734,23 @@ fn sync_client_to_server(
                     ) {
                         Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                         Ok(sync::RenameOutcome::NoOp) => {}
-                        Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                            &r.old_canonical,
-                            &r.new_canonical,
-                            &ann_parent,
-                        )),
+                        Ok(sync::RenameOutcome::Collision) => {
+                            ann_collided.push(ann_parent.join(&r.old_canonical));
+                            c.push(rename_collision(
+                                &r.old_canonical,
+                                &r.new_canonical,
+                                &ann_parent,
+                            ));
+                        }
                         Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                     }
                 }
             }
             let ann_legacy = ann_parent.join(&srv_canonical);
             sync_announce_channel(db, git, srv_base, srv, client_base, client, &ann_legacy, c);
+            for dir in &ann_collided {
+                sync_announce_channel(db, git, srv_base, srv, client_base, client, dir, c);
+            }
 
             // 0.9.0: api.md + handlers.md target moved to docs/server-api/
             // Auto-migrate old docs/api.md to docs/server-api/api.md.
@@ -851,6 +887,9 @@ fn sync_server_to_microservice(
         }
 
         // F-033 Stage 1e: replay ms-server-repo renames on parent side (microservice-requirements/).
+        // T-000190: COLLISION survivors join the pair migration as extra
+        // sides — the old dir's files still belong to this lane.
+        let mut ms_req_collided: Vec<PathBuf> = Vec::new();
         match db.list_renames_for_repo(ms_server_repo.id) {
             Ok(renames) => {
                 for r in renames {
@@ -861,11 +900,14 @@ fn sync_server_to_microservice(
                     ) {
                         Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                         Ok(sync::RenameOutcome::NoOp) => {}
-                        Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                            &r.old_canonical,
-                            &r.new_canonical,
-                            &ms_req_parent,
-                        )),
+                        Ok(sync::RenameOutcome::Collision) => {
+                            ms_req_collided.push(ms_req_parent.join(&r.old_canonical));
+                            c.push(rename_collision(
+                                &r.old_canonical,
+                                &r.new_canonical,
+                                &ms_req_parent,
+                            ));
+                        }
                         Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                     }
                 }
@@ -895,6 +937,7 @@ fn sync_server_to_microservice(
         }
 
         // F-033 Stage 1e: replay server renames on ms side (server-requirements/).
+        let mut srv_req_collided: Vec<PathBuf> = Vec::new();
         match db.list_renames_for_repo(srv.id) {
             Ok(renames) => {
                 for r in renames {
@@ -905,11 +948,14 @@ fn sync_server_to_microservice(
                     ) {
                         Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                         Ok(sync::RenameOutcome::NoOp) => {}
-                        Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                            &r.old_canonical,
-                            &r.new_canonical,
-                            &ms_srv_parent,
-                        )),
+                        Ok(sync::RenameOutcome::Collision) => {
+                            srv_req_collided.push(ms_srv_parent.join(&r.old_canonical));
+                            c.push(rename_collision(
+                                &r.old_canonical,
+                                &r.new_canonical,
+                                &ms_srv_parent,
+                            ));
+                        }
                         Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                     }
                 }
@@ -965,14 +1011,18 @@ fn sync_server_to_microservice(
         // unified kind-aware pass for this pair in both directions.
         let srv_out = sync::outbox_dir(srv_base, &ms_canonical);
         let ms_in = sync::inbox_dir(ms_base, &parent_folder);
+        let mut sides: Vec<(&Path, &Path)> = vec![
+            (srv_ms_dir.as_path(), srv_out.as_path()),
+            (ms_srv_dir.as_path(), ms_in.as_path()),
+        ];
+        for dir in &ms_req_collided {
+            sides.push((dir.as_path(), srv_out.as_path()));
+        }
+        for dir in &srv_req_collided {
+            sides.push((dir.as_path(), ms_in.as_path()));
+        }
         let mut mig_warnings = Vec::new();
-        match sync::migrate_req_pair(
-            &[
-                (srv_ms_dir.as_path(), srv_out.as_path()),
-                (ms_srv_dir.as_path(), ms_in.as_path()),
-            ],
-            &mut mig_warnings,
-        ) {
+        match sync::migrate_req_pair(&sides, &mut mig_warnings) {
             Ok(o) => {
                 c.migrated += o.migrated;
                 if o.channel_ready {
@@ -990,6 +1040,7 @@ fn sync_server_to_microservice(
         // pair — folder named by the ms PROJECT (like microservice-api), so
         // project renames replay on it before the files move.
         let ann_parent = srv_base.join("docs").join("microservice-announcements");
+        let mut ann_collided: Vec<PathBuf> = Vec::new();
         match db.list_renames_for_project(*ms_project_id) {
             Ok(renames) => {
                 for r in renames {
@@ -997,6 +1048,7 @@ fn sync_server_to_microservice(
                         Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                         Ok(sync::RenameOutcome::NoOp) => {}
                         Ok(sync::RenameOutcome::Collision) => {
+                            ann_collided.push(ann_parent.join(&r.old_name));
                             c.push(rename_collision(&r.old_name, &r.new_name, &ann_parent))
                         }
                         Err(e) => c.push(rename_failed(&r.old_name, &r.new_name, e)),
@@ -1016,6 +1068,11 @@ fn sync_server_to_microservice(
             &ann_legacy,
             c,
         );
+        // T-000190: a rename COLLISION leaves the old-named folder beside the
+        // new one — its files belong to this same lane and migrate this pass.
+        for dir in &ann_collided {
+            sync_announce_channel(db, git, ms_base, &ms_server_repo, srv_base, srv, dir, c);
+        }
 
         // 0.9.0: Microservice → Parent server — api.md + handlers.md + my_api.
         // Target on parent: docs/microservice-api/<ms-project-name>/{api,handlers}.md.
@@ -1298,6 +1355,8 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
     let recipient_dir = recipient_srv_parent.join(sender.canonical_folder_name());
 
     // Replay recipient (codex) repo renames on the sender's microservice-requirements/ side.
+    // T-000190: COLLISION survivors join the pair migration as extra sides.
+    let mut sender_req_collided: Vec<PathBuf> = Vec::new();
     match db.list_renames_for_repo(recipient.id) {
         Ok(renames) => {
             for r in renames {
@@ -1308,11 +1367,14 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
                 ) {
                     Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                     Ok(sync::RenameOutcome::NoOp) => {}
-                    Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                        &r.old_canonical,
-                        &r.new_canonical,
-                        &sender_req_parent,
-                    )),
+                    Ok(sync::RenameOutcome::Collision) => {
+                        sender_req_collided.push(sender_req_parent.join(&r.old_canonical));
+                        c.push(rename_collision(
+                            &r.old_canonical,
+                            &r.new_canonical,
+                            &sender_req_parent,
+                        ));
+                    }
                     Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                 }
             }
@@ -1321,6 +1383,7 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
     }
 
     // Replay sender (consumer) repo renames on the recipient's server-requirements/ side.
+    let mut recipient_srv_collided: Vec<PathBuf> = Vec::new();
     match db.list_renames_for_repo(sender.id) {
         Ok(renames) => {
             for r in renames {
@@ -1331,11 +1394,14 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
                 ) {
                     Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                     Ok(sync::RenameOutcome::NoOp) => {}
-                    Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                        &r.old_canonical,
-                        &r.new_canonical,
-                        &recipient_srv_parent,
-                    )),
+                    Ok(sync::RenameOutcome::Collision) => {
+                        recipient_srv_collided.push(recipient_srv_parent.join(&r.old_canonical));
+                        c.push(rename_collision(
+                            &r.old_canonical,
+                            &r.new_canonical,
+                            &recipient_srv_parent,
+                        ));
+                    }
                     Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                 }
             }
@@ -1350,14 +1416,18 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
     replay_inoutbox_renames(db, recipient_base, sender, c);
     let sender_out = sync::outbox_dir(sender_base, &recipient.canonical_folder_name());
     let recipient_in = sync::inbox_dir(recipient_base, &sender.canonical_folder_name());
+    let mut sides: Vec<(&Path, &Path)> = vec![
+        (sender_dir.as_path(), sender_out.as_path()),
+        (recipient_dir.as_path(), recipient_in.as_path()),
+    ];
+    for dir in &sender_req_collided {
+        sides.push((dir.as_path(), sender_out.as_path()));
+    }
+    for dir in &recipient_srv_collided {
+        sides.push((dir.as_path(), recipient_in.as_path()));
+    }
     let mut mig_warnings = Vec::new();
-    match sync::migrate_req_pair(
-        &[
-            (sender_dir.as_path(), sender_out.as_path()),
-            (recipient_dir.as_path(), recipient_in.as_path()),
-        ],
-        &mut mig_warnings,
-    ) {
+    match sync::migrate_req_pair(&sides, &mut mig_warnings) {
         Ok(o) => {
             c.migrated += o.migrated;
             if o.channel_ready {
@@ -2904,6 +2974,58 @@ mod tests {
     }
 
     #[test]
+    fn test_req_pair_client_to_server_on_unified_layout() {
+        // T-000190 spec verification 2: REQ → response → impl-close rides the
+        // unified layout end-to-end — `outbox/` authors, `inbox/` receives,
+        // the receipt backflows, `.impl.md` tears down the triple on both.
+        let db = make_db();
+        let srv_dir = TempDir::new().unwrap();
+        let cli_dir = TempDir::new().unwrap();
+        let p = db.create_project("App", None, "standard").unwrap();
+        db.insert_local_repository(
+            srv_dir.path().to_str().unwrap(),
+            "srv",
+            Some(p.id),
+            Some("server"),
+        )
+        .unwrap();
+        db.insert_local_repository(
+            cli_dir.path().to_str().unwrap(),
+            "cli",
+            Some(p.id),
+            Some("client"),
+        )
+        .unwrap();
+
+        run_project_sync(&db, p.id).unwrap();
+        let cli_out = cli_dir.path().join("docs/InOutBox/outbox/srv");
+        let srv_in = srv_dir.path().join("docs/InOutBox/inbox/cli");
+        fs::write(cli_out.join("REQ-001_feat.md"), "please").unwrap();
+
+        run_project_sync(&db, p.id).unwrap();
+        assert_eq!(
+            fs::read_to_string(srv_in.join("REQ-001_feat.md")).unwrap(),
+            "please"
+        );
+
+        fs::write(srv_in.join("REQ-001_feat.response.md"), "implemented").unwrap();
+        run_project_sync(&db, p.id).unwrap();
+        assert_eq!(
+            fs::read_to_string(cli_out.join("REQ-001_feat.response.md")).unwrap(),
+            "implemented"
+        );
+
+        fs::write(cli_out.join("REQ-001_feat.impl.md"), "x").unwrap();
+        let r = run_project_sync(&db, p.id).unwrap();
+        assert!(r.auto_closed.contains(&"REQ-001_feat.md".to_string()));
+        for d in [&cli_out, &srv_in] {
+            assert!(!d.join("REQ-001_feat.md").exists());
+            assert!(!d.join("REQ-001_feat.response.md").exists());
+            assert!(!d.join("REQ-001_feat.impl.md").exists());
+        }
+    }
+
+    #[test]
     fn test_peer_channel_linked_pair_end_to_end() {
         // T-000192: two linked client repos in one project. A full project sync
         // must create the channel on both sides, carry an outbox file into the
@@ -3234,5 +3356,250 @@ mod tests {
         let closed = closed_announce_names(&git, dir.path(), &legacy, &inbox);
         assert!(closed.contains("ANNOUNCE-002_b.md"), "{:?}", closed);
         assert!(!closed.contains("ANNOUNCE-001_a.md"));
+    }
+
+    // ----- T-000190: portfolio-copy dry-run (spec verification 6) ----------
+
+    /// The sync-relevant surface of one repo mirror: `docs/`, `.sdh/` and the
+    /// managed root files. `.git` stays out on purpose — with no `.git` the
+    /// copies cannot fetch, push or plumb anywhere, so a dry run can never
+    /// touch the originals or the remote.
+    fn mirror_portfolio_repo(src: &Path, dst: &Path) {
+        fn copy_tree(s: &Path, d: &Path) {
+            let Ok(entries) = fs::read_dir(s) else { return };
+            for e in entries.filter_map(|e| e.ok()) {
+                let sp = e.path();
+                let dp = d.join(e.file_name());
+                if sp.is_dir() {
+                    fs::create_dir_all(&dp).unwrap();
+                    copy_tree(&sp, &dp);
+                } else if sp.is_file() {
+                    fs::create_dir_all(dp.parent().unwrap()).unwrap();
+                    fs::copy(&sp, &dp).unwrap();
+                }
+            }
+        }
+        for sub in ["docs", ".sdh"] {
+            copy_tree(&src.join(sub), &dst.join(sub));
+        }
+        for f in [".gitignore", ".gitattributes", "CLAUDE.md"] {
+            if let Ok(bytes) = fs::read(src.join(f)) {
+                fs::write(dst.join(f), bytes).unwrap();
+            }
+        }
+    }
+
+    /// rel-path → (len, hash) for every file under `root`. DefaultHasher is
+    /// std-only and good enough to compare two snapshots of one tree.
+    fn inventory(root: &Path) -> std::collections::BTreeMap<String, (u64, u64)> {
+        use std::hash::{Hash, Hasher};
+        let mut map = std::collections::BTreeMap::new();
+        fn walk(dir: &Path, root: &Path, map: &mut std::collections::BTreeMap<String, (u64, u64)>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, root, map);
+                } else if p.is_file() {
+                    let rel = p
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let bytes = fs::read(&p).unwrap_or_default();
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    bytes.hash(&mut h);
+                    map.insert(rel, (bytes.len() as u64, h.finish()));
+                }
+            }
+        }
+        walk(root, root, &mut map);
+        map
+    }
+
+    /// T-000190 spec, verification 6 ("~45-repo reality"): run every project's
+    /// sync against a COPY of the live portfolio — a `VACUUM INTO` snapshot of
+    /// `data.db` plus `docs/`-only mirrors of each repo — never the originals.
+    /// Asserts the migration loses no legacy-channel bytes (every file under a
+    /// legacy REQ/announce dir either lands under `docs/InOutBox/` or stays
+    /// where it was) and that a second sync is a no-op (identical inventory).
+    ///
+    /// Run: `cargo test portfolio_dry_run -- --include-ignored --nocapture`
+    /// (optionally `SDH_DRYRUN_DB=<path to data.db>`).
+    #[ignore = "dry-run on a copy of the live portfolio; opt-in via --include-ignored"]
+    #[test]
+    fn portfolio_dry_run_migrates_channel_folders() {
+        let src_db = std::env::var("SDH_DRYRUN_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("solo-dev-hub")
+                    .join("data.db")
+            });
+        if !src_db.exists() {
+            eprintln!(
+                "portfolio dry-run: no live data.db at {:?} — skipped",
+                src_db
+            );
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        // A consistent snapshot even while the app runs (WAL-safe).
+        let copy_db = tmp.path().join("data.db");
+        let conn = rusqlite::Connection::open(&src_db).unwrap();
+        conn.execute(
+            &format!(
+                "VACUUM INTO '{}'",
+                copy_db
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+                    .replace('\'', "''")
+            ),
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = AppDb::new(copy_db).unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        // Mirror every repo's sync surface and repoint the copy's local_path.
+        let repos = db.list_repos_with_local_path(None).unwrap();
+        let mut mirrored = 0usize;
+        for r in &repos {
+            let Some(lp) = r.local_path.as_deref() else {
+                continue;
+            };
+            let src = Path::new(lp);
+            if !src.is_dir() {
+                continue;
+            }
+            let dst = tmp.path().join(format!("repo-{}", r.id));
+            mirror_portfolio_repo(src, &dst);
+            db.set_repo_local_path(r.id, dst.to_str()).unwrap();
+            mirrored += 1;
+        }
+
+        // Legacy-channel bytes present BEFORE the sync, per repo: hash → the
+        // rel path that produced it (for error messages).
+        const LEGACY: &[&str] = &[
+            "docs/backend-requirements",
+            "docs/client-requirements",
+            "docs/microservice-requirements",
+            "docs/server-requirements",
+            "docs/server-announcements",
+            "docs/microservice-announcements",
+        ];
+        let mirror_of = |rid: i64| tmp.path().join(format!("repo-{}", rid));
+        let mut legacy_before: std::collections::BTreeMap<
+            i64,
+            std::collections::BTreeMap<u64, String>,
+        > = Default::default();
+        // Q3: `docs/InOutBox/registry/` ledgers are agent-owned — the app may
+        // carry them through git but must never create or rewrite one.
+        let mut registry_before: std::collections::BTreeMap<i64, Vec<(String, u64)>> =
+            Default::default();
+        for r in &repos {
+            for (rel, (_, h)) in inventory(&mirror_of(r.id)) {
+                if LEGACY.iter().any(|d| rel.starts_with(&format!("{}/", d))) {
+                    legacy_before
+                        .entry(r.id)
+                        .or_default()
+                        .entry(h)
+                        .or_insert(rel.clone());
+                }
+                if rel.starts_with("docs/InOutBox/registry/") {
+                    registry_before.entry(r.id).or_default().push((rel, h));
+                }
+            }
+        }
+
+        // First pass: the real entry point, every project.
+        let mut issues = Vec::new();
+        for p in db.list_projects().unwrap() {
+            if let Ok(r) = run_project_sync_in(&db, p.id, Some(home.clone())) {
+                issues.extend(
+                    r.errors
+                        .iter()
+                        .map(|i| format!("{}: {:?} {}", p.name, i.code, i.subject)),
+                );
+            }
+        }
+
+        // Every legacy byte is accounted for inside the same repo: moved
+        // under docs/InOutBox/, or still at its own path (a divergent
+        // migration keeps both versions; an unmigrated file stays).
+        let mut lost = Vec::new();
+        let mut after_invs: std::collections::BTreeMap<i64, _> = Default::default();
+        for r in &repos {
+            let inv = inventory(&mirror_of(r.id));
+            let hashes: std::collections::HashSet<u64> = inv.values().map(|(_, h)| *h).collect();
+            for (h, rel) in legacy_before.get(&r.id).into_iter().flatten() {
+                if !hashes.contains(h) {
+                    lost.push(format!("{}: {}", r.display_name(), rel));
+                }
+            }
+            let registry_after: Vec<(String, u64)> = inv
+                .iter()
+                .filter(|(rel, _)| rel.starts_with("docs/InOutBox/registry/"))
+                .map(|(rel, (_, h))| (rel.clone(), *h))
+                .collect();
+            assert_eq!(
+                registry_before.get(&r.id).cloned().unwrap_or_default(),
+                registry_after,
+                "the app must never write ledger content ({})",
+                r.display_name()
+            );
+            after_invs.insert(r.id, inv);
+        }
+        assert!(
+            lost.is_empty(),
+            "the migration lost channel bytes:\n{}",
+            lost.join("\n")
+        );
+
+        // Second pass: a no-op — identical inventory on every repo.
+        for p in db.list_projects().unwrap() {
+            let _ = run_project_sync_in(&db, p.id, Some(home.clone()));
+        }
+        let mut churn = Vec::new();
+        for r in &repos {
+            let now = inventory(&mirror_of(r.id));
+            let before = after_invs.get(&r.id).unwrap();
+            if &now != before {
+                let mut detail = String::new();
+                for (rel, _) in &now {
+                    if !before.contains_key(rel.as_str()) {
+                        detail.push_str(&format!("\n  + {}", rel));
+                    }
+                }
+                for (rel, (ph, _)) in before {
+                    match now.get(rel.as_str()) {
+                        None => detail.push_str(&format!("\n  - {}", rel)),
+                        Some((nh, _)) if nh != ph => detail.push_str(&format!("\n  ~ {}", rel)),
+                        _ => {}
+                    }
+                }
+                churn.push(format!("{}{}", r.display_name(), detail));
+            }
+        }
+        assert!(
+            churn.is_empty(),
+            "second sync was not a no-op for:\n{}",
+            churn.join("\n")
+        );
+
+        eprintln!(
+            "portfolio dry-run: {} repos mirrored, {} projects synced, {} legacy-channel files accounted, {} sync issues (see below)\n{}",
+            mirrored,
+            db.list_projects().unwrap().len(),
+            legacy_before.values().map(|m| m.len()).sum::<usize>(),
+            issues.len(),
+            issues.join("\n")
+        );
     }
 }

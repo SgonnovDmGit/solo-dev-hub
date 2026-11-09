@@ -244,10 +244,15 @@ fn is_req_channel_file(name: &str) -> bool {
 
 /// One planned move in a pair migration. `Dedup` means the destination already
 /// holds byte-identical content: the source is deleted, the copy kept.
+/// `Copy` keeps the source: the file also lands on the pair's OTHER side,
+/// which has no channel copy of its own (the mirror prunes an inbox replica
+/// that lacks an outbox master — a body found only on the recipient's legacy
+/// dir must reach the sender's outbox or it is eaten on the next pass).
 #[derive(Debug)]
 enum Planned {
     Move { src: PathBuf, dst: PathBuf },
     Dedup { src: PathBuf, dst: PathBuf },
+    Copy { src: PathBuf, dst: PathBuf },
 }
 
 /// Build the move plan for one legacy dir into its new channel dir.
@@ -312,6 +317,13 @@ fn apply_plan(plan: &[Planned]) -> Result<usize, String> {
                 Planned::Dedup { src, .. } => {
                     fs::remove_file(src).map_err(|e| format!("{}: {}", src.display(), e))?;
                 }
+                Planned::Copy { src, dst } => {
+                    if let Some(p) = dst.parent() {
+                        fs::create_dir_all(p).map_err(|e| format!("{}: {}", p.display(), e))?;
+                    }
+                    fs::copy(src, dst)
+                        .map_err(|e| format!("{} -> {}: {}", src.display(), dst.display(), e))?;
+                }
             }
             moved.push(step);
             done += 1;
@@ -336,6 +348,9 @@ fn rollback_steps<'a>(steps: impl Iterator<Item = &'a Planned>) {
             }
             Planned::Dedup { src, dst } => {
                 let _ = fs::copy(dst, src);
+            }
+            Planned::Copy { dst, .. } => {
+                let _ = fs::remove_file(dst);
             }
         }
     }
@@ -373,6 +388,78 @@ fn remove_dir_if_empty(dir: &Path) -> Result<bool, String> {
     }
 }
 
+/// Recursively collect `(relative_path, file_path)` under `dir`.
+fn walk_files(dir: &Path, rel: &Path, out: &mut Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| format!("{}: {}", dir.display(), e))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let p = entry.path();
+        let r = rel.join(entry.file_name());
+        if p.is_dir() {
+            walk_files(&p, &r, out)?;
+        } else if p.is_file() {
+            out.push((r, p));
+        }
+    }
+    Ok(())
+}
+
+/// Drop `dir` and every subdirectory left empty — the mirror of a merge that
+/// walked nested paths (`<body>.ack/<key>` markers sit one level down).
+fn prune_tree(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.filter_map(|e| e.ok()) {
+        let p = e.path();
+        if p.is_dir() {
+            prune_tree(&p);
+        }
+    }
+    let _ = fs::remove_dir(dir);
+}
+
+/// T-000190: merge a channel dir a rename COLLISION left behind into the
+/// new-named dir — both name the same counterparty, so the old dir's files
+/// belong to the same pair and migrate in the same pass instead of waiting
+/// for the blocking dir to retire (an InOutBox lane dir never does).
+/// Recursive; identical targets dedup, divergent same-name files keep BOTH
+/// and report `MigrationDiverged` — the old dir keeps the frozen version for
+/// the operator to resolve. A failed move rolls this call's own steps back.
+pub fn merge_channel_dir(
+    src_dir: &Path,
+    dst_dir: &Path,
+    warnings: &mut Vec<SyncIssue>,
+) -> Result<usize, String> {
+    let mut files = Vec::new();
+    if src_dir.is_dir() {
+        walk_files(src_dir, Path::new(""), &mut files)?;
+    }
+    let mut plan = Vec::new();
+    for (rel, src) in files {
+        let dst = dst_dir.join(&rel);
+        if dst.exists() {
+            let a = fs::read(&src).map_err(|e| format!("{}: {}", src.display(), e))?;
+            let b = fs::read(&dst).map_err(|e| format!("{}: {}", dst.display(), e))?;
+            if a == b {
+                plan.push(Planned::Dedup { src, dst });
+            } else {
+                warnings.push(
+                    SyncIssue::new(
+                        SyncIssueCode::MigrationDiverged,
+                        rel.to_string_lossy().replace('\\', "/"),
+                    )
+                    .target(dst_dir.display().to_string()),
+                );
+            }
+        } else {
+            plan.push(Planned::Move { src, dst });
+        }
+    }
+    let done = apply_plan(&plan)?;
+    prune_tree(src_dir);
+    Ok(done)
+}
+
 /// Outcome of one REQ pair's legacy->InOutBox migration.
 #[derive(Debug, Default)]
 pub struct ReqMigrationOutcome {
@@ -381,6 +468,83 @@ pub struct ReqMigrationOutcome {
     /// The pair's channel may sync on the new layout this pass. False when a
     /// failure rolled the migration back — the legacy dirs keep working.
     pub channel_ready: bool,
+}
+
+/// Cross-populate channel files that only ONE side of the pair still has.
+/// The new layout splits each file's copies across repos: the sender's
+/// `outbox/` holds the master and the recipient's `inbox/` the replica, and
+/// the mirror prunes a replica whose master is absent. A REQ body the sender
+/// already lost locally survives only on the recipient's legacy dir — moving
+/// it into `inbox/` alone would be eaten on the very next pass. So every file
+/// a side migrates also lands as a COPY in each other side's new dir whenever
+/// that side has no channel file of the same name. The copy reads the file's
+/// post-move location (`dst`), which is why this runs after the side plans.
+/// Byte-identical targets dedup; divergent same-name targets keep both and
+/// report `MigrationDiverged`.
+fn plan_cross(
+    sides: &[(&Path, &Path)],
+    plans: &[Vec<Planned>],
+    warnings: &mut Vec<SyncIssue>,
+) -> Result<Vec<Planned>, String> {
+    let mut cross = Vec::new();
+    let mut planned: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
+    for (i, plan_i) in plans.iter().enumerate() {
+        // Post-migration location of every file this side contributes — a
+        // diverged name has no plan entry and stays frozen, so it is also
+        // exempt from crossing.
+        for step in plan_i {
+            // `src` exists at plan time; `dst` is where the bytes live once
+            // the side plan applies — the Copy must read the latter.
+            let (src, post) = match step {
+                Planned::Move { src, dst } | Planned::Dedup { src, dst } => (src, dst),
+                Planned::Copy { .. } => continue,
+            };
+            let Some(name) = post.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            for (j, (src_j, dst_j)) in sides.iter().enumerate() {
+                if i == j || *dst_j == sides[i].1 {
+                    continue;
+                }
+                // The other side holds its own version — its side plan owns
+                // the name, a cross copy would collide.
+                if src_j.join(name).is_file() {
+                    continue;
+                }
+                let dst = dst_j.join(name);
+                if dst.exists() {
+                    let a = fs::read(src).map_err(|e| format!("{}: {}", src.display(), e))?;
+                    let b = fs::read(&dst).map_err(|e| format!("{}: {}", dst.display(), e))?;
+                    if a != b {
+                        warnings.push(
+                            SyncIssue::new(SyncIssueCode::MigrationDiverged, name.to_string())
+                                .target(dst_j.display().to_string()),
+                        );
+                    }
+                    continue;
+                }
+                if let Some(first) = planned.get(&dst) {
+                    // Another side already feeds this target — dedup identical
+                    // bytes, keep both (and report) on divergence.
+                    let a = fs::read(src).map_err(|e| format!("{}: {}", src.display(), e))?;
+                    let b = fs::read(first).map_err(|e| format!("{}: {}", first.display(), e))?;
+                    if a != b {
+                        warnings.push(
+                            SyncIssue::new(SyncIssueCode::MigrationDiverged, name.to_string())
+                                .target(dst_j.display().to_string()),
+                        );
+                    }
+                    continue;
+                }
+                cross.push(Planned::Copy {
+                    src: post.clone(),
+                    dst: dst.clone(),
+                });
+                planned.insert(dst, src.clone());
+            }
+        }
+    }
+    Ok(cross)
 }
 
 /// T-000190: move a REQ pair's legacy folders onto the InOutBox layout.
@@ -394,8 +558,10 @@ pub struct ReqMigrationOutcome {
 /// a filesystem failure rolls back everything this call already did — the
 /// channel never runs half on the old layout, half on the new. Conflicting
 /// bytes at a target keep BOTH versions (the legacy file stays, an issue is
-/// raised). Idempotent: a second call sees an empty source list and returns
-/// `channel_ready` without touching anything.
+/// raised). A file only one side still holds is cross-populated to every
+/// other side's new dir so no replica is left without its master. Idempotent:
+/// a second call sees an empty source list and returns `channel_ready`
+/// without touching anything.
 pub fn migrate_req_pair(
     sides: &[(&Path, &Path)],
     warnings: &mut Vec<SyncIssue>,
@@ -404,6 +570,7 @@ pub fn migrate_req_pair(
     for (src, dst) in sides {
         plans.push(plan_dir(src, dst, warnings)?);
     }
+    let cross = plan_cross(sides, &plans, warnings)?;
     let mut out = ReqMigrationOutcome {
         channel_ready: true,
         ..Default::default()
@@ -425,6 +592,19 @@ pub fn migrate_req_pair(
                 warnings.push(SyncIssue::new(SyncIssueCode::MigrationFailed, e));
                 return Ok(out);
             }
+        }
+    }
+    match apply_plan(&cross) {
+        Ok(n) => out.migrated += n,
+        Err(e) => {
+            // The cross plan rolled itself back; put the side moves back so
+            // the whole pair returns to the legacy layout.
+            for (plan, _) in applied.iter().rev() {
+                rollback_steps(plan.iter().rev());
+            }
+            out.channel_ready = false;
+            warnings.push(SyncIssue::new(SyncIssueCode::MigrationFailed, e));
+            return Ok(out);
         }
     }
     // All sides applied — drop legacy dirs that came out empty.
@@ -1279,6 +1459,111 @@ mod tests {
         assert!(!a_dst.join("REQ-001_x.md").exists());
         // Side B never moved.
         assert!(b_src.join("REQ-002_y.md").exists());
+    }
+
+    #[test]
+    fn test_migrate_req_pair_cross_populates_a_one_sided_body() {
+        // The sender lost its own copy of the body long ago — only an orphan
+        // response receipt remains; the recipient still holds the whole pair.
+        // Without the cross copy the body lands in `inbox/` alone and the
+        // mirror prunes the masterless replica on the very next pass.
+        let tmp = TempDir::new().unwrap();
+        let sender_legacy = tmp.path().join("client/docs/backend-requirements");
+        let sender_out = tmp.path().join("client/docs/InOutBox/outbox/backend");
+        let recipient_legacy = tmp
+            .path()
+            .join("server/docs/client-requirements/web-client");
+        let recipient_in = tmp.path().join("server/docs/InOutBox/inbox/web-client");
+        fs::create_dir_all(&sender_legacy).unwrap();
+        fs::write(sender_legacy.join("REQ-159_x.response.md"), "receipt body").unwrap();
+        seed_pair(&recipient_legacy, "REQ-159_x.md");
+        let body = fs::read(recipient_legacy.join("REQ-159_x.md")).unwrap();
+
+        let mut w = Vec::new();
+        let o = migrate_req_pair(
+            &[
+                (sender_legacy.as_path(), sender_out.as_path()),
+                (recipient_legacy.as_path(), recipient_in.as_path()),
+            ],
+            &mut w,
+        )
+        .unwrap();
+        assert!(o.channel_ready);
+        assert!(w.is_empty(), "{:?}", w);
+        // The body reaches the sender's outbox — the master the replica needs.
+        assert_eq!(fs::read(sender_out.join("REQ-159_x.md")).unwrap(), body);
+        assert_eq!(fs::read(recipient_in.join("REQ-159_x.md")).unwrap(), body);
+        // The response ends up on both sides too — the recipient-authored
+        // copy in the inbox plus the carried-back replica in the outbox.
+        assert!(sender_out.join("REQ-159_x.response.md").exists());
+        assert!(recipient_in.join("REQ-159_x.response.md").exists());
+    }
+
+    #[test]
+    fn test_migrate_req_pair_cross_dedups_a_two_sided_pair() {
+        // Both sides hold the same pair — nothing crosses, the side plans own
+        // every name.
+        let tmp = TempDir::new().unwrap();
+        let a_src = tmp.path().join("a-legacy");
+        let a_dst = tmp.path().join("a-new");
+        let b_src = tmp.path().join("b-legacy");
+        let b_dst = tmp.path().join("b-new");
+        seed_pair(&a_src, "REQ-001_x.md");
+        seed_pair(&b_src, "REQ-001_x.md");
+
+        let mut w = Vec::new();
+        let o = migrate_req_pair(
+            &[
+                (a_src.as_path(), a_dst.as_path()),
+                (b_src.as_path(), b_dst.as_path()),
+            ],
+            &mut w,
+        )
+        .unwrap();
+        assert!(o.channel_ready);
+        assert_eq!(o.migrated, 4, "two moves per side, no extra copies");
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(a_dst.join("REQ-001_x.md").exists());
+        assert!(b_dst.join("REQ-001_x.md").exists());
+    }
+
+    #[test]
+    fn test_merge_channel_dir_merges_a_collision_leftover_recursively() {
+        // A rename COLLISION leaves `outbox/<old>` beside `outbox/<new>` — the
+        // live dir never empties, so the old one's files merge in the same
+        // pass: moves land, byte-identical targets dedup, divergent names
+        // keep BOTH and report, nested `.ack/` markers come along.
+        let tmp = TempDir::new().unwrap();
+        let old = tmp.path().join("docs/InOutBox/outbox/old-name");
+        let new = tmp.path().join("docs/InOutBox/outbox/new-name");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join("NOTE-001_x.md"), "note").unwrap();
+        fs::write(old.join("NOTE-002_same.md"), "same").unwrap();
+        fs::write(new.join("NOTE-002_same.md"), "same").unwrap();
+        fs::write(old.join("NOTE-003_diff.md"), "old bytes").unwrap();
+        fs::write(new.join("NOTE-003_diff.md"), "new bytes").unwrap();
+        // A nested ack marker rides the merge too.
+        fs::create_dir_all(old.join("ANNOUNCE-001_a.md.ack")).unwrap();
+        fs::write(old.join("ANNOUNCE-001_a.md.ack/helper"), "").unwrap();
+
+        let mut w = Vec::new();
+        let n = merge_channel_dir(&old, &new, &mut w).unwrap();
+        assert_eq!(n, 3, "1 move + 1 dedup + 1 nested move");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].code, crate::models::SyncIssueCode::MigrationDiverged);
+        assert_eq!(fs::read(new.join("NOTE-001_x.md")).unwrap(), b"note");
+        assert!(new.join("ANNOUNCE-001_a.md.ack/helper").is_file());
+        // Divergent pair keeps both versions.
+        assert_eq!(fs::read(new.join("NOTE-003_diff.md")).unwrap(), b"new bytes");
+        assert_eq!(
+            fs::read(old.join("NOTE-003_diff.md")).unwrap(),
+            b"old bytes"
+        );
+        // Everything else merged away — only the frozen file keeps the dir.
+        assert!(old.is_dir());
+        assert!(!old.join("NOTE-002_same.md").exists());
+        assert!(!old.join("ANNOUNCE-001_a.md.ack").exists());
     }
 
     #[test]
