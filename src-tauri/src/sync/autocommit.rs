@@ -3,18 +3,22 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::git_ops::{commit_paths, is_ignored_for_add, CommitOutcome, GitBinary};
+use crate::git_ops::{
+    commit_paths, commit_paths_index_only, is_ignored_for_add, list_markers_in_rev, path_in_index,
+    rev_exists, CommitOutcome, GitBinary,
+};
 
 /// Doc subfolders that hold cross-repo synced content (REQ pairs, API contracts,
-/// announcements). Auto-commit is scoped (git pathspec) to these (plus the
-/// managed root files below) — the dev's own WIP anywhere else (including docs/
-/// root files like the sender's own api.md, or the skeleton CLAUDE.md /
-/// docs/project.md) is never swept in.
+/// announcements, and — T-000190 — the unified InOutBox channel). Auto-commit is
+/// scoped (git pathspec) to these (plus the managed root files below) — the
+/// dev's own WIP anywhere else (including docs/ root files like the sender's
+/// own api.md, or the skeleton CLAUDE.md / docs/project.md) is never swept in.
 pub const CROSS_REPO_DIRS: &[&str] = &[
     "docs/backend-requirements",
     "docs/client-requirements",
     "docs/microservice-requirements",
     "docs/server-requirements",
+    "docs/InOutBox",
     "docs/server-api",
     "docs/microservice-api",
     "docs/server-announcements",
@@ -30,10 +34,22 @@ pub const MANAGED_ROOT_FILES: &[&str] = &[".gitignore", ".gitattributes"];
 pub const SDH_COMMIT_NAME: &str = "Solo Dev Hub";
 pub const SDH_COMMIT_EMAIL: &str = "noreply@solodevhub.app";
 
+/// Subject and body of the marker-removal commit: deletion only, never an add.
+const MARKER_REMOVAL_SUBJECT: &str = "chore(sdh-sync): untrack rule hand-back markers";
+const MARKER_REMOVAL_BODY: &str = "Rule hand-back markers (docs/sdh_skills/*.approved, \
+*.conflict) are local service files; Solo Dev Hub removed them from git. The \
+working-tree files are untouched.";
+
 /// Commit any changes (add/modify/delete) within the cross-repo folders that
 /// exist in `repo_root`, on `branch`, with the SDH marker identity + message.
 /// Returns `NothingToCommit` if no cross-repo folder exists or nothing changed;
 /// `WrongBranch` if the repo isn't currently on `branch` (never checks out).
+///
+/// T-000244: a rule hand-back marker the branch still tracks is deleted from
+/// git even when there is nothing else to commit (and when `docs/sdh_skills/`
+/// no longer exists on disk — the deletion is read from `HEAD`). A marker is
+/// never added or modified by the commit: only its removal travels. This repo's
+/// push stays the owner's own step; the app never pushes here.
 pub fn autocommit_repo(
     git: &GitBinary,
     repo_root: &Path,
@@ -44,10 +60,24 @@ pub fn autocommit_repo(
     // git won't add it, and forcing it in would fight that choice — so skip it.
     // Skipping also fixes the crash where `git add` on an ignored path exits 1
     // and aborted the whole commit for the tracked folders alongside it.
+    // T-000190: a folder GONE from disk but still present in the index is
+    // included too — a migration's old-dir deletion must travel in the same
+    // commit as the new-layout files, otherwise the archive resurrects on the
+    // next pull. The check reads the INDEX, not HEAD: index entries mean the
+    // deletions are unstaged and `git add -A` can still match the pathspec —
+    // a dir the user already `git rm`'d is left to their own commit rather
+    // than erroring out on an unmatched spec.
     let mut tracked: Vec<PathBuf> = Vec::new();
     for d in CROSS_REPO_DIRS {
         let rel = PathBuf::from(d);
         if !repo_root.join(&rel).exists() {
+            if !path_in_index(git, repo_root, &rel)? {
+                continue;
+            }
+            // The dir is gone but tracked: the pathspec stages its deletion.
+            // Never force-add — an ignored path spec stays ignored, only the
+            // tracked entries' deletions are picked up.
+            tracked.push(rel);
             continue;
         }
         if is_ignored_for_add(git, repo_root, &rel)? {
@@ -67,6 +97,38 @@ pub fn autocommit_repo(
             continue;
         }
         tracked.push(rel);
+    }
+    // T-000244: rule hand-back markers still tracked in the branch. Read from
+    // HEAD, not from the worktree or the current sweep, so a restart or a
+    // failed commit still finds them. `docs/sdh_skills/` is deliberately NOT
+    // added to `CROSS_REPO_DIRS`: only the markers' deletion has a path in.
+    // Review fix (f0a40b2): an unborn HEAD has no history, so it can hold no
+    // marker — the initial scoped commit works exactly as before the check.
+    // Any other failure to read HEAD still errors.
+    let markers = if rev_exists(git, repo_root, "HEAD")? {
+        list_markers_in_rev(git, repo_root, "HEAD")?
+    } else {
+        Vec::new()
+    };
+    if !markers.is_empty() {
+        let (subject, body) = if tracked.is_empty() {
+            (MARKER_REMOVAL_SUBJECT, MARKER_REMOVAL_BODY)
+        } else {
+            (
+                "chore(sdh-sync): sync cross-repo files",
+                "Cross-repo requirement, API-contract and announcement files (plus managed root files) synced by Solo Dev Hub.",
+            )
+        };
+        return commit_paths_index_only(
+            git,
+            repo_root,
+            branch,
+            &tracked,
+            subject,
+            Some(body),
+            SDH_COMMIT_NAME,
+            SDH_COMMIT_EMAIL,
+        );
     }
     if tracked.is_empty() {
         return Ok(CommitOutcome::NothingToCommit);
@@ -435,6 +497,568 @@ mod tests {
             !hf.contains(&".gitattributes".to_string()),
             "gitignored .gitattributes must NOT be committed, got {:?}",
             hf
+        );
+    }
+
+    // ── T-000190: a migrated dir's deletion travels in the sync commit ───────
+
+    #[test]
+    fn test_autocommit_commits_tracked_dir_deletion() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        // A tracked legacy dir, then deleted from the worktree only (as the
+        // InOutBox migration leaves it) — plus a synced file to commit.
+        write_file(
+            tmp.path(),
+            "docs/backend-requirements/REQ-001_x.md",
+            "# r\n",
+        );
+        run_git(
+            tmp.path(),
+            &["add", "docs/backend-requirements/REQ-001_x.md"],
+        );
+        run_git(tmp.path(), &["commit", "-q", "-m", "track legacy dir"]);
+        fs::remove_dir_all(tmp.path().join("docs/backend-requirements")).unwrap();
+        // Different bytes — identical content would collapse to a rename and
+        // the file count would read 1 although the deletion still lands.
+        write_file(
+            tmp.path(),
+            "docs/InOutBox/outbox/backend/REQ-001_x.md",
+            "# migrated\n",
+        );
+        // The dev's own staged WIP must survive, not be swept in.
+        write_file(tmp.path(), "src/keep.rs", "wip\n");
+        run_git(tmp.path(), &["add", "src/keep.rs"]);
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+
+        // HEAD now holds the InOutBox file and NOT the legacy one.
+        let out = Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            head.contains("docs/InOutBox/outbox/backend/REQ-001_x.md"),
+            "{:?}",
+            head
+        );
+        assert!(
+            !head.contains("docs/backend-requirements/REQ-001_x.md"),
+            "the legacy file must be deleted in the same commit: {:?}",
+            head
+        );
+        // The unrelated staged WIP is untouched.
+        assert!(
+            staged_files(tmp.path()).contains(&"src/keep.rs".to_string()),
+            "src/keep.rs must remain staged"
+        );
+    }
+
+    #[test]
+    fn test_autocommit_leaves_user_staged_deletion_alone() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        // The user themselves `git rm`'d the legacy dir — index already holds
+        // the deletion; the scoped commit must neither fail nor claim it.
+        write_file(
+            tmp.path(),
+            "docs/backend-requirements/REQ-001_x.md",
+            "# r\n",
+        );
+        run_git(
+            tmp.path(),
+            &["add", "docs/backend-requirements/REQ-001_x.md"],
+        );
+        run_git(tmp.path(), &["commit", "-q", "-m", "track legacy dir"]);
+        run_git(tmp.path(), &["rm", "-r", "-q", "docs/backend-requirements"]);
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        // The staged deletion is still staged — the user's own change.
+        let out = Command::new("git")
+            .args(["diff", "--cached", "--name-status"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let staged = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            staged.contains("D\tdocs/backend-requirements/REQ-001_x.md"),
+            "user-staged deletion must survive: {:?}",
+            staged
+        );
+    }
+
+    // ── T-000244: markers travel out of git as deletions only ────────────────
+
+    /// `<status> <path>` of everything staged against HEAD.
+    fn staged_status(dir: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["diff", "--cached", "--name-status", "-z"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let fields: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
+        fields
+            .chunks(2)
+            .map(|c| format!("{} {}", c[0], c[1]))
+            .collect()
+    }
+
+    /// Files of HEAD's tree.
+    fn tree_files(dir: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// A repo whose HEAD tracks a rule copy and a marker, exactly as a
+    /// contributor's agent leaves it behind (committed together with the edit).
+    fn repo_with_tracked_marker(dir: &Path) {
+        init_test_repo(dir);
+        write_file(dir, "README.md", "# r\n");
+        write_file(dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA REVISED\n");
+        write_file(dir, "docs/sdh_skills/sdh-alpha.md.approved", "approved\n");
+        run_git(dir, &["add", "-A", "."]);
+        run_git(dir, &["commit", "-q", "-m", "marker committed by an agent"]);
+    }
+
+    /// A tracked marker that is also untracked from the index (the refresh
+    /// sweep's staging), so both halves of the fix meet in one repo.
+    fn repo_with_swept_marker(dir: &Path) {
+        repo_with_tracked_marker(dir);
+        run_git(
+            dir,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "docs/sdh_skills/sdh-alpha.md.approved",
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_delivers_a_marker_deletion_with_nothing_else_to_commit() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_swept_marker(tmp.path());
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Committed { files: 1 });
+        let tree = tree_files(tmp.path());
+        assert!(
+            !tree.iter().any(|f| f.ends_with(".approved")),
+            "the marker left the branch: {:?}",
+            tree
+        );
+        assert!(tree.contains(&"docs/sdh_skills/sdh-alpha.md".to_string()));
+        // The live marker and the copy stay on disk, byte-for-byte.
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap(),
+            "approved\n"
+        );
+        assert!(
+            staged_status(tmp.path()).is_empty(),
+            "{:?}",
+            staged_status(tmp.path())
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_finds_the_marker_deletion_after_a_restart_without_the_folder() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path());
+        // The whole folder is gone from disk (an old clone, a manual cleanup):
+        // the deletion is still owed to the branch.
+        fs::remove_dir_all(tmp.path().join("docs/sdh_skills")).unwrap();
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Committed { files: 1 });
+        assert!(!tree_files(tmp.path())
+            .iter()
+            .any(|f| f.ends_with(".approved")));
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_never_adds_a_live_marker_or_the_rule_copy() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_swept_marker(tmp.path());
+        // A second, still-untracked marker and an untracked rule copy beside it.
+        write_file(tmp.path(), "docs/sdh_skills/sdh-beta.md", "BETA\n");
+        write_file(
+            tmp.path(),
+            "docs/sdh_skills/sdh-beta.md.approved",
+            "approved\n",
+        );
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Committed { files: 1 });
+        let tree = tree_files(tmp.path());
+        assert!(
+            !tree
+                .iter()
+                .any(|f| f.ends_with(".approved") || f.ends_with(".conflict")),
+            "no marker may be added: {:?}",
+            tree
+        );
+        assert!(
+            !tree.contains(&"docs/sdh_skills/sdh-beta.md".to_string()),
+            "docs/sdh_skills/ is not a cross-repo folder: {:?}",
+            tree
+        );
+        assert!(tmp
+            .path()
+            .join("docs/sdh_skills/sdh-beta.md.approved")
+            .exists());
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_marker_deletion_keeps_foreign_wip_out_and_intact() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_swept_marker(tmp.path());
+        write_file(tmp.path(), "src/lib.rs", "fn main() {}\n");
+        run_git(tmp.path(), &["add", "src/lib.rs"]);
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        // The cross-repo file travels with the deletion; the foreign staged
+        // file does not, and it is still staged afterwards.
+        assert_eq!(outcome, CommitOutcome::Committed { files: 2 });
+        let tree = tree_files(tmp.path());
+        assert!(
+            tree.contains(&"docs/server-api/api.md".to_string()),
+            "{:?}",
+            tree
+        );
+        assert!(!tree.contains(&"src/lib.rs".to_string()), "{:?}", tree);
+        assert!(staged_status(tmp.path()).contains(&"A src/lib.rs".to_string()));
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_failed_marker_commit_loses_nothing_and_is_retried() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_swept_marker(tmp.path());
+        // Signing is on but no key exists: the commit fails. The app must not
+        // bypass signing, and must not lose the staged deletion either.
+        run_git(tmp.path(), &["config", "commit.gpgsign", "true"]);
+        run_git(
+            tmp.path(),
+            &["config", "user.signingkey", "0000000000000000"],
+        );
+
+        let git = check_git_available().expect("git available");
+        let failed = autocommit_repo(&git, tmp.path(), "master");
+
+        assert!(
+            failed.is_err(),
+            "the signed commit must fail, got {:?}",
+            failed
+        );
+        assert!(
+            tree_files(tmp.path())
+                .iter()
+                .any(|f| f.ends_with(".approved")),
+            "the marker is still tracked in HEAD"
+        );
+        assert!(
+            staged_status(tmp.path())
+                .contains(&"D docs/sdh_skills/sdh-alpha.md.approved".to_string()),
+            "the staged deletion survived the failure: {:?}",
+            staged_status(tmp.path())
+        );
+
+        // The owner turns signing off; the next pass delivers the deletion.
+        run_git(tmp.path(), &["config", "commit.gpgsign", "false"]);
+        let retried = autocommit_repo(&git, tmp.path(), "master").unwrap();
+        assert_eq!(retried, CommitOutcome::Committed { files: 1 });
+        assert!(!tree_files(tmp.path())
+            .iter()
+            .any(|f| f.ends_with(".approved")));
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_marker_deletion_waits_for_the_allowed_branch() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_swept_marker(tmp.path());
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "dev").unwrap();
+
+        assert_eq!(
+            outcome,
+            CommitOutcome::WrongBranch {
+                current: Some("master".to_string()),
+                expected: "dev".to_string(),
+            }
+        );
+        let tree = tree_files(tmp.path());
+        assert!(tree.iter().any(|f| f.ends_with(".approved")), "{:?}", tree);
+        assert!(
+            !tree.contains(&"docs/server-api/api.md".to_string()),
+            "{:?}",
+            tree
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_without_tracked_markers_ignores_docs_sdh_skills_entirely() {
+        let tmp = TempDir::new().unwrap();
+        init_test_repo(tmp.path());
+        seed_baseline(tmp.path());
+        // Untracked rule copies and markers only: nothing is tracked in HEAD,
+        // so the ordinary path must not stage or commit any of them.
+        write_file(tmp.path(), "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write_file(
+            tmp.path(),
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved\n",
+        );
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        assert!(tree_files(tmp.path())
+            .iter()
+            .all(|f| !f.contains("sdh_skills")));
+        assert!(staged_status(tmp.path()).is_empty());
+    }
+
+    // ── Review of f0a40b2: unborn HEAD, and merges the commit must wait out ──
+
+    /// HEAD's commit id — to assert it did not move.
+    fn head_sha(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The unmerged stage lines of the index, to compare them across a call.
+    fn unmerged_lines(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["ls-files", "-u"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A repo with no commits at all: HEAD is unborn but named.
+    fn unborn_repo(dir: &Path) {
+        init_test_repo(dir);
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_on_an_unborn_head_commits_the_initial_sync_file() {
+        let tmp = TempDir::new().unwrap();
+        unborn_repo(tmp.path());
+        // An eligible initial sync file: the first scoped commit must work,
+        // as it did before the marker check read `HEAD` unconditionally.
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Committed { files: 1 });
+        assert!(head_files(tmp.path()).contains(&"docs/server-api/api.md".to_string()));
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_on_an_unborn_head_without_sync_files_is_a_noop() {
+        let tmp = TempDir::new().unwrap();
+        unborn_repo(tmp.path());
+        // Nothing eligible and no history to hold a marker: a clean no-op,
+        // not the "invalid object name 'HEAD'" error it used to be.
+        write_file(tmp.path(), "docs/todo.md", "- [ ] x\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+    }
+
+    /// Review fix (2nd pass of T-000244): a branch ref that exists but points
+    /// at a MISSING commit object is a damaged repo, not an unborn HEAD — yet
+    /// `rev_exists` folded every nonzero `rev-parse` exit into "unborn", so
+    /// autocommit answered a clean `NothingToCommit` and silently dropped the
+    /// marker deletion the branch still owed. The failure must surface.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_errors_on_a_broken_head_instead_of_a_clean_noop() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path());
+        // Break the branch: the ref stays, the commit object it names is gone.
+        let sha = head_sha(tmp.path());
+        fs::remove_file(
+            tmp.path()
+                .join(format!(".git/objects/{}/{}", &sha[..2], &sha[2..])),
+        )
+        .unwrap();
+
+        let git = check_git_available().expect("git available");
+        let failed = autocommit_repo(&git, tmp.path(), "master");
+
+        let err = failed.expect_err("a damaged repo must error, not report a no-op");
+        assert!(err.contains("rev-parse"), "{}", err);
+        // HEAD no longer resolves, so the tree is read from the index instead:
+        // the marker is still tracked and nothing was staged against the
+        // broken branch.
+        let ls = Command::new("git")
+            .args(["ls-files", "--", "docs/sdh_skills/"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let listed = String::from_utf8_lossy(&ls.stdout).into_owned();
+        assert!(
+            listed.contains("sdh-alpha.md.approved"),
+            "the marker is still tracked, nothing was committed: {}",
+            listed
+        );
+    }
+
+    /// A clean merge that has not been committed: MERGE_HEAD is set, the merge
+    /// result sits staged, HEAD has not moved. Committing here would create a
+    /// two-parent commit WITHOUT the other branch's changes and clear
+    /// MERGE_HEAD.
+    fn repo_in_clean_uncommitted_merge(dir: &Path) {
+        repo_with_tracked_marker(dir);
+        run_git(dir, &["checkout", "-q", "-b", "other"]);
+        write_file(dir, "other.txt", "from other\n");
+        run_git(dir, &["add", "other.txt"]);
+        run_git(dir, &["commit", "-q", "-m", "other"]);
+        run_git(dir, &["checkout", "-q", "master"]);
+        // Diverge master too, so a real merge (never a fast-forward) runs.
+        write_file(dir, "master.txt", "from master\n");
+        run_git(dir, &["add", "master.txt"]);
+        run_git(dir, &["commit", "-q", "-m", "master"]);
+        run_git(dir, &["merge", "--no-commit", "other"]);
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_waits_out_a_clean_uncommitted_merge() {
+        let tmp = TempDir::new().unwrap();
+        repo_in_clean_uncommitted_merge(tmp.path());
+        let head_before = head_sha(tmp.path());
+        assert!(tmp.path().join(".git/MERGE_HEAD").exists());
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        assert_eq!(head_sha(tmp.path()), head_before, "HEAD must not move");
+        assert!(
+            tmp.path().join(".git/MERGE_HEAD").exists(),
+            "the in-flight merge is not concluded behind the dev's back"
+        );
+        let tree = tree_files(tmp.path());
+        assert!(
+            !tree.contains(&"docs/server-api/api.md".to_string()),
+            "{:?}",
+            tree
+        );
+        assert!(
+            !tree.contains(&"other.txt".to_string()),
+            "no two-parent commit without the other side's changes: {:?}",
+            tree
+        );
+        assert!(
+            tree.iter().any(|f| f.ends_with(".approved")),
+            "the marker deletion waits too: {:?}",
+            tree
+        );
+        assert!(
+            staged_status(tmp.path()).contains(&"A other.txt".to_string()),
+            "the staged merge result is intact: {:?}",
+            staged_status(tmp.path())
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_autocommit_waits_out_a_conflicted_merge() {
+        let tmp = TempDir::new().unwrap();
+        repo_with_tracked_marker(tmp.path());
+        write_file(tmp.path(), "README.md", "base\n");
+        run_git(tmp.path(), &["add", "README.md"]);
+        run_git(tmp.path(), &["commit", "-q", "-m", "base"]);
+        run_git(tmp.path(), &["checkout", "-q", "-b", "other"]);
+        fs::write(tmp.path().join("README.md"), "theirs\n").unwrap();
+        run_git(tmp.path(), &["commit", "-q", "-am", "theirs"]);
+        run_git(tmp.path(), &["checkout", "-q", "master"]);
+        fs::write(tmp.path().join("README.md"), "ours\n").unwrap();
+        run_git(tmp.path(), &["commit", "-q", "-am", "ours"]);
+        let merge = Command::new("git")
+            .args(["merge", "other"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            !merge.status.success(),
+            "the merge must conflict: {}",
+            String::from_utf8_lossy(&merge.stderr)
+        );
+        let head_before = head_sha(tmp.path());
+        let unmerged = unmerged_lines(tmp.path());
+        assert!(!unmerged.trim().is_empty(), "the fixture must conflict");
+        write_file(tmp.path(), "docs/server-api/api.md", "# API\n");
+
+        let git = check_git_available().expect("git available");
+        let outcome = autocommit_repo(&git, tmp.path(), "master").unwrap();
+
+        assert_eq!(outcome, CommitOutcome::NothingToCommit);
+        assert_eq!(head_sha(tmp.path()), head_before, "HEAD must not move");
+        assert_eq!(
+            unmerged_lines(tmp.path()),
+            unmerged,
+            "the unresolved entries are still in the real index"
+        );
+        assert!(tmp.path().join(".git/MERGE_HEAD").exists());
+        let tree = tree_files(tmp.path());
+        assert!(
+            !tree.contains(&"docs/server-api/api.md".to_string()),
+            "the synced file is not committed over a conflict: {:?}",
+            tree
+        );
+        assert!(
+            tree.iter().any(|f| f.ends_with(".approved")),
+            "the marker deletion waits too: {:?}",
+            tree
         );
     }
 }

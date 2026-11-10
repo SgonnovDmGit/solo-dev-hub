@@ -140,17 +140,28 @@ fn refuse_protected(name: &str) -> Result<(), String> {
     }
 }
 
-/// Conservative branch-name check (a subset of `git check-ref-format`): we
-/// only accept short names, never `refs/...`, never anything that could be read
-/// as an option or a refspec.
-fn validate_branch(name: &str) -> Result<(), String> {
+/// Branch-name check matching `git check-ref-format --branch` for short
+/// names. Review follow-up (F-000045): the previous check only looked at the
+/// name as a whole, so `.hidden`, `dev/.hidden` and `bad.lock/branch` passed
+/// — git rejects them, and after the clone they silently became an "absent
+/// branch" that attached on the default branch. Every rule of git is now
+/// applied per component:
+/// * no component may begin with `.` or end with `.lock`;
+/// * no `..`, no leading/trailing `/`, no `//`, no trailing `.`;
+/// * no ASCII control char, whitespace or one of `~ ^ : ? * [ \`;
+/// * no `@{`, not `@`, not `HEAD` (any case);
+/// * only short names (never `refs/...`) and nothing that could be read as
+///   an option or a refspec.
+/// F-000045: also used by `clone_repo_to` to reject a garbage configured
+/// branch *before* anything is cloned — malformed must stay a `CloneFailed`,
+/// distinct from the ratified "valid but absent → stay on the default branch".
+pub(crate) fn validate_branch(name: &str) -> Result<(), String> {
     let bad = name.is_empty()
         || name.starts_with('-')
         || name.starts_with('/')
         || name.starts_with("refs/")
         || name.ends_with('/')
         || name.ends_with('.')
-        || name.ends_with(".lock")
         || name.contains("..")
         || name.contains("//")
         || name.contains("@{")
@@ -158,7 +169,10 @@ fn validate_branch(name: &str) -> Result<(), String> {
         || name.eq_ignore_ascii_case("HEAD")
         || name
             .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c));
+            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
+        || name
+            .split('/')
+            .any(|part| part.starts_with('.') || part.ends_with(".lock"));
     if bad {
         Err(format!("invalid branch name '{}'", name))
     } else {
@@ -468,6 +482,8 @@ fn classify_net_stderr(stderr: &str) -> NetErrorKind {
         "network is unreachable",
         "does not appear to be a git repository",
         "could not read from remote repository",
+        "does not exist",
+        "no such file or directory",
         "operation timed out",
         "timed out",
     ];
@@ -1306,6 +1322,408 @@ fn parse_push_output(
 }
 
 // ---------------------------------------------------------------------------
+// F-000045: clone a repo that has no local folder
+// ---------------------------------------------------------------------------
+
+/// F-000045: production clone URL of a validated `owner/repo` GitHub name.
+/// The PAT never appears here — credentials come from the system git helper,
+/// exactly like `fetch`.
+pub fn github_clone_url(github_name: &str) -> String {
+    format!("https://github.com/{}.git", github_name)
+}
+
+/// F-000045: why preparing a clone target failed. `Invalid` leaves the target
+/// exactly as it was; after `Failed` the target may hold leftovers of a partial
+/// clone, which the caller must name and never bind as a success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloneTargetError {
+    Invalid(String),
+    Failed(NetError),
+}
+
+/// F-000045: what `prepare_clone_target` found / did at the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClonePrep {
+    /// `git clone` ran. `checked_out` is false when the target branch has no
+    /// `refs/remotes/origin/<branch>`: the default branch / HEAD that
+    /// `git clone` picked stays, no branch is created — deliberately not an
+    /// error (owner's decision, 2026-11-08).
+    FreshClone { checked_out: bool },
+    /// The target already held a clone of the same repo: nothing was touched —
+    /// not the branch, the index, the working files or the remotes.
+    ExistingClone,
+}
+
+/// `git clone <url> <target>` — non-interactive, under the same timeout and
+/// credential hygiene as `fetch` (system helper only, nothing in the URL, env
+/// or args, stderr redacted, the whole process tree killed on timeout).
+/// `cwd` must be an existing absolute directory: the target may not exist yet,
+/// so it cannot host the run.
+pub fn clone_repo(git: &GitBinary, url: &str, cwd: &Path, target: &Path) -> Result<(), NetError> {
+    validate_rev(url).map_err(|m| NetError {
+        kind: NetErrorKind::Other,
+        message: m,
+    })?;
+    if !target.is_absolute() {
+        return Err(NetError {
+            kind: NetErrorKind::Other,
+            message: format!("clone target must be absolute: {}", target.display()),
+        });
+    }
+    let mut args: Vec<std::ffi::OsString> = LOW_SPEED_ARGS.iter().map(Into::into).collect();
+    args.push("clone".into());
+    args.push(url.into());
+    args.push(target.as_os_str().to_owned());
+    let env = net_env();
+    let out = run_git(git, cwd, &args, &net_opts(&env, NET_TIMEOUT)).map_err(net_error_from_run)?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(net_error_from_output("clone", &out))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F-000045 review: incomplete-clone marker
+// ---------------------------------------------------------------------------
+
+/// FNV-1a 64 — implemented inline because the hash must be stable across
+/// releases: a marker written by an older build has to be found after an
+/// update (`DefaultHasher` guarantees no such thing).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// F-000045 review: path of the "this clone never finished" marker of
+/// `target` — `<canonical-parent>/.sdh-clone-incomplete-<hash>`. Design
+/// constraints:
+/// * OUTSIDE the clone root — a file inside would dirty the worktree the
+///   clone just produced;
+/// * BOTH the marker's DIRECTORY and its FILENAME derive from the same
+///   NORMALISED FILESYSTEM IDENTITY of the target, never from its spelling
+///   (R2: `C:\work\repo`, `C:\work\.\repo`, `C:\work\repo\`,
+///   `C:\work\..\work\repo` and a spelling through a parent junction/symlink
+///   all name the same folder but hashed differently, so a retry that merely
+///   spelled the folder differently missed the marker and bound an
+///   incomplete clone) — see `clone_target_identity`;
+/// * the directory is the parent OF THE IDENTITY, not the lexical
+///   `target.parent()` (R4: a lexical parent let `target/.git/..` — or a
+///   spelling through a target-level junction/symlink — resolve to the SAME
+///   repo root while naming a DIFFERENT parent folder, so the retry looked
+///   next to the alias instead of next to the real folder and sailed past
+///   the marker). Whatever spelling names the target, the identity's parent
+///   is the same physical folder, so the marker file always lands in the
+///   very same place;
+/// * `Ok(None)` when the target has no parent folder (a filesystem root —
+///   the clone itself is refused there anyway), `Err` when the identity
+///   could not be resolved at all (`clone_target_identity` names why).
+/// Markers left by builds before R4 hashed the raw spelling and/or used the
+/// lexical parent; they are no longer found and simply stay behind as inert
+/// orphan files.
+fn clone_incomplete_marker_resolved(target: &Path) -> Result<Option<PathBuf>, String> {
+    Ok(marker_location_from_identity(clone_target_identity(
+        target,
+    )?))
+}
+
+/// The seam behind `clone_incomplete_marker_resolved`: `canonicalize` is
+/// injected so tests can drive the "the existing ancestor cannot be
+/// canonicalized" error through the whole marker layer, not just the
+/// identity helper.
+fn clone_incomplete_marker_resolved_with(
+    target: &Path,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    Ok(marker_location_from_identity(clone_target_identity_with(
+        target,
+        canonicalize,
+    )?))
+}
+
+/// The marker path for a resolved identity. `identity` is
+/// `<canonical ancestor>/<missing leaf...>`, so its parent is that
+/// canonicalized ancestor — the real folder the marker must sit next to
+/// for every equivalent spelling of the target.
+fn marker_location_from_identity(identity: PathBuf) -> Option<PathBuf> {
+    let dir = identity.parent().filter(|d| !d.as_os_str().is_empty())?;
+    let key = identity.to_string_lossy().replace(['/', '\\'], "/");
+    #[cfg(windows)]
+    let key = key.to_lowercase();
+    Some(dir.join(format!(
+        ".sdh-clone-incomplete-{:016x}",
+        fnv1a64(key.as_bytes())
+    )))
+}
+
+/// The marker location as a plain `Option` (creation's error path goes
+/// through `mark_clone_incomplete`, the refusal's through
+/// `prepare_clone_target`, both of which use `clone_incomplete_marker_resolved`
+/// so an unresolvable identity can be told apart from "no parent folder").
+pub(crate) fn clone_incomplete_marker(target: &Path) -> Option<PathBuf> {
+    clone_incomplete_marker_resolved(target).ok().flatten()
+}
+
+/// R2: a canonical identity of `target`, stable across equivalent spellings.
+/// The deepest ancestor of `target` that already exists (the target itself
+/// when it does — the filesystem root of an absolute path always does) is
+/// `canonicalize`d, which resolves junctions, symlinks, `.`/`..` and letter
+/// case of the existing part (on Windows the result is a `\\?\` verbatim
+/// path — fine, it only has to be deterministic). The remaining,
+/// not-yet-existing components are appended and normalised LEXICALLY: `.` is
+/// skipped, `..` pops the previous component without ever climbing above the
+/// canonical ancestor. When NOTHING exists (`k == 0`, e.g. a relative path
+/// whose every component is missing) there is no base to canonicalize and
+/// the whole target is normalised lexically — still consistent between
+/// spellings. When an ancestor WAS found but canonicalizing it fails, the
+/// failure is PROPAGATED (R4: the old `unwrap_or_default()` silently dropped
+/// the existing prefix, so for an existing target the identity collapsed to
+/// the empty suffix — an empty/unstable key that collided on markers);
+/// callers refuse the preparation instead of searching with an invented key.
+fn clone_target_identity(target: &Path) -> Result<PathBuf, String> {
+    clone_target_identity_with(target, Path::canonicalize)
+}
+
+/// The seam behind `clone_target_identity`: `canonicalize` is injected so
+/// tests can drive the "an existing ancestor cannot be canonicalized" error
+/// path — hard to trigger portably on a real filesystem.
+fn clone_target_identity_with(
+    target: &Path,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Result<PathBuf, String> {
+    let comps: Vec<Component<'_>> = target.components().collect();
+    let prefix = |k: usize| comps[..k].iter().collect::<PathBuf>();
+    // Deepest existing ancestor: start at the target itself and walk up.
+    let mut k = comps.len();
+    while k > 0 && !prefix(k).exists() {
+        k -= 1;
+    }
+    // `canonicalize("")` fails, so a missing base (k == 0) stays lexical;
+    // a FOUND base that fails to canonicalize is a real error (see above).
+    let mut identity = if k > 0 {
+        canonicalize(&prefix(k)).map_err(|e| {
+            format!(
+                "could not resolve the real path of {}: {}",
+                prefix(k).display(),
+                e
+            )
+        })?
+    } else {
+        PathBuf::new()
+    };
+    let base = identity.components().count();
+    for c in &comps[k..] {
+        match c {
+            Component::Normal(s) => identity.push(s),
+            Component::CurDir => {}
+            // Pops only within the appended part: the ancestor's own
+            // `..`-resolution is already baked into `canonicalize`.
+            Component::ParentDir => {
+                if identity.components().count() > base {
+                    identity.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(identity)
+}
+
+/// Write the marker before the first mutation of a fresh clone target. The
+/// content is the target path, so a human stumbling over the file knows what
+/// it was for; only its existence is ever checked.
+pub(crate) fn mark_clone_incomplete(target: &Path) -> Result<(), String> {
+    let marker = clone_incomplete_marker_resolved(target)?.ok_or_else(|| {
+        format!(
+            "{} has no parent folder to hold the clone marker",
+            target.display()
+        )
+    })?;
+    std::fs::write(&marker, format!("{}\n", target.display()))
+        .map_err(|e| format!("could not write {}: {}", marker.display(), e))
+}
+
+/// Remove the marker after a fully successful preparation. A missing marker
+/// is fine; a removal that fails must not block the bind, so errors are
+/// swallowed (the worst case is a spurious refusal on a later retry, never a
+/// wrong attach).
+pub(crate) fn clear_clone_incomplete_marker(target: &Path) {
+    if let Some(marker) = clone_incomplete_marker(target) {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
+/// F-000045: after a fresh clone, switch onto `branch` when the remote has it.
+/// The exact ref `refs/remotes/origin/<branch>` decides — a same-named tag
+/// does not count. `Ok(false)` when the ref is absent: HEAD, the index and the
+/// working tree keep what `git clone` left and no branch is created. A failure
+/// of the check or the checkout itself is a real error (nothing is bound).
+pub fn checkout_remote_branch_if_present(
+    git: &GitBinary,
+    target: &Path,
+    branch: &str,
+) -> Result<bool, String> {
+    validate_branch(branch)?;
+    let remote_ref = format!("refs/remotes/origin/{}", branch);
+    if rev_parse(git, target, &remote_ref)?.is_none() {
+        return Ok(false);
+    }
+    let local_ref = format!("refs/heads/{}", branch);
+    if rev_parse(git, target, &local_ref)?.is_none() {
+        // No local branch yet (the clone checked out a different default):
+        // create one tracking the exact remote ref. Unlike `update_ref_cas`
+        // this may name `main`/`master`: it creates a branch exactly at the
+        // remote tip and checks it out — it never moves history.
+        run_ok(
+            git,
+            target,
+            &["branch", "--track", branch, remote_ref.as_str()],
+        )?;
+    }
+    run_ok(git, target, &["checkout", branch]).map(|_| true)
+}
+
+/// F-000045: the origin fetch URL of a valid work-tree root at `target`.
+/// `Err` (naming why) when the folder is not a git repository, is bare, is a
+/// nested folder of another repo's work tree, or has no unambiguous
+/// `remote.origin.url`. Reading the config through git — not by parsing
+/// `.git/config` — also works when `.git` is a file (linked worktree).
+pub fn origin_url_of_worktree_root(git: &GitBinary, target: &Path) -> Result<String, String> {
+    let bare = run_ok(git, target, &["rev-parse", "--is-bare-repository"])?;
+    if stdout_text(&bare) != "false" {
+        return Err("bare repository: no working tree to attach".to_string());
+    }
+    let top = run_ok(git, target, &["rev-parse", "--show-toplevel"])?;
+    let top = PathBuf::from(stdout_text(&top));
+    let same_dir = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if !same_dir(&top, target) {
+        return Err(format!(
+            "not the repository root (the work-tree root is {})",
+            top.display()
+        ));
+    }
+    let urls = config_get_all(git, target, "remote.origin.url")?;
+    match urls.len() {
+        1 => Ok(urls.into_iter().next().expect("len checked")),
+        0 => Err("remote 'origin' is not configured".to_string()),
+        _ => Err("remote 'origin' has several URLs".to_string()),
+    }
+}
+
+/// F-000045: make `target` a clone of `github_name` fetched from `url`, or
+/// verify that it already is one. Target classes:
+/// * missing or an empty folder → `git clone` (+ the branch checkout). The
+///   incomplete-clone marker is written to the target's canonical parent
+///   BEFORE the first
+///   mutation and removed only after clone AND checkout both succeeded — a
+///   failure leaves it behind together with the leftovers it names;
+/// * an existing clone of the same repo (origin matches `github_name` via the
+///   exact GitHub matcher) → `ExistingClone`, nothing touched;
+/// * anything else (a file, an unreadable folder, another repo, a non-empty
+///   non-git folder, a nested folder of another repo) → `Invalid`;
+/// * a target with a leftover incomplete-clone marker → `Invalid` naming the
+///   marker (review follow-up: a valid `.git` plus a matching origin only
+///   proves a non-bare root of the right repo — a clone whose checkout failed
+///   looks exactly like that, and a blind retry would bind a broken tree).
+///   Nothing is ever deleted for the user: the marker message names what to
+///   remove by hand.
+pub fn prepare_clone_target(
+    git: &GitBinary,
+    url: &str,
+    github_name: &str,
+    target: &Path,
+    branch: &str,
+) -> Result<ClonePrep, CloneTargetError> {
+    let invalid = CloneTargetError::Invalid;
+    // First, the unfinished-attempt marker: while it exists the folder's state
+    // is unproven, so the target must not be adopted as an ExistingClone.
+    // R4: a marker location that cannot even be RESOLVED is itself a refusal
+    // — searching with an invented key could miss a leftover marker (binding
+    // an incomplete clone) or collide with another target's.
+    match clone_incomplete_marker_resolved(target) {
+        Err(why) => return Err(invalid(why)),
+        Ok(Some(marker)) => {
+            if marker.exists() {
+                return Err(invalid(format!(
+                    "{} holds the leftovers of an unfinished clone attempt (marker {}); \
+                     nothing was touched - delete the marker and, if unwanted, the folder, then retry",
+                    target.display(),
+                    marker.display()
+                )));
+            }
+        }
+        Ok(None) => {}
+    }
+    if target.exists() {
+        if !target.is_dir() {
+            return Err(invalid(format!("{} is a file", target.display())));
+        }
+        // A folder we cannot list is a refusal, not an "empty folder".
+        let empty = std::fs::read_dir(target)
+            .map_err(|e| invalid(format!("{} cannot be read: {}", target.display(), e)))?
+            .next()
+            .is_none();
+        if !empty {
+            let origin = origin_url_of_worktree_root(git, target).map_err(invalid)?;
+            if !crate::git_ops::remote_matches_github(&origin, github_name) {
+                return Err(invalid(format!(
+                    "{} already holds another repository or foreign files",
+                    target.display()
+                )));
+            }
+            return Ok(ClonePrep::ExistingClone);
+        }
+    }
+    // The picked folder is the clone root itself; git hosts the run from the
+    // parent, which must exist (the target does not yet).
+    let cwd = target.parent().ok_or_else(|| {
+        invalid(format!(
+            "{} has no parent folder to clone from",
+            target.display()
+        ))
+    })?;
+    if !cwd.is_dir() {
+        return Err(invalid(format!(
+            "the parent folder {} does not exist",
+            cwd.display()
+        )));
+    }
+    // Marker first (F-000045 review): from here on the target is mutated, and
+    // until clone AND checkout both succeed its contents are unproven — a
+    // partial clone looks exactly like a complete one. The marker sits in the
+    // parent, so writing it cannot dirty anything git is about to create; if
+    // the write itself fails, nothing has been cloned yet → `Invalid`.
+    mark_clone_incomplete(target).map_err(invalid)?;
+    let checked_out = match clone_repo(git, url, cwd, target) {
+        // The marker stays after a failure — that is the point: the next
+        // attempt at the same target is refused until the user has removed
+        // the leftovers (and the marker) by hand.
+        Err(e) => return Err(CloneTargetError::Failed(e)),
+        Ok(()) => match checkout_remote_branch_if_present(git, target, branch) {
+            Ok(checked_out) => checked_out,
+            Err(e) => {
+                return Err(CloneTargetError::Failed(NetError {
+                    kind: NetErrorKind::Other,
+                    message: e,
+                }))
+            }
+        },
+    };
+    // Clone and checkout both succeeded (or the checkout was deliberately
+    // skipped): the target is a proven clone, the marker can go. A failed
+    // removal must not un-prove it, so errors are swallowed inside.
+    clear_clone_incomplete_marker(target);
+    Ok(ClonePrep::FreshClone { checked_out })
+}
+
+// ---------------------------------------------------------------------------
 // Local repo config
 // ---------------------------------------------------------------------------
 
@@ -1325,6 +1743,30 @@ pub fn config_get(git: &GitBinary, repo: &Path, key: &str) -> Result<Option<Stri
     }
     if out.status.code() == Some(1) {
         return Ok(None);
+    }
+    Err(failure("config", &out))
+}
+
+/// F-000045: every value of a (possibly multi-valued) local config key, via
+/// `--get-all`. An absent key is an empty vec. The clone attach check uses it
+/// so an ambiguous `remote.origin.url` is a refusal, not a silent pick.
+pub fn config_get_all(git: &GitBinary, repo: &Path, key: &str) -> Result<Vec<String>, String> {
+    validate_rev(key)?;
+    let out = run_git(
+        git,
+        repo,
+        &["config", "--local", "--get-all", key],
+        &RunOpts::LOCAL,
+    )
+    .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect());
+    }
+    if out.status.code() == Some(1) {
+        return Ok(Vec::new());
     }
     Err(failure("config", &out))
 }
@@ -1522,8 +1964,11 @@ mod tests {
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn branch_name_validation() {
-        assert!(validate_branch("dev").is_ok());
-        assert!(validate_branch("sdh/shared-1").is_ok());
+        // Good: plain and hierarchical names, dots/dashes/underscores inside.
+        for good in ["dev", "feature/x", "release-1.2", "a.b-c_d", "sdh/shared-1"] {
+            assert!(validate_branch(good).is_ok(), "{good:?} should be valid");
+        }
+        // Bad: git check-ref-format rules, whole-name and per-component.
         for bad in [
             "",
             "-x",
@@ -1535,8 +1980,17 @@ mod tests {
             "x/",
             "a~1",
             "a@{1}",
+            "@",
             "HEAD",
             "head",
+            // F-000045 review, per-'/'-component rules: a component may not
+            // start with '.' nor end with '.lock' (git rejects these, the old
+            // whole-name check let them through — the clone then silently
+            // attached on the default branch).
+            ".hidden",
+            "dev/.hidden",
+            "bad.lock/branch",
+            "dev/",
         ] {
             assert!(validate_branch(bad).is_err(), "{bad:?} should be invalid");
         }
@@ -2341,6 +2795,775 @@ mod tests {
             Some("-weird")
         );
         assert!(config_get(&gb(), &fx.a, "--list").is_err());
+    }
+
+    // ----- F-000045: clone -------------------------------------------------
+
+    #[test]
+    fn github_clone_url_is_plain_https() {
+        // Production builder — checked separately from the transport, which
+        // tests drive with a local path.
+        assert_eq!(
+            github_clone_url("owner/repo"),
+            "https://github.com/owner/repo.git"
+        );
+    }
+
+    /// A bare remote with `default` as its HEAD plus one commit on every name
+    /// in `branches`, pushed from a throw-away seed clone.
+    fn bare_remote(tmp: &TempDir, name: &str, default: &str, branches: &[&str]) -> PathBuf {
+        let remote = tmp.path().join(name);
+        fs::create_dir(&remote).unwrap();
+        g(&remote, &["init", "--bare", "-q"]);
+        let head = format!("refs/heads/{default}");
+        g(&remote, &["symbolic-ref", "HEAD", head.as_str()]);
+        let seed = tmp.path().join(format!("{name}-seed"));
+        fs::create_dir(&seed).unwrap();
+        g(&seed, &["init", "-q"]);
+        g(&seed, &["symbolic-ref", "HEAD", head.as_str()]);
+        configure(&seed);
+        g(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        fs::write(seed.join("README.md"), "hello\n").unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "-q", "-m", "init"]);
+        let default_ref = format!("HEAD:refs/heads/{default}");
+        g(&seed, &["push", "-q", "origin", default_ref.as_str()]);
+        for b in branches {
+            let spec = format!("HEAD:refs/heads/{b}");
+            g(&seed, &["push", "-q", "origin", spec.as_str()]);
+        }
+        remote
+    }
+
+    const CLONE_GH: &str = "owner/repo";
+
+    /// Point a clone's origin at a fictive GitHub URL (no fetch ever happens —
+    /// the matcher only reads the config), so the local-path origin used for
+    /// cloning looks like the production remote.
+    fn fake_github_origin(dir: &Path, github_name: &str) {
+        let url = github_clone_url(github_name);
+        g(dir, &["remote", "set-url", "origin", url.as_str()]);
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_fresh_into_missing_and_empty_folder() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &["shared"]);
+        let url = remote.to_string_lossy().into_owned();
+
+        // Missing folder.
+        let target = tmp.path().join("missing");
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: true }
+        );
+        assert_eq!(
+            g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "dev",
+            "the default branch is already dev: checkout is a no-op"
+        );
+        assert_eq!(g(&target, &["config", "branch.dev.remote"]), "origin");
+
+        // Empty folder: git clones into it as-is (no extra name appended).
+        let empty = tmp.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &empty, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: true }
+        );
+        assert!(empty.join(".git").exists());
+        assert_eq!(g(&empty, &["rev-parse", "--abbrev-ref", "HEAD"]), "dev");
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_prefers_the_configured_branch_over_dev() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &["shared"]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "shared").unwrap(),
+            ClonePrep::FreshClone { checked_out: true }
+        );
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "shared");
+        // A tracking branch was created from the exact remote ref.
+        assert_eq!(g(&target, &["config", "branch.shared.remote"]), "origin");
+        assert_eq!(
+            g(&target, &["config", "branch.shared.merge"]),
+            "refs/heads/shared"
+        );
+        assert_eq!(
+            g(&target, &["rev-parse", "shared"]),
+            g(&target, &["rev-parse", "origin/shared"])
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_without_dev_keeps_the_default_branch() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "main", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+
+        // Bare remote default `main`, no configured branch → dev is wanted but
+        // missing: attach succeeds on `main`, no `dev` is created.
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: false }
+        );
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(g(&target, &["branch", "--list", "dev"]).is_empty());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_with_missing_configured_branch_never_falls_back_to_dev() {
+        let tmp = TempDir::new().unwrap();
+        // Default `main` and a `dev` branch: the configured `staging` does not
+        // exist — the default branch stays and neither branch is created.
+        let remote = bare_remote(&tmp, "remote.git", "main", &["dev"]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "staging").unwrap(),
+            ClonePrep::FreshClone { checked_out: false }
+        );
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(g(&target, &["branch", "--list", "staging"]).is_empty());
+        assert!(
+            g(&target, &["branch", "--list", "dev"]).is_empty(),
+            "no silent dev fallback"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_a_same_named_tag_is_not_a_branch() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "main", &[]);
+        // A tag named `dev` on the remote, but no `dev` branch.
+        let seed = tmp.path().join("remote.git-seed");
+        g(&seed, &["tag", "dev"]);
+        g(&seed, &["push", "-q", "origin", "refs/tags/dev"]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: false }
+        );
+        // The tag came down with the clone, but HEAD stayed on the default
+        // branch and no local `dev` branch was created from it.
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(
+            !g(&target, &["tag", "--list", "dev"]).is_empty(),
+            "the tag exists locally"
+        );
+        assert!(g(&target, &["branch", "--list", "dev"]).is_empty());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_existing_same_repo_attaches_without_touching_it() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &["shared"]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap();
+        // The local-path origin does not match the GitHub name: swap in a
+        // fictive GitHub origin (never fetched) and re-run as the user would.
+        fake_github_origin(&target, "Owner/Repo");
+        g(&target, &["checkout", "-q", "shared"]);
+        fs::write(target.join("README.md"), "local edit\n").unwrap();
+        let head = g(&target, &["rev-parse", "HEAD"]);
+
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, "owner/repo", &target, "dev").unwrap(),
+            ClonePrep::ExistingClone
+        );
+        // Branch, HEAD, index and working files are untouched until the
+        // normal sync runs.
+        assert_eq!(g(&target, &["rev-parse", "--abbrev-ref", "HEAD"]), "shared");
+        assert_eq!(g(&target, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            fs::read_to_string(target.join("README.md")).unwrap(),
+            "local edit\n"
+        );
+        assert!(g(&target, &["status", "--porcelain"]).contains("README.md"));
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_rejects_a_foreign_clone_and_never_touches_it() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap();
+        fake_github_origin(&target, "owner/elsewhere");
+        let head = g(&target, &["rev-parse", "HEAD"]);
+
+        let e = prepare_clone_target(&gb(), &url, "owner/repo", &target, "dev").unwrap_err();
+        match &e {
+            CloneTargetError::Invalid(m) => {
+                assert!(m.contains("another repository"), "{m}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert_eq!(g(&target, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            g(&target, &["config", "--local", "remote.origin.url"]),
+            "https://github.com/owner/elsewhere.git"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_rejects_file_non_git_and_nested_folders() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+
+        // A file.
+        let file = tmp.path().join("a-file");
+        fs::write(&file, "x").unwrap();
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &file, "dev").unwrap_err();
+        assert!(
+            matches!(&e, CloneTargetError::Invalid(m) if m.contains("is a file")),
+            "{e:?}"
+        );
+
+        // A non-empty non-git folder.
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(plain.join("stuff")).unwrap();
+        fs::write(plain.join("stuff/keep.txt"), "x").unwrap();
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &plain, "dev").unwrap_err();
+        assert!(matches!(&e, CloneTargetError::Invalid(_)), "{e:?}");
+        assert!(plain.join("stuff/keep.txt").exists(), "nothing was deleted");
+
+        // A nested folder inside another repo's work tree.
+        let clone_dir = tmp.path().join("clone");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &clone_dir, "dev").unwrap();
+        fake_github_origin(&clone_dir, CLONE_GH);
+        let nested = clone_dir.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("x.txt"), "x").unwrap();
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &nested, "dev").unwrap_err();
+        assert!(
+            matches!(&e, CloneTargetError::Invalid(m) if m.contains("not the repository root")),
+            "{e:?}"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_from_an_unreachable_remote_is_a_net_failure() {
+        let tmp = TempDir::new().unwrap();
+        let url = tmp.path().join("nope.git").to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap_err();
+        match e {
+            CloneTargetError::Failed(net) => assert_eq!(net.kind, NetErrorKind::Network),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_success_and_checkout_skip_clear_the_marker() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+
+        // A full success (clone + checkout) removes the marker.
+        let target = tmp.path().join("t");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap();
+        assert!(!clone_incomplete_marker(&target)
+            .expect("target has a parent")
+            .exists());
+
+        // The justified checkout skip (branch absent on the remote) is also a
+        // fully proven clone — the marker must not survive it either.
+        let other_remote = bare_remote(&tmp, "other.git", "main", &[]);
+        let other_url = other_remote.to_string_lossy().into_owned();
+        let other = tmp.path().join("t2");
+        assert_eq!(
+            prepare_clone_target(&gb(), &other_url, CLONE_GH, &other, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: false }
+        );
+        assert!(!clone_incomplete_marker(&other)
+            .expect("target has a parent")
+            .exists());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_failure_leaves_the_marker_and_a_retry_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+
+        // The clone itself fails: the marker must stay behind.
+        let dead = tmp.path().join("nope.git").to_string_lossy().into_owned();
+        assert!(matches!(
+            prepare_clone_target(&gb(), &dead, CLONE_GH, &target, "dev"),
+            Err(CloneTargetError::Failed(_))
+        ));
+        let marker = clone_incomplete_marker(&target).unwrap();
+        assert!(marker.exists(), "the marker must outlive the failed clone");
+        assert_ne!(marker.parent(), Some(target.as_path()));
+
+        // A retry at the SAME target is refused before anything is touched —
+        // even with a perfectly good remote — and names the leftover.
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap_err();
+        match &e {
+            CloneTargetError::Invalid(m) => assert!(
+                m.contains("unfinished clone") && m.contains(".sdh-clone-incomplete-"),
+                "{m}"
+            ),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert!(marker.exists(), "the refusal deletes nothing");
+
+        // A different target never collides with the leftover marker.
+        let elsewhere = tmp.path().join("elsewhere");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &elsewhere, "dev").unwrap();
+    }
+
+    // ----- R2: marker identity vs equivalent target spellings -------------
+
+    #[test]
+    fn clone_marker_identity_is_stable_across_equivalent_spellings() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let target = sub.join("repo"); // the leaf does NOT exist
+
+        mark_clone_incomplete(&target).unwrap();
+        let marker = clone_incomplete_marker(&target).expect("target has a parent");
+        assert!(marker.exists());
+        // R4: the marker lives next to the target's REAL folder (the parent of
+        // the canonical identity), which is `sub` here — compared through
+        // `canonicalize` because on Windows the identity's parent is a
+        // verbatim `\\?\` path.
+        assert_eq!(
+            marker.parent().and_then(|p| p.canonicalize().ok()),
+            sub.canonicalize().ok(),
+            "the marker lives in the target's parent folder"
+        );
+
+        // The same folder, spelled differently — every spelling must find
+        // the very same marker file.
+        let dot = PathBuf::from(sub.join(".")).join("repo"); // sub/./repo
+        let trailing_sep = PathBuf::from(format!(
+            "{}{}",
+            target.to_string_lossy(),
+            std::path::MAIN_SEPARATOR
+        ));
+        let detour = sub.join("..").join("sub").join("repo"); // sub/../sub/repo
+                                                              // R4: a spelling that dips into the target itself — `target/.git/..`
+                                                              // resolves to `target`, so it must find the very same marker (the
+                                                              // lexical parent of this spelling is `target/.git`, a trap the old
+                                                              // marker DIRECTORY fell into).
+        let via_dotgit = target.join(".git").join("..");
+        for spelling in [&target, &dot, &trailing_sep, &detour, &via_dotgit] {
+            let m = clone_incomplete_marker(spelling).expect("spelling has a parent");
+            assert_eq!(
+                m.file_name(),
+                marker.file_name(),
+                "{}: same marker file",
+                spelling.display()
+            );
+            assert_eq!(
+                m.parent().and_then(|p| p.canonicalize().ok()),
+                sub.canonicalize().ok(),
+                "{}: same marker directory",
+                spelling.display()
+            );
+            assert!(m.exists(), "{}: must find the marker", spelling.display());
+        }
+
+        // The identity may not depend on the leaf existing either: once it
+        // does, the same marker is still resolved.
+        fs::create_dir(&target).unwrap();
+        assert_eq!(
+            clone_incomplete_marker(&target)
+                .expect("target has a parent")
+                .file_name(),
+            marker.file_name()
+        );
+    }
+
+    #[test]
+    fn clone_marker_identity_distinguishes_different_folders() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        fs::create_dir_all(tmp.path().join("other")).unwrap();
+        let target = tmp.path().join("sub").join("repo");
+        mark_clone_incomplete(&target).unwrap();
+        let marker = clone_incomplete_marker(&target).unwrap();
+
+        let other = tmp.path().join("other").join("repo");
+        let other_marker = clone_incomplete_marker(&other).unwrap();
+        assert_ne!(marker.file_name(), other_marker.file_name());
+        assert!(
+            !other_marker.exists(),
+            "no collision with a different folder"
+        );
+    }
+
+    #[test]
+    fn clone_prep_refuses_a_leftover_marker_under_equivalent_spellings() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let target = sub.join("repo"); // still missing: the leftover scenario
+        mark_clone_incomplete(&target).unwrap();
+
+        // The marker check runs before anything else, so no git is ever
+        // spawned: with a bogus binary any spawn would surface as a
+        // `Failed`, while every refusal below must be the marker's `Invalid`.
+        let nogit = GitBinary(PathBuf::from("/definitely/not/git"));
+        let dot = PathBuf::from(sub.join(".")).join("repo");
+        let trailing_sep = PathBuf::from(format!(
+            "{}{}",
+            target.to_string_lossy(),
+            std::path::MAIN_SEPARATOR
+        ));
+        let detour = sub.join("..").join("sub").join("repo");
+        // R4: `target/.git/..` RESOLVES to `target` (whether `target/.git`
+        // exists or not) while its lexical parent is `target/.git` — the old
+        // marker DIRECTORY fell for that and the retry sailed past the
+        // leftover. Every equivalent spelling must be refused, nothing bound.
+        let via_dotgit = target.join(".git").join("..");
+        for spelling in [&target, &dot, &trailing_sep, &detour, &via_dotgit] {
+            let e = prepare_clone_target(
+                &nogit,
+                "https://github.com/owner/repo.git",
+                CLONE_GH,
+                spelling,
+                "dev",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&e, CloneTargetError::Invalid(m) if m.contains("unfinished clone")),
+                "{}: {e:?}",
+                spelling.display()
+            );
+        }
+        // The refusals deleted nothing and cloned nothing.
+        assert!(clone_incomplete_marker(&target).unwrap().exists());
+        assert!(!target.exists());
+
+        // A genuinely different folder is unaffected by the leftover: its own
+        // marker key differs, and the preparation reaches the clone step
+        // (a `Failed` spawn against the bogus binary — not the marker's
+        // `Invalid` refusal). Its failed attempt then leaves ITS OWN marker,
+        // a different file from `target`'s leftover.
+        let elsewhere = sub.join("elsewhere");
+        let e = prepare_clone_target(
+            &nogit,
+            "https://github.com/owner/repo.git",
+            CLONE_GH,
+            &elsewhere,
+            "dev",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, CloneTargetError::Failed(_)),
+            "a different folder must not trip the leftover marker: {e:?}"
+        );
+        assert_ne!(
+            clone_incomplete_marker(&elsewhere)
+                .expect("elsewhere has a parent")
+                .file_name(),
+            clone_incomplete_marker(&target).unwrap().file_name(),
+            "no marker-key collision between different folders"
+        );
+    }
+
+    /// Make `link` a directory alias for `original` (a real junction/symlink
+    /// AT the target level). Windows: a symlink first (needs privileges),
+    /// then a junction via `cmd /c mklink /J` (no privileges needed).
+    /// `None` when the platform allows no alias: the caller skips the test
+    /// gracefully instead of failing.
+    fn make_dir_alias(original: &Path, link: &Path) -> Option<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link).ok()
+        }
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(original, link).is_ok() {
+                return Some(());
+            }
+            // `mklink` is a cmd builtin, so it must go through cmd /C.
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(original)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|_| ())
+        }
+    }
+
+    #[test]
+    fn clone_prep_refuses_a_leftover_marker_through_a_target_alias() {
+        let tmp = TempDir::new().unwrap();
+        let real_parent = tmp.path().join("real");
+        let real = real_parent.join("repo");
+        fs::create_dir_all(&real).unwrap();
+        let alias_parent = tmp.path().join("work");
+        fs::create_dir_all(&alias_parent).unwrap();
+        let alias = alias_parent.join("repo");
+        let Some(()) = make_dir_alias(&real, &alias) else {
+            eprintln!("skipping: no directory alias could be created on this host");
+            return;
+        };
+
+        // The leftover marker is created through the ALIAS: it must land
+        // next to the REAL folder (the canonical parent), never next to the
+        // alias spelling.
+        mark_clone_incomplete(&alias).unwrap();
+        let via_real = clone_incomplete_marker(&real).expect("real has a parent");
+        assert!(
+            via_real.exists(),
+            "a marker written through the alias must be found at the real folder"
+        );
+        assert_eq!(
+            clone_incomplete_marker(&alias)
+                .expect("alias has a parent")
+                .file_name(),
+            via_real.file_name(),
+            "alias and real spellings resolve the same marker"
+        );
+
+        // Refusing through the alias needs no git (the marker check runs
+        // first) — the bogus binary would surface as `Failed`.
+        let nogit = GitBinary(PathBuf::from("/definitely/not/git"));
+        for spelling in [&alias, &real] {
+            let e = prepare_clone_target(
+                &nogit,
+                "https://github.com/owner/repo.git",
+                CLONE_GH,
+                spelling,
+                "dev",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&e, CloneTargetError::Invalid(m) if m.contains("unfinished clone")),
+                "{}: {e:?}",
+                spelling.display()
+            );
+        }
+        // Nothing was bound or mutated by the refusals.
+        assert!(via_real.exists());
+        assert!(real.read_dir().expect("real is readable").next().is_none());
+
+        // A genuinely different folder in the alias's parent is unaffected.
+        let unrelated = alias_parent.join("unrelated");
+        let e = prepare_clone_target(
+            &nogit,
+            "https://github.com/owner/repo.git",
+            CLONE_GH,
+            &unrelated,
+            "dev",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, CloneTargetError::Failed(_)),
+            "an unrelated folder must not trip the alias's marker: {e:?}"
+        );
+
+        // Remove the alias itself (not its target) so TempDir cleanup is safe.
+        let _ = fs::remove_dir(&alias);
+    }
+
+    #[test]
+    fn clone_target_identity_reports_a_failing_canonicalization() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let target = sub.join("repo"); // missing leaf: the walk stops at `sub`
+
+        // Injected canonicalize that fails for the EXISTING ancestor: the
+        // prefix must not be silently dropped (R4 — that left an empty,
+        // unstable identity); the failure propagates and names the folder.
+        let e = clone_target_identity_with(&target, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "locked",
+            ))
+        })
+        .unwrap_err();
+        assert!(e.contains("could not resolve"), "{e}");
+        assert!(e.contains("sub"), "{e}");
+
+        // The marker layer propagates the same failure rather than
+        // inventing a key — driven through its own injected seam, since the
+        // real filesystem canonicalizes this target just fine.
+        assert!(clone_incomplete_marker_resolved_with(&target, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "locked",
+            ))
+        })
+        .is_err());
+
+        // Sanity: with the real canonicalize the same target resolves fine.
+        assert!(clone_target_identity(&target).is_ok());
+        assert!(clone_incomplete_marker_resolved(&target).is_ok());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_refuses_a_leftover_marker_over_a_valid_clone() {
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("t");
+        assert_eq!(
+            prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap(),
+            ClonePrep::FreshClone { checked_out: true }
+        );
+        fake_github_origin(&target, CLONE_GH);
+
+        // Without a marker this exact clone would bind as an ExistingClone;
+        // with one on top (a clone whose checkout failed leaves exactly this
+        // picture) the retry must still be refused — through an equivalent
+        // spelling of the same folder as well.
+        mark_clone_incomplete(&target).unwrap();
+        let dot = PathBuf::from(tmp.path().join(".")).join("t");
+        for spelling in [&target, &dot] {
+            let e = prepare_clone_target(&gb(), &url, CLONE_GH, spelling, "dev").unwrap_err();
+            assert!(
+                matches!(&e, CloneTargetError::Invalid(m) if m.contains("unfinished clone")),
+                "{}: {e:?}",
+                spelling.display()
+            );
+        }
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn origin_url_of_worktree_root_bare_plain_and_linked_worktree() {
+        let tmp = TempDir::new().unwrap();
+        // Bare: no working tree at all.
+        let bare = bare_remote(&tmp, "remote.git", "dev", &[]);
+        assert!(origin_url_of_worktree_root(&gb(), &bare).is_err());
+        // Not a git repository.
+        let plain = tmp.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        assert!(origin_url_of_worktree_root(&gb(), &plain).is_err());
+        // A linked worktree carries a `.git` file, not a folder.
+        let clone_dir = tmp.path().join("clone");
+        let url = bare.to_string_lossy().into_owned();
+        prepare_clone_target(&gb(), &url, CLONE_GH, &clone_dir, "dev").unwrap();
+        fake_github_origin(&clone_dir, CLONE_GH);
+        assert_eq!(
+            origin_url_of_worktree_root(&gb(), &clone_dir).unwrap(),
+            "https://github.com/owner/repo.git"
+        );
+        let wt = tmp.path().join("wt");
+        g(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt-branch",
+                wt.to_str().unwrap(),
+            ],
+        );
+        assert!(wt.join(".git").is_file());
+        assert_eq!(
+            origin_url_of_worktree_root(&gb(), &wt).unwrap(),
+            "https://github.com/owner/repo.git"
+        );
+        // A clone with no origin at all is refused, not guessed.
+        let no_origin = tmp.path().join("no-origin");
+        prepare_clone_target(&gb(), &url, CLONE_GH, &no_origin, "dev").unwrap();
+        g(&no_origin, &["remote", "remove", "origin"]);
+        assert!(origin_url_of_worktree_root(&gb(), &no_origin).is_err());
+    }
+
+    #[cfg(unix)]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_prep_an_unreadable_folder_is_a_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let remote = bare_remote(&tmp, "remote.git", "dev", &[]);
+        let url = remote.to_string_lossy().into_owned();
+        let target = tmp.path().join("locked");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+        let e = prepare_clone_target(&gb(), &url, CLONE_GH, &target, "dev").unwrap_err();
+        assert!(
+            matches!(&e, CloneTargetError::Invalid(m) if m.contains("cannot be read")),
+            "{e:?}"
+        );
+        // Restore so TempDir can clean up.
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn clone_leaves_no_credentials_in_the_error() {
+        let tmp = TempDir::new().unwrap();
+        // Nothing listens on port 9: a connection failure naming the URL.
+        let e = clone_repo(
+            &gb(),
+            "http://user:supersecret@127.0.0.1:9/x.git",
+            tmp.path(),
+            &tmp.path().join("t"),
+        )
+        .unwrap_err();
+        assert!(!e.message.contains("supersecret"), "{}", e.message);
+        assert!(matches!(
+            e.kind,
+            NetErrorKind::Network | NetErrorKind::Timeout
+        ));
+    }
+
+    #[test]
+    fn clone_target_must_be_absolute() {
+        let e = clone_repo(
+            &gb(),
+            "https://github.com/owner/repo.git",
+            Path::new("/definitely/exists"),
+            Path::new("relative/target"),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, NetErrorKind::Other);
+        assert!(e.message.contains("absolute"), "{}", e.message);
+    }
+
+    #[test]
+    fn clone_prep_parent_must_exist() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("no/such/parent/t");
+        let e = prepare_clone_target(
+            &gb(),
+            "https://github.com/owner/repo.git",
+            CLONE_GH,
+            &target,
+            "dev",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, CloneTargetError::Invalid(m) if m.contains("parent folder")),
+            "{e:?}"
+        );
     }
 
     // ----- merge_or_abort ---------------------------------------------------

@@ -93,6 +93,11 @@ pub fn run() {
             Some(report).filter(|r| !r.is_quiet())
         });
 
+    // T-000241: the rule-proposal channel's startup sweep — unfinished
+    // decisions resume, owed receipts retry, terminal proposal rows are
+    // GC'd. Per-repo, best effort; failures only delay a retry.
+    commands::rule_proposals::sweep_rule_channels_at_startup(&db);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -161,6 +166,8 @@ pub fn run() {
             commands::misc::delete_pat,
             // local_path
             commands::repo::set_repo_local_path,
+            // F-000045: clone a repo that has no local folder
+            commands::repo::clone_repo_to,
             commands::repo::update_repo_description,
             // Repo deletion (B-003)
             commands::repo::delete_repository,
@@ -236,6 +243,7 @@ pub fn run() {
             // F-000044: shared (contributor-mode) repos
             commands::shared::shared_mode_preflight,
             commands::shared::enable_shared_mode,
+            commands::shared::set_repo_share_specs,
             commands::shared::set_shared_admin_verified,
             commands::shared::disable_shared_mode,
             commands::shared::approve_join_request,
@@ -255,6 +263,11 @@ pub fn run() {
             commands::templates::list_rule_events,
             commands::templates::get_rule_conflict,
             commands::templates::resolve_rule_conflict,
+            commands::rule_proposals::list_rule_proposals,
+            commands::rule_proposals::list_rule_acceptances,
+            commands::rule_proposals::withdraw_rule_proposal,
+            commands::rule_proposals::decide_rule_proposal,
+            commands::rule_proposals::resolve_rule_acceptance_conflict,
             // Deploy (0.7.0 / v0.18.0 multi-env)
             commands::deploy::set_deploy_target,
             commands::deploy::get_repo_deploy_config,

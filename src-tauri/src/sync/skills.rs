@@ -218,6 +218,164 @@ pub(crate) fn rules_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// T-000243 review (twentieth/twenty-first passes): rendezvous probes for
+// the phase-2 repo render. `REPO_RENDER_PROBES` fires BEFORE the repo's
+// policy guard is taken — a test can land a repath or a role change in
+// exactly the window the review found, and the render must revalidate
+// and skip. `REPO_RENDER_RECHECK_PROBES` fires AFTER the recheck passed,
+// still inside the guard hold — a test can prove the guard is held
+// through the write. Both are keyed by (repo id, checkout path): the
+// path separates parallel tests' independent databases, whose first
+// repo ids collide (same isolation `shared.rs`' probes use).
+#[cfg(test)]
+struct RepoRenderProbe {
+    entered: std::sync::mpsc::Sender<i64>,
+    /// Taken on the first fire — the rendezvous happens once.
+    release: Option<std::sync::mpsc::Receiver<i64>>,
+    /// Fires when the acquisition observed the guard busy — proof the
+    /// render serialized on a live holder rather than slipping past.
+    contended: std::sync::mpsc::Sender<i64>,
+}
+
+#[cfg(test)]
+type ProbeMap = Mutex<std::collections::HashMap<(i64, PathBuf), RepoRenderProbe>>;
+
+#[cfg(test)]
+static REPO_RENDER_PROBES: std::sync::OnceLock<ProbeMap> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static REPO_RENDER_RECHECK_PROBES: std::sync::OnceLock<ProbeMap> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_repo_render_probe(
+    repo_id: i64,
+    base: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+    contended: std::sync::mpsc::Sender<i64>,
+) {
+    let cell = REPO_RENDER_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo_id, base.to_path_buf()),
+        RepoRenderProbe {
+            entered,
+            release: Some(release),
+            contended,
+        },
+    );
+}
+
+#[cfg(test)]
+fn install_repo_render_recheck_probe(
+    repo_id: i64,
+    base: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell =
+        REPO_RENDER_RECHECK_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo_id, base.to_path_buf()),
+        RepoRenderProbe {
+            // Unused on this boundary — a dead channel is fine.
+            contended: entered.clone(),
+            entered,
+            release: Some(release),
+        },
+    );
+}
+
+/// The pre-lock rendezvous: signals `entered`, then waits for `release`.
+/// The probe entry stays in the map — `contended` may still need it —
+/// but `release` is taken, so a second pass over the same key does not
+/// rendezvous again. If the test dies, the dropped sender ends the wait
+/// with an error and the render proceeds.
+#[cfg(test)]
+fn repo_render_probe(repo_id: i64, base: &Path) {
+    let key = (repo_id, base.to_path_buf());
+    let cell = REPO_RENDER_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let rx = {
+        let mut g = cell.lock().unwrap();
+        g.get_mut(&key).and_then(|p| {
+            p.release.take().map(|rx| {
+                let _ = p.entered.send(repo_id);
+                rx
+            })
+        })
+    };
+    if let Some(rx) = rx {
+        // The render has NOT taken the policy guard yet — whatever the
+        // test interleaves here lands before the freshness recheck.
+        let _ = rx.recv();
+    }
+}
+
+/// The post-recheck rendezvous: the recheck passed and the policy guard
+/// is still held. Same once-only contract as `repo_render_probe`.
+#[cfg(test)]
+fn repo_render_recheck_probe(repo_id: i64, base: &Path) {
+    let key = (repo_id, base.to_path_buf());
+    let cell =
+        REPO_RENDER_RECHECK_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let rx = {
+        let mut g = cell.lock().unwrap();
+        g.get_mut(&key).and_then(|p| {
+            p.release.take().map(|rx| {
+                let _ = p.entered.send(repo_id);
+                rx
+            })
+        })
+    };
+    if let Some(rx) = rx {
+        let _ = rx.recv();
+    }
+}
+
+/// Report a contended acquisition, if a probe is installed for the key.
+#[cfg(test)]
+fn repo_render_contended(repo_id: i64, base: &Path) {
+    let cell = REPO_RENDER_PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let g = cell.lock().unwrap();
+    if let Some(p) = g.get(&(repo_id, base.to_path_buf())) {
+        let _ = p.contended.send(repo_id);
+    }
+}
+
+/// The phase-2 policy-guard acquisition. Production: a plain blocking
+/// lock. Under `cfg(test)` the pre-lock rendezvous fires first, then a
+/// `try_lock` that observes the guard busy reports `contended` before
+/// the blocking wait — proof the render serialized on a live holder.
+#[cfg(not(test))]
+fn lock_repo_policy<'a>(
+    arc: &'a Mutex<()>,
+    _repo_id: i64,
+    _base: &Path,
+) -> std::sync::MutexGuard<'a, ()> {
+    arc.lock().unwrap()
+}
+
+#[cfg(test)]
+fn lock_repo_policy<'a>(
+    arc: &'a Mutex<()>,
+    repo_id: i64,
+    base: &Path,
+) -> std::sync::MutexGuard<'a, ()> {
+    repo_render_probe(repo_id, base);
+    match arc.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            repo_render_contended(repo_id, base);
+            arc.lock().unwrap()
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            // Production's `lock().unwrap()` refuses a poisoned mutex —
+            // the instrumentation must not recover what shipping code
+            // would not (T-000243 review, twenty-second pass).
+            arc.lock().unwrap()
+        }
+    }
+}
+
 /// Marker dropped beside a rendered skill copy: this copy was edited on purpose
 /// and the owner has already approved the text. A suffix rather than a prefix so
 /// it sorts next to the file it belongs to, and so the prune pass — which only
@@ -315,6 +473,8 @@ struct Collected {
     errors: Vec<SyncIssue>,
     /// T-000206: see `RulesRefresh::quiet_conflicts`.
     quiet_conflicts: Vec<String>,
+    /// T-000241: skills whose edit was proposed to a shared repo's owner.
+    proposed: Vec<String>,
 }
 
 /// One repo's handed-back copy of a skill, as found beside its marker.
@@ -335,6 +495,9 @@ struct Found {
     /// Skill -> its handed-back copies; sorted by skill, copies by label, so
     /// reports and reason files read the same on every pass.
     handed: Vec<(String, Vec<HandedCopy>)>,
+    /// T-000241: skill -> the proposal candidates of contributor-role repos —
+    /// same grouping and conflict settlement as `handed`, a different apply.
+    proposals: Vec<(String, Vec<HandedCopy>)>,
     /// Repos whose `docs/sdh_skills/` was read this pass.
     read: HashSet<i64>,
     /// `(skill, repo id)`: a flagged copy that could not be read.
@@ -462,9 +625,14 @@ fn classify(
 ) -> Found {
     let mut found = Found::default();
     let mut handed: HashMap<String, Vec<HandedCopy>> = HashMap::new();
+    let mut proposals: HashMap<String, Vec<HandedCopy>> = HashMap::new();
     for scan in scans {
         found.read.insert(scan.repo_id);
         let label = scan.label.as_str();
+        // T-000241: a contributor-role repo's markers are proposals to its
+        // owner, never hand-backs and never superseded-by-followed — the
+        // followed rule is exactly what the contributor proposes to change.
+        let contributor = is_contributor_repo(db, scan.repo_id);
         for marker in &scan.markers {
             let name = marker.name.as_str();
             let Some(current) = known.get(name) else {
@@ -475,7 +643,8 @@ fn classify(
                 continue;
             };
             // A rule that follows an owner (shared_canon) has its text from his
-            // repo; a hand-back of it is set aside like the owner's own edit.
+            // repo; a hand-back of it is set aside like the owner's own edit —
+            // on a contributor repo the same flag proposes a change instead.
             // T-000214: the same for a marker older than the owner's last save or
             // reset of the rule, which the owner made while this checkout could
             // not be read (so no pass superseded it then).
@@ -485,7 +654,7 @@ fn classify(
             if stale {
                 out.owner_superseded.insert(name.to_string());
             }
-            if settings_edit == Some(name) || followed.contains(name) || stale {
+            if settings_edit == Some(name) || (!contributor && (followed.contains(name) || stale)) {
                 match remove_if_present(&marker.path) {
                     Ok(()) => {
                         out.superseded.push(format!("{} ({})", name, label));
@@ -518,16 +687,18 @@ fn classify(
                     if let Some(note) = &note {
                         eprintln!("[skills] {} hands back {}: {}", label, name, note);
                     }
-                    handed
-                        .entry(name.to_string())
-                        .or_default()
-                        .push(HandedCopy {
-                            repo_id: scan.repo_id,
-                            label: label.to_string(),
-                            content,
-                            marker: marker.path.clone(),
-                            note,
-                        });
+                    let copy = HandedCopy {
+                        repo_id: scan.repo_id,
+                        label: label.to_string(),
+                        content,
+                        marker: marker.path.clone(),
+                        note,
+                    };
+                    if contributor {
+                        proposals.entry(name.to_string()).or_default().push(copy);
+                    } else {
+                        handed.entry(name.to_string()).or_default().push(copy);
+                    }
                 }
                 Err(e) => {
                     found.unread.insert((name.to_string(), scan.repo_id));
@@ -542,7 +713,43 @@ fn classify(
         copies.sort_by(|a, b| a.label.cmp(&b.label));
     }
     found.handed = handed;
+    let mut proposals: Vec<(String, Vec<HandedCopy>)> = proposals.into_iter().collect();
+    proposals.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, copies) in &mut proposals {
+        copies.sort_by(|a, b| a.label.cmp(&b.label));
+    }
+    found.proposals = proposals;
     found
+}
+
+/// T-000241: `repo_id` is a contributor-role shared repo — its markers are
+/// proposals to its owner, not hand-backs.
+fn is_contributor_repo(db: &AppDb, repo_id: i64) -> bool {
+    db.get_shared_state(repo_id)
+        .map(|s| s.shared_role.as_deref() == Some("contributor"))
+        .unwrap_or(false)
+}
+
+/// The owner (main) login of the shared repo `repo_id`: a followed rule's
+/// entry names it directly; when nothing is followed yet, the structure file
+/// in the checkout does.
+fn owner_login_of(db: &AppDb, repo_id: i64, repo: Option<&Repository>) -> String {
+    for f in crate::sync::shared_canon::followed_rules(db).into_values() {
+        if f.repo_id == repo_id {
+            return f.login;
+        }
+    }
+    repo.and_then(|r| r.local_path.as_deref())
+        .map(std::path::Path::new)
+        .and_then(|root| {
+            std::fs::read_to_string(root.join(crate::sync::shared_structure::STRUCTURE_REL_PATH))
+                .ok()
+        })
+        .and_then(|json| {
+            serde_json::from_str::<crate::sync::shared_structure::ProjectStructure>(&json).ok()
+        })
+        .map(|s| s.main.login)
+        .unwrap_or_default()
 }
 
 /// T-000206: decide every conflict that was open before this pass and is not
@@ -823,6 +1030,66 @@ fn take_up(db: &AppDb, name: String, copies: &[HandedCopy], out: &mut Collected)
     out.taken.push(name);
 }
 
+/// T-000241 R1: apply the agreed proposal text as the local canon AND record
+/// the proposal to every contributing repo's owner — one DB transaction per
+/// repo (`create_rule_proposal_txn`), so a crash cannot leave a canon with no
+/// proposal or a proposal that never landed. A re-collected marker of the
+/// same open proposal is idempotent: the row's text already matches, so the
+/// seq is not bumped again. The markers are cleared after the write, the
+/// same way `take_up` clears them.
+fn propose_up(
+    db: &AppDb,
+    repos: &[Repository],
+    name: String,
+    copies: &[HandedCopy],
+    out: &mut Collected,
+) {
+    let login = db.github_login().unwrap_or_default();
+    for copy in copies {
+        let file_name = crate::sync::rule_proposals::proposal_file_name(&name, &login);
+        // A real re-edit reuses the file name with a fresh seq; the same
+        // proposal collected again bumps nothing.
+        let same_open = db
+            .get_rule_proposal(copy.repo_id, &file_name)
+            .ok()
+            .flatten()
+            .is_some_and(|p| {
+                p.status == crate::models::proposal_status::OPEN && p.text == copy.content
+            });
+        if same_open {
+            if let Err(e) = remove_if_present(&copy.marker) {
+                out.rule_failed(&name, copy.marker.display().to_string(), e);
+            }
+            continue;
+        }
+        let repo = repos.iter().find(|r| r.id == copy.repo_id);
+        let main_login = owner_login_of(db, copy.repo_id, repo);
+        match db.create_rule_proposal_txn(
+            copy.repo_id,
+            &file_name,
+            &login,
+            &name,
+            &copy.content,
+            &crate::db::utc_now_rfc3339(),
+            Some(&copy.label),
+            &main_login,
+        ) {
+            Ok(_) => {
+                if let Err(e) = crate::sync::rule_canon::acknowledge(db, &name) {
+                    out.rule_failed(&name, crate::sync::rule_canon::RULE_FORK_CANON_KEY, e);
+                }
+                if let Err(e) = remove_if_present(&copy.marker) {
+                    // The text is already the rule; a surviving marker now sits
+                    // beside a copy equal to the canon and reads as lost.
+                    out.rule_failed(&name, copy.marker.display().to_string(), e);
+                }
+            }
+            Err(e) => out.rule_failed(&name, &file_name, e.to_string()),
+        }
+    }
+    out.proposed.push(name);
+}
+
 /// T-000205: take an approved rule edit back out of a repo's own copy.
 ///
 /// The copies under `docs/sdh_skills/` are normally outputs, rewritten on every
@@ -894,7 +1161,129 @@ fn collect_approved_skill_edits(
             take_up(db, name, &copies, &mut out);
         }
     }
+    // T-000241: contributor proposals get the same grouping and conflict
+    // settlement — two contributor repos proposing different texts of one
+    // skill conflict like two hand-backs would.
+    for (name, copies) in found.proposals {
+        if in_conflict(&copies) {
+            record_conflict(db, repos, &name, &copies, open.get(&name), &mut out);
+        } else if !undecided.contains(&name) {
+            propose_up(db, repos, name, &copies, &mut out);
+        }
+    }
     out.sorted()
+}
+
+/// T-000244: take every rule hand-back marker git still tracks out of the index
+/// of every local checkout — the sweep half of "markers are local service
+/// files".
+///
+/// Dogfooding showed the other half was missing: a contributor's agent
+/// committed the marker together with the rule edit, so the take-up succeeded
+/// while git kept tracking the marker. The app then deleted the worktree file
+/// and left a permanent uncommitted deletion, and a tracked copy coming back
+/// from the remote restored the marker — whose next collection then read as
+/// `lost`, since the copy already equalled the canon.
+///
+/// The sweep is idempotent and runs on every refresh and at startup (startup
+/// does not go through `refresh_rules_locked`): a marker can arrive later, so
+/// there is no "already done" flag and no migration. It takes the FULL list of
+/// repos with a local path, not `rules_repos`: a shared contributor's or
+/// pending helper's checkout renders no copies and collects no markers, but its
+/// branch may still track one. The collection and the render keep their filter.
+///
+/// What it does per checkout: read the markers the INDEX still lists
+/// (`git ls-files`, not the disk — the collection may already have deleted the
+/// worktree file while the index entry keeps the marker in the branch) and
+/// remove each with `git rm --cached`, no `-f`, nothing deleted or overwritten
+/// in the worktree. A checkout that is mid-merge, mid-rebase, unmerged or on a
+/// detached HEAD waits for a safer pass; the index is not touched. Non-git and
+/// missing checkouts, and a machine without git, are skipped silently; anything
+/// else — including a checkout whose state cannot be read — is a `RuleFailed`,
+/// never fatal, so a stuck sweep is never mistaken for a deferred one; the
+/// next pass tries again. Git runs
+/// through `cached_git` / `spawn_cmd` (no console window on Windows) and the
+/// state is read with `git_sync::repo_state` (`--git-path`), so a linked
+/// worktree is judged too, which `git_ops::detect_repo_state` cannot do.
+///
+/// The sweep only stages the deletion. Delivering it to the remote needs an
+/// allowed auto-commit (`sync::autocommit`, `sync::shared`) or the owner's own
+/// commit; until then the remote still carries the marker.
+pub(crate) fn untrack_rule_markers(db: &AppDb, report: &mut RulesRefresh) {
+    let Some(git) = crate::git_ops::cached_git() else {
+        return;
+    };
+    let repos = match db.list_repos_with_local_path(None) {
+        Ok(r) => r,
+        Err(e) => {
+            report.errors.push(
+                SyncIssue::new(SyncIssueCode::RuleFailed, "")
+                    .target("repositories")
+                    .detail(e),
+            );
+            return;
+        }
+    };
+    for repo in &repos {
+        let Some(base) = existing_checkout(repo) else {
+            continue;
+        };
+        if !crate::git_ops::is_git_repo(base) {
+            continue;
+        }
+        match marker_sweep_safe(&git, base) {
+            // A recognized unsafe state waits for a safer pass, silently by
+            // design; a state that cannot be read is reported, never skipped.
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                sweep_failed(report, repo, e);
+                continue;
+            }
+        }
+        let tracked = match crate::git_ops::list_tracked_files(
+            &git,
+            base,
+            crate::git_ops::MARKER_PATHSPECS,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                sweep_failed(report, repo, e);
+                continue;
+            }
+        };
+        if tracked.is_empty() {
+            continue;
+        }
+        match crate::git_ops::untrack_files(&git, base, &tracked) {
+            Ok(r) if r.errors.is_empty() => {}
+            // A chunk that git refused is reported inside a successful
+            // `UntrackReport`, not as an `Err` — both paths are a `RuleFailed`.
+            Ok(r) => sweep_failed(report, repo, r.errors.join("; ")),
+            Err(e) => sweep_failed(report, repo, e),
+        }
+    }
+}
+
+/// May this checkout's index be touched by the marker sweep? Mid-merge /
+/// mid-rebase (a linked worktree included, through `--git-path`), a detached
+/// HEAD and unmerged index entries all postpone it (`Ok(false)`), and the
+/// check is the shared `git_ops::commit_state_safe`. A state that cannot be
+/// READ is an error, not a silent skip: without the report, a stuck sweep is
+/// indistinguishable from a deferred merge. A refusal here never turns into a
+/// forced removal or a re-add.
+fn marker_sweep_safe(git: &crate::git_ops::GitBinary, base: &Path) -> Result<bool, String> {
+    crate::git_ops::commit_state_safe(git, base)
+}
+
+/// One checkout's sweep step failed: reported, never fatal — the next refresh
+/// runs the sweep again.
+fn sweep_failed(report: &mut RulesRefresh, repo: &Repository, e: impl std::fmt::Display) {
+    report.errors.push(
+        SyncIssue::new(SyncIssueCode::RuleFailed, rule_copy_label(repo))
+            .target("docs/sdh_skills/")
+            .detail(e),
+    );
 }
 
 /// T-000206: the error of `resolve_conflict` when the rule has no open
@@ -1009,9 +1398,32 @@ pub fn resolve_conflict(
     };
 
     if let Some(side) = accepted {
-        let file_name = format!("{}{}{}", SKILL_PREFIX, rule, SKILL_SUFFIX);
-        db.upsert_template_file("_global", &file_name, &side.content, true)
+        // T-000241: an accepted contributor side is a proposal to its repo's
+        // owner — the same transaction as `propose_up`, which applies the
+        // text and writes the row atomically.
+        let contributor_side = repos
+            .iter()
+            .find(|r| rule_copy_label(r) == side.repo && is_contributor_repo(db, r.id));
+        if let Some(repo) = contributor_side {
+            let login = db.github_login().unwrap_or_default();
+            let file_name = crate::sync::rule_proposals::proposal_file_name(rule, &login);
+            let main_login = owner_login_of(db, repo.id, Some(repo));
+            db.create_rule_proposal_txn(
+                repo.id,
+                &file_name,
+                &login,
+                rule,
+                &side.content,
+                &crate::db::utc_now_rfc3339(),
+                Some(&side.repo),
+                &main_login,
+            )
             .map_err(|e| e.to_string())?;
+        } else {
+            let file_name = format!("{}{}{}", SKILL_PREFIX, rule, SKILL_SUFFIX);
+            db.upsert_template_file("_global", &file_name, &side.content, true)
+                .map_err(|e| e.to_string())?;
+        }
     }
     let mut out = Collected::default();
     if accepted.is_some() {
@@ -1036,6 +1448,10 @@ pub fn resolve_conflict(
     close_conflict(db, &repos, rule, repo, note, &mut out);
 
     let mut report = refresh_rules_locked(db, claude_dir, RenderScope::Everywhere, Some(rule));
+    // The per-repo renders wait for the rules lock — same defer as
+    // `refresh_rules` (T-000243 review, nineteenth pass).
+    drop(_guard);
+    render_pending_repo_skills(db, &mut report);
     let mut errors = out.errors;
     errors.append(&mut report.errors);
     report.errors = errors;
@@ -1049,7 +1465,11 @@ pub enum RenderScope<'a> {
     /// `~/.claude/skills/` plus every repo with a local checkout.
     Everywhere,
     /// One checkout only (init docs). `~/.claude/skills/` is left alone.
-    Repo(&'a Path),
+    /// The second element is the registered repo the path belongs to, when
+    /// the caller knows it — phase 2 revalidates that identity under the
+    /// repo's policy guard, so a repathed checkout is skipped rather than
+    /// rendered into its stale path (T-000243 review, twentieth pass).
+    Repo(&'a Path, Option<i64>),
     /// `~/.claude/skills/` only (the global-rules button).
     Global,
     /// Nothing of its own: the caller renders the repos it owns afterwards
@@ -1076,8 +1496,14 @@ pub fn refresh_rules(
     scope: RenderScope,
     settings_edit: Option<&str>,
 ) -> RulesRefresh {
-    let _guard = rules_guard();
-    refresh_rules_locked(db, claude_dir, scope, settings_edit)
+    let mut report = {
+        let _guard = rules_guard();
+        refresh_rules_locked(db, claude_dir, scope, settings_edit)
+    };
+    // The per-repo renders run only now — after the rules lock is released,
+    // each serializing on its repo's policy guard (T-000243 review).
+    render_pending_repo_skills(db, &mut report);
+    report
 }
 
 /// The body of `refresh_rules` for a caller that already holds `rules_guard()`
@@ -1094,9 +1520,33 @@ pub(crate) fn refresh_rules_locked(
 
     let collected = collect_approved_skill_edits(db, &repos, settings_edit);
     report.absorb(collected);
+    // T-000244: after the collection, before anything is rendered — the
+    // collection may have taken a marker's worktree file while git still tracks
+    // it, and the render must not be the pass that leaves that behind.
+    untrack_rule_markers(db, &mut report);
     let everywhere = !report.taken.is_empty();
-    render_scope(db, claude_dir, scope, everywhere, &repos, &mut report);
+    render_scope(db, claude_dir, scope, everywhere, &mut report);
     reconcile_fork_canon(db, &mut report);
+    report
+}
+
+/// T-000241 (decision machine, DELIVERY step): render the CURRENT DB canon
+/// to every eligible target — `~/.claude/skills/` plus each repo's
+/// `docs/sdh_skills/` — WITHOUT the collection half of `refresh_rules`: no
+/// hand-back collect, no uptake, no marker cleanup, no owner-save supersede.
+/// Flagged copies keep their markers for a later collection; a held copy is
+/// not a failure (its issue lands in `errors`, like everywhere else).
+pub fn deliver_rules_only(db: &AppDb, claude_dir: Option<&Path>) -> RulesRefresh {
+    let mut report = {
+        let _guard = rules_guard();
+        let mut report = RulesRefresh::default();
+        render_scope(db, claude_dir, RenderScope::Everywhere, true, &mut report);
+        reconcile_fork_canon(db, &mut report);
+        report
+    };
+    // Same defer as `refresh_rules`: the per-repo renders serialize on each
+    // repo's policy guard after the rules lock is released.
+    render_pending_repo_skills(db, &mut report);
     report
 }
 
@@ -1155,62 +1605,193 @@ fn render_scope(
     claude_dir: Option<&Path>,
     scope: RenderScope,
     everywhere: bool,
-    repos: &[Repository],
     report: &mut RulesRefresh,
 ) {
     let everywhere = everywhere || matches!(scope, RenderScope::Everywhere);
     if everywhere {
-        let (skills, touched, errors) =
-            render_skills_everywhere(db, claude_dir, repos, &report.quiet_conflicts);
+        // Only the user-level target renders under the rules lock — it has
+        // no repo lifecycle to race. The per-repo copies are deferred to
+        // `render_pending_repo_skills`, which runs after the lock is
+        // released so each repo can serialize on its own policy guard
+        // without inverting the policy → rules order (T-000243 review,
+        // nineteenth pass).
+        let (skills, errors) = render_global_skills(db, claude_dir);
         report.skills = skills;
-        report.repos = touched;
         report.errors.extend(errors);
-        if !matches!(scope, RenderScope::Repo(_)) {
-            return;
+    }
+    if !everywhere {
+        if let RenderScope::Global = scope {
+            match claude_dir.map(|dir| render_skills_global(db, dir)) {
+                Some(Ok(n)) => report.skills = n,
+                Some(Err(e)) => report.errors.push(claude_skills_issue(e)),
+                None => {}
+            }
         }
     }
-    match scope {
-        RenderScope::Repo(base) => {
-            // Р16: a contributor's / pending helper's checkout takes no rule
-            // copies. `repos` already leaves such a repo out, so it is found by
-            // its path in the whole portfolio.
-            if db
-                .list_all_repos()
-                .map(|all| {
-                    all.iter().any(|r| {
-                        r.local_path.as_deref().map(Path::new) == Some(base)
-                            && skips_rule_copies(db, r.id)
-                    })
-                })
-                .unwrap_or(false)
-            {
-                return;
+    report.pending_repo_render = Some(crate::models::PendingRepoRender {
+        everywhere,
+        repo: match scope {
+            RenderScope::Repo(base, repo_id) => Some(match repo_id {
+                Some(id) => crate::models::PendingRepoTarget::Registered {
+                    repo_id: id,
+                    path: base.to_path_buf(),
+                },
+                None => classify_repo_target(db, report, base),
+            }),
+            _ => None,
+        },
+    });
+}
+
+/// Classify a Repo-scope target the caller could not name by id: a repo
+/// registered at `base` becomes `Registered` — phase 2 revalidates it like
+/// any other — a confirmed miss `Unregistered`, and a failed listing
+/// `Unknown`, which phase 2 renders nothing for: an unmanaged guess could
+/// write into a registered checkout whose binding moved mid-pass
+/// (T-000243 review, twentieth pass).
+fn classify_repo_target(
+    db: &AppDb,
+    report: &mut RulesRefresh,
+    base: &Path,
+) -> crate::models::PendingRepoTarget {
+    match db.list_all_repos() {
+        Ok(all) => match all
+            .iter()
+            .find(|r| r.local_path.as_deref().map(Path::new) == Some(base))
+        {
+            Some(r) => crate::models::PendingRepoTarget::Registered {
+                repo_id: r.id,
+                path: base.to_path_buf(),
+            },
+            None => crate::models::PendingRepoTarget::Unregistered(base.to_path_buf()),
+        },
+        Err(e) => {
+            report
+                .errors
+                .push(SyncIssue::lookup(lookup::REPOS, "").detail(e));
+            crate::models::PendingRepoTarget::Unknown
+        }
+    }
+}
+
+/// Phase 2 of a rules render — the per-repo `docs/sdh_skills/` copies.
+/// MUST run after `rules_guard` is released: each repo is serialized on
+/// its own lifecycle policy guard — a blocking take is safe here because
+/// the policy → rules order `after_fetch → adopt_main_canon` relies on
+/// cannot invert while the rules lock is not held — and revalidated
+/// fresh, so a shared-mode transition landing mid-refresh can neither be
+/// overwritten by a stale snapshot nor lose its delivery: the write
+/// simply waits for the sync (T-000243 review, nineteenth pass).
+pub fn render_pending_repo_skills(db: &AppDb, report: &mut RulesRefresh) {
+    let Some(pending) = report.pending_repo_render.take() else {
+        return;
+    };
+    let mut rendered: HashSet<i64> = HashSet::new();
+    if pending.everywhere {
+        let repos = portfolio_repos(db, report);
+        let mut touched = 0;
+        for repo in &repos {
+            // A stored local_path can point at a checkout that only exists
+            // on another machine — normal portfolio state, skipped silently.
+            let Some(base) = existing_checkout(repo) else {
+                continue;
+            };
+            let guard = crate::sync::shared::specs_policy_guard(repo.id);
+            let _g = lock_repo_policy(&guard, repo.id, base);
+            let current = db.get_repository(repo.id).ok().is_some_and(|fresh| {
+                fresh.local_path.as_deref().map(Path::new)
+                    == repo.local_path.as_deref().map(Path::new)
+                    && !skips_rule_copies(db, repo.id)
+            });
+            if !current {
+                continue;
             }
-            // Rendered even after an everywhere pass: the target may not be among
-            // the stored checkouts, and an unchanged file is not rewritten anyway.
+            // T-000198: the same label the project-sync skeleton pass uses,
+            // so a held copy seen by both renders of one pass is reported
+            // once.
+            let label = rule_copy_label(repo);
+            // The rules lock is retaken for the write itself — policy →
+            // rules, the same order `after_fetch → adopt_main_canon` uses,
+            // so a concurrent pass's collection cannot read a copy mid-
+            // render (and nothing holding the rules lock ever waits on a
+            // policy guard, so the order cannot deadlock).
+            let _rules = rules_guard();
             match render_skills_to_repo(db, base) {
-                // Already rendered (and its held copies reported) by the
-                // everywhere pass when the target is a stored checkout.
-                Ok(_) if everywhere => {}
                 Ok(r) => {
-                    report.repos = 1;
-                    report.errors.extend(
-                        r.held_issues(&base.display().to_string(), &report.quiet_conflicts),
-                    );
+                    touched += 1;
+                    rendered.insert(repo.id);
+                    report
+                        .errors
+                        .extend(r.held_issues(&label, &report.quiet_conflicts));
                 }
                 Err(e) => report.errors.push(
-                    SyncIssue::new(SyncIssueCode::ManagedFileFailed, base.display().to_string())
+                    SyncIssue::new(SyncIssueCode::ManagedFileFailed, label)
                         .target("docs/sdh_skills/")
                         .detail(e),
                 ),
             }
         }
-        RenderScope::Global => match claude_dir.map(|dir| render_skills_global(db, dir)) {
-            Some(Ok(n)) => report.skills = n,
-            Some(Err(e)) => report.errors.push(claude_skills_issue(e)),
-            None => {}
-        },
-        RenderScope::Everywhere | RenderScope::UptakeOnly => {}
+        report.repos = touched;
+        if pending.repo.is_none() {
+            return;
+        }
+    }
+    let Some(target) = pending.repo else {
+        return;
+    };
+    // RenderScope::Repo fallback — rendered even after an everywhere pass:
+    // the target may not be among the stored checkouts. A registered target
+    // gets the same policy-guard serialization and fresh revalidation as the
+    // everywhere loop — and is NEVER downgraded to an unmanaged write when
+    // its binding no longer matches (T-000243 review, twentieth pass). An
+    // unregistered target renders unmanaged; an unknown one renders
+    // nothing. A repo the everywhere pass already rendered is neither
+    // rendered nor counted twice.
+    use crate::models::PendingRepoTarget as Target;
+    match target {
+        Target::Registered { repo_id, path } => {
+            if rendered.contains(&repo_id) {
+                return;
+            }
+            let guard = crate::sync::shared::specs_policy_guard(repo_id);
+            // The guard stays held through the recheck AND the render —
+            // a lifecycle writer cannot interleave between them
+            // (T-000243 review, twenty-first pass).
+            let _g = lock_repo_policy(&guard, repo_id, &path);
+            let current = db.get_repository(repo_id).ok().is_some_and(|fresh| {
+                fresh.local_path.as_deref().map(Path::new) == Some(path.as_path())
+                    && !skips_rule_copies(db, repo_id)
+            });
+            if !current {
+                return;
+            }
+            #[cfg(test)]
+            repo_render_recheck_probe(repo_id, &path);
+            render_fallback_repo(db, report, &path);
+        }
+        Target::Unregistered(path) => render_fallback_repo(db, report, &path),
+        Target::Unknown => {}
+    }
+}
+
+/// The shared tail of a phase-2 fallback render: rules lock, write,
+/// count, report. The caller holds whatever serialization the target
+/// needs — the policy guard for a registered repo (still alive in the
+/// match arm's scope), nothing extra for an unregistered path.
+fn render_fallback_repo(db: &AppDb, report: &mut RulesRefresh, base: &Path) {
+    let _rules = rules_guard();
+    match render_skills_to_repo(db, base) {
+        Ok(r) => {
+            report.repos += 1;
+            report
+                .errors
+                .extend(r.held_issues(&base.display().to_string(), &report.quiet_conflicts));
+        }
+        Err(e) => report.errors.push(
+            SyncIssue::new(SyncIssueCode::ManagedFileFailed, base.display().to_string())
+                .target("docs/sdh_skills/")
+                .detail(e),
+        ),
     }
 }
 
@@ -1220,30 +1801,20 @@ impl RulesRefresh {
         self.lost = collected.lost;
         self.superseded = collected.superseded;
         self.quiet_conflicts = collected.quiet_conflicts;
+        self.proposed = collected.proposed;
         self.errors.extend(collected.errors);
     }
 }
 
-/// T-000203: apply the current rule text everywhere an agent reads it from —
-/// the user-level Claude Code skills plus every repo with a local checkout.
+/// T-000203: apply the current rule text to the user-level Claude Code
+/// skills — the target with no repo lifecycle to race, so it renders under
+/// the rules lock. The per-repo half moved to `render_pending_repo_skills`,
+/// which runs after the lock is released (T-000243 review, nineteenth
+/// pass).
 ///
-/// Until this existed the two targets had unrelated triggers: `~/.claude/skills/`
-/// only on the global-rules button, `docs/sdh_skills/` only on a project sync
-/// (automatic solely for projects opted into auto-sync). An agreed rule could
-/// therefore sit undelivered for days while agents kept working off the old text.
-///
-/// Private since T-000207: reached only through `render_scope`, from
-/// `refresh_rules_locked` and `deliver_rules_at_startup`, both of which collect
-/// the hand-backs in `repos` before this overwrites them.
-///
-/// Returns `(skills, repos, errors)`. Errors are per-target and non-fatal: one
-/// unwritable repo must not stop the rest of the portfolio from being updated.
-fn render_skills_everywhere(
-    db: &AppDb,
-    claude_dir: Option<&Path>,
-    repos: &[Repository],
-    quiet: &[String],
-) -> (usize, usize, Vec<SyncIssue>) {
+/// Returns `(skills, errors)`. Errors are non-fatal: one unwritable target
+/// must not stop the rest of the portfolio from being updated.
+fn render_global_skills(db: &AppDb, claude_dir: Option<&Path>) -> (usize, Vec<SyncIssue>) {
     let mut errors = Vec::new();
     let skills = match claude_dir.map(|dir| render_skills_global(db, dir)) {
         Some(Ok(n)) => n,
@@ -1253,30 +1824,7 @@ fn render_skills_everywhere(
         }
         None => 0,
     };
-    let mut touched = 0;
-    for repo in repos {
-        // A stored local_path can point at a checkout that only exists on
-        // another machine. That is normal portfolio state, not a failure —
-        // skipped silently rather than drowning the real errors.
-        let Some(base) = existing_checkout(repo) else {
-            continue;
-        };
-        // T-000198: the same label the project-sync skeleton pass uses, so a
-        // held copy seen by both renders of one pass is reported once.
-        let label = rule_copy_label(repo);
-        match render_skills_to_repo(db, base) {
-            Ok(r) => {
-                touched += 1;
-                errors.extend(r.held_issues(&label, quiet));
-            }
-            Err(e) => errors.push(
-                SyncIssue::new(SyncIssueCode::ManagedFileFailed, label)
-                    .target("docs/sdh_skills/")
-                    .detail(e),
-            ),
-        }
-    }
-    (skills, touched, errors)
+    (skills, errors)
 }
 
 /// Startup, on every launch: collect pending hand-backs, THEN seed the bundled
@@ -1292,32 +1840,34 @@ fn render_skills_everywhere(
 ///
 /// Returns `None` when there is nothing to tell and nothing was rendered.
 pub fn deliver_rules_at_startup(db: &AppDb, claude_dir: Option<&Path>) -> Option<RulesRefresh> {
-    let _guard = rules_guard();
-    let mut report = RulesRefresh::default();
-    let repos = portfolio_repos(db, &mut report);
-    report.absorb(collect_approved_skill_edits(db, &repos, None));
+    let (mut report, render) = {
+        let _guard = rules_guard();
+        let mut report = RulesRefresh::default();
+        let repos = portfolio_repos(db, &mut report);
+        report.absorb(collect_approved_skill_edits(db, &repos, None));
+        // T-000244: after the collection and before the seed — startup does not go
+        // through `refresh_rules_locked`, so its own sweep lives here.
+        untrack_rule_markers(db, &mut report);
 
-    let seeded = match crate::template_seeder::seed_bundled_templates(db) {
-        Ok(n) => n,
-        Err(e) => {
-            report
-                .errors
-                .push(SyncIssue::lookup(lookup::SEEDING, "").detail(e));
-            0
+        let seeded = match crate::template_seeder::seed_bundled_templates(db) {
+            Ok(n) => n,
+            Err(e) => {
+                report
+                    .errors
+                    .push(SyncIssue::lookup(lookup::SEEDING, "").detail(e));
+                0
+            }
+        };
+        reconcile_fork_canon(db, &mut report);
+        let render = seeded > 0 || !report.taken.is_empty() || !report.lost.is_empty();
+        if render {
+            render_scope(db, claude_dir, RenderScope::UptakeOnly, true, &mut report);
         }
+        (report, render)
     };
-    reconcile_fork_canon(db, &mut report);
-    let render = seeded > 0 || !report.taken.is_empty() || !report.lost.is_empty();
-    if render {
-        render_scope(
-            db,
-            claude_dir,
-            RenderScope::UptakeOnly,
-            true,
-            &repos,
-            &mut report,
-        );
-    }
+    // The per-repo renders run only now — after the rules lock is released
+    // (T-000243 review, nineteenth pass).
+    render_pending_repo_skills(db, &mut report);
     if render || !report.errors.is_empty() {
         Some(report)
     } else {
@@ -2539,7 +3089,7 @@ mod tests {
         let owner = TempDir::new().unwrap();
         repo_with_role(&db, &ordinary, "acme/one", None);
         repo_with_role(&db, &contributor, "acme/two", Some("contributor"));
-        repo_with_role(&db, &pending, "acme/three", Some("pending"));
+        let pending_repo = repo_with_role(&db, &pending, "acme/three", Some("pending"));
         let owner_repo = repo_with_role(&db, &owner, "me/four", Some("main"));
         db.set_shared_mode(owner_repo.id, true).unwrap();
         // The contributor's clone holds the owner's tracked copies, one of them
@@ -2567,9 +3117,282 @@ mod tests {
         assert!(!pending.path().join("docs").exists(), "nothing written");
         assert_eq!(count_render_targets(&db).unwrap(), 2);
         // The single-repo render of init docs honours it too.
-        let report = refresh_rules(&db, None, RenderScope::Repo(pending.path()), None);
+        let report = refresh_rules(
+            &db,
+            None,
+            RenderScope::Repo(
+                Path::new(pending_repo.local_path.as_deref().unwrap()),
+                Some(pending_repo.id),
+            ),
+            None,
+        );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(!pending.path().join("docs").exists());
+    }
+
+    /// Bound a test-side probe wait: the probe map keeps its senders
+    /// alive, so a worker that dies before its rendezvous leaves a bare
+    /// `recv()` connected forever — the wait must fail loudly instead
+    /// (T-000243 review, twenty-second pass).
+    fn probe_recv(rx: &std::sync::mpsc::Receiver<i64>, what: &str) {
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+    }
+
+    /// Remove a test's probe entries at scope end, panic or not — the
+    /// map keeps senders alive, so leftovers would hold channels open
+    /// past the test. Keyed by (repo id, checkout path).
+    struct ProbeCleanup(i64, PathBuf);
+    impl Drop for ProbeCleanup {
+        fn drop(&mut self) {
+            for cell in [&REPO_RENDER_PROBES, &REPO_RENDER_RECHECK_PROBES] {
+                if let Some(cell) = cell.get() {
+                    cell.lock().unwrap().remove(&(self.0, self.1.clone()));
+                }
+            }
+        }
+    }
+
+    /// T-000243 review (twentieth pass): the deferred per-repo render
+    /// rendezvous sits at the phase-2 policy-guard boundary — the worker
+    /// signals it is ABOUT to take the guard, the test lands a lifecycle
+    /// change, and the render must revalidate and skip rather than write
+    /// into the stale binding. The channels live INSIDE the scope so a
+    /// panicking interleave drops the release sender and frees the
+    /// worker before the scope joins (twenty-first pass).
+    #[test]
+    fn a_deferred_render_revalidates_at_the_policy_guard_boundary() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_role(&db, &tmp, "acme/one", None);
+        let rendered = tmp.path().join("docs/sdh_skills/sdh-alpha.md");
+
+        refresh_rules(&db, None, RenderScope::Everywhere, None);
+        assert!(rendered.exists(), "the ordinary repo renders its copies");
+        fs::remove_file(&rendered).unwrap();
+
+        std::thread::scope(|s| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (contended_tx, _contended_rx) = std::sync::mpsc::channel();
+            install_repo_render_probe(repo.id, tmp.path(), entered_tx, release_rx, contended_tx);
+            let _cleanup = ProbeCleanup(repo.id, tmp.path().to_path_buf());
+            let worker = s.spawn(|| {
+                refresh_rules(&db, None, RenderScope::Everywhere, None);
+            });
+            // The worker is parked at the phase-2 boundary — before the guard.
+            probe_recv(&entered_rx, "phase-2 boundary");
+            assert!(!rendered.exists());
+            // A repath lands in the window: the binding the plan captured
+            // is gone, so the render must skip — not write into the stale
+            // path and not fall back to an unmanaged write.
+            crate::sync::shared::rebind_local_path(&db, repo.id, Some("Q:/repathed")).unwrap();
+            release_tx.send(1).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(
+            !rendered.exists(),
+            "a repathed repo renders nothing into its stale path"
+        );
+    }
+
+    /// Same boundary, opposite outcome: with the lifecycle unchanged the
+    /// render proceeds once the guard frees — deferred, never dropped.
+    /// The `contended` signal proves the worker's acquisition actually
+    /// observed the held guard before the test releases it.
+    #[test]
+    fn a_deferred_render_waits_for_a_held_policy_guard_and_still_delivers() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_role(&db, &tmp, "acme/one", None);
+        let rendered = tmp.path().join("docs/sdh_skills/sdh-alpha.md");
+
+        refresh_rules(&db, None, RenderScope::Everywhere, None);
+        assert!(rendered.exists());
+        fs::remove_file(&rendered).unwrap();
+
+        std::thread::scope(|s| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+            install_repo_render_probe(repo.id, tmp.path(), entered_tx, release_rx, contended_tx);
+            let _cleanup = ProbeCleanup(repo.id, tmp.path().to_path_buf());
+            // A lifecycle writer holds the repo's policy guard — a sync's
+            // phase B. The render must WAIT for it, not skip the repo.
+            let policy = crate::sync::shared::specs_policy_guard(repo.id);
+            let held = policy.lock().unwrap();
+            let worker = s.spawn(|| {
+                refresh_rules(&db, None, RenderScope::Everywhere, None);
+            });
+            probe_recv(&entered_rx, "phase-2 boundary");
+            release_tx.send(1).unwrap();
+            // The worker's try_lock observed the busy guard — genuine
+            // contention, not an early arrival — and it now waits on the
+            // blocking acquisition.
+            probe_recv(&contended_rx, "contended acquisition");
+            drop(held);
+            worker.join().unwrap();
+        });
+        assert!(
+            rendered.exists(),
+            "delivery completes once the guard frees — it is deferred, not dropped"
+        );
+    }
+
+    /// The role half of the recheck: a repo that became a contributor or a
+    /// pending helper between the phases takes no rule copies.
+    #[test]
+    fn a_role_change_before_the_deferred_render_skips_the_repo() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_role(&db, &tmp, "acme/one", None);
+        let rendered = tmp.path().join("docs/sdh_skills/sdh-alpha.md");
+
+        refresh_rules(&db, None, RenderScope::Everywhere, None);
+        assert!(rendered.exists());
+        fs::remove_file(&rendered).unwrap();
+
+        std::thread::scope(|s| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (contended_tx, _contended_rx) = std::sync::mpsc::channel();
+            install_repo_render_probe(repo.id, tmp.path(), entered_tx, release_rx, contended_tx);
+            let _cleanup = ProbeCleanup(repo.id, tmp.path().to_path_buf());
+            let worker = s.spawn(|| {
+                refresh_rules(&db, None, RenderScope::Everywhere, None);
+            });
+            probe_recv(&entered_rx, "phase-2 boundary");
+            db.set_shared_role(repo.id, Some("contributor")).unwrap();
+            release_tx.send(1).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(
+            !rendered.exists(),
+            "a repo that stopped taking copies renders nothing"
+        );
+    }
+
+    /// T-000243 review (twentieth pass, major): a Repo-scope target that
+    /// was REGISTERED at plan time and detached before phase 2 must not
+    /// degrade to an unmanaged write into the stale path — the everywhere
+    /// loop rejects the same binding, and so must the fallback.
+    #[test]
+    fn a_repathed_repo_scope_target_is_not_rendered_unmanaged() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_role(&db, &tmp, "acme/one", None);
+        let base = tmp.path().to_path_buf();
+
+        std::thread::scope(|s| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (contended_tx, _contended_rx) = std::sync::mpsc::channel();
+            install_repo_render_probe(repo.id, &base, entered_tx, release_rx, contended_tx);
+            let _cleanup = ProbeCleanup(repo.id, base.clone());
+            let worker = s.spawn(|| {
+                refresh_rules(
+                    &db,
+                    None,
+                    RenderScope::Repo(base.as_path(), Some(repo.id)),
+                    None,
+                );
+            });
+            probe_recv(&entered_rx, "phase-2 boundary");
+            crate::sync::shared::rebind_local_path(&db, repo.id, Some("Q:/repathed")).unwrap();
+            release_tx.send(1).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(
+            !base.join("docs").exists(),
+            "the detached registered target writes nothing — managed or unmanaged"
+        );
+    }
+
+    /// T-000243 review (twenty-first pass, major): the registered
+    /// fallback must hold the policy guard through the render itself —
+    /// a lifecycle writer cannot be allowed between the recheck and the
+    /// write. The recheck rendezvous parks the worker inside the hold; a
+    /// `try_lock` from the test proves the guard is still taken at that
+    /// boundary.
+    #[test]
+    fn the_registered_fallback_holds_the_policy_guard_through_the_render() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_role(&db, &tmp, "acme/one", None);
+        let base = tmp.path().to_path_buf();
+        let rendered = base.join("docs/sdh_skills/sdh-alpha.md");
+
+        std::thread::scope(|s| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            install_repo_render_recheck_probe(repo.id, &base, entered_tx, release_rx);
+            let _cleanup = ProbeCleanup(repo.id, base.clone());
+            let worker = s.spawn(|| {
+                refresh_rules(
+                    &db,
+                    None,
+                    RenderScope::Repo(base.as_path(), Some(repo.id)),
+                    None,
+                );
+            });
+            // Parked post-recheck, inside the guard hold.
+            probe_recv(&entered_rx, "post-recheck boundary");
+            let policy = crate::sync::shared::specs_policy_guard(repo.id);
+            assert!(
+                matches!(policy.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                "the policy guard must still be held at the write boundary"
+            );
+            release_tx.send(1).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(rendered.exists(), "the render completes after release");
+    }
+
+    /// An unregistered Repo target still renders unmanaged, and an uptake
+    /// that widened the scope to everywhere counts BOTH the loop renders
+    /// and the fallback — the fallback must add, not replace, the count.
+    #[test]
+    fn an_uptake_everywhere_pass_counts_the_unregistered_repo_target() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let stray = TempDir::new().unwrap();
+        let (_repo, skills) = rendered_repo(&db, &tmp, "a");
+        hand_back(&skills, "sdh-alpha", "ALPHA REVISED", "approved");
+
+        let report = refresh_rules(&db, None, RenderScope::Repo(stray.path(), None), None);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.repos, 2,
+            "the registered repo plus the unregistered target"
+        );
+        assert!(stray.path().join("docs/sdh_skills/sdh-alpha.md").exists());
+    }
+
+    /// The dedup half: a registered Repo target the everywhere pass
+    /// already rendered is neither rendered nor counted twice.
+    #[test]
+    fn a_registered_repo_target_already_rendered_is_not_counted_twice() {
+        let db = db_with_skill();
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let (_repo_a, skills_a) = rendered_repo(&db, &tmp_a, "a");
+        let repo_b = repo_with_role(&db, &tmp_b, "b", None);
+        hand_back(&skills_a, "sdh-alpha", "ALPHA REVISED", "approved");
+        let b_path = PathBuf::from(repo_b.local_path.clone().unwrap());
+
+        let report = refresh_rules(
+            &db,
+            None,
+            RenderScope::Repo(b_path.as_path(), Some(repo_b.id)),
+            None,
+        );
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.repos, 2,
+            "repo a and repo b once each — b's fallback is deduped"
+        );
     }
 
     #[test]
@@ -2969,5 +3792,617 @@ mod tests {
             .path()
             .join("docs/sdh_skills/sdh-cross-repo-req-send.md")
             .exists());
+    }
+
+    // ── T-000244: markers must never stay git-tracked ────────────────────────
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git invocation failed");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `git` that is allowed to fail (a conflicted merge is the point here).
+    fn git_conflict(dir: &Path, args: &[&str]) {
+        let _ = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output();
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Paths the index still lists for one pathspec.
+    fn ls_files(dir: &Path, spec: &str) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args(["ls-files", "-z", "--", spec])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// `<status> <path>` of everything staged against HEAD.
+    fn staged_status(dir: &Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-status", "-z"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let fields: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
+        fields
+            .chunks(2)
+            .map(|c| format!("{} {}", c[0], c[1]))
+            .collect()
+    }
+
+    fn init_git(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "t@example.com"]);
+        git(dir, &["config", "user.name", "T"]);
+        git(dir, &["symbolic-ref", "HEAD", "refs/heads/master"]);
+    }
+
+    /// A git checkout of `dir` whose HEAD tracks the rendered rule copies and
+    /// `marker` beside them — what a contributor's agent leaves behind when it
+    /// commits the marker together with the rule edit. Returns the repo row.
+    fn git_repo_with_tracked_marker(
+        db: &AppDb,
+        dir: &Path,
+        name: &str,
+        marker: &str,
+        note: &str,
+    ) -> Repository {
+        init_git(dir);
+        render_skills_to_repo(db, dir).unwrap();
+        fs::write(dir.join("docs/sdh_skills").join(marker), note).unwrap();
+        git(dir, &["add", "-A", "."]);
+        git(dir, &["commit", "-q", "-m", "marker committed by an agent"]);
+        db.insert_local_repository(&dir.to_string_lossy(), name, None, None)
+            .unwrap()
+    }
+
+    fn marker_sweep(db: &AppDb) -> RulesRefresh {
+        let mut report = RulesRefresh::default();
+        untrack_rule_markers(db, &mut report);
+        report
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_untracks_a_tracked_marker_and_keeps_the_worktree_file() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved");
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/one",
+            "sdh-alpha.md.approved",
+            "approved in chat\n",
+        );
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.approved").is_empty(),
+            "no marker in the index any more"
+        );
+        assert!(ls_files(tmp.path(), "docs/sdh_skills/*.conflict").is_empty());
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "approved in chat\n",
+            "the live marker is byte-for-byte intact"
+        );
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.approved".to_string()],
+            "the deletion is staged, waiting for an allowed commit"
+        );
+        assert!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.md")
+                .contains(&"docs/sdh_skills/sdh-alpha.md".to_string()),
+            "the rule copy keeps its tracking"
+        );
+
+        // Idempotent: a second sweep changes nothing.
+        let again = marker_sweep(&db);
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.approved".to_string()]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_untracks_a_tracked_conflict_reason_file() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/two",
+            "sdh-alpha.md.conflict",
+            "# Hand-back not taken: conflict\n",
+        );
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(ls_files(tmp.path(), "docs/sdh_skills/*.conflict").is_empty());
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.conflict".to_string()]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_without_tracked_markers_is_a_noop() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        init_git(tmp.path());
+        render_skills_to_repo(&db, tmp.path()).unwrap();
+        // Untracked marker beside the copies: nothing to untrack.
+        fs::write(
+            tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "approved\n",
+        )
+        .unwrap();
+        git(tmp.path(), &["add", "docs/sdh_skills/sdh-alpha.md"]);
+        git(tmp.path(), &["commit", "-q", "-m", "copies"]);
+        fs::write(
+            tmp.path().join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "approved\n",
+        )
+        .unwrap();
+        db.insert_local_repository(&tmp.path().to_string_lossy(), "acme/three", None, None)
+            .unwrap();
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(staged_status(tmp.path()).is_empty(), "no change staged");
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_refresh_untracks_a_marker_whose_worktree_file_the_collection_deleted() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let skills = tmp.path().join("docs/sdh_skills");
+        // A marker beside an UNCHANGED copy: the collection reports it lost and
+        // deletes the worktree marker before the sweep runs. The index entry is
+        // what the sweep has to find.
+        git_repo_with_tracked_marker(&db, tmp.path(), "acme/four", "sdh-alpha.md.approved", "x\n");
+        let label = tmp.path().to_string_lossy().to_string();
+
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+
+        assert_eq!(report.lost, vec![format!("sdh-alpha ({})", label)]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            !skills.join("sdh-alpha.md.approved").exists(),
+            "the collection took the worktree marker"
+        );
+        assert!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.approved").is_empty(),
+            "the sweep still found the index entry"
+        );
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.approved".to_string()]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_startup_untracks_a_tracked_marker_without_a_new_seed() {
+        let tmp = TempDir::new().unwrap();
+        let db = AppDb::new(tmp.path().join("test.db")).unwrap();
+        db.upsert_template_file("_global", "skill.sdh-alpha.md.tmpl", "ALPHA BODY", false)
+            .unwrap();
+        crate::template_seeder::seed_bundled_templates(&db).unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        git_repo_with_tracked_marker(
+            &db,
+            repo_dir.path(),
+            "acme/five",
+            "sdh-debugging.md.approved",
+            "approved\n",
+        );
+
+        deliver_rules_at_startup(&db, None);
+
+        assert!(
+            ls_files(repo_dir.path(), "docs/sdh_skills/*.approved").is_empty(),
+            "startup swept the marker out of the index"
+        );
+        assert_eq!(
+            staged_status(repo_dir.path()),
+            vec!["D docs/sdh_skills/sdh-debugging.md.approved".to_string()]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_a_sweep_before_the_collection_leaves_a_pending_handback_alone() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let skills = tmp.path().join("docs/sdh_skills");
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/six",
+            "sdh-alpha.md.approved",
+            "approved\n",
+        );
+        // The agent edited its copy and re-dropped the marker: a pending
+        // hand-back whose marker git also tracks.
+        fs::write(skills.join("sdh-alpha.md"), "ALPHA REVISED\n").unwrap();
+        git(tmp.path(), &["add", "-A", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "edit + marker"]);
+
+        marker_sweep(&db);
+
+        assert_eq!(
+            fs::read_to_string(skills.join("sdh-alpha.md")).unwrap(),
+            "ALPHA REVISED\n",
+            "the sweep does not touch the text"
+        );
+        assert_eq!(
+            fs::read_to_string(skills.join("sdh-alpha.md.approved")).unwrap(),
+            "approved\n",
+            "nor the marker"
+        );
+        assert!(ls_files(tmp.path(), "docs/sdh_skills/*.approved").is_empty());
+
+        // And the full refresh still takes the edit, keeping the staged
+        // deletion of the marker alive through the take-up.
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+
+        assert_eq!(report.taken, vec!["sdh-alpha".to_string()]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!skills.join("sdh-alpha.md.approved").exists());
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.approved".to_string()]
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_covers_a_shared_contributor_checkout_but_collects_nothing_there() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/seven",
+            "sdh-alpha.md.approved",
+            "approved\n",
+        );
+        // The agent edited the copy before handing back: were the collection to
+        // reach this checkout, the text would be taken up.
+        fs::write(
+            tmp.path().join("docs/sdh_skills/sdh-alpha.md"),
+            "ALPHA REVISED\n",
+        )
+        .unwrap();
+        git(tmp.path(), &["add", "-A", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "edit + marker"]);
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        assert!(
+            skips_rule_copies(&db, repo.id),
+            "the uptake filter is unchanged"
+        );
+
+        let report = marker_sweep(&db);
+        // The collection of a real refresh runs over `rules_repos`, which
+        // leaves a contributor's checkout out — its uptake filter is unchanged.
+        let repos: Vec<Repository> = db
+            .list_repos_with_local_path(None)
+            .unwrap()
+            .into_iter()
+            .filter(|r| !skips_rule_copies(&db, r.id))
+            .collect();
+        let collected = collect_approved_skill_edits(&db, &repos, None);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(ls_files(tmp.path(), "docs/sdh_skills/*.approved").is_empty());
+        assert_eq!(
+            staged_status(tmp.path()),
+            vec!["D docs/sdh_skills/sdh-alpha.md.approved".to_string()]
+        );
+        assert!(
+            collected.taken.is_empty(),
+            "a contributor hands nothing back"
+        );
+    }
+
+    #[test]
+    fn test_sweep_skips_non_git_and_missing_checkouts_without_an_error() {
+        let db = db_with_skill();
+        let plain = TempDir::new().unwrap();
+        render_skills_to_repo(&db, plain.path()).unwrap();
+        fs::write(
+            plain.path().join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "approved\n",
+        )
+        .unwrap();
+        db.insert_local_repository(&plain.path().to_string_lossy(), "acme/plain", None, None)
+            .unwrap();
+        insert_repo(&db, "acme/ghost", "F:/definitely/not/cloned/here");
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_leaves_a_mid_merge_checkout_alone() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/merge",
+            "sdh-alpha.md.approved",
+            "approved\n",
+        );
+        fs::write(tmp.path().join(".git/MERGE_HEAD"), "deadbeef\n").unwrap();
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.approved"),
+            vec!["docs/sdh_skills/sdh-alpha.md.approved".to_string()],
+            "the index is not touched mid-merge"
+        );
+        assert!(staged_status(tmp.path()).is_empty());
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_leaves_a_detached_head_checkout_alone() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/detached",
+            "sdh-alpha.md.approved",
+            "approved\n",
+        );
+        git(tmp.path(), &["checkout", "-q", "--detach"]);
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.approved").len(),
+            1,
+            "a detached HEAD is not the place to move the index"
+        );
+        assert!(staged_status(tmp.path()).is_empty());
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_leaves_an_unmerged_index_alone() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/unmerged",
+            "sdh-alpha.md.approved",
+            "approved\n",
+        );
+        // A merge that conflicts on an unrelated file leaves unmerged entries.
+        fs::write(tmp.path().join("README.md"), "base\n").unwrap();
+        git(tmp.path(), &["add", "README.md"]);
+        git(tmp.path(), &["commit", "-q", "-m", "base"]);
+        git(tmp.path(), &["checkout", "-q", "-b", "other"]);
+        fs::write(tmp.path().join("README.md"), "theirs\n").unwrap();
+        git(tmp.path(), &["commit", "-q", "-am", "theirs"]);
+        git(tmp.path(), &["checkout", "-q", "master"]);
+        fs::write(tmp.path().join("README.md"), "ours\n").unwrap();
+        git(tmp.path(), &["commit", "-q", "-am", "ours"]);
+        git_conflict(tmp.path(), &["merge", "other"]);
+        assert!(
+            !git_out(tmp.path(), &["ls-files", "-u"]).is_empty(),
+            "the merge really conflicted"
+        );
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(ls_files(tmp.path(), "docs/sdh_skills/*.approved").len(), 1);
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_reads_a_linked_worktree_state_through_git_path() {
+        let db = db_with_skill();
+        let main = TempDir::new().unwrap();
+        init_git(main.path());
+        fs::write(main.path().join("README.md"), "# r\n").unwrap();
+        git(main.path(), &["add", "."]);
+        git(main.path(), &["commit", "-q", "-m", "init"]);
+        let wt = main.path().join("wt");
+        git(
+            main.path(),
+            &["worktree", "add", "-q", "-b", "wt", wt.to_str().unwrap()],
+        );
+        render_skills_to_repo(&db, &wt).unwrap();
+        fs::write(
+            wt.join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "approved\n",
+        )
+        .unwrap();
+        git(&wt, &["add", "-A", "."]);
+        git(&wt, &["commit", "-q", "-m", "marker"]);
+        db.insert_local_repository(&wt.to_string_lossy(), "acme/wt", None, None)
+            .unwrap();
+
+        let report = marker_sweep(&db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            ls_files(&wt, "docs/sdh_skills/*.approved").is_empty(),
+            "a linked worktree is a normal checkout for the sweep"
+        );
+
+        // Mid-merge of THAT worktree is read through `--git-path`: the marker
+        // file of the main checkout would hide it from a `.git/` lookup.
+        let merge_head = git_out(&wt, &["rev-parse", "--git-path", "MERGE_HEAD"]);
+        fs::write(Path::new(&merge_head), "deadbeef\n").unwrap();
+        let other = TempDir::new().unwrap();
+        init_git(other.path());
+        render_skills_to_repo(&db, other.path()).unwrap();
+        fs::write(
+            other.path().join("docs/sdh_skills/sdh-beta.md.conflict"),
+            "reason\n",
+        )
+        .unwrap();
+        git(other.path(), &["add", "-A", "."]);
+        git(other.path(), &["commit", "-q", "-m", "reason file"]);
+        db.insert_local_repository(&other.path().to_string_lossy(), "acme/other", None, None)
+            .unwrap();
+
+        let second = marker_sweep(&db);
+
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(
+            ls_files(&wt, "docs/sdh_skills/*.md").len(),
+            2,
+            "the mid-merge worktree is left alone"
+        );
+        assert!(ls_files(other.path(), "docs/sdh_skills/*.conflict").is_empty());
+    }
+
+    /// Review of f0a40b2: a checkout whose state cannot be READ is reported,
+    /// not skipped. Collapsing the failure into `Ok(false)` made a stuck sweep
+    /// indistinguishable from a deferred merge. A `.git` file pointing nowhere
+    /// satisfies `is_git_repo` but fails every git command of the check.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_reports_a_checkout_whose_state_cannot_be_read() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".git"),
+            "gitdir: F:/definitely/not/a/repository\n",
+        )
+        .unwrap();
+        let repo = db
+            .insert_local_repository(&tmp.path().to_string_lossy(), "acme/broken", None, None)
+            .unwrap();
+
+        let report = marker_sweep(&db);
+
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert_eq!(
+            report.errors[0].code,
+            SyncIssueCode::RuleFailed,
+            "{}",
+            report.errors[0]
+        );
+        assert_eq!(
+            report.errors[0].subject,
+            rule_copy_label(&repo),
+            "{}",
+            report.errors[0]
+        );
+        assert_eq!(
+            report.errors[0].target.as_deref(),
+            Some("docs/sdh_skills/"),
+            "{}",
+            report.errors[0]
+        );
+    }
+
+    /// Review fix (2nd pass of T-000244): `repo_state` only resolves
+    /// `--git-path`s and still succeeds here, while `symbolic-ref -q HEAD`
+    /// exits 128 — the branch ref points at itself, so HEAD resolves to
+    /// nothing. `current_branch` folded every nonzero exit into `Ok(None)`,
+    /// so `commit_state_safe` read this broken checkout as a DETACHED one and
+    /// the sweep skipped it silently; the branch-lookup failure must reach
+    /// `sweep_failed` as a `RuleFailed` instead.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_sweep_reports_a_checkout_whose_branch_cannot_be_read() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let repo = git_repo_with_tracked_marker(
+            &db,
+            tmp.path(),
+            "acme/cyclic",
+            "sdh-alpha.md.approved",
+            "approved in chat\n",
+        );
+        // A cyclic symbolic ref: `refs/heads/master` points at itself.
+        fs::write(
+            tmp.path().join(".git/refs/heads/master"),
+            "ref: refs/heads/master\n",
+        )
+        .unwrap();
+
+        let report = marker_sweep(&db);
+
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert_eq!(
+            report.errors[0].code,
+            SyncIssueCode::RuleFailed,
+            "{}",
+            report.errors[0]
+        );
+        assert_eq!(
+            report.errors[0].subject,
+            rule_copy_label(&repo),
+            "{}",
+            report.errors[0]
+        );
+        assert!(
+            report.errors[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("symbolic-ref")),
+            "the branch-lookup failure is the reported one: {}",
+            report.errors[0]
+        );
+        // Not silently skipped: the marker stays tracked and the index is
+        // untouched (`ls-files` reads the index alone — HEAD no longer
+        // resolves, so a diff against it is not a usable oracle here).
+        assert_eq!(
+            ls_files(tmp.path(), "docs/sdh_skills/*.approved"),
+            vec!["docs/sdh_skills/sdh-alpha.md.approved".to_string()],
+            "the sweep staged nothing against the broken branch"
+        );
     }
 }

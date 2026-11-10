@@ -2,10 +2,30 @@ use crate::db::AppDb;
 use crate::models::*;
 use crate::sync;
 use chrono;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tauri::State;
 
 // ── Requirements sync commands ───────────────────────────────────────────────
+
+/// T-000190: REQ bodies across a pair's possible dirs — the InOutBox lane
+/// first, then the legacy path (migration residue still counts as live).
+fn scan_pair(dirs: &[PathBuf]) -> Vec<String> {
+    let mut out = Vec::new();
+    for d in dirs {
+        for f in sync::scan_requirements(d) {
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `name` exists in any of the side's dirs (new lane or legacy residue).
+fn exists_in(dirs: &[PathBuf], name: &str) -> bool {
+    dirs.iter().any(|d| d.join(name).exists())
+}
 
 #[derive(serde::Serialize)]
 pub struct SyncGlobalClaudeResult {
@@ -101,16 +121,62 @@ fn init_docs_for_repo_in(
         updated.push("docs/bug-reports.md".to_string());
     }
     // F-000044: a shared repo renders both blocks for sharing (same as the sync).
-    let shared = sync::shared::is_shared_repo(db, repo_id);
-    let gitignore_template = sync::shared::gitignore_template_for(&gitignore_template, shared);
-    let gitattributes_template =
-        sync::shared::gitattributes_template_for(&gitattributes_template, shared);
-    if sync::sync_gitignore_section(&gitignore_template, base)? {
-        updated.push(".gitignore (section)".to_string());
+    // T-000243: the same effective `share_specs` policy the sync pass uses —
+    // the owner's stored setting, the owner's published flag for a helper.
+    // T-000243 review (second pass): a helper resolves the policy from the
+    // SAME authoritative discovery the sync runs (`render_structure_of`) —
+    // reading only the work tree let a stale copy supply the policy after
+    // phase A had refused a malformed remote one. The guard spans the policy
+    // read AND the `.gitignore` write (an old-ON render must not land after
+    // an OFF save or overwrite a newer OFF render), and a refused structure
+    // errors the command instead of writing a guessed-on `.gitignore`. A repo
+    // that is not shared resolves no policy at all.
+    // T-000243 review (fifteenth pass): the guard precedes the membership
+    // read for EVERY repo — `is_shared_repo` is lifecycle state a disable /
+    // enable moves under the same guard, so reading it first let a stale
+    // render keep `shared = true` after the repo left shared mode. Both
+    // managed-block writes stay inside the one hold.
+    let policy = sync::shared::specs_policy_guard(repo_id);
+    let _policy = policy.lock().unwrap();
+    // T-000243 review (sixteenth pass): re-read the binding under the guard
+    // — a repath that landed since `base` was captured makes the managed
+    // writes below target a detached checkout.
+    let binding_fresh = db
+        .get_repository(repo_id)
+        .map(|r| r.local_path.as_deref() == Some(path))
+        .unwrap_or(false);
+    let shared = binding_fresh && sync::shared::is_shared_repo(db, repo_id);
+    if shared {
+        // No git binary on the machine: no discovery is possible. The
+        // owner's policy needs none (its database row answers); a helper's
+        // render is REFUSED rather than answered from a work-tree copy that
+        // may carry a stale ON (T-000243 review, fourth pass).
+        let git = crate::git_ops::cached_git();
+        let structure = sync::shared::render_structure_opt(db, git.as_ref(), &repo)?;
+        let share_specs = sync::shared::effective_share_specs(db, &repo, structure.as_ref())?;
+        let rendered = sync::shared::gitignore_template_for(&gitignore_template, true, share_specs);
+        if sync::sync_gitignore_section(&rendered, base)? {
+            updated.push(".gitignore (section)".to_string());
+        }
+        // Test rendezvous: fires while the guard is still held, right after
+        // the write (see `render_write_probe`).
+        #[cfg(test)]
+        sync::shared::render_write_probe(repo_id, base);
+    } else if binding_fresh {
+        let rendered = sync::shared::gitignore_template_for(&gitignore_template, false, true);
+        if sync::sync_gitignore_section(&rendered, base)? {
+            updated.push(".gitignore (section)".to_string());
+        }
     }
-    if sync::sync_gitattributes_section(&gitattributes_template, base)? {
-        updated.push(".gitattributes (section)".to_string());
+    if binding_fresh {
+        let gitattributes_template =
+            sync::shared::gitattributes_template_for(&gitattributes_template, shared);
+        if sync::sync_gitattributes_section(&gitattributes_template, base)? {
+            updated.push(".gitattributes (section)".to_string());
+        }
     }
+    drop(_policy);
+    drop(policy);
     // App-owned files (project.md + CLAUDE.md section) — always overwritten when
     // the repo is attached to a project. Orphan repos (project_id=None) skip this
     // since project-context wouldn't render meaningfully.
@@ -121,7 +187,7 @@ fn init_docs_for_repo_in(
     let rules = sync::refresh_rules(
         db,
         claude_dir.as_deref(),
-        sync::RenderScope::Repo(base),
+        sync::RenderScope::Repo(base, Some(repo.id)),
         None,
     );
     updated.push("docs/sdh_skills/".to_string());
@@ -213,22 +279,29 @@ pub fn list_project_requirements(
             for client in &clients {
                 if let Some(ref client_path) = client.local_path {
                     let client_base = Path::new(client_path);
-                    let client_req_dir = client_base.join("docs").join("backend-requirements");
                     // F-033: canonical_folder_name() is the single source of truth.
                     let client_name = client.canonical_folder_name();
-                    let srv_client_dir = srv_base
-                        .join("docs")
-                        .join("client-requirements")
-                        .join(&client_name);
+                    // T-000190: the new lane first, legacy dir for residue.
+                    let client_dirs = vec![
+                        sync::outbox_dir(client_base, &srv.canonical_folder_name()),
+                        client_base.join("docs").join("backend-requirements"),
+                    ];
+                    let srv_dirs = vec![
+                        sync::inbox_dir(srv_base, &client_name),
+                        srv_base
+                            .join("docs")
+                            .join("client-requirements")
+                            .join(&client_name),
+                    ];
 
-                    for req_file in sync::scan_requirements(&client_req_dir) {
-                        let on_server = srv_client_dir.join(&req_file).exists();
+                    for req_file in scan_pair(&client_dirs) {
+                        let on_server = exists_in(&srv_dirs, &req_file);
                         let response_name = req_file.replace(".md", ".response.md");
-                        let has_response = srv_client_dir.join(&response_name).exists()
-                            || client_req_dir.join(&response_name).exists();
+                        let has_response = exists_in(&srv_dirs, &response_name)
+                            || exists_in(&client_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (client) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = client_req_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&client_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -284,18 +357,18 @@ pub fn list_project_requirements(
                     }
 
                     // Also check server side for reqs that may only exist there
-                    for req_file in sync::scan_requirements(&srv_client_dir) {
+                    for req_file in scan_pair(&srv_dirs) {
                         if result.iter().any(|r| {
                             r.filename == req_file && r.source_repo == client.display_name()
                         }) {
                             continue;
                         }
                         let response_name = req_file.replace(".md", ".response.md");
-                        let has_response = srv_client_dir.join(&response_name).exists()
-                            || client_req_dir.join(&response_name).exists();
+                        let has_response = exists_in(&srv_dirs, &response_name)
+                            || exists_in(&client_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (client) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = client_req_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&client_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -323,23 +396,30 @@ pub fn list_project_requirements(
                     // F-033: REQ folders use canonical repo names; nested per parent on ms side.
                     let ms_canonical = ms_server_repo.canonical_folder_name();
                     let parent_folder = srv.canonical_folder_name();
-                    let srv_ms_dir = srv_base
-                        .join("docs")
-                        .join("microservice-requirements")
-                        .join(&ms_canonical);
-                    let ms_srv_dir = ms_base
-                        .join("docs")
-                        .join("server-requirements")
-                        .join(&parent_folder);
+                    // T-000190: new lane + legacy residue, on both sides.
+                    let srv_dirs = vec![
+                        sync::outbox_dir(srv_base, &ms_canonical),
+                        srv_base
+                            .join("docs")
+                            .join("microservice-requirements")
+                            .join(&ms_canonical),
+                    ];
+                    let ms_dirs = vec![
+                        sync::inbox_dir(ms_base, &parent_folder),
+                        ms_base
+                            .join("docs")
+                            .join("server-requirements")
+                            .join(&parent_folder),
+                    ];
 
-                    for req_file in sync::scan_requirements(&srv_ms_dir) {
-                        let on_ms = ms_srv_dir.join(&req_file).exists();
+                    for req_file in scan_pair(&srv_dirs) {
+                        let on_ms = exists_in(&ms_dirs, &req_file);
                         let response_name = req_file.replace(".md", ".response.md");
-                        let has_response = ms_srv_dir.join(&response_name).exists()
-                            || srv_ms_dir.join(&response_name).exists();
+                        let has_response = exists_in(&ms_dirs, &response_name)
+                            || exists_in(&srv_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (server) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = srv_ms_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&srv_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -361,18 +441,18 @@ pub fn list_project_requirements(
                     }
 
                     // Also check ms side
-                    for req_file in sync::scan_requirements(&ms_srv_dir) {
+                    for req_file in scan_pair(&ms_dirs) {
                         if result.iter().any(|r| {
                             r.filename == req_file && r.target_repo == ms_server_repo.display_name()
                         }) {
                             continue;
                         }
                         let response_name = req_file.replace(".md", ".response.md");
-                        let has_response = ms_srv_dir.join(&response_name).exists()
-                            || srv_ms_dir.join(&response_name).exists();
+                        let has_response = exists_in(&ms_dirs, &response_name)
+                            || exists_in(&srv_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (server) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = srv_ms_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&srv_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -460,24 +540,31 @@ pub fn list_project_requirements(
                     let parent_base = Path::new(parent_local);
                     let parent_canonical = parent_server.canonical_folder_name();
 
-                    let parent_ms_dir = parent_base
-                        .join("docs")
-                        .join("microservice-requirements")
-                        .join(&ms_canonical);
-                    let ms_parent_dir = ms_base
-                        .join("docs")
-                        .join("server-requirements")
-                        .join(&parent_canonical);
+                    // T-000190: new lane + legacy residue, on both sides.
+                    let parent_dirs = vec![
+                        sync::outbox_dir(parent_base, &ms_canonical),
+                        parent_base
+                            .join("docs")
+                            .join("microservice-requirements")
+                            .join(&ms_canonical),
+                    ];
+                    let ms_dirs = vec![
+                        sync::inbox_dir(ms_base, &parent_canonical),
+                        ms_base
+                            .join("docs")
+                            .join("server-requirements")
+                            .join(&parent_canonical),
+                    ];
 
                     // REQ files parent → this ms (server_to_microservice direction)
-                    for req_file in sync::scan_requirements(&parent_ms_dir) {
+                    for req_file in scan_pair(&parent_dirs) {
                         let response_name = req_file.replace(".md", ".response.md");
-                        let on_ms = ms_parent_dir.join(&req_file).exists();
-                        let has_response = ms_parent_dir.join(&response_name).exists()
-                            || parent_ms_dir.join(&response_name).exists();
+                        let on_ms = exists_in(&ms_dirs, &req_file);
+                        let has_response = exists_in(&ms_dirs, &response_name)
+                            || exists_in(&parent_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (parent server) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = parent_ms_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&parent_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -499,7 +586,7 @@ pub fn list_project_requirements(
                     }
 
                     // ms-side files без зеркала на parent (например ms ответил, до next sync)
-                    for req_file in sync::scan_requirements(&ms_parent_dir) {
+                    for req_file in scan_pair(&ms_dirs) {
                         if result.iter().any(|r| {
                             r.filename == req_file
                                 && r.direction == "server_to_microservice"
@@ -509,11 +596,11 @@ pub fn list_project_requirements(
                             continue;
                         }
                         let response_name = req_file.replace(".md", ".response.md");
-                        let has_response = ms_parent_dir.join(&response_name).exists()
-                            || parent_ms_dir.join(&response_name).exists();
+                        let has_response = exists_in(&ms_dirs, &response_name)
+                            || exists_in(&parent_dirs, &response_name);
                         // F-000039: impl-ack lives in the sender's (parent server) outgoing dir.
                         let impl_name = req_file.replace(".md", ".impl.md");
-                        let has_impl = parent_ms_dir.join(&impl_name).exists();
+                        let has_impl = exists_in(&parent_dirs, &impl_name);
 
                         let status = if has_response {
                             "responded".to_string()
@@ -635,7 +722,9 @@ fn peer_channels_for(db: &AppDb, project_id: i64) -> Result<Vec<PeerChannelInfo>
                 info.inbox_count = sync::scan_bodies(&my_in).len();
                 info.pact_count = sync::scan_bodies(&my_pact).len();
 
-                info.registry_present = sync::registry_path(my_base).is_file();
+                // T-000190: per-pair `registry/<peer>.md` plus the frozen
+                // legacy ledger aliases — presence only, the agent owns bytes.
+                info.registry_present = sync::registry_present(my_base, &peer_name);
 
                 if my_base.is_dir() && peer_base.is_dir() {
                     let synced = sync::dirs_equal(&my_out, &peer_in)
@@ -859,6 +948,90 @@ mod tests {
             );
             assert!(!skills.join(format!("{}.md.approved", name)).exists());
         }
+    }
+
+    /// T-000243 review (second pass): the standalone init-docs render takes
+    /// the same per-repo policy guard as the sync, and holds it THROUGH the
+    /// `.gitignore` write — the probe fires right after the write and the
+    /// guard is still held there, so a specs save (or a phase B policy
+    /// section) cannot interleave between the policy read and the write.
+    #[test]
+    fn test_init_docs_holds_the_policy_guard_through_the_write() {
+        let db = make_db();
+        let dir = TempDir::new().unwrap();
+        let repo = db
+            .insert_local_repository(dir.path().to_string_lossy().as_ref(), "render", None, None)
+            .unwrap();
+        let repo_id = repo.id;
+        db.set_shared_mode(repo_id, true).unwrap();
+        db.set_shared_role(repo_id, Some("main")).unwrap();
+        // The owner opts out: the render must keep the specs folder ignored.
+        db.set_repo_share_specs(repo_id, false).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        crate::sync::shared::install_render_write_probe(
+            repo_id,
+            dir.path(),
+            entered_tx,
+            release_rx,
+        );
+        let home = TempDir::new().unwrap();
+        let init = std::thread::spawn(move || {
+            init_docs_for_repo_in(&db, Some(home.path().to_path_buf()), repo_id).unwrap()
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the render probe never fired: the render did not run");
+        assert!(
+            crate::sync::shared::specs_policy_guard(repo_id)
+                .try_lock()
+                .is_err(),
+            "the guard must still be held AFTER the .gitignore write"
+        );
+        release_tx.send(1).unwrap();
+        init.join().unwrap();
+        let text = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(
+            text.contains("docs/superpowers/"),
+            "the OFF render keeps the specs folder ignored:\n{}",
+            text
+        );
+    }
+
+    /// T-000243 review (second pass): the standalone init-docs path resolves a
+    /// helper's policy through the same authoritative discovery as the sync
+    /// (`render_structure_of`) — a malformed remote copy refuses the whole
+    /// render (the command errors) instead of falling back to the stale
+    /// work-tree copy and writing a shared-ON `.gitignore`.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn test_init_docs_refuses_the_render_when_the_structure_is_refused() {
+        use crate::sync::shared::test_support::{g, two_installs, write};
+        let fx = two_installs();
+        fx.make_participant();
+        // The owner's authoritative copy on the dev branch goes bad; the
+        // helper's work tree still holds the previous valid (default-ON) copy.
+        write(&fx.main_dir, ".sdh/project.json", "{ not json at all");
+        g(&fx.main_dir, &["add", ".sdh"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "break the structure"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        // The standalone button does not fetch; the corrupted ref must be in
+        // the helper's remote-tracking view, as the last sync left it.
+        g(&fx.helper_dir, &["fetch", "-q", "origin"]);
+
+        let home = TempDir::new().unwrap();
+        let err = init_docs_for_repo_in(
+            &fx.helper_db,
+            Some(home.path().to_path_buf()),
+            fx.helper_repo,
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid JSON"), "{}", err);
+        assert!(
+            !fx.helper_dir.join(".gitignore").exists(),
+            "no `.gitignore` may be written from the stale work-tree policy"
+        );
     }
 
     /// T-000207 follow-up: the global-rules button renders `~/.claude/skills/`.
@@ -1092,14 +1265,16 @@ mod current_branch_tests {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_autocommit_branch(
     db: State<AppDb>,
     repo_id: i64,
     branch: Option<String>,
 ) -> Result<(), String> {
-    db.set_autocommit_branch(repo_id, branch.as_deref())
-        .map_err(|e| e.to_string())
+    // T-000243 review (eighteenth pass): the branch is the shared pass's own
+    // branch — the guarded setter bumps the lifecycle generation so an
+    // in-flight pass cannot keep pushing to the old recipient set.
+    crate::sync::shared::set_autocommit_branch_guarded(&db, repo_id, branch.as_deref())
 }
 
 // ── v0.20.0: Task sync commands ───────────────────────────────────────────────

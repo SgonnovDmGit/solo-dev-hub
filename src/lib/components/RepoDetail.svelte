@@ -5,8 +5,8 @@
   import { projects, loadProjects } from '$lib/stores/projects';
   import { currentScreen, selectedRepoId, deployDrillTarget } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
-  import { setRepoLocalPath, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch, getRepoStructure, listJoinRequests, approveJoinRequest, sharedParticipantsActivity, setProjectAutoSync } from '$lib/api/tauri-commands';
-  import type { RepoRename, ProjectStructure, JoinRequest, ParticipantActivity } from '$lib/types';
+  import { setRepoLocalPath, cloneRepoTo, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch, getRepoStructure, listJoinRequests, approveJoinRequest, sharedParticipantsActivity, setProjectAutoSync } from '$lib/api/tauri-commands';
+  import type { RepoRename, ProjectStructure, JoinRequest, ParticipantActivity, SyncIssue } from '$lib/types';
   import { deleteRepoOnGitHub, splitRepoFullName, listBranches, type BranchInfo } from '$lib/api/github';
   import { addToast } from '$lib/stores/ui';
   import { getRoleLabel, getDisplayName, type Role } from '$lib/types';
@@ -459,10 +459,47 @@
   // a repo without one (a contributor's, not linked yet) is probed for the
   // owner's structure, which links it to a project.
   let syncingProject = $state(false);
-  const syncBusy = $derived(syncingProject || $isSyncing);
+
+  // F-000045: the clone offer for a GitHub repo without a local folder. One
+  // object holds the whole run — confirm dialog, folder picker, `clone_repo_to`,
+  // the bind and the follow-up sync — captured before the first await, so a
+  // repo switch mid-flight can never bind or sync another repo. `dialog` drops
+  // as soon as the user answers while the rest keeps the button busy.
+  let cloneFlow = $state<{ id: number; name: string; projectId: number | null; dialog: boolean } | null>(null);
+  const cloneBusy = $derived(cloneFlow !== null);
+  const syncBusy = $derived(syncingProject || $isSyncing || cloneBusy);
+  // While a clone runs, the button names what it is doing instead of «Синк».
+  const syncButtonLabel = $derived(
+    cloneFlow
+      ? $tStore('repo.cloneBusy' as any).replace('{0}', cloneFlow.name)
+      : $tStore('repo.syncButton' as any),
+  );
+
+  // F-000045: a rejected `clone_repo_to` arrives as a SyncIssue-shaped object,
+  // so String(err) would render "[object Object]". Anything else is an IPC
+  // error outside the contract.
+  function isSyncIssueLike(err: unknown): err is SyncIssue {
+    return (
+      typeof err === 'object' &&
+      err !== null &&
+      typeof (err as SyncIssue).code === 'string' &&
+      typeof (err as SyncIssue).subject === 'string'
+    );
+  }
 
   async function handleSyncRepo() {
     if (!repo || syncBusy) return;
+    // F-000045: a repo without a local folder offers to clone itself first;
+    // a local-only repo has nothing to clone from and keeps the existing
+    // «Указать папку» affordance (handleSetLocalPath is unchanged).
+    if (!repo.local_path) {
+      if (!repo.github_name) {
+        addToast($tStore('repo.cloneNoGithub' as any), 'error');
+        return;
+      }
+      cloneFlow = { id: repo.id, name: getDisplayName(repo), projectId: repo.project_id, dialog: true };
+      return;
+    }
     const action = chooseSyncAction(repo.project_id);
     if (action.kind === 'project') {
       syncingProject = true;
@@ -474,6 +511,56 @@
     } else {
       await runSharedProbe();
     }
+  }
+
+  // F-000045: confirmed the clone — pick the folder, clone, bind, then run the
+  // ordinary sync for the repo the click started from (chooseSyncAction decides
+  // project vs shared mode; cloning never enables shared mode or changes roles).
+  async function handleCloneConfirm() {
+    const target = cloneFlow;
+    if (!target) return;
+    cloneFlow = { ...target, dialog: false };
+    try {
+      const picked = await open({ directory: true, title: $tStore('repo.selectFolder' as any) });
+      // Cancelling the confirm or the picker is a silent no-op: no clone, no
+      // bind, no sync, no error toast.
+      if (!picked) return;
+      const bound = await cloneRepoTo(target.id, picked as string);
+      await loadAllRepos();
+      await loadCurrentBranch();
+      // Says the folder is bound and the sync started — never that the sync
+      // succeeded; runProjectSync / runSharedProbe report their own outcome.
+      addToast(
+        $tStore('repo.cloneSuccess' as any)
+          .replace('{0}', target.name)
+          .replace('{1}', bound.local_path ?? (picked as string)),
+        'success',
+      );
+      const action = chooseSyncAction(target.projectId);
+      if (action.kind === 'project') {
+        syncingProject = true;
+        try {
+          await runProjectSync(action.projectId);
+        } finally {
+          syncingProject = false;
+        }
+      } else {
+        await runSharedProbe();
+      }
+    } catch (err) {
+      if (isSyncIssueLike(err)) {
+        addToast(formatSyncIssues([err]), 'error');
+      } else {
+        addToast(String(err), 'error');
+      }
+    } finally {
+      cloneFlow = null;
+    }
+  }
+
+  // F-000045: declining the dialog ends the flow quietly.
+  function handleCloneCancel() {
+    cloneFlow = null;
   }
 
   async function handleInitDocs() {
@@ -609,9 +696,9 @@
           <span class="local-path warn">⚠ {$tStore('repo.localPathNotFound' as any)}</span>
           <button class="ghost mini" onclick={handleSetLocalPath} type="button">{$tStore('repo.localPathSet' as any)}</button>
         {/if}
-        <button class="sync-btn row-action" onclick={handleSyncRepo} type="button" disabled={syncBusy} title={$tStore('repo.syncButton' as any)}>
+        <button class="sync-btn row-action" onclick={handleSyncRepo} type="button" disabled={syncBusy} title={syncButtonLabel}>
           <span class="btn-icon">🔄</span>
-          <span class="btn-label">{$tStore('repo.syncButton' as any)}</span>
+          <span class="btn-label">{syncButtonLabel}</span>
         </button>
         <button class="init-docs-btn row-action" onclick={handleInitDocs} type="button" title={$tStore('repo.initDocsButton' as any)}>
           <span class="btn-icon">📚</span>
@@ -949,6 +1036,19 @@
       </div>
     </div>
   </ConfirmDialog>
+{/if}
+
+{#if cloneFlow && cloneFlow.dialog}
+  <!-- F-000045: a GitHub repo without a local folder — clone it into a folder
+       the user picks. The captured `cloneFlow` (not the live selection) drives
+       the dialog and the run, so a repo switch under an open dialog changes
+       nothing. -->
+  <ConfirmDialog
+    title={$tStore('repo.cloneConfirmTitle' as any).replace('{0}', cloneFlow.name)}
+    message={$tStore('repo.cloneConfirmMessage' as any).replace('{0}', cloneFlow.name)}
+    onConfirm={handleCloneConfirm}
+    onCancel={handleCloneCancel}
+  />
 {/if}
 
 {#if showUntrackDialog && repo}

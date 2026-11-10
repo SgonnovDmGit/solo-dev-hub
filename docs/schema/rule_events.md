@@ -8,10 +8,10 @@ v33 (T-000174) — append-only history of the workflow rules: the sdh-* skills a
 <summary><strong>Table Definition</strong></summary>
 
 ```sql
-CREATE TABLE rule_events (
+CREATE TABLE "rule_events" (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              rule TEXT NOT NULL,
-             kind TEXT NOT NULL CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved')),
+             kind TEXT NOT NULL CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved','proposed','proposal_accepted','proposal_rejected','proposal_withdrawn')),
              repo TEXT,
              note TEXT,
              created_at TEXT NOT NULL
@@ -33,10 +33,10 @@ CREATE TABLE rule_events (
 
 ## Constraints
 
-| Name | Type        | Definition                                                                                   |
-| ---- | ----------- | -------------------------------------------------------------------------------------------- |
-| id   | PRIMARY KEY | PRIMARY KEY (id)                                                                             |
-| -    | CHECK       | CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved')) |
+| Name | Type        | Definition                                                                                                                                                           |
+| ---- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| id   | PRIMARY KEY | PRIMARY KEY (id)                                                                                                                                                     |
+| -    | CHECK       | CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved','proposed','proposal_accepted','proposal_rejected','proposal_withdrawn')) |
 
 ## Indexes
 

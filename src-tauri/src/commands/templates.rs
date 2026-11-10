@@ -100,13 +100,18 @@ fn save_template_file_in(
     // happened to be unwritable.
     db.upsert_template_file(language_key, file_name, content, true)
         .map_err(|e| e.to_string())?;
-    Ok(after_rule_write(
+    let home_missing = home.is_none();
+    let delivered = after_rule_write(
         db,
         home,
         language_key,
         file_name,
         (!unchanged).then_some(rule_event::SAVED),
-    ))
+    );
+    // The per-repo renders wait for the rules lock — same defer as
+    // `refresh_rules` (T-000243 review, nineteenth pass).
+    drop(_guard);
+    Ok(finish_rule_delivery(db, home_missing, delivered))
 }
 
 /// The rule a template file stands for, or `None` for an ordinary template.
@@ -140,15 +145,20 @@ fn refuse_followed(db: &AppDb, language_key: &str, file_name: &str) -> Result<()
 /// **The caller holds `sync::rules_guard()`** for a rule (T-000174): the write,
 /// the event and the delivery are one hold, and the delivery therefore calls
 /// `refresh_rules_locked`.
+/// The refresh half of a rule write, run under the caller's rules-guard
+/// hold. Returns the rules report, the pre-refresh errors and whether a
+/// delivery render ran — the caller drops the guard, runs
+/// `render_pending_repo_skills`, then `finish_rule_delivery`
+/// (T-000243 review, nineteenth pass).
 fn after_rule_write(
     db: &AppDb,
     home: Option<PathBuf>,
     language_key: &str,
     file_name: &str,
     kind: Option<&str>,
-) -> TemplateSaveOutcome {
+) -> Option<(RulesRefresh, Vec<SyncIssue>, bool)> {
     let Some(rule) = rule_of(language_key, file_name) else {
-        return TemplateSaveOutcome::default();
+        return None;
     };
     // Written before the render, so a hand-back the render then supersedes
     // reads after the edit that superseded it. A failed history write must not
@@ -172,10 +182,7 @@ fn after_rule_write(
         );
     }
     let Some(skill_name) = sync::skill_name_of(file_name) else {
-        return TemplateSaveOutcome {
-            errors,
-            ..TemplateSaveOutcome::default()
-        };
+        return Some((RulesRefresh::default(), errors, false));
     };
 
     // T-000203: a rule is only agreed once it reaches the agents. Render both
@@ -192,7 +199,30 @@ fn after_rule_write(
         sync::RenderScope::Everywhere,
         Some(skill_name),
     );
-    rendered_outcome(rules, errors, claude_dir.is_none())
+    Some((rules, errors, true))
+}
+
+/// The post-guard half of a rule write's delivery: the deferred per-repo
+/// renders serialize on each repo's lifecycle policy guard, which must not
+/// be taken while the rules lock is held (T-000243 review, nineteenth
+/// pass). Call only after the caller's `rules_guard` hold is released.
+fn finish_rule_delivery(
+    db: &AppDb,
+    home_missing: bool,
+    delivered: Option<(RulesRefresh, Vec<SyncIssue>, bool)>,
+) -> TemplateSaveOutcome {
+    let Some((mut rules, errors, rendered)) = delivered else {
+        return TemplateSaveOutcome::default();
+    };
+    sync::render_pending_repo_skills(db, &mut rules);
+    if rendered {
+        rendered_outcome(rules, errors, home_missing)
+    } else {
+        TemplateSaveOutcome {
+            errors,
+            ..TemplateSaveOutcome::default()
+        }
+    }
 }
 
 /// The outcome of a delivery to the whole portfolio: `errors` first, then the
@@ -351,13 +381,10 @@ fn reset_template_file_in(
     refuse_followed(db, language_key, file_name)?;
     db.upsert_template_file(language_key, file_name, &bundled, false)
         .map_err(|e| e.to_string())?;
-    Ok(after_rule_write(
-        db,
-        home,
-        language_key,
-        file_name,
-        Some(rule_event::RESET),
-    ))
+    let home_missing = home.is_none();
+    let delivered = after_rule_write(db, home, language_key, file_name, Some(rule_event::RESET));
+    drop(_guard);
+    Ok(finish_rule_delivery(db, home_missing, delivered))
 }
 
 #[cfg(test)]

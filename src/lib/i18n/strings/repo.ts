@@ -28,6 +28,11 @@ export const ru = {
   'repo.initDocsButton': 'Обновить документацию репозитория',
   'repo.syncButton': 'Синк',
   'repo.untrackGitignoredButton': 'Очистить из индекса',
+  'repo.cloneConfirmTitle': 'Клонировать репозиторий?',
+  'repo.cloneConfirmMessage': 'У репозитория {0} нет локальной папки. Клонировать его в выбранную папку?',
+  'repo.cloneBusy': 'Клонирование {0}…',
+  'repo.cloneSuccess': '{0}: папка привязана ({1}), синк запущен',
+  'repo.cloneNoGithub': 'Это локальный репозиторий без GitHub — клонировать нечего. Привяжите папку кнопкой «Указать папку».',
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
@@ -60,4 +65,9 @@ export const en: Record<keyof typeof ru, string> = {
   'repo.initDocsButton': 'Update repo docs',
   'repo.syncButton': 'Sync',
   'repo.untrackGitignoredButton': 'Untrack gitignored',
+  'repo.cloneConfirmTitle': 'Clone repository?',
+  'repo.cloneConfirmMessage': 'Repository {0} has no local folder. Clone it into a folder you pick?',
+  'repo.cloneBusy': 'Cloning {0}…',
+  'repo.cloneSuccess': '{0}: folder bound ({1}), sync started',
+  'repo.cloneNoGithub': 'This is a local-only repository with no GitHub remote — there is nothing to clone. Bind a folder with the "Set folder" button.',
 };

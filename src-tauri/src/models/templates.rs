@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TemplateFile {
@@ -62,6 +63,49 @@ pub struct RulesRefresh {
     /// copies — so a conflict no longer fires a toast on every sync.
     #[serde(default)]
     pub quiet_conflicts: Vec<String>,
+    /// T-000241: skills whose edit was proposed to a shared repo's owner
+    /// (contributor side of the rule-proposal channel).
+    #[serde(default)]
+    pub proposed: Vec<String>,
+    /// The deferred per-repo render plan, consumed by
+    /// `sync::skills::render_pending_repo_skills` — which MUST run after
+    /// `rules_guard` is released, because each repo render serializes on
+    /// the repo's lifecycle policy guard and taking that while still
+    /// holding the rules lock would invert the policy → rules order
+    /// (T-000243 review, nineteenth pass). Internal only, never serialized.
+    #[serde(skip)]
+    pub pending_repo_render: Option<PendingRepoRender>,
+}
+
+/// What a refresh still owes the per-repo `docs/sdh_skills/` targets once
+/// the rules lock is released. Internal to the render pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct PendingRepoRender {
+    /// Render every eligible repo checkout — an Everywhere scope, or any
+    /// scope widened by an uptake.
+    pub everywhere: bool,
+    /// One checkout to render after the everywhere pass (init docs).
+    pub repo: Option<PendingRepoTarget>,
+}
+
+/// The Repo-scope render target, resolved when the plan was made so phase 2
+/// revalidates an identity, not a bare path (T-000243 review, twentieth
+/// pass): a registered checkout detached between the phases must be
+/// skipped, never downgraded to an unmanaged write into the stale path.
+#[derive(Debug, Clone)]
+pub enum PendingRepoTarget {
+    /// A registered repo's checkout — its id and the local_path it was
+    /// bound to at plan time. Phase 2 takes the repo's policy guard and
+    /// renders only while the binding still matches and rule copies are
+    /// still allowed there.
+    Registered { repo_id: i64, path: PathBuf },
+    /// The target is not a registered repo — an unmanaged render under the
+    /// rules lock alone.
+    Unregistered(PathBuf),
+    /// Registration could not be determined — the repo listing failed, so
+    /// the target cannot be proven unregistered. Phase 2 renders nothing:
+    /// an unmanaged guess could write into a registered checkout.
+    Unknown,
 }
 
 impl RulesRefresh {

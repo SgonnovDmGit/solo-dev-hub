@@ -115,6 +115,14 @@ export async function setRepoLocalPath(id: number, localPath: string | null): Pr
   return invoke<Repository>('set_repo_local_path', { id, localPath });
 }
 
+// F-000045: clone a GitHub repo that has no local folder into a folder the user
+// picked (the picked directory is the clone root). Rejects with a `SyncIssue`
+// (`clone_target_invalid` / `clone_failed` / `clone_attach_failed`) — a failed
+// sync preparation, not a `SyncResult`; the folder is left unbound.
+export async function cloneRepoTo(id: number, targetDir: string): Promise<Repository> {
+  return invoke<Repository>('clone_repo_to', { id, targetDir });
+}
+
 export async function updateRepoDescription(repoId: number, newDescription: string): Promise<Repository> {
   return invoke<Repository>('update_repo_description', { repoId, newDescription });
 }

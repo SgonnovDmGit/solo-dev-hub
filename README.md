@@ -155,7 +155,9 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Shipped**
 
-- **v1.22.0** *(current — 2026-10-24)* — macOS builds (Apple Silicon and Intel); a sync button on the repository screen; the owner sees when a participant last pushed; shared mode in organization repositories; a mark on rules whose canon moved after your edit.
+- **v1.23.0** *(current — 2026-11-10)* — clone a repository with no local folder straight from the app; `docs/superpowers/` specs travel to contributors; a contributor's rule edit becomes a proposal the owner decides on; all cross-repo channels share the `docs/InOutBox/` layout; announcements get per-participant acknowledgements; `.approved`/`.conflict` markers stay out of git.
+- **v1.22.1** — a join request shows on the Participants tab without a repo switch; native macOS window chrome; a Linux clone is found when its folder case differs from the GitHub name.
+- **v1.22.0** — macOS builds (Apple Silicon and Intel); a sync button on the repository screen; the owner sees when a participant last pushed; shared mode in organization repositories; a mark on rules whose canon moved after your edit.
 - **v1.21.0** — removing repositories the current token cannot see; a better merge base for shared task files; the close button stays in a narrow window on Linux.
 - **v1.20.0** — contributor mode: a helper with their own install works in the same repositories; tasks, done items and bugs travel through git and merge by id.
 - **v1.19.0** — a Rules screen: which rules were changed, where an edit came from, settling two repos that handed one rule back differently; Linux builds (AppImage and .deb).

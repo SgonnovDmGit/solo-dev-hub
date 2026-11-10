@@ -35,7 +35,7 @@ First line — the status, then the reasoning:
 ## Closing
 
 - PACT → the initiator drops `.impl.md`; HANDOFF / NOTE → the sender drops `.done.md`. The app removes the files on both sides. As a recipient you delete nothing.
-- Log every incoming exchange in your own `docs/InOutBox/registry.md` with direction `in` — the counter is `max` over the whole file.
+- Log every incoming exchange in your own `docs/InOutBox/registry/<peer>.md` with direction `in` — the counter is `max` over every `registry/*.md` line.
 - Whoever drops the marker fills `closed`, final status and where the result went in the same pass. Missing registry → create it.
 
 ## Never

@@ -9,8 +9,9 @@
   import { verifyAdmin } from '$lib/sync-core';
   import { needsOwnAdminCheck } from '$lib/utils/shared-admin';
   import { addToast } from '$lib/stores/ui';
-  import { sharedModePreflight, enableSharedMode, disableSharedMode } from '$lib/api/tauri-commands';
+  import { sharedModePreflight, enableSharedMode, disableSharedMode, setRepoShareSpecs, getRepoSharedState } from '$lib/api/tauri-commands';
   import { isRepoPublic, splitRepoFullName } from '$lib/api/github';
+  import { saveSpecsToggle, chipActionAllowed } from '$lib/utils/specs-toggle';
   import type { IgnoreLine } from '$lib/types';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import SharedEnableDialog from './SharedEnableDialog.svelte';
@@ -44,6 +45,82 @@
   let blockingLines = $state<IgnoreLine[]>([]);
   let isPublic = $state<boolean | null>(null);
 
+  // T-000243: the owner's "Делиться спеками и планами" checkbox. The flag is
+  // read from the DB through `get_repo_shared_state` on purpose: the store
+  // RepoDetail's switch reads (`list_repo_shared_states`) skips repos that
+  // never enabled sharing, so for a preconfigured non-shared repo the store's
+  // absence must never be guessed as "on". null = not loaded (or failed to):
+  // the checkbox stays disabled, the value is never defaulted.
+  let specs = $state<boolean | null>(null);
+  // What the checkbox DISPLAYS. The browser flips a native checkbox before
+  // `onchange` runs, so the box is bound to this draft (bind:checked) and every
+  // outcome of the save writes it back: a refused or failed save restores the
+  // stored value, which Svelte then puts into the DOM again — the box can never
+  // be left showing a value the backend never accepted.
+  let specsChecked = $state(false);
+  let specsBusy = $state(false);
+
+  async function loadSpecs() {
+    try {
+      const st = await getRepoSharedState(repoId);
+      if (!alive) return;
+      specs = st.share_specs;
+      specsChecked = specs === true;
+    } catch {
+      if (!alive) return;
+      specs = null;
+      addToast($tStore('shared.specs.loadFailed' as any), 'error');
+    }
+  }
+
+  // On mount and on every flip of the shared-mode switch: enabling/disabling
+  // refreshes the shared state around this chip, and the flag must not be
+  // cached across that (mid-sync changes are re-read the same way).
+  $effect(() => {
+    void checked;
+    void loadSpecs();
+  });
+
+  async function handleSpecsToggle() {
+    // T-000243 review (second pass): one action family — while a shared-mode
+    // action is in flight (or the stored value has not loaded) the save does
+    // not start; the browser has already flipped the box, so the stored value
+    // is written back into the draft either way. (The `specs === null` check
+    // is what the gate says for `toggleSpecs`; it also narrows the type.)
+    if (specs === null || !chipActionAllowed({ specs, specsBusy, modeBusy: busy }, 'toggleSpecs')) {
+      specsChecked = specs === true;
+      return;
+    }
+    const stored = specs;
+    specsBusy = true;
+    try {
+      const res = await saveSpecsToggle(
+        { repoId, repoFullName: githubName, login: $githubLogin, token: $pat, stored },
+        {
+          verifyAdmin,
+          setRepoShareSpecs: (id, on) => setRepoShareSpecs(id, on),
+        },
+      );
+      if (!alive) return;
+      if (res.ok) {
+        specs = res.value;
+        onChanged();
+        if (res.note) addToast(res.note, 'warning');
+      } else if (res.kind === 'notAdmin') {
+        // T-000243 review: an organization's admin must be verified before the
+        // backend accepts the flag — the same bridge and the same refusal as
+        // the shared-mode switch, without enabling anything.
+        addToast($tStore('shared.preflight.notOwnerOrAdmin' as any), 'error');
+      } else {
+        addToast($tStore('shared.specs.saveFailed' as any).replace('{0}', String(res.error)), 'error');
+      }
+      // Success and refusal alike: the box shows exactly what is stored.
+      specsChecked = (res.ok ? res.value : stored) === true;
+    } finally {
+      specsBusy = false;
+    }
+  }
+
   async function checkPublic(): Promise<boolean | null> {
     if (!$pat || !githubName || !githubName.includes('/')) return null;
     const { owner, repo } = splitRepoFullName(githubName);
@@ -51,7 +128,12 @@
   }
 
   async function handleToggle() {
-    if (busy) return;
+    // T-000243 review (second pass): serialized with the specs save — the
+    // enable direction especially, whose first autosync must see the
+    // persisted specs choice, never the default while a save is pending.
+    if (!chipActionAllowed({ specs, specsBusy, modeBusy: busy }, checked ? 'disableMode' : 'enableMode')) {
+      return;
+    }
     if (checked) {
       showDisable = true;
       return;
@@ -90,7 +172,10 @@
   }
 
   async function confirmEnable() {
-    if (busy) return;
+    if (!chipActionAllowed({ specs, specsBusy, modeBusy: busy }, 'enableMode')) {
+      showEnable = false;
+      return;
+    }
     busy = true;
     try {
       await enableSharedMode(repoId, blockingLines.length > 0);
@@ -106,7 +191,7 @@
 
   async function confirmDisable() {
     showDisable = false;
-    if (busy) return;
+    if (!chipActionAllowed({ specs, specsBusy, modeBusy: busy }, 'disableMode')) return;
     busy = true;
     try {
       const res = await disableSharedMode(repoId);
@@ -123,6 +208,10 @@
 
 <div class="chip" class:on={checked} title={$tStore('shared.chipHint' as any)}>
   <span class="chip-label">{$tStore('shared.chipLabel' as any)}:</span>
+  <!-- T-000243 review (second pass): the switch is disabled while ANY action
+       of the chip is in flight, and the enable direction also while the
+       stored specs value has not loaded (the first autosync must see the
+       persisted choice). -->
   <button
     type="button"
     class="switch"
@@ -130,12 +219,29 @@
     role="switch"
     aria-checked={checked}
     aria-label={$tStore('shared.chipLabel' as any)}
-    disabled={busy}
+    disabled={busy || specsBusy || (!checked && specs === null)}
     onclick={handleToggle}
   >
     <span class="knob"></span>
   </button>
 </div>
+
+<!-- T-000243: the owner's specs switch, same chip language. Rendered inside
+     this component (under RepoDetail's showSharedToggle) so it is owner/main
+     only — also before shared mode is enabled, for preconfiguration. The input
+     is BOUND to the draft state: the browser flips a native checkbox before
+     `onchange` runs, and the handler writes the draft back from the outcome of
+     the save, so a refused or failed save restores the box to what is stored. -->
+<label class="chip" class:on={specsChecked} title={$tStore('shared.specs.hint' as any)}>
+  <input
+    class="specs-check"
+    type="checkbox"
+    bind:checked={specsChecked}
+    disabled={specs === null || specsBusy || busy}
+    onchange={handleSpecsToggle}
+  />
+  <span class="chip-label">{$tStore('shared.specs.label' as any)}</span>
+</label>
 
 {#if showEnable}
   <SharedEnableDialog
@@ -143,7 +249,7 @@
     {devBranch}
     {isPublic}
     {blockingLines}
-    {busy}
+    busy={busy || specsBusy}
     onConfirm={confirmEnable}
     onCancel={() => (showEnable = false)}
   />
@@ -219,5 +325,21 @@
   .switch.on .knob {
     transform: translateX(12px);
     background: white;
+  }
+
+  /* T-000243: the specs checkbox — the same chip language, a native checkbox
+     instead of the switch. The label wraps the input, so clicking the text
+     toggles it too (and does nothing while it is disabled). */
+  .specs-check {
+    margin: 0;
+    width: 13px;
+    height: 13px;
+    accent-color: var(--toast-success);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .specs-check:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 </style>

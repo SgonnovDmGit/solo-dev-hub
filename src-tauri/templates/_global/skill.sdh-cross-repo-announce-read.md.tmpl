@@ -3,10 +3,10 @@ name: sdh-cross-repo-announce-read
 description: >
   Use at session start to process unsolicited announcements that arrived from
   another repo — a client reads from its server, a parent server reads from its
-  microservices (ANNOUNCE-NNN.md files in docs/server-announcements/ or
-  docs/microservice-announcements/). Covers scanning the folders, integrating,
-  acknowledging by deleting the file, and committing. To PUSH an announcement
-  yourself — skill sdh-cross-repo-announce-send.
+  microservices (ANNOUNCE-NNN.md files in docs/InOutBox/inbox/). Covers
+  scanning the folders, integrating, acknowledging with a `.ack/<key>`
+  marker, and committing. To PUSH an announcement yourself — skill
+  sdh-cross-repo-announce-send.
 ---
 
 An announcement arrived: a push from another repo that needs your reaction and expects no answer. Pushing one yourself → `sdh-cross-repo-announce-send`; a `REQ-*.md` arrived → `sdh-cross-repo-req-answer`.
@@ -17,15 +17,15 @@ At session start **and** at every release closure (a long session outlives an ar
 
 ## Where
 
-- Client → `docs/server-announcements/<sender>/`.
-- Parent server (including a microservice with its own microservices) → `docs/microservice-announcements/<sender>/`.
+- `docs/InOutBox/inbox/<sender>/` — every direction: a client reading its server, a parent server reading a microservice.
+- Transition: a frozen legacy folder (`docs/server-announcements/`, `docs/microservice-announcements/`) may still hold un-migrated files — process one the same way and delete it; deletion is the old-style acknowledgement the app honours and never resurrects. Never write into those folders yourself.
 - Every role → also the peer channel `docs/InOutBox/inbox/<peer>/` and `pact/<peer>/` (`sdh-peer-channel-answer`) — nothing else surfaces a peer NOTE.
 
 ## Each `ANNOUNCE-*.md`
 
 1. Read it and apply what "What you need to do" requires.
 2. An announcement introducing a new error code or status: test that exact code against your handler, even if it says "keep your current check" — an equality predicate silently routes a new code elsewhere.
-3. Delete the file — deletion is the acknowledgement; there is no receipt and no ✓.
-4. Commit the deletion together with the changes it caused.
+3. Drop an empty marker `ANNOUNCE-NNN_<slug>.md.ack/<key>` — the key is your login on a shared repo, your repo's canonical name otherwise. That marker is the acknowledgement; the app carries it back to the sender. Anything non-empty, mis-named or nested inside `.ack/` is an issue, not an ack.
+4. Commit the marker together with the changes the announcement caused.
 
-Deleting it yourself is allowed: the app does not track or restore announcements. Never keep a processed one — it reads as unprocessed next session.
+Never delete the body — it is a replica: the mirror restores it, and without your marker the announcement never closes. The app deletes body and markers on both sides after every expected key has arrived; a new revision of the body resets the ack group, so check whether a file you already acked came back changed.

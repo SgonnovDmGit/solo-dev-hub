@@ -9,6 +9,11 @@ export const ru = {
   'shared.myBandsHint': 'Номера задач и багов, которые выдаются этой установке.',
   'shared.readOnlyHint': 'Задаёт главный общего проекта — здесь только для чтения.',
   'shared.contributorInfo': 'Общий репо главного {0} · отправляю в {1} и {2}',
+  // T-000243: the owner's docs/superpowers/ switch.
+  'shared.specs.label': 'Делиться спеками и планами (docs/superpowers/)',
+  'shared.specs.hint': 'Настройка общего режима (доступна и до его включения). Выкл: новые файлы docs/superpowers/ не коммитятся и не передаются; уже закоммиченные остаются в репо с историей — флаг не снимает их с трекинга и не переписывает историю. Вкл возобновляет передачу. Задачи, сделанное и баги передаются при любом значении.',
+  'shared.specs.saveFailed': 'Не удалось сохранить настройку спеков: {0}',
+  'shared.specs.loadFailed': 'Не удалось прочитать настройку спеков этого репо.',
 
   // ── Preflight / enabling ───────────────────────────────────────────────────
   'shared.preflight.missingProject': 'Общий режим не включён: репо не входит в проект. Назначьте проект в чипе «Проект».',
@@ -41,6 +46,9 @@ export const ru = {
   'shared.colRole': 'Роль',
   'shared.colLastPush': 'Последняя отправка',
   'shared.colLastPushHint': 'Когда установка участника последний раз отправила коммит синка. Синк без изменений следа не оставляет.',
+  'shared.colVersion': 'Версия',
+  'shared.colVersionHint': 'Версия приложения, которую установка участника последней опубликовала на dev-ветке.',
+  'shared.versionUnknown': 'неизвестна',
   'shared.autoSyncOff': 'Автосинк выключен — задачи и баги уедут главному только по кнопке «Синк».',
   'shared.autoSyncEnable': 'Включить',
   'shared.roleOwner': 'главный',
@@ -107,6 +115,11 @@ export const en: Record<keyof typeof ru, string> = {
   'shared.myBandsHint': 'The task and bug numbers issued to this install.',
   'shared.readOnlyHint': 'Set by the owner of the shared project — read-only here.',
   'shared.contributorInfo': 'Shared repo of the owner {0} · sending to {1} and {2}',
+  // T-000243: the owner's docs/superpowers/ switch.
+  'shared.specs.label': 'Share specs and plans (docs/superpowers/)',
+  'shared.specs.hint': 'A shared-mode setting (available before enabling it too). Off: new docs/superpowers/ files are not committed and not sent; the already committed ones stay in the repo with their history — the flag neither untracks them nor rewrites history. On resumes sharing. Tasks, done items and bugs travel whatever the value.',
+  'shared.specs.saveFailed': 'Could not save the specs setting: {0}',
+  'shared.specs.loadFailed': 'Could not read this repo\'s specs setting.',
 
   'shared.preflight.missingProject': 'Shared mode not enabled: the repo is not in a project. Assign a project in the "Project" chip.',
   'shared.preflight.missingDevBranch': 'Shared mode not enabled: the owner\'s branch is not set. Enter it (for example dev) in the "Auto-commit" chip.',
@@ -136,6 +149,9 @@ export const en: Record<keyof typeof ru, string> = {
   'shared.colRole': 'Role',
   'shared.colLastPush': 'Last push',
   'shared.colLastPushHint': "When the participant's install last pushed a sync commit. A sync with no changes leaves no trace.",
+  'shared.colVersion': 'Version',
+  'shared.colVersionHint': 'The app version the install last published on the dev branch.',
+  'shared.versionUnknown': 'unknown',
   'shared.autoSyncOff': 'Auto-sync is off — tasks and bugs reach the owner only via the Sync button.',
   'shared.autoSyncEnable': 'Turn on',
   'shared.roleOwner': 'owner',

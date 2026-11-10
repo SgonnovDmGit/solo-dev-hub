@@ -355,9 +355,11 @@ export function autoSyncOffHint(
   return !globalEnabled || !project.auto_sync_enabled ? { projectId } : null;
 }
 
-/** `login (any case) -> last push time` from the activity list; keys are lower-cased. */
+/** `login (any case) -> activity` from the activity list; keys are lower-cased. */
 export function activityByLogin(
-  list: { login: string; last_at: string | null }[],
-): Map<string, string | null> {
-  return new Map(list.map((a) => [a.login.trim().toLowerCase(), a.last_at]));
+  list: { login: string; last_at: string | null; app_version?: string | null }[],
+): Map<string, { last_at: string | null; app_version: string | null }> {
+  return new Map(
+    list.map((a) => [a.login.trim().toLowerCase(), { last_at: a.last_at, app_version: a.app_version ?? null }]),
+  );
 }

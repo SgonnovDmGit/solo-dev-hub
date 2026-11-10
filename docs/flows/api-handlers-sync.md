@@ -67,19 +67,22 @@ web-app-backend/docs/         (свой server)
 │  └─ auth-service/            ← имя microservice-проекта
 │     ├─ api.md                ← пришёл от auth-backend
 │     └─ handlers.md           ← пришёл от auth-backend
-├─ client-requirements/        (см. requirements-sync.md)
-└─ microservice-requirements/  (см. requirements-sync.md)
+├─ InOutBox/                   (REQ-каналы с v1.23.0 — см. requirements-sync.md)
+├─ client-requirements/        (замороженный legacy-архив)
+└─ microservice-requirements/  (замороженный legacy-архив)
 
 web-app-frontend/docs/         (client)
 ├─ server-api/
 │  ├─ api.md                   ← пришёл от web-app-backend
 │  └─ handlers.md              ← пришёл от web-app-backend
-└─ backend-requirements/       (см. requirements-sync.md)
+├─ InOutBox/                   (REQ-каналы с v1.23.0 — см. requirements-sync.md)
+└─ backend-requirements/       (замороженный legacy-архив)
 
 auth-backend/docs/             (server-репо микросервиса auth-service)
 ├─ api.md                      ← первоисточник (microservice → parent)
 ├─ handlers.md                 ← первоисточник (microservice → parent)
-└─ server-requirements/        (см. requirements-sync.md)
+├─ InOutBox/                   (REQ-каналы с v1.23.0 — см. requirements-sync.md)
+└─ server-requirements/        (замороженный legacy-архив)
 ```
 
 ## UI (SyncScreen)

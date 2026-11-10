@@ -164,4 +164,197 @@ mod tests {
         assert!(content.contains("new-rule"));
         assert_eq!(content.matches("solo-dev-hub:end").count(), 1);
     }
+
+    // ── T-000244: the bundled template ignores the hand-back markers ────────
+
+    use crate::git_ops::{check_ignore, GitBinary};
+    use crate::sync::shared::gitignore_template_for;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    /// The real bundled `.gitignore` template.
+    fn bundled_gitignore() -> String {
+        crate::template_seeder::bundled_file_content("_global", ".gitignore.tmpl")
+            .expect("bundled .gitignore.tmpl")
+    }
+
+    /// Init a git repo (identity + pinned `master`) so `check-ignore` has a repo.
+    fn init_git(dir: &Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "T"],
+            vec!["symbolic-ref", "HEAD", "refs/heads/master"],
+        ] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .expect("git invocation failed");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn test_bundled_gitignore_carries_both_marker_globs() {
+        let template = bundled_gitignore();
+        assert!(
+            template
+                .lines()
+                .any(|l| l.trim() == "docs/sdh_skills/*.approved"),
+            "the approval marker glob is missing:\n{}",
+            template
+        );
+        assert!(
+            template
+                .lines()
+                .any(|l| l.trim() == "docs/sdh_skills/*.conflict"),
+            "the conflict marker glob is missing:\n{}",
+            template
+        );
+        assert!(
+            template.lines().any(|l| l.trim() == "docs/sdh_skills/"),
+            "the ordinary repo still ignores the whole folder"
+        );
+    }
+
+    #[test]
+    fn test_shared_render_keeps_the_marker_globs_and_drops_the_folder() {
+        let shared = gitignore_template_for(&bundled_gitignore(), true, true);
+        assert!(
+            !shared.lines().any(|l| l.trim() == "docs/sdh_skills/"),
+            "shared render stops ignoring the owner's rule copies:\n{}",
+            shared
+        );
+        assert!(shared
+            .lines()
+            .any(|l| l.trim() == "docs/sdh_skills/*.approved"));
+        assert!(shared
+            .lines()
+            .any(|l| l.trim() == "docs/sdh_skills/*.conflict"));
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_normal_render_ignores_both_markers_for_git() {
+        let tmp = TempDir::new().unwrap();
+        init_git(tmp.path());
+        sync_gitignore_section(&bundled_gitignore(), tmp.path()).unwrap();
+        let git = GitBinary(PathBuf::from("git"));
+
+        for marker in [
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "docs/sdh_skills/a.md.conflict",
+        ] {
+            assert!(
+                check_ignore(&git, tmp.path(), Path::new(marker), true).unwrap(),
+                "{} must be ignored by the rendered .gitignore",
+                marker
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_shared_render_leaves_the_rule_copy_visible_but_ignores_the_markers() {
+        let tmp = TempDir::new().unwrap();
+        init_git(tmp.path());
+        let shared = gitignore_template_for(&bundled_gitignore(), true, true);
+        sync_gitignore_section(&shared, tmp.path()).unwrap();
+        let git = GitBinary(PathBuf::from("git"));
+
+        assert!(
+            !check_ignore(
+                &git,
+                tmp.path(),
+                Path::new("docs/sdh_skills/sdh-alpha.md"),
+                true
+            )
+            .unwrap(),
+            "the owner's committed rule copy travels through git"
+        );
+        for marker in [
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "docs/sdh_skills/a.md.conflict",
+        ] {
+            assert!(
+                check_ignore(&git, tmp.path(), Path::new(marker), true).unwrap(),
+                "{} stays ignored in a shared repo",
+                marker
+            );
+        }
+    }
+
+    /// T-000243: judged by `git check-ignore`, not by the text alone — with the
+    /// flag off even an EMPTY custom template must leave the specs folder
+    /// ignored (the ensured managed rule answers), and turning the flag back on
+    /// with the same empty template removes the stale rule again.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn test_off_render_keeps_the_specs_ignored_with_an_empty_template() {
+        let tmp = TempDir::new().unwrap();
+        init_git(tmp.path());
+        let git = GitBinary(PathBuf::from("git"));
+
+        sync_gitignore_section(&gitignore_template_for("", true, false), tmp.path()).unwrap();
+        assert!(
+            check_ignore(
+                &git,
+                tmp.path(),
+                Path::new("docs/superpowers/specs/x.md"),
+                true
+            )
+            .unwrap(),
+            "off keeps the specs ignored even with an empty custom template"
+        );
+
+        sync_gitignore_section(&gitignore_template_for("", true, true), tmp.path()).unwrap();
+        assert!(
+            !check_ignore(
+                &git,
+                tmp.path(),
+                Path::new("docs/superpowers/specs/x.md"),
+                true
+            )
+            .unwrap(),
+            "on with the same empty template drops the stale managed rule"
+        );
+    }
+
+    #[test]
+    fn test_marker_glob_of_the_user_is_not_duplicated_by_the_block() {
+        let tmp = TempDir::new().unwrap();
+        // The user already ignores the markers by hand.
+        fs::write(
+            tmp.path().join(".gitignore"),
+            "# mine\ndocs/sdh_skills/*.approved\n",
+        )
+        .unwrap();
+
+        let changed = sync_gitignore_section(&bundled_gitignore(), tmp.path()).unwrap();
+
+        assert!(changed);
+        let content = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(
+            content.matches("docs/sdh_skills/*.approved").count(),
+            1,
+            "the user's line is kept, not duplicated:\n{}",
+            content
+        );
+        assert!(
+            content.contains("docs/sdh_skills/*.conflict"),
+            "the other glob is new, so the block carries it"
+        );
+        // And a second render changes nothing.
+        assert!(!sync_gitignore_section(&bundled_gitignore(), tmp.path()).unwrap());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
+            content
+        );
+    }
 }

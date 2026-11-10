@@ -141,8 +141,8 @@ sequenceDiagram
     participant App as Solo Dev Hub
     participant S as Server repo
 
-    C->>C: author docs/backend-requirements/REQ-007_slug.md
-    App->>S: sync copies it to docs/client-requirements/<client>/
+    C->>C: author docs/InOutBox/outbox/<server>/REQ-007_slug.md
+    App->>S: sync copies it to docs/InOutBox/inbox/<client>/
     S->>S: implement, then write REQ-007_slug.response.md
     App->>C: sync copies the receipt back
     C->>C: drop REQ-007_slug.impl.md next to the request

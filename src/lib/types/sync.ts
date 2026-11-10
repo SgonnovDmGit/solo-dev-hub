@@ -33,6 +33,9 @@ export const SYNC_ISSUE_CODES = [
   'shared_no_own_branch',
   'shared_pending_approval',
   'shared_no_login',
+  'clone_target_invalid',
+  'clone_failed',
+  'clone_attach_failed',
 ] as const;
 export type SyncIssueCode = (typeof SYNC_ISSUE_CODES)[number];
 
@@ -232,6 +235,11 @@ export interface ParticipantActivity {
   login: string;
   /** ISO-8601; null when no commit with the login's trailer was found. */
   last_at: string | null;
+  /**
+   * T-000190: app version the login's install last published on the shared dev
+   * branch; null when unknown (old binary, missing/malformed file).
+   */
+  app_version: string | null;
 }
 
 export interface StructureParticipant {
@@ -245,7 +253,8 @@ export interface ProjectStructure {
   format: number;
   project: { name: string; type: string };
   main: { login: string; dev_branch: string };
-  repos: { github: string; role: string }[];
+  /** T-000243: absent `share_specs` (legacy structure) means the default on. */
+  repos: { github: string; role: string; share_specs?: boolean }[];
   microservices: string[];
   participants: StructureParticipant[];
 }

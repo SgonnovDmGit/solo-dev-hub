@@ -1,22 +1,79 @@
 # Flow: Cross-repo announcements (proactive push)
 
-**Введено в:** v0.26.0 (F-000040)
-**Связанные файлы:** [src-tauri/src/sync.rs](../../src-tauri/src/sync.rs) (`generate_project_md` — `## Parent projects` секция расширена local path для MS use case)
+**Введено в:** v0.26.0 (F-000040) — direct-write + delete-to-ack.
+**Переработано в:** v1.23.0 (T-000245) — app-side транспорт через единый InOutBox + per-recipient `.ack/<key>` маркеры.
+**Связанные файлы:** [src-tauri/src/sync/peer_channels.rs](../../src-tauri/src/sync/peer_channels.rs) (ack-механика), [src-tauri/src/sync/project_sync.rs](../../src-tauri/src/sync/project_sync.rs) (`sync_announce_channel`, dual-write), [src-tauri/src/sync/requirements.rs](../../src-tauri/src/sync/requirements.rs) (`migrate_announce_dir`).
 
 ## Модель
 
 Announcement — **однонаправленный push-канал** для unsolicited информации, которая не помещается в REQ/receipt pattern. Используется когда sender'у нужно что-то сказать recipient'у, но recipient этого не просил.
 
-Канал отличается от REQ/receipt тем, что **Solo Dev Hub в нём не участвует**: LLM пишет файл напрямую в filesystem recipient'а, recipient читает и удаляет файл — deletion = implicit ack. Никаких `.response.md` companion'ов, никакого app-side sync'а, никакой confirm ✓ кнопки в UI.
+С v1.23.0 announcement едет по **тому же парному транспорту InOutBox**, что REQ / NOTE / HANDOFF / PACT ([peer-channels.md](peer-channels.md)):
 
-Существуют **два направления** announcement'а, симметрично:
-
-| Направление | Recipient folder |
+| Роль | Путь |
 |---|---|
-| Server → client | `<client-repo-path>/docs/server-announcements/<server-canonical>/ANNOUNCE-NNN_<slug>.md` |
-| Microservice → parent server | `<parent-server-repo-path>/docs/microservice-announcements/<ms-project-name>/ANNOUNCE-NNN_<slug>.md` |
+| Sender пишет | `<sender-repo>/docs/InOutBox/outbox/<recipient-canonical>/ANNOUNCE-NNN_<slug>.md` |
+| Recipient читает | `<recipient-repo>/docs/InOutBox/inbox/<sender-canonical>/ANNOUNCE-NNN_<slug>.md` |
 
-В обратные стороны (client→server, server→MS) announcement'ов нет — там флоу через REQ/receipt.
+Приложение зеркалит outbox→inbox, переносит маркеры обратно и убирает закрытые пары. Парность — repo↔repo: анонс для N получателей = N файлов в N outbox-папках, broadcast-лейна нет.
+
+Существуют **два вертикальных направления** (как в REQ-модели):
+
+| Направление | Sender | Recipient |
+|---|---|---|
+| Server → client | server repo | каждый client repo |
+| Microservice → parent server | ms repo | каждый parent server repo |
+
+В обратные стороны (client→server, server→MS) announcement'ов нет — там флоу через REQ/receipt. Горизонтальные peer-пары (equal repos) технически несут тот же механизм через `peer_links`.
+
+## Ack: `.ack/<key>` маркер вместо удаления файла
+
+До v1.23.0 recipient подтверждал анонс **удалением файла** — это ломалось на shared-репо: одна общая `dev`-ветка видна всем участникам, и один удалённый файл не может сказать, кто именно прочитал.
+
+Теперь recipient'ский агент кладёт **пустой файл-маркер** рядом с телом:
+
+```
+inbox/<sender>/ANNOUNCE-015_rename.md
+inbox/<sender>/ANNOUNCE-015_rename.md.ack/<key>     # пустой файл
+```
+
+- `key` — **login участника** в shared-репо (`.sdh/project.json` roster), иначе **canonical name** recipient-репо (один логический читатель).
+- Маркер **пустой** — любой непустой файл / невалидное имя / поддиректория / symlink внутри `.ack/` считается issue (`peer_channel_failed`), не ack'ом.
+- Приложение маркеры не пишет — это честь читателя. Приложение их **транспортирует** обратно в outbox sender'а (union per key — чужой ранний ack никогда не исчезает) и валидирует.
+
+### Ревизии тела
+
+Автор меняет body → маркеры к старым байтам недействительны:
+
+- На локальной паре: body в outbox и inbox разошлись → `.ack/` группа стирается на **обеих** копиях **до** доставки новой редакции.
+- На shared-репо: маркер засчитывается, только если коммит, его внёсший, — потомок коммита, установившего текущие байты body (`git merge-base --is-ancestor`). Поздний merge со старым маркером = **conflict** (`version_conflict` issue), не ack. Незакоммиченный маркер в worktree — единственный доказуемо свежий (написан под тело этого worktree).
+- Новый `NNN` не наследует маркеры — каждый номер начинает с чистого `.ack/`.
+
+### Cleanup (owner-side)
+
+Когда **все ожидаемые читатели** recipient-стороны подтвердили:
+
+- non-shared: единственный ключ — canonical name репо;
+- shared: roster `main.login ∪ participants[].login` из `.sdh/project.json` — **перечитывается на каждом проходе** (новый участник → его ключа нет → анонс остаётся открытым для него);
+
+— приложение удаляет body и всю `.ack/` группу на обеих копиях (outbox + inbox). Без известного roster'а (нет БД / нет структуры) cleanup **не** выполняется — shared-репо без login'а читает, но не подтверждает и не подметает.
+
+`.ack/` директория без тела — сирота: sweeper убирает её, body **не воскрешает**.
+
+## Переходный протокол (v1.23.x)
+
+Legacy-папки живут как проекция и источник миграции:
+
+| Направление | Legacy-путь (на стороне recipient'а) |
+|---|---|
+| Server → client | `docs/server-announcements/<server-canonical>/` |
+| MS → parent server | `docs/microservice-announcements/<ms-project-name>/` |
+
+- **Миграция** (`migrate_announce_dir`): оставшиеся legacy-файлы переезжают в `inbox/<sender>/` + `outbox/<recipient>/` попарно, byte-identical; dedup при равных байтах, `migration_diverged` при разных (оба варианта живут). Non-shared recipient → legacy-файл убирается; shared → остаётся как проекция.
+- **Dual-write** (`ANNOUNCE_LEGACY_DUAL_WRITE`, shared recipient'ы): каждое новое body в `inbox/<sender>/` проецируется byte-identical файлом на legacy-путь — **один раз**. Отсутствующий файл, бывший в git-истории, = старый delete-ack → **не воскрешается**. Существующий — собственность старого агента, не переписывается.
+- **Retire**: пара закрыта в новой раскладке (body было в истории и исчезло) → legacy-проекция снимается. Файл, чьё new-body никогда не существовало — pre-migration остаток, живёт.
+- Поздний старый маркер / удаление проекции не воскрешают закрытый анонс (`closed_announce_names` по git-истории).
+- Release-гейт: когда все установки на ≥ v1.23.0, `ANNOUNCE_LEGACY_DUAL_WRITE` выключается — проекции перестают писаться, legacy-папки остаются архивом.
 
 ## Когда использовать announcement vs REQ receipt
 
@@ -31,21 +88,15 @@ Announcement — **однонаправленный push-канал** для uns
 
 **Positive criterion** (helper если sender не уверен): если recipient должен изменить код / конфиг / поведение чтобы продолжать корректно работать — пиши announcement. Если recipient может работать дальше unchanged и подобрать изменение позже через `api.md` — не пиши. Чрезмерные announcements обесценивают канал.
 
-Полная таблица + threshold подраздел — в global CLAUDE.md section `# Cross-repo announcements`.
-
 ## Lifecycle (server → client пример)
 
 Сервер переименовал rate-limit header `X-RateLimit-Hour-Remaining` → `X-RateLimit-Remaining-Hour`. Клиент не просил, но если не подстроится — будет читать undefined.
 
-1. **Server-LLM открывает свой `docs/project.md`** → `## Repositories` table, находит row(s) с `role` ∈ {`client`, `admin_client`, `test_client`}, берёт значение колонки `Path`. Это локальный путь client-репо в файловой системе разработчика.
+1. **Server-LLM канонизирует имена.** `docs/project.md` `## Repositories`: свою row (sender canonical) и row каждого client (`role` ∈ {`client`, `admin_client`, `test_client`}).
 
-2. **Server-LLM канонизирует своё имя.** В том же `docs/project.md` `## Repositories` находит row, у которого `Path` совпадает с текущим working directory (или server-LLM знает имя своего проекта по контексту). Берёт last-segment github_name — e.g. `web-app-backend`, не `SgonnovDmGit/web-app-backend`. Это subfolder name на recipient-стороне.
+2. **Picks `NNN`** — из глобального счётчика репо ([peer-channels.md](peer-channels.md) §реестр): `1 + max` по всем `docs/InOutBox/registry/*.md` и замороженным legacy-реестрам, сквозной по родам, направлениям и контрагентам. Строку `out` в `registry/<client-canonical>.md` пишет в том же проходе, что и body; ранее закрытые номера не переиспользуются — это сохраняет читаемость истории.
 
-3. **Resolves recipient announcement folder:** `<client-path>/docs/server-announcements/<server-canonical>/`. Если её нет — создаёт. Если path missing (`no local path configured` в project.md) — **announcement не deliverable**, server-LLM поднимает gap у юзера (own session log / `T-NNNNNN` в todo.md), файл "в никуда" не пишет.
-
-4. **Picks `NNN`** — `max(existing ANNOUNCE-NNN_*.md) + 1` если folder не пустой, иначе `001`. `NNN` — **monotonic** counter per (sender × recipient) pair, не slot allocator: previously deleted (acknowledged) entries не освобождают свои слоты для переиспользования. Это сохраняет читаемость git history recipient-репо — номера всегда растут.
-
-5. **Пишет файл** напрямую в recipient'ский filesystem по пути `<client-path>/docs/server-announcements/<server-canonical>/ANNOUNCE-NNN_<slug>.md`. 4-section структура:
+3. **Пишет файл** в СВОЙ outbox: `<server-repo>/docs/InOutBox/outbox/<client-canonical>/ANNOUNCE-NNN_<slug>.md` — один файл на каждого client. 4-section структура:
 
    ```markdown
    # ANNOUNCE-007: Rate-limit header renamed
@@ -72,29 +123,18 @@ Announcement — **однонаправленный push-канал** для uns
    - `internal/middleware/ratelimit.go:42`
    ```
 
-   **Sender НЕ хранит outbox-копию.** Git history recipient-репо — audit trail. Если sender'у нужно вспомнить что было отправлено — `git log` в recipient-репо (или session-log).
+   Отсюда доставка — дело приложения: на ближайшем sync body зеркалит в `inbox/<server>/` каждого client'а (а для shared client'а едет по git на общую `dev`-ветку до всех участников).
 
-6. **Recipient в новой сессии scan'ит** свой `docs/server-announcements/` (если client) или `docs/microservice-announcements/` (если parent server). Каждый subfolder — это sender (по canonical name). Для каждого найденного `ANNOUNCE-*.md`:
-   - Читает body (4 секции).
-   - Интегрирует / применяет изменения в собственный код.
-   - **Удаляет файл.** Deletion = implicit ack.
-   - Commit'ит deletion (вместе с code-changes которые она вызвала) в свой git. Это audit trail.
+4. **Recipient в новой сессии scan'ит** `docs/InOutBox/inbox/<sender>/` (а на переходный период — и legacy-папку, где могут жить остатки). Для каждого `ANNOUNCE-*.md`:
+   - Читает body, интегрирует изменения.
+   - **Кладёт `.ack/<key>`-маркер** — пустой файл `ANNOUNCE-NNN_<slug>.md.ack/<key>`: свой login в shared-репо, canonical name репо иначе. Удалять body **не нужно** — это делает приложение после всех подтверждений.
+   - Маркер коммитится вместе с вызванными code-changes (shared-репо — через обычный plumb на `dev`).
+
+5. **Приложение закрывает пару**: все ожидаемые ключи собраны → body + `.ack/` удаляются с обеих сторон.
 
 ## Microservice → parent server flow
 
-Зеркальный flow с одной asymmetry: MS получает recipient path из `## Parent projects` секции своего `docs/project.md`. С v0.26.0 каждая строка читается как:
-
-```
-- **<parent-name>** — server repo: <name> (path: <local-path>)
-```
-
-(До v0.26.0 path в строку не выводился — F-000040 добавил расширение в `generate_project_md`.)
-
-Если в строке `(no local path configured)` или `⚠ server repo not resolvable` — announcement не deliverable, MS-LLM не пишет файл.
-
-Folder на стороне parent server'а: `<parent-path>/docs/microservice-announcements/<ms-project-name>/`. Subfolder name — **canonical name of MS project** (тот же что используется в `microservice-requirements/<ms-project>/` на server-стороне для REQ flow).
-
-Всё остальное (NNN counter, 4-section structure, ack-via-delete) идентично server→client направлению.
+Зеркально: sender — ms repo, recipient — каждый parent server. MS пишет в свой `outbox/<parent-canonical>/`; parent читает `inbox/<ms-canonical>/`. Legacy-проекция на стороне parent'а: `docs/microservice-announcements/<ms-project-name>/` — имя папки от **ms project**, rename реплеится по `project_renames`.
 
 ## Сценарии — когда announcement уместен
 
@@ -128,37 +168,24 @@ Server планирует через 2 минорки убрать legacy endpoi
 
 | Шаг | Solo Dev Hub | LLM |
 |---|---|---|
-| Generate `docs/project.md` (recipient paths + canonical names) | ✓ | — |
-| Сшить parent server path в MS-side project.md (v0.26.0) | ✓ (`generate_project_md`) | — |
-| Discover recipient path | — | ✓ (читает project.md) |
-| Subfolder canonical naming | — | ✓ (берёт last-segment github_name из project.md row) |
-| Pick next NNN | — | ✓ (grep + max+1) |
-| Write `ANNOUNCE-*.md` в recipient-filesystem | — | ✓ (direct fs write, carve-out из no-cross-repo-writes rule) |
-| Detect файлы recipient'ом | — | ✓ (scan на session start) |
-| Delete after ack | — | ✓ |
-| Commit deletion | — | ✓ (вместе с triggered code changes) |
-| Track outbox / inbox count в UI | — | — (нет: нет UI counter, badge, screen для announcements) |
-| Audit trail | — | git history recipient-репо |
+| Generate `docs/project.md` (canonical names) | ✓ | — |
+| Транспорт body outbox→inbox (включая shared `dev`-ветку) | ✓ | — |
+| Перенос `.ack/` маркеров обратно в outbox (union per key) | ✓ | — |
+| Сброс маркеров при ревизии body; ancestry-гард на shared | ✓ | — |
+| Legacy-миграция + dual-write проекции + retire | ✓ (shared recipient'ы, пока gate on) | — |
+| Cleanup body+`.ack/` после всех подтверждений | ✓ | — |
+| Pick next NNN, написать body в свой outbox | — | ✓ |
+| Прочитать, применить, положить `.ack/<key>` | — | ✓ |
+| Track outbox / inbox count в UI | — | — (нет UI counter, badge, screen) |
+| Audit trail | — | git history обоих репо |
 
-В отличие от REQ/receipt flow, где Solo Dev Hub несёт основную работу по перемещению файлов между репо, в announcement flow **app не делает ничего за рантайм**. Единственная роль app — генерация `docs/project.md`, в которой content для recipient paths и canonical names уже доступен.
+## Carve-out из no-cross-repo-writes rule — снят
 
-## Carve-out из no-cross-repo-writes rule
-
-Global CLAUDE.md секция `# Cross-repo requirements` запрещает LLM копировать / перемещать / удалять файлы через границы репо вручную — это владение Solo Dev Hub'а для REQ pairs. Announcements — **explicit exception**:
-
-- Sender-LLM **пишет** `ANNOUNCE-*.md` в filesystem recipient'а напрямую.
-- Recipient-LLM **удаляет** `ANNOUNCE-*.md` из собственного репо после интеграции.
-- Solo Dev Hub **не отслеживает, не пропагирует, не surface'ит** announcement-файлы — нет UI counter, нет badge, нет confirm-✓.
-
-Carve-out обоснован асимметрией flow: announcement не имеет recipient-response (а значит нет необходимости в bidirectional sync), и потеря/дубликат сообщения не разрушает invariants (recipient просто узнает позже / получит ту же info дважды и удалит).
+До v1.23.0 announcement был explicit exception: sender-LLM писал напрямую в filesystem recipient'а. С v1.23.0 агент пишет **только в собственный репо** (`outbox/<recipient>/`) — carve-out больше не нужен, границу репо пересекает приложение.
 
 ## Cross-reference
 
-Нормативный текст — в global CLAUDE.md section `# Cross-repo announcements (proactive push)`:
-- `## When to use an announcement vs a REQ receipt` — таблица + `### Threshold: actionable impact required` подраздел
-- `## Directions` — server→client / MS→parent server
-- `## How the sender writes an announcement` — 3 numbered шага (project.md path lookup → NNN → write)
-- `## How the recipient reads an announcement` — scan + ack-via-delete
-- `## Carve-out from the no-cross-repo-writes rule` — explicit exception
-
-Для триангулярного flow (client → server → microservice) через REQ/receipt — см. [microservice-server-sync.md § Triangular flow](microservice-server-sync.md).
+- Парный транспорт, teardown-семантика, registry: [peer-channels.md](peer-channels.md)
+- REQ/receipt и триангулярный flow: [requirements-sync.md](requirements-sync.md), [microservice-server-sync.md](microservice-server-sync.md)
+- Shared-режим, roster, plumb: [contributor-mode.md](contributor-mode.md)
+- Нормативный текст для агентов — скиллы `sdh-cross-repo-announce-send` / `sdh-cross-repo-announce-read`

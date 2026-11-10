@@ -13,15 +13,20 @@
     /** Login of the request being approved right now. */
     approving: string | null;
     onApprove: (login: string) => void;
-    /** Last push per participant, keyed by lower-cased login (owner's install only). */
-    activity?: Map<string, string | null>;
+    /** Last push + app version per login, keyed by lower-cased login (owner's install only). */
+    activity?: Map<string, { last_at: string | null; app_version: string | null }>;
   }
 
   let { rows, isOwnerInstall, approving, onApprove, activity = new Map() }: Props = $props();
 
   // The column is the owner's view: a contributor's install has no such data.
   const lastPush = (row: ParticipantRow): string | null =>
-    row.kind === 'participant' ? (activity.get(row.login.trim().toLowerCase()) ?? null) : null;
+    activity.get(row.login.trim().toLowerCase())?.last_at ?? null;
+
+  // T-000190: the version a login last published on the dev branch; shown for
+  // every row kind — the owner and a pending helper publish theirs too.
+  const appVersion = (row: ParticipantRow): string | null =>
+    activity.get(row.login.trim().toLowerCase())?.app_version ?? null;
 
   function roleKey(kind: ParticipantRow['kind']): string {
     return kind === 'owner' ? 'shared.roleOwner' : kind === 'participant' ? 'shared.roleParticipant' : 'shared.roleRequest';
@@ -41,6 +46,7 @@
           <th>{$tStore('shared.colRole' as any)}</th>
           {#if isOwnerInstall}
             <th title={$tStore('shared.colLastPushHint' as any)}>{$tStore('shared.colLastPush' as any)}</th>
+            <th title={$tStore('shared.colVersionHint' as any)}>{$tStore('shared.colVersion' as any)}</th>
           {/if}
           <th class="action-col"></th>
         </tr>
@@ -64,11 +70,19 @@
             <td><span class="role-badge {row.kind}">{$tStore(roleKey(row.kind) as any)}</span></td>
             {#if isOwnerInstall}
               {@const at = lastPush(row)}
+              {@const ver = appVersion(row)}
               <td class="last-push" title={at ? new Date(at).toLocaleString() : ''}>
                 {#if at}
                   {formatRelativeTime(at, $nowTick, $locale === 'en' ? 'en' : 'ru')}
                 {:else}
                   {$tStore('shared.bandNone' as any)}
+                {/if}
+              </td>
+              <td class="app-version mono">
+                {#if ver}
+                  {ver}
+                {:else}
+                  {$tStore('shared.versionUnknown' as any)}
                 {/if}
               </td>
             {/if}
@@ -141,6 +155,11 @@
   }
 
   .last-push {
+    white-space: nowrap;
+    color: var(--text-muted);
+  }
+
+  .app-version {
     white-space: nowrap;
     color: var(--text-muted);
   }

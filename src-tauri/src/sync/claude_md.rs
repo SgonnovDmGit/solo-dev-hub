@@ -471,6 +471,7 @@ mod tests {
             repos: vec![StructRepo {
                 github: "owner/app".into(),
                 role: "tool".into(),
+                share_specs: None,
             }],
             microservices: vec![],
             participants: participants
@@ -730,5 +731,58 @@ Desc"
 
         // Assert: setting still absent (we never reached the set_setting call)
         assert!(db.get_setting("ai_rules_last_sync_at").unwrap().is_none());
+    }
+
+    // ── T-000244: the seeded contract reaches ~/.claude/CLAUDE.md ─────────────
+
+    /// The contract line of the real bundled global template: hand-back
+    /// markers are local service files and are never committed.
+    #[test]
+    fn test_seeded_global_template_carries_the_marker_contract() {
+        let template = crate::template_seeder::bundled_file_content(
+            "_global",
+            crate::sync::GLOBAL_SECTION_FILE,
+        )
+        .expect("bundled claude.md.global.tmpl");
+        assert!(
+            template.contains("Never commit a `.approved` / `.conflict` file"),
+            "the contract line is missing from the bundle:\n{}",
+            template
+        );
+    }
+
+    /// `update_claude_md_global` delivers the seeded template — with the new
+    /// contract — into the managed block of `~/.claude/CLAUDE.md`. It is the
+    /// global template that carries it, not the per-repo section.
+    #[test]
+    fn test_update_claude_md_global_writes_the_marker_contract_into_the_block() {
+        let db = make_test_db();
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join("CLAUDE.md");
+        fs::write(&claude, "# My own rules\n\nkeep them.\n").unwrap();
+
+        update_claude_md_global(&db, &claude).unwrap();
+
+        let content = fs::read_to_string(&claude).unwrap();
+        assert!(
+            content.starts_with("# My own rules"),
+            "user content stays above the block:\n{}",
+            content
+        );
+        let begin = content.find("manager:begin").expect("managed block");
+        let end = content.find("manager:end").expect("managed block end");
+        let block = &content[begin..end];
+        assert!(
+            block.contains("Never commit a `.approved` / `.conflict` file"),
+            "the contract is inside the managed block:\n{}",
+            block
+        );
+        // And the per-repo section template does not carry it.
+        let section = db
+            .get_template_file("_global", "claude.md.section.tmpl")
+            .unwrap()
+            .unwrap()
+            .content;
+        assert!(!section.contains("`.approved`"));
     }
 }

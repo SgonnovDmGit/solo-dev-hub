@@ -59,6 +59,50 @@ pub struct StructMain {
 pub struct StructRepo {
     pub github: String,
     pub role: String,
+    /// T-000243: whether `docs/superpowers/` travels in shared mode for THIS
+    /// repo. `None` = the field is ABSENT (a legacy structure) = default ON.
+    /// T-000243 review (second pass): a PRESENT value must be a real boolean.
+    /// Serde's plain `Option<bool>` folds an explicit JSON `null` into `None`
+    /// too, which would silently turn sharing ON for a file that says no such
+    /// thing — the spec grants the default only to a field that is MISSING
+    /// («неверный тип — ошибка, не fallback»), and `null` is a wrong type like
+    /// any other. Omission (serde `default`) is the only road to `None`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_share_specs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub share_specs: Option<bool>,
+}
+
+/// `share_specs` deserializer: absent → serde `default` → `None`; present →
+/// `true` / `false` only. Explicit `null` — and every other JSON type — is a
+/// hard parse error, so the file surfaces as untrusted instead of resolving
+/// to the default-on.
+fn deserialize_share_specs<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Bool(b) => Ok(Some(b)),
+        other => Err(D::Error::custom(format!(
+            "share_specs must be true or false, not {}",
+            json_kind(&other)
+        ))),
+    }
+}
+
+/// The JSON type of a non-boolean `share_specs` value, for the parse error.
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,6 +478,19 @@ pub fn validate_structure(
     Ok(())
 }
 
+/// T-000243: the effective `docs/superpowers/` policy of a VALIDATED structure
+/// for one repo: `true` (share) when the repo is absent from `repos` or the
+/// field is missing (legacy structure = default on). Per repo — the value of
+/// one repo never applies to another. An untrusted structure never reaches
+/// this function (`read_structure_file` / `discover_structure` refuse it).
+pub fn share_specs_for(s: &ProjectStructure, github_name: &str) -> bool {
+    s.repos
+        .iter()
+        .find(|r| r.github.eq_ignore_ascii_case(github_name))
+        .and_then(|r| r.share_specs)
+        .unwrap_or(true)
+}
+
 // ---------------------------------------------------------------------------
 // Files
 // ---------------------------------------------------------------------------
@@ -630,11 +687,39 @@ pub fn build_structure(
         .into_iter()
         .filter_map(|r| {
             let github = r.github_name?;
-            let role = r.role?;
-            if !is_valid_repo_full_name(&github) || role.trim().is_empty() {
+            if !is_valid_repo_full_name(&github) {
                 return None;
             }
-            Some(StructRepo { github, role })
+            // T-000243 review (third pass): the repo this structure is built
+            // for — and any sibling of the project the owner already shares —
+            // publishes its specs policy even WITHOUT an architectural role:
+            // `share_specs_for` reads a missing entry as the default ON, so
+            // dropping a role-less shared repo here silently published its
+            // specs to a contributor against the owner's stored OFF. The
+            // placeholder is the `other` role the repositories.role CHECK and
+            // `REPO_ROLES` already know. A NON-shared repo without a role
+            // keeps being left out — nothing of it travels, and its policy
+            // must not appear either.
+            let role = match r.role.as_deref().map(str::trim) {
+                Some(role) if !role.is_empty() => role.to_string(),
+                _ if r.id == repo_id || crate::sync::shared::is_shared_repo(db, r.id) => {
+                    "other".to_string()
+                }
+                _ => return None,
+            };
+            // T-000243: the published specs policy comes from THIS repo's own
+            // stored setting (never from folder existence or .gitignore, and
+            // never copied from a sibling repo of the project). The getter
+            // synthesizes the default — share — for a repo with no row.
+            let share_specs = db
+                .get_shared_state(r.id)
+                .map(|s| s.share_specs)
+                .unwrap_or(true);
+            Some(StructRepo {
+                github,
+                role,
+                share_specs: Some(share_specs),
+            })
         })
         .collect();
 
@@ -1145,6 +1230,16 @@ pub fn pin_after_accept(db: &AppDb, repo_id: i64, s: &ProjectStructure) -> Resul
 ///   are `Untrusted("ambiguous structure: ...")` - none is ever picked.
 ///
 /// A worktree file that fails validation does not stop the search of the refs.
+/// A copy that is PRESENT but cannot be parsed (malformed JSON, a wrong field
+/// type) is `Untrusted` with the parse reason — T-000243 review: it is never
+/// allowed to fall back to an older valid copy, whose `share_specs` policy may
+/// be exactly what the unreadable copy came to change. The second review pass
+/// extends that to a copy that PARSES but does not VALIDATE (an unsupported
+/// format, a main this install does not trust): the authoritative copy — the
+/// pinned ref, or the origin ref the work tree's own dev branch names —
+/// exists and is refused, so the work-tree fallback never supplies the policy
+/// either. Only a ref that carries no structure at all leaves the work tree
+/// in charge.
 pub fn discover_structure(
     git: &GitBinary,
     repo_root: &Path,
@@ -1172,7 +1267,13 @@ pub fn discover_structure(
         }
     }
 
-    let read_ref = |full: &str| -> Option<ProjectStructure> {
+    // Read `.sdh/project.json` out of `full`: `Ok(None)` = the ref carries no
+    // such file, `Ok(Some)` = parsed, `Err` = the file IS there but cannot be
+    // parsed (malformed JSON, a wrong field type). T-000243 review: that third
+    // case must surface as untrusted — an authoritative copy that cannot be
+    // read is never allowed to fall back to an older work-tree copy (a stale
+    // copy may carry an abandoned `share_specs` policy).
+    let read_ref = |full: &str| -> Result<Option<ProjectStructure>, String> {
         match git_sync::show_file_capped(
             git,
             repo_root,
@@ -1180,8 +1281,9 @@ pub fn discover_structure(
             STRUCTURE_REL_PATH,
             MAX_STRUCTURE_BYTES,
         ) {
-            Ok(Some(b)) => parse_structure(&b).ok(),
-            _ => None,
+            Ok(Some(b)) => parse_structure(&b).map(Some),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
         }
     };
 
@@ -1189,21 +1291,42 @@ pub fn discover_structure(
     // be older (a helper branches off `origin/dev` before being approved and
     // its checkout then never sees the approval), so an origin copy that
     // validates always wins. The work tree is the fallback (no remote ref yet,
-    // offline, or the origin copy does not validate).
+    // offline, or the origin copy does not validate) — but NOT for a copy that
+    // is present and unusable: that is an error, not a reason to trust a stale
+    // local file.
     if let Some(pin) = pinned {
         let full = format!("refs/remotes/origin/{}", pin);
-        if let Some(s) = read_ref(&full) {
-            if s.main.dev_branch != pin {
-                // Never hidden by a work-tree copy that still names the pin.
-                return Ok(DiscoverOutcome::Untrusted(dev_branch_changed_reason(
-                    pin,
-                    &s.main.dev_branch,
-                )));
+        match read_ref(&full) {
+            Err(e) => {
+                // The authoritative copy exists and cannot be read: never
+                // hidden by a work-tree copy that still names the pin.
+                return Ok(DiscoverOutcome::Untrusted(format!("origin/{}: {}", pin, e)));
             }
-            match validate_structure(&s, github_name, admins) {
-                Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", pin))),
-                Err(reason) => untrusted = Some(format!("origin/{}: {}", pin, reason)),
+            Ok(Some(s)) => {
+                if s.main.dev_branch != pin {
+                    // Never hidden by a work-tree copy that still names the pin.
+                    return Ok(DiscoverOutcome::Untrusted(dev_branch_changed_reason(
+                        pin,
+                        &s.main.dev_branch,
+                    )));
+                }
+                match validate_structure(&s, github_name, admins) {
+                    Ok(()) => return Ok(DiscoverOutcome::Found(s, format!("origin/{}", pin))),
+                    // T-000243 review (second pass): the AUTHORITATIVE copy
+                    // exists but does not validate (an unsupported format, an
+                    // untrusted main) — the refusal is final. Recording it and
+                    // letting a valid stale WORKTREE copy win would revive
+                    // exactly the stale `share_specs` policy the bad copy may
+                    // have come to change.
+                    Err(reason) => {
+                        return Ok(DiscoverOutcome::Untrusted(format!(
+                            "origin/{}: {}",
+                            pin, reason
+                        )))
+                    }
+                }
             }
+            Ok(None) => {}
         }
     }
 
@@ -1219,12 +1342,51 @@ pub fn discover_structure(
                     // if it validates and names itself, is the newer truth.
                     let branch = s.main.dev_branch.clone();
                     let full = format!("refs/remotes/origin/{}", branch);
-                    if let Some(o) = read_ref(&full) {
-                        if o.main.dev_branch == branch
-                            && validate_structure(&o, github_name, admins).is_ok()
-                        {
-                            return Ok(DiscoverOutcome::Found(o, format!("origin/{}", branch)));
+                    match read_ref(&full) {
+                        Err(e) => {
+                            // Present but unreadable: the newer truth cannot
+                            // be used, and the stale work-tree policy is not
+                            // accepted in its place.
+                            return Ok(DiscoverOutcome::Untrusted(format!(
+                                "origin/{}: {}",
+                                branch, e
+                            )));
                         }
+                        Ok(Some(o)) => {
+                            if o.main.dev_branch != branch {
+                                // T-000243 review (second pass): the ref the
+                                // work tree names carries a structure that
+                                // does not even claim to be that branch's —
+                                // not an authoritative copy we can accept, so
+                                // the stale work-tree policy does not stand in
+                                // for it either.
+                                return Ok(DiscoverOutcome::Untrusted(format!(
+                                    "origin/{}: the structure names dev branch {}",
+                                    branch, o.main.dev_branch
+                                )));
+                            }
+                            match validate_structure(&o, github_name, admins) {
+                                Ok(()) => {
+                                    return Ok(DiscoverOutcome::Found(
+                                        o,
+                                        format!("origin/{}", branch),
+                                    ))
+                                }
+                                // T-000243 review (second pass): the origin ref
+                                // matching the work tree's dev branch EXISTS
+                                // but does not validate — fail closed instead
+                                // of silently skipping the invalid copy (an
+                                // unsupported format or an untrusted main must
+                                // not revive a stale ON policy).
+                                Err(reason) => {
+                                    return Ok(DiscoverOutcome::Untrusted(format!(
+                                        "origin/{}: {}",
+                                        branch, reason
+                                    )))
+                                }
+                            }
+                        }
+                        Ok(None) => {}
                     }
                     return Ok(DiscoverOutcome::Found(s, SOURCE_WORKTREE.to_string()));
                 }
@@ -1251,7 +1413,17 @@ pub fn discover_structure(
         let Some(branch) = full.strip_prefix("refs/remotes/origin/") else {
             continue;
         };
-        let Some(s) = read_ref(&full) else { continue };
+        let s = match read_ref(&full) {
+            Ok(Some(s)) => s,
+            // A ref that sits on its own dev branch but cannot be parsed is
+            // reported, not silently skipped: a malformed copy must not let a
+            // stale work-tree policy win (a valid candidate still does).
+            Err(e) => {
+                untrusted.get_or_insert(format!("origin/{}: {}", branch, e));
+                continue;
+            }
+            Ok(None) => continue,
+        };
         if s.main.dev_branch != branch {
             continue;
         }
@@ -1505,10 +1677,12 @@ mod tests {
                 StructRepo {
                     github: "Owner/web".into(),
                     role: "client".into(),
+                    share_specs: None,
                 },
                 StructRepo {
                     github: "Owner/api".into(),
                     role: "server".into(),
+                    share_specs: None,
                 },
             ],
             microservices: vec!["mailer".into()],
@@ -1648,7 +1822,8 @@ mod tests {
         let db = make_db();
         let (api_id, pid) = seeded(&db);
         db.set_autocommit_branch(api_id, Some("dev")).unwrap();
-        // a repo without a role is left out
+        // a repo without a role that is neither shared nor the current one is
+        // left out (T-000243 review, third pass: see the test below)
         let misc = local_repo(&db, "Owner/misc");
         db.assign_repository(misc, Some(pid), None).unwrap();
         let ms = db.create_project("mailer", None, "microservice").unwrap();
@@ -1689,6 +1864,219 @@ mod tests {
         assert!(build_structure(&db, solo, "Owner", None)
             .unwrap_err()
             .contains("project"));
+    }
+
+    /// T-000243 review (third pass): the repo the structure is built FOR — and
+    /// a shared sibling of the project — publish their specs policy even
+    /// without an architectural role, normalized to `other`. `share_specs_for`
+    /// reads a MISSING entry as the default ON, so dropping such a repo used
+    /// to silently publish its specs to a contributor against the owner's
+    /// stored OFF. A non-shared role-less repo keeps being left out.
+    #[test]
+    fn build_structure_publishes_a_role_less_shared_repo_as_other() {
+        let db = make_db();
+        let (api_id, pid) = seeded(&db);
+        db.set_autocommit_branch(api_id, Some("dev")).unwrap();
+        // A shared sibling with no role at all, opted out of the specs.
+        let misc = local_repo(&db, "Owner/misc");
+        db.assign_repository(misc, Some(pid), None).unwrap();
+        db.set_shared_mode(misc, true).unwrap();
+        db.set_repo_share_specs(misc, false).unwrap();
+        // A plain role-less repo: not shared, not the current repo.
+        let plain = local_repo(&db, "Owner/plain");
+        db.assign_repository(plain, Some(pid), None).unwrap();
+
+        let s = build_structure(&db, api_id, "Owner", None).unwrap();
+        let misc_row = s.repos.iter().find(|r| r.github == "Owner/misc").unwrap();
+        assert_eq!(misc_row.role, "other");
+        assert_eq!(misc_row.share_specs, Some(false));
+        assert!(s.repos.iter().all(|r| r.github != "Owner/plain"));
+        assert!(validate_structure(&s, "Owner/api", &AdminVerified::default()).is_ok());
+        // the entry is exactly what makes the contributor accept the OFF
+        assert!(!share_specs_for(&s, "Owner/misc"));
+
+        // The CURRENT repo itself, role-less and opted out: the review's hole
+        // was the owner sharing a repo that has no architectural role.
+        db.assign_repository(api_id, Some(pid), None).unwrap();
+        db.set_repo_share_specs(api_id, false).unwrap();
+        let s2 = build_structure(&db, api_id, "Owner", None).unwrap();
+        let api_row = s2.repos.iter().find(|r| r.github == "Owner/api").unwrap();
+        assert_eq!(api_row.role, "other");
+        assert_eq!(api_row.share_specs, Some(false));
+        assert!(validate_structure(&s2, "Owner/api", &AdminVerified::default()).is_ok());
+        assert!(!share_specs_for(&s2, "Owner/api"));
+        // while the absent, non-shared sibling still reads as the legacy ON
+        assert!(share_specs_for(&s2, "Owner/plain"));
+    }
+
+    // ----- T-000243: per-repo share_specs policy --------------------------------
+
+    /// A legacy structure file (format 1, written before the field existed):
+    /// every repo parses with `share_specs: None` and means the default ON.
+    #[test]
+    fn share_specs_legacy_structure_without_the_field_means_on() {
+        let legacy = r#"{
+            "format": 1,
+            "project": {"name": "Acme", "type": "standard"},
+            "main": {"login": "Owner", "dev_branch": "dev"},
+            "repos": [
+                {"github": "Owner/web", "role": "client"},
+                {"github": "Owner/api", "role": "server"}
+            ],
+            "microservices": ["mailer"],
+            "participants": []
+        }"#;
+        let s: ProjectStructure = serde_json::from_str(legacy).unwrap();
+        assert!(s.repos.iter().all(|r| r.share_specs.is_none()));
+        assert!(validate_structure(&s, "Owner/web", &AdminVerified::default()).is_ok());
+        // default on for a listed repo (case-insensitively) and for one that
+        // the structure does not list at all
+        assert!(share_specs_for(&s, "Owner/web"));
+        assert!(share_specs_for(&s, "owner/API"));
+        assert!(share_specs_for(&s, "Owner/unlisted"));
+        // a `None` repo is not written back with the field: the file stays legacy
+        assert!(!serialize_structure(&s).contains("share_specs"));
+    }
+
+    #[test]
+    fn share_specs_explicit_values_round_trip_per_repo() {
+        let mut s = sample();
+        s.repos[0].share_specs = Some(false); // Owner/web
+        s.repos[1].share_specs = Some(true); // Owner/api
+        let text = serialize_structure(&s);
+        assert!(text.contains("\"share_specs\": false"));
+        assert!(text.contains("\"share_specs\": true"));
+        // serialize sorts repos by name, so look them up after the round trip
+        let back: ProjectStructure = serde_json::from_str(&text).unwrap();
+        let by_name = |name: &str| {
+            back.repos
+                .iter()
+                .find(|r| r.github == name)
+                .unwrap()
+                .share_specs
+        };
+        assert_eq!(by_name("Owner/web"), Some(false));
+        assert_eq!(by_name("Owner/api"), Some(true));
+        // the accessor reads each repo's own value, never a sibling's
+        assert!(!share_specs_for(&back, "Owner/web"));
+        assert!(!share_specs_for(&back, "owner/WEB"));
+        assert!(share_specs_for(&back, "Owner/api"));
+        // and the whole thing still validates
+        assert!(validate_structure(&back, "Owner/web", &AdminVerified::default()).is_ok());
+    }
+
+    /// A wrong JSON type for the flag is a hard error at parse time — never a
+    /// silent fallback to the default (which would quietly turn sharing on).
+    /// T-000243 review (second pass): explicit `null` is one of those wrong
+    /// types, not "absent" — the default-on is granted only to a field that is
+    /// MISSING, and a present `null` must never resolve to it.
+    #[test]
+    fn share_specs_wrong_type_is_a_hard_error_not_a_fallback() {
+        let with = |repos: &str| {
+            format!(
+                r#"{{"format":1,"project":{{"name":"Acme","type":"standard"}},
+                "main":{{"login":"Owner","dev_branch":"dev"}},
+                "repos":[{repos}],"microservices":[],"participants":[]}}"#
+            )
+        };
+        for bad in [
+            r#"{"github":"Owner/web","role":"client","share_specs":"yes"}"#,
+            r#"{"github":"Owner/web","role":"client","share_specs":"true"}"#,
+            r#"{"github":"Owner/web","role":"client","share_specs":1}"#,
+            r#"{"github":"Owner/web","role":"client","share_specs":["off"]}"#,
+            r#"{"github":"Owner/web","role":"client","share_specs":null}"#,
+            r#"{"github":"Owner/web","role":"client","share_specs":{}}"#,
+        ] {
+            let raw = with(bad);
+            assert!(
+                serde_json::from_str::<ProjectStructure>(&raw).is_err(),
+                "must be rejected: {}",
+                bad
+            );
+        }
+        // Omission stays the one legacy form that means the default on.
+        let legacy = with(r#"{"github":"Owner/web","role":"client"}"#);
+        let legacy_s: ProjectStructure = serde_json::from_str(&legacy).unwrap();
+        assert!(legacy_s.repos[0].share_specs.is_none());
+        assert!(share_specs_for(&legacy_s, "Owner/web"));
+        // a present null surfaces as a structure error through the real read
+        // path, exactly like a wrong scalar type — never a default-on
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(".sdh")).unwrap();
+        fs::write(
+            tmp.path().join(".sdh/project.json"),
+            with(r#"{"github":"Owner/web","role":"client","share_specs":null}"#),
+        )
+        .unwrap();
+        let err =
+            read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default()).unwrap_err();
+        assert!(err.contains("share_specs"), "{}", err);
+        assert!(err.contains("null"), "{}", err);
+        // the same file with a proper boolean is fine
+        fs::write(
+            tmp.path().join(".sdh/project.json"),
+            with(r#"{"github":"Owner/web","role":"client","share_specs":false}"#),
+        )
+        .unwrap();
+        let ok = read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default())
+            .unwrap()
+            .unwrap();
+        assert!(!share_specs_for(&ok, "Owner/web"));
+    }
+
+    #[test]
+    fn build_structure_publishes_each_repos_own_share_specs() {
+        let db = make_db();
+        let (api_id, pid) = seeded(&db);
+        db.set_autocommit_branch(api_id, Some("dev")).unwrap();
+        // only the api repo opts out; the sibling keeps the default
+        db.set_repo_share_specs(api_id, false).unwrap();
+        // a third repo of the same project, also untouched
+        let extra = local_repo(&db, "Owner/extra");
+        db.assign_repository(extra, Some(pid), Some("tool"))
+            .unwrap();
+
+        let s = build_structure(&db, api_id, "Owner", None).unwrap();
+        let by_name = |s: &ProjectStructure, name: &str| {
+            s.repos.iter().find(|r| r.github == name).unwrap().clone()
+        };
+        assert_eq!(by_name(&s, "Owner/api").share_specs, Some(false));
+        assert_eq!(
+            by_name(&s, "Owner/web").share_specs,
+            Some(true),
+            "one repo's off must not leak to a sibling"
+        );
+        assert_eq!(by_name(&s, "Owner/extra").share_specs, Some(true));
+        assert!(validate_structure(&s, "Owner/api", &AdminVerified::default()).is_ok());
+        assert!(!share_specs_for(&s, "Owner/api"));
+        assert!(share_specs_for(&s, "Owner/web"));
+
+        // a fresh read of the same project follows a later toggle
+        db.set_repo_share_specs(api_id, true).unwrap();
+        let s2 = build_structure(&db, api_id, "Owner", None).unwrap();
+        assert_eq!(by_name(&s2, "Owner/api").share_specs, Some(true));
+    }
+
+    /// An untrusted structure (here: `main.login` is not the repo owner) never
+    /// supplies the policy — the same fail-closed path the trust tests use.
+    #[test]
+    fn share_specs_from_an_untrusted_structure_is_not_used() {
+        let mut s = sample();
+        s.repos[0].share_specs = Some(false);
+        s.main.login = "helper".into();
+        assert!(validate_structure(&s, "Owner/web", &AdminVerified::default()).is_err());
+        let tmp = TempDir::new().unwrap();
+        write_structure_if_changed(tmp.path(), &s).unwrap();
+        // the file exists and names off, but it is refused wholesale
+        assert!(read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default()).is_err());
+        // the very same content from the real owner is usable and says off
+        let mut trusted = s;
+        trusted.main.login = "Owner".into();
+        write_structure_if_changed(tmp.path(), &trusted).unwrap();
+        let ok = read_structure_file(tmp.path(), "Owner/web", &AdminVerified::default())
+            .unwrap()
+            .unwrap();
+        assert!(!share_specs_for(&ok, "Owner/web"));
     }
 
     // ----- roles and bands -------------------------------------------------
@@ -2009,15 +2397,175 @@ mod tests {
             .map(|i| StructRepo {
                 github: format!("Owner/{}-{}", "r".repeat(90), i),
                 role: "tool".into(),
+                share_specs: None,
             })
             .collect();
         assert!(serialize_structure(&big).len() as u64 > MAX_STRUCTURE_BYTES);
         publish_struct(&fx, "dev", &big, "2026-01-01T00:00:00Z");
         let c = contributor(&fx);
-        assert_eq!(
-            discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap(),
-            DiscoverOutcome::NotFound
+        // T-000243 review: a copy that IS present but cannot be read (here:
+        // past the size cap) is untrusted, not silently skipped — an
+        // unreadable authoritative copy must never let a stale local policy win.
+        match discover_structure(&gb(), &c, REPO, None, &AdminVerified::default()).unwrap() {
+            DiscoverOutcome::Untrusted(reason) => {
+                assert!(reason.contains("too large"), "{}", reason)
+            }
+            other => panic!("expected Untrusted, got {:?}", other),
+        }
+    }
+
+    /// Commit a RAW `.sdh/project.json` (not the serialized model) onto branch
+    /// `name` and push it: the fixture of an unreadable authoritative copy.
+    fn publish_raw(fx: &Fx, name: &str, content: &str) {
+        g(&fx.a, &["checkout", "-q", "-B", name, "HEAD"]);
+        fs::create_dir_all(fx.a.join(".sdh")).unwrap();
+        fs::write(fx.a.join(".sdh/project.json"), content).unwrap();
+        g(&fx.a, &["add", ".sdh"]);
+        g(&fx.a, &["commit", "-q", "-m", "structure"]);
+        g(&fx.a, &["push", "-q", "origin", name]);
+        // back to a structure-free base for the next branch
+        let base = g(&fx.a, &["rev-list", "--max-parents=0", "HEAD"]);
+        g(&fx.a, &["checkout", "-q", "--detach", &base]);
+    }
+
+    /// T-000243 review: the authoritative copy of the owner's dev branch being
+    /// malformed (invalid JSON, a wrong field type) must surface as
+    /// `Untrusted` — the older valid copy in the work tree is NOT accepted in
+    /// its place, because its `share_specs` policy may be exactly what the
+    /// unreadable copy came to change («неверный тип — ошибка, не fallback»).
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_malformed_origin_structure_is_never_replaced_by_a_stale_worktree_copy() {
+        for pinned in [Some("dev"), None] {
+            let fx = fx();
+            publish_raw(&fx, "dev", "{ not json at all");
+            let c = contributor(&fx);
+            // The stale but perfectly valid work-tree copy opts the specs out.
+            let mut stale = sample();
+            stale.repos[0].share_specs = Some(false);
+            write_structure_if_changed(&c, &stale).unwrap();
+            match discover_structure(&gb(), &c, REPO, pinned, &AdminVerified::default()).unwrap() {
+                DiscoverOutcome::Untrusted(reason) => {
+                    assert!(reason.contains("invalid JSON"), "{}", reason);
+                    assert!(reason.starts_with("origin/dev:"), "{}", reason);
+                }
+                other => panic!("pinned={:?}: expected Untrusted, got {:?}", pinned, other),
+            }
+        }
+    }
+
+    /// The same refusal for a wrong FIELD TYPE (not just broken JSON): a
+    /// structure that says `"share_specs": "yes"` cannot be read, so its
+    /// policy is an error rather than a fallback to the stale copy.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_wrongly_typed_share_specs_field_is_refused_not_fallback() {
+        let fx = fx();
+        publish_raw(
+            &fx,
+            "dev",
+            "{\"format\":1,\"project\":{\"name\":\"Acme\",\"type\":\"standard\"},\
+             \"main\":{\"login\":\"Owner\",\"dev_branch\":\"dev\"},\
+             \"repos\":[{\"github\":\"Owner/web\",\"role\":\"server\",\
+             \"share_specs\":\"yes\"}],\"microservices\":[],\"participants\":[]}",
         );
+        let c = contributor(&fx);
+        let mut stale = sample();
+        stale.repos[0].share_specs = Some(false);
+        write_structure_if_changed(&c, &stale).unwrap();
+        match discover_structure(&gb(), &c, REPO, Some("dev"), &AdminVerified::default()).unwrap() {
+            DiscoverOutcome::Untrusted(reason) => {
+                assert!(reason.contains("invalid JSON"), "{}", reason)
+            }
+            other => panic!("expected Untrusted, got {:?}", other),
+        }
+    }
+
+    /// T-000243 review (second pass), through discovery: an explicit
+    /// `"share_specs": null` in the AUTHORITATIVE copy is a wrong type, not
+    /// "absent" — it must surface as `Untrusted`, never let the valid stale
+    /// work-tree copy answer (and never resolve to the default on).
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_null_share_specs_in_the_authoritative_copy_is_untrusted_not_a_default_on() {
+        for pinned in [Some("dev"), None] {
+            let fx = fx();
+            publish_raw(
+                &fx,
+                "dev",
+                "{\"format\":1,\"project\":{\"name\":\"Acme\",\"type\":\"standard\"},\
+                 \"main\":{\"login\":\"Owner\",\"dev_branch\":\"dev\"},\
+                 \"repos\":[{\"github\":\"Owner/web\",\"role\":\"server\",\
+                 \"share_specs\":null}],\"microservices\":[],\"participants\":[]}",
+            );
+            let c = contributor(&fx);
+            // The stale but perfectly valid work-tree copy opts the specs OUT:
+            // if the null were folded into "absent", the default ON would win;
+            // if the stale copy were allowed to answer, OFF would win. Neither
+            // may happen — the copy is present and unreadable.
+            let mut stale = sample();
+            stale.repos[0].share_specs = Some(false);
+            write_structure_if_changed(&c, &stale).unwrap();
+            match discover_structure(&gb(), &c, REPO, pinned, &AdminVerified::default()).unwrap() {
+                DiscoverOutcome::Untrusted(reason) => {
+                    assert!(reason.contains("share_specs"), "{}", reason);
+                    assert!(reason.contains("null"), "{}", reason);
+                }
+                other => panic!("pinned={:?}: expected Untrusted, got {:?}", pinned, other),
+            }
+        }
+    }
+
+    /// T-000243 review (second pass), through discovery: an authoritative copy
+    /// that PARSES but does not VALIDATE (an unsupported format, a main this
+    /// install does not trust) used to be recorded and then silently replaced
+    /// by a valid stale work-tree copy — reviving a stale ON policy. Both the
+    /// pinned and the unpinned path must refuse it instead.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_origin_structure_that_fails_validation_is_never_replaced_by_a_stale_worktree_copy() {
+        // (mutation, a word of the refusal reason): a format from the future,
+        // and a main that is not the repo owner.
+        let cases: [(&dyn Fn(&mut ProjectStructure), &str); 2] = [
+            (
+                &|s: &mut ProjectStructure| s.format = 2,
+                "unsupported format",
+            ),
+            (
+                &|s: &mut ProjectStructure| s.main.login = "helper".into(),
+                "main is not the repo owner",
+            ),
+        ];
+        for (mutate, word) in cases {
+            for pinned in [Some("dev"), None] {
+                let fx = fx();
+                let mut bad = sample();
+                mutate(&mut bad);
+                publish_struct(&fx, "dev", &bad, "2026-01-01T00:00:00Z");
+                let c = contributor(&fx);
+                // A perfectly valid, perfectly stale ON copy in the work tree:
+                // exactly the policy the bad origin copy may have come to change.
+                let mut stale = sample();
+                stale.repos[0].share_specs = Some(true);
+                write_structure_if_changed(&c, &stale).unwrap();
+                assert!(
+                    share_specs_for(&stale, REPO),
+                    "fixture: the stale copy is ON"
+                );
+                match discover_structure(&gb(), &c, REPO, pinned, &AdminVerified::default())
+                    .unwrap()
+                {
+                    DiscoverOutcome::Untrusted(reason) => {
+                        assert!(reason.starts_with("origin/dev:"), "{}", reason);
+                        assert!(reason.contains(word), "{}", reason);
+                    }
+                    other => panic!(
+                        "pinned={:?}, case {}: expected Untrusted, got {:?}",
+                        pinned, word, other
+                    ),
+                }
+            }
+        }
     }
 
     // ----- apply locally -----------------------------------------------------
@@ -2379,6 +2927,7 @@ mod tests {
         s.repos = vec![StructRepo {
             github: ORG_REPO.into(),
             role: "client".into(),
+            share_specs: None,
         }];
         s
     }
@@ -2564,6 +3113,7 @@ mod tests {
         s.repos.push(StructRepo {
             github: "Acme-Org/api".into(),
             role: "server".into(),
+            share_specs: None,
         });
         // without a verification the structure is refused outright
         assert!(apply_structure_locally(&db, web, &s).is_err());
@@ -2607,6 +3157,7 @@ mod tests {
         s.repos.push(StructRepo {
             github: "Stranger/api".into(),
             role: "server".into(),
+            share_specs: None,
         });
         apply_structure_locally(&db, web, &s).unwrap();
         assert!(db.get_repository(web).unwrap().project_id.is_some());

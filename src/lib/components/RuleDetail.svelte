@@ -7,6 +7,7 @@
   import RuleConflict from './RuleConflict.svelte';
   import RuleDiff from './RuleDiff.svelte';
   import RuleHistory from './RuleHistory.svelte';
+  import RuleProposals from './RuleProposals.svelte';
 
   let {
     rule,
@@ -20,6 +21,7 @@
     onSave,
     onReset,
     onResolve,
+    onChanged,
   }: {
     rule: RuleInfo;
     /** Repos a skill is delivered to. */
@@ -34,9 +36,11 @@
     onSave: () => void;
     onReset: () => void;
     onResolve: (accept: string | null) => void;
+    /** T-000241: a proposal decision applied or withdrew rule text — parent re-reads. */
+    onChanged: () => void;
   } = $props();
 
-  type Tab = 'text' | 'diff' | 'history';
+  type Tab = 'text' | 'diff' | 'history' | 'proposals';
   let tab = $state<Tab>('text');
   let showResetConfirm = $state(false);
 
@@ -111,6 +115,9 @@
       <button type="button" role="tab" aria-selected={tab === 'history'} class:active={tab === 'history'} onclick={() => (tab = 'history')}>
         {$tStore('rules.tabHistory')} · {events.length}
       </button>
+      <button type="button" role="tab" aria-selected={tab === 'proposals'} class:active={tab === 'proposals'} onclick={() => (tab = 'proposals')}>
+        {$tStore('rules.proposals.title')}
+      </button>
     </div>
 
     {#if tab === 'text'}
@@ -135,9 +142,13 @@
         <RuleDiff {diff} legend emptyText={$tStore('rules.diffEmpty')} />
         <div class="footer">{$tStore('rules.diffReadOnly')}</div>
       </div>
-    {:else}
+    {:else if tab === 'history'}
       <div class="pane">
         <RuleHistory {events} />
+      </div>
+    {:else}
+      <div class="pane">
+        <RuleProposals {rule} generation={conflictGeneration} {onChanged} />
       </div>
     {/if}
   {/if}

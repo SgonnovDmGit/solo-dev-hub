@@ -85,6 +85,8 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         mig_v33_rule_events_and_conflicts,
     ),
     (34, "contributor_mode", mig_v34_contributor_mode),
+    (35, "share_specs", mig_v35_share_specs),
+    (36, "rule_proposals", mig_v36_rule_proposals),
 ];
 
 impl AppDb {
@@ -1098,6 +1100,107 @@ fn mig_v34_contributor_mode(conn: &Connection) -> SqlResult<()> {
     )
 }
 
+fn mig_v35_share_specs(conn: &Connection) -> SqlResult<()> {
+    // T-000243 (v1.23.0): per-repo opt-out for sharing `docs/superpowers/`
+    // (specs, plans, mockups) in contributor mode. A column, not
+    // `shared_import` JSON: the flag is the owner's local choice, must be
+    // settable BEFORE shared mode is enabled, and must survive disabling and
+    // re-enabling shared mode. Default ON — the shared set covers the folder
+    // unless the owner switches it off.
+    conn.execute_batch(
+        "ALTER TABLE repositories ADD COLUMN share_specs INTEGER NOT NULL DEFAULT 1;
+         PRAGMA user_version = 35;",
+    )
+}
+
+fn mig_v36_rule_proposals(conn: &Connection) -> SqlResult<()> {
+    // T-000241 (v1.23.0): a contributor's `.approved` hand-back no longer dies
+    // against the owner's canon — it becomes a *proposal*, applied locally at
+    // once and carried to the owner, whose accept/reject travels back as an
+    // immutable receipt. The wire side is `.sdh/rule-proposals/` (contributor
+    // writes) and `.sdh/rule-decisions/` (owner writes) on the dev branch;
+    // these tables are each install's local state for them.
+    //
+    // `rule_proposals` — this install's own proposals, one row per proposal
+    // file: the mutable version history (seq, status) plus the receipt
+    // resolution overlay (`resolved_*`, never serialized back onto the wire).
+    // `remote_ver` holds the last origin-confirmed remote version as a
+    // `{seq,status,sha}` tuple for the terminal-row GC.
+    //
+    // `rule_proposal_seq` — the seq high-water mark per proposal file; kept
+    // separately so the GC can drop a terminal row without letting a
+    // re-proposal reuse a seq the remote once saw.
+    //
+    // `rule_acceptances` — the owner's decisions: one immutable row per
+    // receipt. `status` tracks the local work pipeline
+    // (prepared -> decided -> applied -> rendered, plus the stable side
+    // states conflicted / expired / superseded); `pub_state` tracks the
+    // receipt's own journey to origin (pending / blocked / published /
+    // overtaken) and never rolls `status` back. `proposal_text` is the
+    // validated snapshot the canon is applied FROM — the mutable proposal
+    // file is never re-read for it.
+    conn.execute_batch(
+        "CREATE TABLE rule_proposals (
+             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             file_name TEXT NOT NULL,
+             login TEXT NOT NULL,
+             rule TEXT NOT NULL,
+             seq INTEGER NOT NULL,
+             status TEXT NOT NULL CHECK (status IN ('open','withdrawn')),
+             local_state TEXT NOT NULL CHECK (local_state IN ('pending_apply','applied')),
+             text TEXT NOT NULL,
+             at TEXT NOT NULL,
+             resolved_action TEXT,
+             resolved_by TEXT,
+             resolved_at TEXT,
+             resolved_rev TEXT,
+             remote_ver TEXT,
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY (repo_id, file_name)
+         );
+         CREATE TABLE rule_proposal_seq (
+             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             file_name TEXT NOT NULL,
+             max_seq INTEGER NOT NULL,
+             PRIMARY KEY (repo_id, file_name)
+         );
+         CREATE TABLE rule_acceptances (
+             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             rule TEXT NOT NULL,
+             proposer_login TEXT NOT NULL,
+             decided_rev TEXT NOT NULL,
+             action TEXT NOT NULL CHECK (action IN ('accept','reject')),
+             receipt_json TEXT NOT NULL,
+             proposal_text TEXT NOT NULL,
+             status TEXT NOT NULL CHECK (status IN ('prepared','decided','applied','rendered','conflicted','expired','superseded')),
+             pub_state TEXT NOT NULL CHECK (pub_state IN ('pending','blocked','published','overtaken')),
+             base_canon_hash TEXT NOT NULL,
+             canon_hash TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY (repo_id, rule, proposer_login, decided_rev)
+         );
+         CREATE INDEX idx_rule_proposals_repo ON rule_proposals(repo_id, rule);
+         CREATE INDEX idx_rule_acceptances_repo ON rule_acceptances(repo_id, rule);
+         -- The proposal lifecycle adds four kinds to the rule history; the
+         -- CHECK on rule_events.kind from v33 must be widened, which SQLite
+         -- only does by rebuilding the table.
+         CREATE TABLE rule_events_v36 (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule TEXT NOT NULL,
+             kind TEXT NOT NULL CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved','proposed','proposal_accepted','proposal_rejected','proposal_withdrawn')),
+             repo TEXT,
+             note TEXT,
+             created_at TEXT NOT NULL
+         );
+         INSERT INTO rule_events_v36 SELECT * FROM rule_events;
+         DROP TABLE rule_events;
+         ALTER TABLE rule_events_v36 RENAME TO rule_events;
+         CREATE INDEX idx_rule_events_rule ON rule_events(rule, created_at);
+         PRAGMA user_version = 36;",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1390,6 +1493,120 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(version, 34);
+
+        // T-000243: v35 landed on top of v34 — same DB, same row, now with the
+        // specs flag defaulting ON for the pre-existing row.
+        mig_v35_share_specs(&conn).unwrap();
+        let share: i64 = conn
+            .query_row(
+                "SELECT share_specs FROM repositories WHERE id = ?1",
+                [repo_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(share, 1, "an upgraded row defaults to share_specs on");
+    }
+
+    /// T-000243: v35 adds `repositories.share_specs` — the per-repo opt-out
+    /// for sharing `docs/superpowers/`. Default ON (the shared set covers the
+    /// folder), and the column lives on the row itself so the flag is settable
+    /// before shared mode is enabled and survives its toggles.
+    #[test]
+    fn test_db_migration_v35_share_specs_column() {
+        // Fresh DB: the column exists, NOT NULL, default 1.
+        let db = make_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            let (dflt, notnull): (String, i32) = conn
+                .query_row(
+                    "SELECT dflt_value, \"notnull\" FROM pragma_table_info('repositories')
+                     WHERE name = 'share_specs'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(dflt, "1");
+            assert_eq!(notnull, 1);
+            conn.execute(
+                "INSERT INTO repositories (github_name) VALUES ('o/fresh')",
+                [],
+            )
+            .unwrap();
+            let share: i64 = conn
+                .query_row(
+                    "SELECT share_specs FROM repositories WHERE github_name = 'o/fresh'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(share, 1, "a fresh row defaults to share_specs on");
+        }
+
+        // Idempotency of the dispatcher: user_version is 35, so re-running
+        // migrations (also what a restart does) changes nothing.
+        db.run_migrations().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            let version: i32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 36);
+        }
+
+        // Upgrade path: a v34-shaped DB keeps its rows and they default to 1.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        for &(target, _name, mig_fn) in MIGRATIONS {
+            if target <= 34 {
+                mig_fn(&conn).unwrap();
+            }
+        }
+        conn.execute(
+            "INSERT INTO repositories (github_name, github_url, role, shared_mode) \
+             VALUES ('o/old', 'u', 'client', 1)",
+            [],
+        )
+        .unwrap();
+        let repo_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO repositories (github_name, role) VALUES ('o/old2', 'tool')",
+            [],
+        )
+        .unwrap();
+
+        mig_v35_share_specs(&conn).unwrap();
+
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM repositories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 2, "v34 rows survive the upgrade");
+        let (share, mode): (i64, i64) = conn
+            .query_row(
+                "SELECT share_specs, shared_mode FROM repositories WHERE id = ?1",
+                [repo_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(share, 1, "existing rows default to share_specs on");
+        assert_eq!(mode, 1, "v34 values are untouched");
+        let all_on: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM repositories WHERE share_specs = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(all_on, 2);
+        // both values storable
+        conn.execute(
+            "UPDATE repositories SET share_specs = 0 WHERE id = ?1",
+            [repo_id],
+        )
+        .unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 35);
     }
 
     #[test]
@@ -1400,7 +1617,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         // Update this when a new migration is added.
-        assert!(version >= 34);
+        assert!(version >= 35);
     }
 
     #[test]
@@ -1748,11 +1965,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v34 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v35 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 36);
 
         drop(conn);
         let _ = repo;
@@ -1819,7 +2036,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 36);
     }
 
     #[test]

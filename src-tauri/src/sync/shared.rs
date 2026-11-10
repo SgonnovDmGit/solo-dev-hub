@@ -19,12 +19,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::db::AppDb;
 use crate::git_ops::{
-    commit_paths, current_branch, is_git_repo, spawn_cmd, CommitOutcome, GitBinary,
+    commit_paths, commit_paths_index_only, current_branch, is_git_repo, list_markers_in_rev,
+    spawn_cmd, CommitOutcome, GitBinary,
 };
 use crate::git_sync::{self, BranchCommit, FfOutcome, FileChange, MergeOutcome, PushOutcome};
 use crate::merge_driver::register_merge_driver;
@@ -47,6 +48,12 @@ const REMOTE: &str = "origin";
 /// as one of our own commits wherever the sync judges a branch.
 const REMOVAL_SUBJECT: &str = "chore(sdh-sync): remove shared project structure";
 
+/// T-000241: subjects of the proposal channel's commits — a contributor's
+/// proposal upload and the owner's receipt write. Both count as our own
+/// commits wherever the sync judges a branch, like the two above.
+const PROPOSAL_SUBJECT: &str = "chore(sdh-sync): rule proposals";
+const DECISION_SUBJECT: &str = "chore(sdh-sync): rule decisions";
+
 /// How often a repo that is not (yet) known to be shared is probed with a
 /// `git fetch` to see whether its owner switched sharing on.
 const PROBE_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -57,7 +64,8 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Status of a shared repo. The declaration order is the priority order: the
 /// first variant that applies wins (`shared_untrusted` > fetch / push failed >
-/// push rejected > needs manual merge > no own branch > pending approval).
+/// push rejected > needs manual merge > dev checked out elsewhere > no own
+/// branch > pending approval).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SharedStatus {
     Untrusted,
@@ -65,6 +73,10 @@ pub enum SharedStatus {
     PushFailed,
     PushRejected,
     NeedsManualMerge,
+    /// T-000241: the proposal channel's transport needs the dev branch, and
+    /// dev is checked out in ANOTHER worktree — its files cannot be written
+    /// here. Retried on the next pass; cleared when the checkout frees.
+    Blocked,
     NoOwnBranch,
     PendingApproval,
     /// Only ever alone: the repo is not processed at all.
@@ -80,6 +92,7 @@ impl SharedStatus {
             SharedStatus::PushFailed => "push_failed",
             SharedStatus::PushRejected => "push_rejected",
             SharedStatus::NeedsManualMerge => "needs_manual_merge",
+            SharedStatus::Blocked => "shared_blocked",
             SharedStatus::NoOwnBranch => "no_own_branch",
             SharedStatus::PendingApproval => "pending_approval",
             SharedStatus::NoLogin => "shared_no_login",
@@ -93,6 +106,7 @@ impl SharedStatus {
             SharedStatus::PushFailed => Code::SharedPushFailed,
             SharedStatus::PushRejected => Code::SharedPushRejected,
             SharedStatus::NeedsManualMerge => Code::SharedNeedsManualMerge,
+            SharedStatus::Blocked => Code::SharedNeedsManualMerge,
             SharedStatus::NoOwnBranch => Code::SharedNoOwnBranch,
             SharedStatus::PendingApproval => Code::SharedPendingApproval,
             SharedStatus::NoLogin => Code::SharedNoLogin,
@@ -171,8 +185,342 @@ pub fn is_shared_repo(db: &AppDb, repo_id: i64) -> bool {
         .unwrap_or(false)
 }
 
+/// T-000243 review (sixth pass): per-repo shared-lifecycle GENERATION.
+/// In-memory on purpose: a pass never outlives its sync call, so the
+/// counter needs no persistence (and no schema change). Keyed by
+/// (repo_id, root) like the net/probe slots — test fixtures share repo ids.
+/// Every lifecycle writer bumps it while holding `specs_policy_guard`; a
+/// pass seals the generation that was current when its phase-A decisions
+/// STARTED (before the shared-state read at the top of the repo loop), and
+/// `finish` treats a mismatch as stale. A generation — not a state
+/// snapshot — because lifecycle round trips (disable→re-enable) restore
+/// identical state, and because the pass's decisions span phase A while
+/// writers do not wait for the seal: a disable that completes between the
+/// pass's discovery and its seal still bumps the counter the pass sealed.
+fn lifecycle_generations() -> &'static Mutex<HashMap<(i64, String), u64>> {
+    static G: OnceLock<Mutex<HashMap<(i64, String), u64>>> = OnceLock::new();
+    G.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lifecycle_generation(repo_id: i64, root: &Path) -> u64 {
+    lifecycle_generations()
+        .lock()
+        .unwrap()
+        .get(&(repo_id, root.to_string_lossy().into_owned()))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Bump the lifecycle generation of `repo_id` at `root`. Callers hold
+/// `specs_policy_guard(repo_id)` — the bump must be atomic with `finish`'s
+/// guarded freshness check, or a writer could land between the check and
+/// the settlement.
+fn bump_lifecycle_generation(repo_id: i64, root: &Path) {
+    let key = (repo_id, root.to_string_lossy().into_owned());
+    *lifecycle_generations()
+        .lock()
+        .unwrap()
+        .entry(key)
+        .or_insert(0) += 1;
+}
+
+/// T-000243 review (eighth pass): the freshness gate every phase-A
+/// lifecycle mutation passes UNDER the guard before writing. `expected`
+/// is the pass's capture (`gen0`) plus its own bumps so far — equality
+/// means no foreign lifecycle landed after the observation that
+/// justified this write; anything else means the write is obsolete and
+/// is skipped entirely (the pass seals stale anyway).
+fn lifecycle_is_current(repo_id: i64, root: &Path, expected: u64) -> bool {
+    lifecycle_generation(repo_id, root) == expected
+}
+
+/// A pass's OWN lifecycle transition: guarded, freshness-checked, and —
+/// on a real change — generation-bumped and counted as the pass's own
+/// bump, which `seal_lifecycle_gen` subtracts again. `expected` is
+/// `gen0 + own_bumps` at the call site.
+fn pass_role_transition(pass: &mut RepoPass, db: &AppDb, role: Option<&str>, expected: u64) {
+    let guard = specs_policy_guard(pass.repo.id);
+    let _g = guard.lock().unwrap();
+    pass_role_transition_locked(pass, db, role, expected);
+}
+
+/// Caller holds `specs_policy_guard(pass.repo.id)` — the locked half for
+/// acceptance sections that already hold the guard across the observation
+/// revalidation and the role write, so the two cannot be split by a
+/// structure republish that leaves the generation unchanged (T-000243
+/// review, eighteenth pass).
+fn pass_role_transition_locked(pass: &mut RepoPass, db: &AppDb, role: Option<&str>, expected: u64) {
+    if !lifecycle_is_current(pass.repo.id, &pass.root, expected) {
+        return;
+    }
+    let cur = db
+        .get_shared_state(pass.repo.id)
+        .ok()
+        .and_then(|s| s.shared_role);
+    if cur.as_deref() == role {
+        return;
+    }
+    let _ = db.set_shared_role(pass.repo.id, role);
+    bump_lifecycle_generation(pass.repo.id, &pass.root);
+    pass.own_bumps += 1;
+}
+
+/// The role+status cleanup that belongs to NO pass (the loop's stale-cache
+/// cleanup, the `NotFound` cleanup): ONE guarded freshness decision for
+/// both writes — an obsolete observation cannot erase a newer lifecycle.
+/// Returns how many generation bumps it applied, so the caller can carry
+/// the resulting expected generation forward (T-000243 review, ninth
+/// pass — the same pass's pin cleanup must not invalidate itself).
+fn foreign_state_cleanup(db: &AppDb, repo_id: i64, root: &Path, expected: u64) -> u64 {
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
+    foreign_state_cleanup_locked(db, repo_id, root, expected)
+}
+
+/// Caller holds `specs_policy_guard(repo_id)` — lets a caller pair the
+/// freshness check with its own revalidation under ONE hold (T-000243
+/// review, seventeenth pass).
+fn foreign_state_cleanup_locked(db: &AppDb, repo_id: i64, root: &Path, expected: u64) -> u64 {
+    if !lifecycle_is_current(repo_id, root, expected) {
+        return 0;
+    }
+    let st = db.get_shared_state(repo_id).ok();
+    let Some(st) = st else { return 0 };
+    let mut bumps = 0;
+    if st.shared_role.is_some() {
+        let _ = db.set_shared_role(repo_id, None);
+        bump_lifecycle_generation(repo_id, root);
+        bumps += 1;
+    }
+    if st.shared_status.is_some() {
+        let _ = db.set_shared_status(repo_id, None);
+        bump_lifecycle_generation(repo_id, root);
+        bumps += 1;
+    }
+    bumps
+}
+
+/// Rebind `local_path` atomically vs pass generation capture: the guard
+/// covers read-old → write → bump-both, so a pass initializing
+/// concurrently sees either the old binding with its pre-bump generation
+/// (then goes stale on the bumps) or the new binding with the post-bump
+/// one — never a new path under an old generation (T-000243 review,
+/// eighth pass).
+pub fn rebind_local_path(
+    db: &AppDb,
+    repo_id: i64,
+    new_path: Option<&str>,
+) -> Result<Repository, String> {
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
+    let before = db.get_repository(repo_id).ok().and_then(|r| r.local_path);
+    let repo = db
+        .set_repo_local_path(repo_id, new_path)
+        .map_err(|e| e.to_string())?;
+    for p in [before.as_deref(), repo.local_path.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        bump_lifecycle_generation(repo_id, Path::new(p));
+    }
+    Ok(repo)
+}
+
+/// T-000243 review (eighteenth pass): the auto-commit branch IS the pass's
+/// own branch (`own_branch_of`) — changing or clearing it mid-pass must
+/// stale the pass, or phase B keeps committing and pushing to the branch
+/// set the pass captured. Serialized under the policy guard and bumped on
+/// the CURRENT binding like every other lifecycle writer.
+pub fn set_autocommit_branch_guarded(
+    db: &AppDb,
+    repo_id: i64,
+    branch: Option<&str>,
+) -> Result<(), String> {
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
+    let before = db.get_autocommit_branch(repo_id).ok().flatten();
+    db.set_autocommit_branch(repo_id, branch)
+        .map_err(|e| e.to_string())?;
+    let after = db.get_autocommit_branch(repo_id).ok().flatten();
+    if before != after {
+        if let Some(p) = db.get_repository(repo_id).ok().and_then(|r| r.local_path) {
+            bump_lifecycle_generation(repo_id, Path::new(&p));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-000243: the per-repo `docs/superpowers/` policy
+// ---------------------------------------------------------------------------
+
+/// This install's own stored `share_specs` policy for `repo_id` (the owner's
+/// checkbox; the default is share). What `build_structure` publishes and what
+/// the pre-enable checks read — before a role exists, the owner's own stored
+/// choice is the only policy there is.
+fn own_share_specs(db: &AppDb, repo_id: i64) -> bool {
+    db.get_shared_state(repo_id)
+        .map(|s| s.share_specs)
+        .unwrap_or(true)
+}
+
+/// T-000243 review: the per-repo guard that serializes a `share_specs` change
+/// with the policy-sensitive work of the sync for the SAME repo. The setter
+/// (`set_repo_share_specs`, an async Tauri command on another thread) takes it
+/// while it reads the role, diagnoses and writes the flag; phase B holds it for
+/// its whole policy section (the structure publish, the pathspecs and every
+/// commit and push of that repo); the managed `.gitignore` render sites hold it
+/// while they resolve the policy AND write the file; and every other writer of
+/// the policy-bearing structure — `enable_shared_mode`, `approve_join_request`
+/// and `disable_shared_mode` (it commits the deletion) — holds it across its
+/// read→build→write sequence. Nothing inside a guard awaits or takes another
+/// repo's guard, so the order cannot deadlock. Phase A is deliberately NOT
+/// guarded: its `pass.share_specs` only steers the fast-forward / divergence
+/// detection, and phase B resolves the policy again under the guard anyway.
+pub(crate) fn specs_policy_guard(repo_id: i64) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<i64, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    // The registry lock is released before anybody waits on a repo guard.
+    let mut m = map.lock().unwrap();
+    m.entry(repo_id)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// The validated structure of the repo's work tree, if any: the same trusted
+/// read (`read_structure_file`) that settles a helper's role.
+/// `Ok(None)` = ABSENT (a repo that never carried a structure, or a legacy
+/// one): the default policy applies. `Err` = PRESENT BUT UNUSABLE — malformed
+/// JSON, a wrong field type, or a source this install does not trust.
+/// T-000243 review: that case is never folded into a policy (and least of all
+/// into the default `on`, which would publish specs on a guess) — the callers
+/// surface it and block the policy-sensitive operation instead.
+fn validated_structure_of(
+    db: &AppDb,
+    repo: &Repository,
+) -> Result<Option<ProjectStructure>, String> {
+    let (Some(path), Some(gh)) = (repo.local_path.as_deref(), repo.github_name.as_deref()) else {
+        return Ok(None);
+    };
+    let admins = ss::AdminVerified::load(db);
+    ss::read_structure_file(Path::new(path), gh, &admins)
+}
+
+/// The effective `docs/superpowers/` policy of one repo of this install,
+/// resolved the way the spec fixes it: this install being the repo's owner
+/// ("main") publishes its own stored setting; a contributor / pending helper
+/// accepts the owner's flag for THIS repo from the same validated structure
+/// that supplied its role — never from folder existence, `.gitignore`, or a
+/// sibling repo of the project. `structure` is a validated structure the
+/// caller already holds (the sync pass); `None` reads the work-tree file the
+/// same validated way. `Ok(true)` is the answer only when the policy really
+/// resolves to share: absent structure (or no GitHub name) is the legacy
+/// default, while a structure that IS present but cannot be used is `Err` —
+/// the caller must block the render / commit on it, not guess. Meaningful
+/// only while the repo is shared.
+pub fn effective_share_specs(
+    db: &AppDb,
+    repo: &Repository,
+    structure: Option<&ProjectStructure>,
+) -> Result<bool, String> {
+    let state = db.get_shared_state(repo.id).ok();
+    if state
+        .as_ref()
+        .is_some_and(|s| s.shared_mode || s.shared_role.as_deref() == Some("main"))
+    {
+        // This install is the repo's owner: its own setting is the policy.
+        return Ok(state.is_some_and(|s| s.share_specs));
+    }
+    let structure = match structure {
+        Some(s) => Some(s.to_owned()),
+        None => validated_structure_of(db, repo)?,
+    };
+    match (structure, repo.github_name.as_deref()) {
+        (Some(s), Some(gh)) => Ok(ss::share_specs_for(&s, gh)),
+        _ => Ok(true),
+    }
+}
+
+/// T-000243 review (second pass): the authoritative structure a STANDALONE
+/// render (the init-docs button, `init_docs_for_repo_in`) resolves a helper's
+/// policy from — the same `discover_structure` the sync pass runs, so a
+/// malformed / untrusted AUTHORITATIVE copy refuses the render instead of the
+/// work-tree file (a possibly stale policy) answering. `Ok(None)`: this
+/// install is the repo's owner (its policy is its own database row, which
+/// `effective_share_specs` reads anyway), or no structure was found anywhere
+/// (the legacy default). Reads the remote-tracking refs the last fetch left
+/// (the button does not fetch); a refused or failed discovery is `Err` — the
+/// render fails closed, it never guesses.
+pub fn render_structure_of(
+    db: &AppDb,
+    git: &GitBinary,
+    repo: &Repository,
+) -> Result<Option<ProjectStructure>, String> {
+    let state = db.get_shared_state(repo.id).map_err(|e| e.to_string())?;
+    if state.shared_mode || state.shared_role.as_deref() == Some("main") {
+        return Ok(None);
+    }
+    let (Some(path), Some(gh)) = (repo.local_path.as_deref(), repo.github_name.as_deref()) else {
+        return Ok(None);
+    };
+    let root = Path::new(path);
+    if !is_git_repo(root) {
+        return Ok(None);
+    }
+    let pinned = ss::read_shared_import(db, repo.id).pinned_dev_branch;
+    match ss::discover_structure(
+        git,
+        root,
+        gh,
+        pinned.as_deref(),
+        &ss::AdminVerified::load(db),
+    ) {
+        Ok(DiscoverOutcome::Found(s, _)) => Ok(Some(s)),
+        Ok(DiscoverOutcome::NotFound) => Ok(None),
+        Ok(DiscoverOutcome::Untrusted(reason)) | Err(reason) => Err(reason),
+    }
+}
+
+/// Whether this install's shared policy for `repo` is its OWN database row —
+/// the owner side (`shared_mode` on, or the cached `main` role). The only
+/// case a policy may resolve without git: a helper's policy lives in the
+/// owner's published structure and must be discovered, never guessed.
+pub fn policy_is_local(db: &AppDb, repo: &Repository) -> bool {
+    db.get_shared_state(repo.id)
+        .map(|s| s.shared_mode || s.shared_role.as_deref() == Some("main"))
+        .unwrap_or(false)
+}
+
+/// `render_structure_of` with an OPTIONAL git binary. Without git no
+/// authoritative discovery is possible: the owner's policy needs none
+/// (`Ok(None)` — its database row answers), while a HELPER's render is
+/// REFUSED (`Err`) — unavailable discovery is not evidence of absence, and
+/// the work-tree copy may carry a stale ON the fetched ref has replaced.
+pub fn render_structure_opt(
+    db: &AppDb,
+    git: Option<&GitBinary>,
+    repo: &Repository,
+) -> Result<Option<ProjectStructure>, String> {
+    match git {
+        Some(git) => render_structure_of(db, git, repo),
+        None => {
+            if policy_is_local(db, repo) {
+                Ok(None)
+            } else {
+                Err("the shared specs policy cannot be resolved: git is \
+                     unavailable, so the owner's published structure cannot \
+                     be discovered"
+                    .to_string())
+            }
+        }
+    }
+}
+
 /// `.gitignore` template lines dropped for a shared repo: the files that travel
-/// through git (spec R10), plus `docs/sdh_skills/` (the owner commits them).
+/// through git (spec R10), plus `docs/sdh_skills/` (the owner commits them) and
+/// `docs/superpowers/` (T-000243 — but ONLY while the per-repo `share_specs`
+/// policy shares it; every consumer of this list applies that flag to the
+/// superpowers line, see `gitignore_template_for` / `probe_paths`).
 pub const SHARED_UNIGNORED_LINES: &[&str] = &[
     "docs/todo.md",
     "docs/done.md",
@@ -185,7 +533,12 @@ pub const SHARED_UNIGNORED_LINES: &[&str] = &[
     "docs/microservice-announcements/",
     "docs/InOutBox/",
     "docs/sdh_skills/",
+    "docs/superpowers/",
 ];
+
+/// T-000243: the specs folder of the shared set, as the `.gitignore` line
+/// spells it.
+const SPECS_IGNORE_LINE: &str = "docs/superpowers/";
 
 /// `.gitattributes` lines added for a shared repo.
 pub const SHARED_ATTRIBUTE_LINES: &[&str] = &[
@@ -196,7 +549,11 @@ pub const SHARED_ATTRIBUTE_LINES: &[&str] = &[
 
 /// The `.gitignore` template to render for a repo: unchanged when it is not
 /// shared, minus the shared paths when it is. Identical for every role.
-pub fn gitignore_template_for(template: &str, shared: bool) -> String {
+/// T-000243: `docs/superpowers/` leaves the render only while the effective
+/// `share_specs` policy shares it; opted out, the managed render MUST keep the
+/// folder ignored even when the custom (or empty) template lacks the line —
+/// off is "never committed", whatever the template says.
+pub fn gitignore_template_for(template: &str, shared: bool, share_specs: bool) -> String {
     if !shared {
         return template.to_string();
     }
@@ -207,6 +564,9 @@ pub fn gitignore_template_for(template: &str, shared: bool) -> String {
     // A trailing newline is not part of any managed rule; keep the text tidy.
     while out.last().is_some_and(|l| l.trim().is_empty()) {
         out.pop();
+    }
+    if !share_specs && !out.iter().any(|l| l.trim() == SPECS_IGNORE_LINE) {
+        out.push(SPECS_IGNORE_LINE);
     }
     out.join("\n")
 }
@@ -228,6 +588,8 @@ pub fn gitattributes_template_for(template: &str, shared: bool) -> String {
 // ---------------------------------------------------------------------------
 
 pub(super) const SKILLS_DIR: &str = "docs/sdh_skills";
+/// T-000243: the specs folder of the shared set, as a pathspec spells it.
+const SPECS_DIR: &str = "docs/superpowers";
 const SKILLS_EXCLUDES: [&str; 2] = [
     ":(exclude)docs/sdh_skills/*.approved",
     ":(exclude)docs/sdh_skills/*.conflict",
@@ -237,31 +599,74 @@ fn request_rel_path(login: &str) -> String {
     format!("{}/{}.json", REQUESTS_REL_DIR, login)
 }
 
+/// T-000190 (versions): `.sdh/app-versions/<login>.json` — the last app
+/// version each install published on the shared dev branch. Permanent ops
+/// visibility, not a transition gate: an old binary simply has no file.
+pub const APP_VERSIONS_REL_DIR: &str = ".sdh/app-versions";
+
+/// Cap for one version file — the contract is a single short JSON object.
+const MAX_APP_VERSION_BYTES: u64 = 4 * 1024;
+
+/// `<login>.json` under the versions dir; the file name is the lower-cased
+/// login (the same key the participant map uses, ASCII case-insensitive).
+fn app_version_rel_path(login: &str) -> String {
+    format!(
+        "{}/{}.json",
+        APP_VERSIONS_REL_DIR,
+        login.to_ascii_lowercase()
+    )
+}
+
 /// Files and folders a role commits (positive pathspecs only; see
-/// `exclude_specs` for the exclusions).
-pub fn shared_pathspec(role: Role, login: &str) -> Vec<String> {
+/// `exclude_specs` for the exclusions). T-000243: `docs/superpowers/` travels
+/// for BOTH the owner and a contributor — but only while `share_specs` is on;
+/// a pending helper never sends specs, whatever the flag says. `docs/sdh_skills/`
+/// stays main-only.
+pub fn shared_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String> {
+    // T-000190: every role publishes its own `.sdh/app-versions/<login>.json`.
+    // An empty/invalid login (preflight callers) must not produce the literal
+    // `.sdh/app-versions/.json` path — the file is skipped, never guessed.
+    let own_version = ss::is_valid_request_login(login).then(|| app_version_rel_path(login));
     if role == Role::Pending {
-        return vec![request_rel_path(login)];
+        return [Some(request_rel_path(login)), own_version]
+            .into_iter()
+            .flatten()
+            .collect();
     }
     let mut v: Vec<String> = CROSS_REPO_DIRS
         .iter()
         .chain(MANAGED_ROOT_FILES.iter())
         .map(|s| s.to_string())
         .collect();
-    v.extend(
-        [
-            "docs/todo.md",
-            "docs/done.md",
-            "docs/bug-reports.md",
-            "docs/InOutBox",
-        ]
-        .map(String::from),
-    );
+    v.extend(["docs/todo.md", "docs/done.md", "docs/bug-reports.md"].map(String::from));
     if role == Role::Main {
         v.push(STRUCTURE_REL_PATH.to_string());
         v.push(REQUESTS_REL_DIR.to_string());
         v.push(SKILLS_DIR.to_string());
     }
+    if share_specs {
+        v.push(SPECS_DIR.to_string());
+    }
+    if let Some(p) = own_version {
+        v.push(p);
+    }
+    v
+}
+
+/// T-000241: the allow-list of paths OUR OWN commits may touch — the generic
+/// shared pathspec plus the two proposal catalogs. The catalogs themselves
+/// stay OUT of `shared_pathspec`: they have their own transport
+/// (`sync_rule_proposals`), their own subjects and their own writers, and
+/// the generic merge would not know what to do with them anyway.
+fn sdh_commit_paths(role: Role, login: &str, share_specs: bool) -> Vec<String> {
+    let mut v = shared_pathspec(role, login, share_specs);
+    v.push(crate::sync::rule_proposals::RULE_PROPOSALS_REL_DIR.to_string());
+    v.push(crate::sync::rule_proposals::RULE_DECISIONS_REL_DIR.to_string());
+    // T-000190: this allow-list judges the commits WE made — it must cover
+    // every install's version file, not only this login's: a pending helper's
+    // plumb commit carries `.sdh/app-versions/<its login>.json` next to the
+    // join request, and a file outside the list marks the branch "not ours".
+    v.push(APP_VERSIONS_REL_DIR.to_string());
     v
 }
 
@@ -336,6 +741,35 @@ pub(super) fn ls_tree(
         if kind == Some("blob") {
             if let Some(sha) = sha {
                 map.insert(path.to_string(), sha.to_string());
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// `path -> (mode, blob sha)` under `paths` at `rev` — the mode-aware
+/// variant the proposal catalogs use: a symlinked artifact is never
+/// opened (`T-000241` spec, mode != symlink).
+fn ls_tree_with_modes(
+    git: &GitBinary,
+    root: &Path,
+    rev: &str,
+    paths: &[String],
+) -> Result<BTreeMap<String, (String, String)>, String> {
+    if paths.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let out = git_bytes(git, root, &["ls-tree", "-r", "-z", rev], paths)?;
+    let mut map = BTreeMap::new();
+    for rec in split_nul(&out) {
+        let Some((meta, path)) = rec.split_once('\t') else {
+            continue;
+        };
+        let mut it = meta.split(' ');
+        let (mode, kind, sha) = (it.next(), it.next(), it.next());
+        if kind == Some("blob") {
+            if let (Some(m), Some(s)) = (mode, sha) {
+                map.insert(path.to_string(), (m.to_string(), s.to_string()));
             }
         }
     }
@@ -847,7 +1281,21 @@ fn plumb_into_branch(
                 }
             }
             (Some(w), None) => {
-                if Some(w) == bs {
+                // The branch deleted the file and we still hold bytes — a
+                // stale copy, unless the file was re-created AFTER the
+                // deletion reached this checkout. The merge base tells them
+                // apart: when the branch's deletion is an ancestor of HEAD,
+                // the file is absent at the base, so its presence here is
+                // fresh work and must publish — the empty `.ack/<key>`
+                // markers re-dropped after a revision reset are the standing
+                // case. `common` (a shared blob) is the fallback only where
+                // the histories share no merge base at all.
+                let stale_base = if base_rev.is_some() {
+                    merge_base_blob
+                } else {
+                    bs
+                };
+                if Some(w) == stale_base {
                     Plan::Skip
                 } else {
                     read_worktree(root, path).map_or(Plan::Skip, Plan::Write)
@@ -880,6 +1328,21 @@ fn plumb_into_branch(
                 content: None,
             }),
         }
+    }
+    // T-000244: rule hand-back markers this branch still tracks leave it as
+    // deletions. The content exclusions above keep a marker out of every other
+    // plan; here the branch's own markers are enumerated directly, because a
+    // contributor's / pending helper's pathspec does not name `docs/sdh_skills/`
+    // at all. This is the narrow exception shared by every role, and it only
+    // ever deletes — a marker is never written into a branch by this pass.
+    for path in ls_tree(git, root, &refname, &[SKILLS_DIR.to_string()])?
+        .keys()
+        .filter(|p| is_excluded_file(p))
+    {
+        changes.push(FileChange {
+            rel_path: PathBuf::from(path),
+            content: None,
+        });
     }
     if changes.is_empty() {
         return Ok(BranchCommit::NothingToCommit);
@@ -1029,6 +1492,10 @@ fn id_number(id: &str) -> Option<i64> {
 /// has not happened, otherwise only the rows that differ from what the database
 /// renders are applied. A file that fails to import keeps its old stored blob,
 /// so the next sync retries it.
+/// Caller holds `specs_policy_guard(repo_id)` — `after_fetch` runs the import
+/// inside the same hold as its freshness-gated branch section, so a repath
+/// cannot slip between the generation check and the import's database and
+/// work-tree writes (T-000243 review, fourteenth pass).
 pub fn import_incoming(
     db: &AppDb,
     git: &GitBinary,
@@ -1093,6 +1560,11 @@ pub fn import_incoming(
         }
     }
     if !done.is_empty() {
+        // Whole-JSON read-modify-write under the caller-held policy guard:
+        // the fresh read and the write stay atomic vs lifecycle writers
+        // (disable's marker, pin, disabling) — a stale snapshot must not
+        // erase them (T-000243 review, eighth pass). Blob fields are not
+        // lifecycle: no bump.
         let mut fresh = ss::read_shared_import(db, repo_id);
         for p in done {
             if let Some(Some(h)) = head_blob.get(p) {
@@ -1291,6 +1763,17 @@ struct RepoPass {
     /// `None` when the repo is not processed (untrusted structure, no login).
     role: Option<Role>,
     structure: Option<ProjectStructure>,
+    /// T-000243 review (second pass): why `structure` is `None` when discovery
+    /// REFUSED a copy (malformed / untrusted authoritative structure): the
+    /// reason must survive to the render, which may not quietly re-read the
+    /// work tree — its (possibly stale) policy is exactly what the refusal
+    /// rejected. `None` here + `None` in `structure` = no structure anywhere
+    /// (the legacy default-on).
+    structure_refused: Option<String>,
+    /// T-000243: the effective `docs/superpowers/` policy this pass settled on
+    /// (phase A). Phase B resolves it again: a toggle between the phases must
+    /// not leave the old `on` in the deferred half of the pass.
+    share_specs: bool,
     own_branch: Option<String>,
     recipients: Vec<String>,
     notes: Vec<StatusNote>,
@@ -1309,6 +1792,24 @@ struct RepoPass {
     /// (repo, login) pairs whose trust rests on a GitHub administrator check the
     /// frontend has to make (T-000227).
     admin_checks: Vec<AdminCheck>,
+    /// T-000243 review (third pass): phase B found the repo no longer in the
+    /// state phase A captured (sharing switched off, or the cached role moved,
+    /// between the phases) and cancelled the policy-sensitive half of the
+    /// pass. `finish` then settles no status from it either — the writer that
+    /// won the guard owns the repo's state now (e.g. a disable that left a
+    /// `push_failed` status with its `disabling` marker must not have it
+    /// cleared by a cancelled pass's empty notes).
+    cancelled: bool,
+    /// T-000243 review (sixth pass): the lifecycle generation sealed when
+    /// this pass's phase-A decisions started (see `lifecycle_generation`).
+    /// `None` only for passes built outside `run_phase_a` (tests): they
+    /// settle unconditionally, as before.
+    lifecycle_gen: Option<u64>,
+    /// T-000243 review (seventh pass): lifecycle bumps THIS pass caused
+    /// itself (role adoption, pin, disable-retry cleanup). `seal_lifecycle_gen`
+    /// subtracts them: only a FOREIGN bump between the capture and the seal
+    /// makes the pass stale.
+    own_bumps: u32,
 }
 
 impl RepoPass {
@@ -1336,6 +1837,22 @@ impl RepoPass {
             diverged: None,
             rejected_branch: None,
             ui: None,
+        });
+    }
+
+    /// Seal under the guard: adopt the current generation only when every
+    /// bump since `g0` is this pass's own lifecycle write (`own_bumps`) —
+    /// a foreign bump (another sync's transition, a disable, an approval
+    /// side effect) makes the pass stale. `g0` can never match again
+    /// because generations are monotonic, so a rejected seal stays stale.
+    fn seal_lifecycle_gen(&mut self, g0: u64) {
+        let guard = specs_policy_guard(self.repo.id);
+        let _g = guard.lock().unwrap();
+        let cur = lifecycle_generation(self.repo.id, &self.root);
+        self.lifecycle_gen = Some(if cur == g0 + u64::from(self.own_bumps) {
+            cur
+        } else {
+            g0
         });
     }
 
@@ -1417,6 +1934,72 @@ impl SharedSync {
             .find(|p| p.repo.id == repo_id)
             .and_then(|p| p.structure.as_ref())
     }
+
+    /// T-000243 review (second pass): phase A's structure outcome for
+    /// `repo_id` as the TRI-STATE the policy needs. `Ok(None)` = no structure
+    /// anywhere (or no pass for the repo — discovery was not refused, it just
+    /// did not run): the legacy default applies, and `effective_share_specs`
+    /// re-reads the work tree the same validated way. `Ok(Some(_))` = a
+    /// structure phase A accepted. `Err(reason)` = discovery REFUSED a copy
+    /// (malformed / untrusted authoritative structure): the caller must block
+    /// the policy-sensitive operation and report the reason — re-reading the
+    /// work tree would hand the policy to a stale copy the refusal just
+    /// rejected. (The owner's own work-tree read error in `phase_a_main` is
+    /// deliberately NOT a refusal: the owner's policy is its own database
+    /// row, which stays readable, and its phase B never runs with a broken
+    /// file.)
+    ///
+    /// T-000243 review (third pass): for a repo WITHOUT a pass the `Ok(None)`
+    /// arm no longer means "authoritatively absent" — phase A is
+    /// project-scoped and never ran for the repo. A RENDER (the only consumer
+    /// that must answer for a repo it did not discover) resolves its policy
+    /// through `render_state_of` instead, which performs the discovery
+    /// itself.
+    pub fn structure_state_of(&self, repo_id: i64) -> Result<Option<&ProjectStructure>, String> {
+        match self.passes.iter().find(|p| p.repo.id == repo_id) {
+            Some(p) => match &p.structure_refused {
+                Some(reason) => Err(reason.clone()),
+                None => Ok(p.structure.as_ref()),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Did phase A produce a pass for `repo_id` in this SharedSync? `false`
+    /// means discovery never ran for the repo HERE — phase A is
+    /// project-scoped, and a KNOWN shared repo of another project (the server
+    /// repo of a connected microservice, which this project's sync renders)
+    /// gets no pass — NOT that no structure exists authoritatively.
+    pub fn has_pass(&self, repo_id: i64) -> bool {
+        self.passes.iter().any(|p| p.repo.id == repo_id)
+    }
+
+    /// T-000243 review (third pass): the structure state a RENDER (the managed
+    /// `.gitignore` of the project sync) resolves a shared repo's policy from,
+    /// distinguishing "phase A discovered this repo" from "phase A never ran
+    /// for it". T-000243 review (fourth pass): a HELPER's answer is ALWAYS
+    /// fresh authoritative discovery (`render_structure_opt`) — a phase-A
+    /// snapshot may already be superseded by another SharedSync of this
+    /// install that fetched and accepted a newer structure between the
+    /// phases, and the work tree alone may hold the stale copy. Only the
+    /// OWNER side still answers from its pass (its policy is its own
+    /// database row anyway, so the structure matters little) or `None`.
+    pub fn render_state_of(
+        &self,
+        db: &AppDb,
+        git: Option<&GitBinary>,
+        repo: &Repository,
+    ) -> Result<Option<ProjectStructure>, String> {
+        if policy_is_local(db, repo) {
+            return match self.has_pass(repo.id) {
+                // A pass of THIS sync answers with its phase-A outcome, so a
+                // refusal stays a refusal.
+                true => self.structure_state_of(repo.id).map(|s| s.cloned()),
+                false => Ok(None),
+            };
+        }
+        render_structure_opt(db, git, repo)
+    }
 }
 
 // ----- throttles ------------------------------------------------------------
@@ -1462,8 +2045,18 @@ fn unix_now() -> i64 {
 }
 
 /// Is a role-less foreign repo due for a probe? Takes the slot (persisted in
-/// `SharedImport`) when it is.
-fn probe_due(db: &AppDb, repo_id: i64, now: i64) -> bool {
+/// `SharedImport`) when it is. `root`/`expected` are the caller's captured
+/// binding and generation: a repathed pass must not consume the NEW
+/// checkout's probe slot for a probe it will not finish (T-000243 review,
+/// seventeenth pass).
+fn probe_due(db: &AppDb, repo_id: i64, root: &Path, expected: u64, now: i64) -> bool {
+    // Whole-JSON read-modify-write: hold the guard so a concurrent lifecycle
+    // writer (pin, disabling marker) cannot be clobbered by this snapshot.
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
+    if !lifecycle_is_current(repo_id, root, expected) {
+        return false;
+    }
     let mut imp = ss::read_shared_import(db, repo_id);
     if let Some(t) = imp.last_probe_unix {
         if now - t < PROBE_INTERVAL.as_secs() as i64 {
@@ -1569,7 +2162,11 @@ fn local_tip_if_ours(git: &GitBinary, root: &Path, branch: &str) -> Result<Optio
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let specs = shared_pathspec(Role::Main, "");
+    // T-000243: this is the HISTORICAL allow-list of SDH paths, not the set of
+    // files the current flag sends: a sync commit made while specs were shared
+    // is still ours after the owner opts out (off stops future commits only),
+    // so the specs path is always allowed here.
+    let specs = sdh_commit_paths(Role::Main, "", true);
     for commit in String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
@@ -1598,7 +2195,10 @@ fn local_tip_if_ours(git: &GitBinary, root: &Path, branch: &str) -> Result<Optio
         if name != SDH_COMMIT_NAME
             || email != SDH_COMMIT_EMAIL
             || parents.split_whitespace().count() != 1
-            || (subject != "chore(sdh-sync): sync shared files" && subject != REMOVAL_SUBJECT)
+            || (subject != "chore(sdh-sync): sync shared files"
+                && subject != REMOVAL_SUBJECT
+                && subject != PROPOSAL_SUBJECT
+                && subject != DECISION_SUBJECT)
             || !has_trailer
         {
             return Ok(None);
@@ -1678,14 +2278,46 @@ fn run_phase_a_with(
     };
     let login = db.github_login();
     let now = unix_now();
-    for repo in repos {
+    for mut repo in repos {
         let Some(gh) = repo.github_name.clone() else {
             continue;
         };
         let Some(lp) = repo.local_path.clone() else {
             continue;
         };
-        let root = PathBuf::from(&lp);
+        let mut root = PathBuf::from(&lp);
+        if !is_git_repo(&root) {
+            continue;
+        }
+        // T-000243 review (sixth pass): the lifecycle generation is read
+        // BEFORE this repo's shared-state read and every pass decision —
+        // any lifecycle writer that bumps it afterwards (under the per-repo
+        // guard, whenever it completes) makes this pass stale at `finish`,
+        // no matter when or where its seal happens.
+        // T-000243 review (eighth pass): the binding is RE-READ under the
+        // same guard hold as the capture — `set_repo_local_path` serializes
+        // against this, so a pass never captures a post-repath generation
+        // for a pre-repath path (or the reverse).
+        let guard = specs_policy_guard(repo.id);
+        let mut lifecycle_gen = {
+            let _g = guard.lock().unwrap();
+            match db.get_repository(repo.id).ok().and_then(|r| r.local_path) {
+                // Unconditional: `Path` equality normalizes separators and
+                // `.` components while the generation key is the LITERAL
+                // string — an "equivalent" spelling would capture the wrong
+                // key's generation (T-000243 review, ninth pass).
+                Some(p) => {
+                    root = PathBuf::from(&p);
+                    repo.local_path = Some(p);
+                }
+                None => {
+                    // The binding was cleared meanwhile: nothing to sync.
+                    continue;
+                }
+            }
+            lifecycle_generation(repo.id, &root)
+        };
+        drop(guard);
         if !is_git_repo(&root) {
             continue;
         }
@@ -1703,25 +2335,30 @@ fn run_phase_a_with(
                 // Shared mode on, but this install does not know its login.
                 let mut pass = new_pass(&repo, &root, "");
                 pass.note(SharedStatus::NoLogin, "");
+                pass.seal_lifecycle_gen(lifecycle_gen);
                 sync.handled.insert(repo.id);
                 sync.passes.push(pass);
                 continue;
             };
             sync.handled.insert(repo.id);
-            sync.passes.push(phase_a_main(db, git, &repo, &root, login));
+            let mut pass = phase_a_main(db, git, &repo, &root, login, lifecycle_gen);
+            pass.seal_lifecycle_gen(lifecycle_gen);
+            sync.passes.push(pass);
             continue;
         }
         if ss::read_shared_import(db, repo.id).disabling.is_some() {
             // Switched off, but the deletion of `.sdh/` did not reach the remote.
-            if let Some(pass) = retry_disabling(db, git, &repo, &root) {
+            if let Some(mut pass) = retry_disabling(db, git, &repo, &root, lifecycle_gen) {
+                pass.seal_lifecycle_gen(lifecycle_gen);
                 sync.passes.push(pass);
             }
             continue;
         }
         if state.shared_role.as_deref() == Some("main") {
-            // Stale cache: the owner switched sharing off.
-            let _ = db.set_shared_role(repo.id, None);
-            let _ = db.set_shared_status(repo.id, None);
+            // Stale cache: the owner switched sharing off. ONE freshness-
+            // checked transition — an obsolete observation cannot erase a
+            // lifecycle that landed after this repo's generation capture.
+            foreign_state_cleanup(db, repo.id, &root, lifecycle_gen);
             continue;
         }
         let Some(login) = login.as_deref() else {
@@ -1745,12 +2382,17 @@ fn run_phase_a_with(
         {
             let mut pass = new_pass(&repo, &root, login);
             fetch_into(git, &mut pass, FetchMode::Probe);
-            drop_stale_structure(db, git, &repo, &root, pass.net_ok);
+            // The cleanup's own pin-clear bumps the generation; the pass
+            // below must capture the RESULT, not the input — otherwise it
+            // seals itself stale for a transition it did not make
+            // (T-000243 review, sixteenth pass).
+            lifecycle_gen +=
+                drop_stale_structure(db, git, &repo, &root, pass.net_ok, lifecycle_gen);
         }
         // A role-less repo is probed at most every 10 minutes (persisted); one
         // that was refused as untrusted is looked at again on every sync.
         if !known && state.shared_status.is_none() {
-            let due = probe_due(db, repo.id, now);
+            let due = probe_due(db, repo.id, &root, lifecycle_gen, now);
             if !due && !force_probe {
                 continue;
             }
@@ -1760,13 +2402,16 @@ fn run_phase_a_with(
         } else {
             FetchMode::Probe
         };
-        if let Some(pass) = phase_a_foreign(db, git, &repo, &root, &gh, login, mode) {
+        if let Some(mut pass) =
+            phase_a_foreign(db, git, &repo, &root, &gh, login, mode, lifecycle_gen)
+        {
             sync.handled.insert(repo.id);
             for rule in &pass.canon_changed {
                 if !sync.canon_changed.contains(rule) {
                     sync.canon_changed.push(rule.clone());
                 }
             }
+            pass.seal_lifecycle_gen(lifecycle_gen);
             sync.passes.push(pass);
         }
     }
@@ -1787,6 +2432,8 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         login: login.to_string(),
         role: None,
         structure: None,
+        structure_refused: None,
+        share_specs: true,
         own_branch: None,
         recipients: Vec::new(),
         notes: Vec::new(),
@@ -1797,6 +2444,9 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         committed: false,
         canon_changed: Vec::new(),
         admin_checks: Vec::new(),
+        cancelled: false,
+        lifecycle_gen: None,
+        own_bumps: 0,
     }
 }
 
@@ -1830,12 +2480,14 @@ fn phase_a_main(
     repo: &Repository,
     root: &Path,
     login: &str,
+    gen0: u64,
 ) -> RepoPass {
     let mut pass = new_pass(repo, root, login);
     let gh = repo.github_name.clone().unwrap_or_default();
     pass.role = Some(Role::Main);
-    let _ = db.set_shared_role(repo.id, Some("main"));
-    register_driver(git, &mut pass);
+    pass_role_transition(&mut pass, db, Some("main"), gen0);
+    let expected = gen0 + u64::from(pass.own_bumps);
+    register_driver(git, &mut pass, expected);
     fetch_into(git, &mut pass, FetchMode::Always);
     let admins = ss::AdminVerified::load(db);
     // The main's own trust may rest on an administrator verification (an
@@ -1850,6 +2502,12 @@ fn phase_a_main(
             return pass;
         }
     }
+    // T-000243: the owner's own stored setting is the policy (its structure
+    // file may still hold the previous value until phase B rewrites it). An
+    // `Err` cannot happen here (the owner answers from its own database row),
+    // and phase A only steers the fast-forward detection anyway — phase B
+    // resolves the policy again under the per-repo guard.
+    pass.share_specs = effective_share_specs(db, repo, pass.structure.as_ref()).unwrap_or(true);
     pass.own_branch = own_branch_of(db, repo.id);
     match &pass.own_branch {
         None => pass.note(SharedStatus::NoOwnBranch, ""),
@@ -1861,7 +2519,7 @@ fn phase_a_main(
             pass.recipients = clean_recipients(rec);
         }
     }
-    after_fetch(db, git, &mut pass);
+    after_fetch(db, git, &mut pass, gen0);
     pass
 }
 
@@ -1873,6 +2531,7 @@ fn phase_a_foreign(
     gh: &str,
     login: &str,
     mode: FetchMode,
+    gen0: u64,
 ) -> Option<RepoPass> {
     let mut pass = new_pass(repo, root, login);
     fetch_into(git, &mut pass, mode);
@@ -1885,8 +2544,11 @@ fn phase_a_foreign(
                 pass.issue(
                     repo_issue(Code::ManagedFileFailed, repo)
                         .target(STRUCTURE_REL_PATH)
-                        .detail(e),
+                        .detail(e.clone()),
                 );
+                // T-000243 review (second pass): discovery failed outright —
+                // the render must not fall back to the work-tree copy either.
+                pass.structure_refused = Some(e);
                 return Some(pass);
             }
             return None;
@@ -1895,14 +2557,33 @@ fn phase_a_foreign(
     match found {
         DiscoverOutcome::NotFound => {
             let st = db.get_shared_state(repo.id).ok();
+            let mut expected = gen0 + u64::from(pass.own_bumps);
             if st.is_some_and(|s| s.shared_role.is_some() || s.shared_status.is_some()) {
-                // Repo is ordinary again (spec R15).
-                let _ = db.set_shared_role(repo.id, None);
-                let _ = db.set_shared_status(repo.id, None);
+                // Repo is ordinary again (spec R15). The clear belongs to no
+                // pass — but it IS a lifecycle transition gated on THIS
+                // pass's generation AND on the NotFound still being true:
+                // a republish accepted meanwhile leaves the generation
+                // unchanged (pin and role already matched), so the
+                // observation itself is re-checked under the same hold —
+                // clearing on a stale NotFound would erase a live role
+                // (T-000243 review, seventeenth pass). Its bumps carry
+                // forward so the pin cleanup below is gated on the RESULT,
+                // not the input.
+                let guard = specs_policy_guard(repo.id);
+                let _g = guard.lock().unwrap();
+                if lifecycle_is_current(repo.id, root, expected)
+                    && matches!(
+                        ss::discover_structure(git, root, gh, pinned.as_deref(), &admins),
+                        Ok(DiscoverOutcome::NotFound)
+                    )
+                {
+                    expected += foreign_state_cleanup_locked(db, repo.id, root, expected);
+                }
             }
             // Facts decide whether anything is left to clean up (nothing, for a repo
-            // that never carried a structure).
-            drop_stale_structure(db, git, repo, root, pass.net_ok);
+            // that never carried a structure). No pass survives this branch,
+            // so the cleanup's bumps need no carrying.
+            let _ = drop_stale_structure(db, git, repo, root, pass.net_ok, expected);
             None
         }
         DiscoverOutcome::Untrusted(reason) => {
@@ -1911,7 +2592,12 @@ fn phase_a_foreign(
             for l in ss::candidate_admin_logins(git, root, gh, pinned.as_deref()) {
                 pass.ask_admin_check(gh, &l);
             }
-            pass.note_untrusted(reason);
+            pass.note_untrusted(reason.clone());
+            // T-000243 review (second pass): the refusal survives to the
+            // render (see `structure_state_of`): the `.gitignore` render is
+            // refused with this reason instead of re-reading the work tree,
+            // whose stale policy is what the refusal just rejected.
+            pass.structure_refused = Some(reason);
             Some(pass)
         }
         DiscoverOutcome::Found(s, _source) => {
@@ -1923,23 +2609,59 @@ fn phase_a_foreign(
             if ss::derive_role(Some(&s), Some(login)) == Some(Role::Main) {
                 return None;
             }
-            if let Err(e) = ss::apply_structure_locally(db, repo.id, &s) {
-                pass.issue(
-                    repo_issue(Code::ManagedFileFailed, repo)
-                        .target(STRUCTURE_REL_PATH)
-                        .detail(e),
-                );
-            }
-            if pinned.is_none() {
-                let _ = ss::pin_after_accept(db, repo.id, &s);
-            }
-            let role = ss::derive_role(Some(&s), Some(login));
+            // T-000243 review (fifteenth pass): applying the discovered
+            // structure mutates project assignments — a stale pass must not
+            // write them. Guarded and freshness-checked like every other
+            // lifecycle mutation; a skipped apply simply lets the newer
+            // lifecycle's own pass do it.
+            // T-000243 review (seventeenth pass): generation equality alone
+            // does not prove the OBSERVED structure is still current — a
+            // republish accepted meanwhile can leave pin and role (and so
+            // the generation) unchanged. Re-run the authoritative discovery
+            // under the same hold and apply only while it still yields the
+            // very structure this pass discovered.
+            // T-000243 review (eighteenth pass): a failed revalidation
+            // abandons the WHOLE acceptance — applying the structure yet
+            // still deriving its role would write a lifecycle from an
+            // observation that is no longer authoritative. The apply, the
+            // pin and the role write share this one hold, so nothing can
+            // interleave between them either; pinning is this pass's own
+            // lifecycle transition, counted so the seal forgives it.
+            let role = {
+                let guard = specs_policy_guard(repo.id);
+                let _g = guard.lock().unwrap();
+                let observation_current =
+                    lifecycle_is_current(repo.id, root, gen0 + u64::from(pass.own_bumps))
+                        && matches!(
+                            ss::discover_structure(git, root, gh, pinned.as_deref(), &admins),
+                            Ok(DiscoverOutcome::Found(ref s2, _)) if *s2 == s
+                        );
+                if !observation_current {
+                    return None;
+                }
+                if let Err(e) = ss::apply_structure_locally(db, repo.id, &s) {
+                    pass.issue(
+                        repo_issue(Code::ManagedFileFailed, repo)
+                            .target(STRUCTURE_REL_PATH)
+                            .detail(e),
+                    );
+                }
+                if pinned.is_none() && ss::pin_after_accept(db, repo.id, &s).is_ok() {
+                    bump_lifecycle_generation(repo.id, root);
+                    pass.own_bumps += 1;
+                }
+                ss::derive_role(Some(&s), Some(login)).map(|role| {
+                    let expected = gen0 + u64::from(pass.own_bumps);
+                    pass_role_transition_locked(&mut pass, db, Some(role.as_str()), expected);
+                    role
+                })
+            };
             let Some(role) = role else {
                 return Some(pass);
             };
-            let _ = db.set_shared_role(repo.id, Some(role.as_str()));
             pass.role = Some(role);
-            register_driver(git, &mut pass);
+            let expected = gen0 + u64::from(pass.own_bumps);
+            register_driver(git, &mut pass, expected);
             pass.own_branch = own_branch_of(db, repo.id)
                 .filter(|b| !same_branch(b, &s.main.dev_branch) || role != Role::Pending);
             let main_dev = s.main.dev_branch.clone();
@@ -1956,16 +2678,21 @@ fn phase_a_foreign(
                 pass.note(SharedStatus::PendingApproval, "");
             }
             if role == Role::Contributor {
-                remove_own_stale_request(git, &pass);
+                remove_own_stale_request(git, &pass, gen0 + u64::from(pass.own_bumps));
             }
             // Р16: this install does not render rule copies here; copies an
             // earlier version (or the time before the join) left untracked
             // would stop the owner's from being fast-forwarded in.
             if role != Role::Main {
-                drop_untracked_rule_copies(git, root);
+                drop_untracked_rule_copies(git, repo.id, root, gen0 + u64::from(pass.own_bumps));
             }
+            // T-000243: the helper takes the specs policy from the very
+            // structure that gave it the role, before any path is computed.
+            // Phase A only steers the fast-forward detection with it; phase B
+            // resolves the policy again under the per-repo guard.
+            pass.share_specs = effective_share_specs(db, repo, Some(&s)).unwrap_or(true);
             pass.structure = Some(s);
-            after_fetch(db, git, &mut pass);
+            after_fetch(db, git, &mut pass, gen0);
             Some(pass)
         }
     }
@@ -2029,29 +2756,64 @@ fn remove_sdh_from_checked_out(
 /// next sync does it again; the pin is dropped only once neither the branch, its
 /// origin copy nor the work tree carries the file (until then it also keeps the
 /// work-tree file from being taken for a live structure).
-fn drop_stale_structure(db: &AppDb, git: &GitBinary, repo: &Repository, root: &Path, net_ok: bool) {
+fn drop_stale_structure(
+    db: &AppDb,
+    git: &GitBinary,
+    repo: &Repository,
+    root: &Path,
+    net_ok: bool,
+    expected_gen: u64,
+) -> u64 {
+    // T-000243 review (tenth pass): the WHOLE cleanup — the switch-off
+    // evidence check, the deletion commits, the pushes and the pin
+    // settlement — runs under the policy guard. Every lifecycle writer
+    // needs the same guard, so the generation cannot move while it is
+    // held: the freshness check below stays valid for every step, and a
+    // republished structure can never be deleted by an obsolete pass.
+    // Returns how many lifecycle bumps it performed: the caller's own
+    // pass must count them or it seals itself stale (T-000243 review,
+    // sixteenth pass).
+    let guard = specs_policy_guard(repo.id);
+    let _g = guard.lock().unwrap();
+    if !lifecycle_is_current(repo.id, root, expected_gen) {
+        return 0;
+    }
     let mut imp = ss::read_shared_import(db, repo.id);
     let Some(pin) = imp.pinned_dev_branch.clone() else {
-        return;
+        return 0;
     };
     if !repo_ready(git, root) {
-        return;
+        return 0;
     }
     // The switch-off must be established by origin's pinned dev branch itself.
     if tracks_structure(git, root, &remote_ref(&pin)) != Some(false) {
-        return;
+        return 0;
     }
-    let finish = |db: &AppDb, imp: &mut ss::SharedImport| {
+    // The guard is already held — `finish` must NOT re-acquire it.
+    let finish = |db: &AppDb, _imp: &mut ss::SharedImport| -> u64 {
         if !root.join(STRUCTURE_REL_PATH).exists() {
-            imp.pinned_dev_branch = None;
-            let _ = ss::write_shared_import(db, repo.id, imp);
+            // Clearing the pin is a lifecycle transition gated on the pin
+            // still being the one the evidence was gathered for — a newer
+            // accept may have pinned a different dev branch meanwhile.
+            let mut fresh = ss::read_shared_import(db, repo.id);
+            if fresh.pinned_dev_branch.as_deref() != Some(pin.as_str()) {
+                return 0;
+            }
+            fresh.pinned_dev_branch = None;
+            if ss::write_shared_import(db, repo.id, &fresh).is_ok() {
+                // T-000241: the repo left the share — its proposal rows
+                // and seq marks have nothing left to describe.
+                let _ = db.delete_rule_proposal_state(repo.id);
+                bump_lifecycle_generation(repo.id, root);
+                return 1;
+            }
         }
+        0
     };
     let Some(own) = own_branch_of(db, repo.id) else {
-        finish(db, &mut imp);
-        return;
+        return finish(db, &mut imp);
     };
-    let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
+    let sdh = sdh_tracked_paths();
     let login = db.github_login().unwrap_or_default();
     let remote = remote_ref(&own);
     let cur = current_branch(git, root).ok().flatten();
@@ -2059,8 +2821,7 @@ fn drop_stale_structure(db: &AppDb, git: &GitBinary, repo: &Repository, root: &P
     if tracks_structure(git, root, &local_ref(&own)) != Some(true)
         && tracks_structure(git, root, &remote) != Some(true)
     {
-        finish(db, &mut imp);
-        return;
+        return finish(db, &mut imp);
     }
 
     // Bring a local copy that only lags up to origin's first (the owner may have
@@ -2095,7 +2856,7 @@ fn drop_stale_structure(db: &AppDb, git: &GitBinary, repo: &Repository, root: &P
             remove_sdh_from_branch(git, root, &own, &sdh, &login)
         };
         if !matches!(removed, Ok(true)) {
-            return;
+            return 0;
         }
     }
     if net_ok && remote_sha.is_some() {
@@ -2104,8 +2865,9 @@ fn drop_stale_structure(db: &AppDb, git: &GitBinary, repo: &Repository, root: &P
     if tracks_structure(git, root, &local_ref(&own)) != Some(true)
         && tracks_structure(git, root, &remote) != Some(true)
     {
-        finish(db, &mut imp);
+        return finish(db, &mut imp);
     }
+    0
 }
 
 /// The owner's deletion of `.sdh/` was committed but not pushed: push it now.
@@ -2115,6 +2877,7 @@ fn retry_disabling(
     git: &GitBinary,
     repo: &Repository,
     root: &Path,
+    gen0: u64,
 ) -> Option<RepoPass> {
     let imp = ss::read_shared_import(db, repo.id);
     let dev = imp.disabling.clone()?;
@@ -2127,11 +2890,28 @@ fn retry_disabling(
         pass.note(SharedStatus::FetchFailed, e.to_string());
         return Some(pass);
     }
+    #[cfg(test)]
+    retry_post_fetch_probe(repo.id, root);
+    // T-000243 review (eleventh pass): from here on the retry MUTATES —
+    // branch fast-forwards/resets, fresh deletion commits, the push. All of
+    // it runs under the policy guard, gated on the generation the retry was
+    // created under: a re-enable (or any newer lifecycle) that landed during
+    // the fetch makes this retry obsolete BEFORE the first mutation, not
+    // just before the database cleanup.
+    let guard = specs_policy_guard(repo.id);
+    let _g = guard.lock().unwrap();
+    if lifecycle_generation(repo.id, root) != gen0 {
+        return None;
+    }
+    let imp_now = ss::read_shared_import(db, repo.id);
+    if imp_now.disabling.as_deref() != Some(dev.as_str()) {
+        return None;
+    }
     // The dev branch and the participant branches whose deletion is pending.
     let mut branches: Vec<String> = vec![dev.clone()];
-    branches.extend(imp.disabling_branches.iter().cloned());
+    branches.extend(imp_now.disabling_branches.iter().cloned());
     let branches = clean_recipients(branches);
-    let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
+    let sdh = sdh_tracked_paths();
     let login = db.github_login().unwrap_or_default();
     let mut to_push: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
@@ -2155,7 +2935,9 @@ fn retry_disabling(
     }
     if to_push.is_empty() {
         if failures.is_empty() {
-            let _ = clear_disabling(db, repo.id);
+            // The clear bumps the generation; the pass is dropped either
+            // way, so there is no settlement left to account for.
+            let _ = clear_disabling_locked(db, repo.id, root);
             return None;
         }
         pass.note(SharedStatus::PushFailed, failures.join("; "));
@@ -2169,7 +2951,7 @@ fn retry_disabling(
                     .iter()
                     .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)) =>
         {
-            let _ = clear_disabling(db, repo.id);
+            let _ = clear_disabling_locked(db, repo.id, root);
             None
         }
         Ok(results) => {
@@ -2237,16 +3019,46 @@ fn refresh_pending_removal(
     Ok(())
 }
 
-fn clear_disabling(db: &AppDb, repo_id: i64) -> Result<(), String> {
+/// Caller holds `specs_policy_guard(repo_id)` — the clear and the
+/// generation bump are already atomic with `finish`'s freshness check.
+fn clear_disabling_locked(db: &AppDb, repo_id: i64, root: &Path) -> Result<(), String> {
     let mut imp = ss::read_shared_import(db, repo_id);
     imp.disabling = None;
     imp.disabling_branches.clear();
     ss::write_shared_import(db, repo_id, &imp)?;
     db.set_shared_status(repo_id, None)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    bump_lifecycle_generation(repo_id, root);
+    Ok(())
 }
 
-fn register_driver(git: &GitBinary, pass: &mut RepoPass) {
+/// `gen0` is the lifecycle generation the retry pass was created under:
+/// only THAT operation may clear the marker. A newer disable / re-enable /
+/// another retry's cleanup bumped the generation meanwhile — clearing then
+/// would erase work this retry does not own (T-000243 review, seventh pass).
+/// Returns `Ok(true)` when the marker was actually cleared.
+/// Production clears go through `retry_disabling`'s guard-held section;
+/// this wrapper remains for the generation-gate regression test.
+#[cfg(test)]
+fn clear_disabling(db: &AppDb, repo_id: i64, root: &Path, gen0: u64) -> Result<bool, String> {
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
+    if lifecycle_generation(repo_id, root) != gen0 {
+        return Ok(false);
+    }
+    clear_disabling_locked(db, repo_id, root)?;
+    Ok(true)
+}
+
+/// Writes the merge-driver config into the checkout — a mutation, so it is
+/// gated on the pass's freshness under the policy guard like every other
+/// phase-A side effect (T-000243 review, seventeenth pass).
+fn register_driver(git: &GitBinary, pass: &mut RepoPass, expected: u64) {
+    let guard = specs_policy_guard(pass.repo.id);
+    let _g = guard.lock().unwrap();
+    if !lifecycle_is_current(pass.repo.id, &pass.root, expected) {
+        return;
+    }
     if let Err(e) = register_merge_driver(git, &pass.root) {
         let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
             .target(".git/config")
@@ -2270,11 +3082,24 @@ fn clean_recipients(list: Vec<String>) -> Vec<String> {
 }
 
 /// A pending helper's own request file is no longer wanted once the helper is a
-/// contributor; remove it when git does not track it.
-fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass) {
+/// contributor; remove it when git does not track it. The tracked check and
+/// the delete run under the policy guard: a concurrent pass's fast-forward
+/// may have made the file tracked since this pass last looked, and deleting
+/// a tracked file would publish its removal (T-000243 review, fifteenth
+/// pass — same check-then-delete race as `drop_untracked_rule_copies`).
+fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass, expected: u64) {
     let rel = request_rel_path(&pass.login);
     let abs = pass.root.join(&rel);
     if !abs.is_file() {
+        return;
+    }
+    let guard = specs_policy_guard(pass.repo.id);
+    let _g = guard.lock().unwrap();
+    // T-000243 review (sixteenth pass): serializing is not enough — a repath
+    // that landed since the pass captured its generation makes this delete
+    // obsolete even though the mutex is free. Skip it on the detached
+    // checkout; the pass seals stale at `finish` regardless.
+    if !lifecycle_is_current(pass.repo.id, &pass.root, expected) {
         return;
     }
     let tracked = spawn_cmd(&git.0)
@@ -2293,7 +3118,19 @@ fn remove_own_stale_request(git: &GitBinary, pass: &RepoPass) {
 /// install renders none there any more, and the owner's committed ones cannot
 /// be fast-forwarded over untracked files. Approval markers, reason files and
 /// anything else are left alone. Skipped when git cannot say what is tracked.
-fn drop_untracked_rule_copies(git: &GitBinary, root: &Path) {
+/// The tracked set and the deletes run under the policy guard: a concurrent
+/// pass's fast-forward may have made a copy tracked since this pass last
+/// looked, and deleting a tracked file would publish its removal on the next
+/// commit (T-000243 review, fifteenth pass).
+fn drop_untracked_rule_copies(git: &GitBinary, repo_id: i64, root: &Path, expected: u64) {
+    let guard = specs_policy_guard(repo_id);
+    let _g = guard.lock().unwrap();
+    // T-000243 review (sixteenth pass): same freshness gate as
+    // `remove_own_stale_request` — a repathed pass must not delete files on
+    // the checkout it no longer owns.
+    if !lifecycle_is_current(repo_id, root, expected) {
+        return;
+    }
     let dir = root.join(SKILLS_DIR);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
@@ -2340,122 +3177,772 @@ fn reset_to_origin(
 }
 
 /// Fast-forward the recipients, guard the non-current ones, then the import hook.
-/// Nothing is touched unless the repo is `repo_ready`.
-fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
+/// Nothing is touched unless the repo is `repo_ready`. `gen0` is the
+/// generation the pass captured: everything below mutates — the branch
+/// section (`reset_to_origin` can roll a branch back over a disable's
+/// unpushed deletion commit), the incoming import and the canon adoption —
+/// so it ALL runs under the policy guard, gated on the pass's freshness
+/// BEFORE the first mutation (T-000243 review, twelfth and fourteenth
+/// passes). The import resolves the repo's CURRENT binding during
+/// reconcile: a repath that landed during the fetch must not let this
+/// pass write the old checkout's rows into the new checkout's files.
+fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
     let Some(role) = pass.role else { return };
     if !repo_ready(git, &pass.root) {
         return;
     }
     let cur = current_branch(git, &pass.root).ok().flatten();
-    let pathspec = shared_pathspec(role, &pass.login);
+    let pathspec = shared_pathspec(role, &pass.login, pass.share_specs);
     let recipients = pass.recipients.clone();
-    for b in &recipients {
-        let remote = remote_ref(b);
-        let has_remote = matches!(git_sync::rev_parse(git, &pass.root, &remote), Ok(Some(_)));
-        let is_current = cur.as_deref().is_some_and(|c| same_branch(c, b));
-        if is_current {
-            if !has_remote {
-                continue;
-            }
-            match ff_current(git, &pass.root, &remote, &pathspec) {
-                Ok(true) => {}
-                Ok(false) => pass.note_diverged(b, true),
-                Err(e) => {
-                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
-                    pass.issue(issue)
+    #[cfg(test)]
+    after_fetch_probe(pass.repo.id, &pass.root);
+    {
+        let guard = specs_policy_guard(pass.repo.id);
+        let _g = guard.lock().unwrap();
+        // A lifecycle that landed during the fetch (disable, re-enable,
+        // approval, repath) makes every side effect below obsolete — the
+        // branch resets AND the import/canon tail. The pass seals stale at
+        // `finish` regardless (T-000243 review, fourteenth pass).
+        if lifecycle_is_current(pass.repo.id, &pass.root, gen0 + u64::from(pass.own_bumps)) {
+            for b in &recipients {
+                let remote = remote_ref(b);
+                let has_remote =
+                    matches!(git_sync::rev_parse(git, &pass.root, &remote), Ok(Some(_)));
+                let is_current = cur.as_deref().is_some_and(|c| same_branch(c, b));
+                if is_current {
+                    if !has_remote {
+                        continue;
+                    }
+                    match ff_current(git, &pass.root, &remote, &pathspec) {
+                        Ok(true) => {}
+                        Ok(false) => pass.note_diverged(b, true),
+                        Err(e) => {
+                            let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                            pass.issue(issue)
+                        }
+                    }
+                    continue;
+                }
+                // Not the current branch: it may only ever hold our own sync commits.
+                let mut check = true;
+                if has_remote {
+                    match git_sync::fast_forward_ref(git, &pass.root, b, &remote) {
+                        Ok(FfOutcome::Diverged) => {
+                            check = false;
+                            let tip = if pass.fetched {
+                                local_tip_if_ours(git, &pass.root, b).unwrap_or(None)
+                            } else {
+                                None
+                            };
+                            let reset = tip.is_some_and(|t| {
+                                reset_to_origin(git, &pass.root, b, &t).unwrap_or(false)
+                            });
+                            if !reset {
+                                pass.blocked.insert(b.to_ascii_lowercase());
+                                pass.note_diverged(b, false);
+                            }
+                        }
+                        Ok(FfOutcome::LocalAhead) => {}
+                        Ok(_) => check = false,
+                        Err(e) => {
+                            check = false;
+                            let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                            pass.issue(issue)
+                        }
+                    }
+                }
+                let exists = matches!(
+                    git_sync::rev_parse(git, &pass.root, &local_ref(b)),
+                    Ok(Some(_))
+                );
+                if check && exists {
+                    match local_only_commits_are_ours(git, &pass.root, b) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            pass.blocked.insert(b.to_ascii_lowercase());
+                            pass.note_diverged(b, false);
+                        }
+                        Err(e) => {
+                            pass.blocked.insert(b.to_ascii_lowercase());
+                            let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                            pass.issue(issue)
+                        }
+                    }
                 }
             }
+            // T-000243 review (fourteenth pass): the import and the canon
+            // adoption are side effects of the same observation — they run
+            // inside this hold, gated by the same freshness check. A repath
+            // during the fetch can no longer leave this pass importing the
+            // old checkout's rows into the new binding's files.
+            if let Err(e) = import_incoming(db, git, pass.repo.id, &pass.root) {
+                // Recurring: `fresh_issues` reports it once until the text changes.
+                let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                    .target("docs/bug-reports.md")
+                    .detail(format!("import of the shared task files: {}", e));
+                pass.issue(issue)
+            }
+            // T-000241: the proposal channel rides the same hold — after the
+            // import, before the canon adoption — so its dev-branch reads and
+            // writes see the same observation as everything else this pass.
+            if let Some(dev_branch) = pass.structure.as_ref().map(|s| s.main.dev_branch.clone()) {
+                sync_rule_proposals(db, git, pass, &dev_branch);
+            }
+            // T-000224 (В4): the owner's committed rule copies are this install's canon.
+            if role == Role::Contributor {
+                let owner = pass
+                    .structure
+                    .as_ref()
+                    .map(|s| (s.main.login.clone(), s.main.dev_branch.clone()));
+                if let Some((main_login, dev_branch)) = owner {
+                    match crate::sync::shared_canon::adopt_main_canon(
+                        db,
+                        git,
+                        &pass.repo,
+                        &pass.root,
+                        &main_login,
+                        &dev_branch,
+                    ) {
+                        Ok(done) => {
+                            pass.canon_changed.extend(done.changed);
+                            if !done.errors.is_empty() {
+                                let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                                    .target("docs/sdh_skills/")
+                                    .detail(format!(
+                                        "canon of the owner's rules: {}",
+                                        done.errors.join("; ")
+                                    ));
+                                pass.issue(issue)
+                            }
+                        }
+                        Err(e) => {
+                            let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                                .target("docs/sdh_skills/")
+                                .detail(format!("canon of the owner's rules: {}", e));
+                            pass.issue(issue)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T-000241: the rule-proposal channel's dedicated transport
+// ---------------------------------------------------------------------------
+//
+// Both catalogs are read at the LOCAL tip of the dev branch — unpushed work
+// included; origin is consulted only for publication checks. Writes go to the
+// dev branch: `commit_paths` when dev is the checked-out branch, the plumbing
+// commit when it is checked out nowhere, and `SharedStatus::Blocked` (retry)
+// when another worktree holds it — that worktree's files cannot be written
+// here. Pushing is the ordinary phase-B `push_recipients`, in which the dev
+// branch already rides for both roles.
+
+use crate::models::{proposal_status, RuleProposalFile};
+use crate::sync::rule_proposals as rp;
+
+/// Read both catalogs at `rev`, bounded and symlink-free: file name ->
+/// (blob sha, parsed artifact). Malformed files are reported as issues and
+/// skipped — a bad artifact stops nothing else.
+pub(crate) fn read_proposal_catalogs(
+    git: &GitBinary,
+    root: &Path,
+    rev: &str,
+    known: &dyn Fn(&str) -> bool,
+    issues: &mut Vec<String>,
+) -> (
+    BTreeMap<String, (String, RuleProposalFile)>,
+    BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+) {
+    let mut proposals: BTreeMap<String, (String, RuleProposalFile)> = BTreeMap::new();
+    let mut decisions: BTreeMap<String, (String, crate::models::RuleDecisionFile)> =
+        BTreeMap::new();
+    let dirs = [
+        rp::RULE_PROPOSALS_REL_DIR.to_string(),
+        rp::RULE_DECISIONS_REL_DIR.to_string(),
+    ];
+    let tree = match ls_tree_with_modes(git, root, rev, &dirs) {
+        Ok(t) => t,
+        Err(e) => {
+            issues.push(format!("{}: {}", dirs[0], e));
+            return (proposals, decisions);
+        }
+    };
+    let mut proposal_count = 0usize;
+    let mut decision_count = 0usize;
+    for (path, (mode, sha)) in &tree {
+        if mode == "120000" {
+            issues.push(format!("{}: symlink, skipped", path));
             continue;
         }
-        // Not the current branch: it may only ever hold our own sync commits.
-        let mut check = true;
-        if has_remote {
-            match git_sync::fast_forward_ref(git, &pass.root, b, &remote) {
-                Ok(FfOutcome::Diverged) => {
-                    check = false;
-                    let tip = if pass.fetched {
-                        local_tip_if_ours(git, &pass.root, b).unwrap_or(None)
-                    } else {
-                        None
-                    };
-                    let reset = tip
-                        .is_some_and(|t| reset_to_origin(git, &pass.root, b, &t).unwrap_or(false));
-                    if !reset {
-                        pass.blocked.insert(b.to_ascii_lowercase());
-                        pass.note_diverged(b, false);
+        let Some(file_name) = path.rsplit('/').next() else {
+            continue;
+        };
+        let is_proposal = path.starts_with(&format!("{}/", rp::RULE_PROPOSALS_REL_DIR));
+        let is_decision = path.starts_with(&format!("{}/", rp::RULE_DECISIONS_REL_DIR));
+        if !is_proposal && !is_decision {
+            continue;
+        }
+        if is_proposal && proposal_count >= rp::MAX_PROPOSAL_FILES {
+            issues.push(format!(
+                "{}: over the {}-file cap",
+                rp::RULE_PROPOSALS_REL_DIR,
+                rp::MAX_PROPOSAL_FILES
+            ));
+            break;
+        }
+        if is_decision && decision_count >= rp::MAX_DECISION_FILES {
+            issues.push(format!(
+                "{}: over the {}-file cap",
+                rp::RULE_DECISIONS_REL_DIR,
+                rp::MAX_DECISION_FILES
+            ));
+            break;
+        }
+        let bytes = match git_sync::show_file_capped(git, root, rev, path, rp::MAX_ARTIFACT_BYTES) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                issues.push(format!("{}: unreadable or oversized", path));
+                continue;
+            }
+            Err(e) => {
+                issues.push(format!("{}: {}", path, e));
+                continue;
+            }
+        };
+        if is_proposal {
+            proposal_count += 1;
+            match serde_json::from_slice::<RuleProposalFile>(&bytes)
+                .map_err(|e| format!("{}: invalid JSON: {}", path, e))
+                .and_then(|p| rp::validate_proposal_file(file_name, &p, known).map(|()| p))
+            {
+                Ok(p) => {
+                    proposals.insert(file_name.to_string(), (sha.clone(), p));
+                }
+                Err(e) => issues.push(e),
+            }
+        } else {
+            decision_count += 1;
+            match serde_json::from_slice::<crate::models::RuleDecisionFile>(&bytes)
+                .map_err(|e| format!("{}: invalid JSON: {}", path, e))
+                .and_then(|d| rp::validate_decision_file(file_name, &d, known).map(|()| d))
+            {
+                Ok(d) => {
+                    decisions.insert(file_name.to_string(), (sha.clone(), d));
+                }
+                Err(e) => issues.push(e),
+            }
+        }
+    }
+    (proposals, decisions)
+}
+
+/// The wire view of one local proposal row.
+fn wire_of(p: &crate::models::RuleProposal) -> RuleProposalFile {
+    RuleProposalFile {
+        format: crate::models::PROPOSAL_FORMAT,
+        login: p.login.clone(),
+        rule: p.rule.clone(),
+        text: p.text.clone(),
+        at: p.at.clone(),
+        seq: p.seq,
+        status: p.status.clone(),
+    }
+}
+
+/// Write `changes` to the dev branch and return the subject used, or report
+/// the blockage on the pass. `None` = nothing written (empty, moved, or
+/// blocked — the pass notes it and the next sync retries).
+fn commit_to_dev(
+    git: &GitBinary,
+    pass: &mut RepoPass,
+    dev_branch: &str,
+    changes: &[FileChange],
+    subject: &str,
+) {
+    if changes.is_empty() {
+        return;
+    }
+    let root = pass.root.clone();
+    let (_, body) = commit_message(&pass.login);
+    let cur = current_branch(git, &root).ok().flatten();
+    if cur.as_deref().is_some_and(|c| same_branch(c, dev_branch)) {
+        // Dev checked out HERE: write the artifacts into the work tree and
+        // commit them scoped — foreign work outside our paths is untouched.
+        for ch in changes {
+            let rel = ch.rel_path.clone();
+            match &ch.content {
+                Some(bytes) => {
+                    let full = root.join(&rel);
+                    if let Some(parent) = full.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = std::fs::write(&full, bytes) {
+                        pass.note(SharedStatus::Blocked, format!("{}: {}", rel.display(), e));
+                        return;
                     }
                 }
-                Ok(FfOutcome::LocalAhead) => {}
-                Ok(_) => check = false,
-                Err(e) => {
-                    check = false;
-                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
-                    pass.issue(issue)
+                None => {
+                    let _ = std::fs::remove_file(root.join(&rel));
                 }
             }
         }
-        let exists = matches!(
-            git_sync::rev_parse(git, &pass.root, &local_ref(b)),
-            Ok(Some(_))
+        let paths: Vec<PathBuf> = changes.iter().map(|c| c.rel_path.clone()).collect();
+        match commit_paths(
+            git,
+            &root,
+            dev_branch,
+            &paths,
+            subject,
+            Some(&body),
+            SDH_COMMIT_NAME,
+            SDH_COMMIT_EMAIL,
+        ) {
+            Ok(CommitOutcome::Committed { .. }) => {
+                pass.committed = true;
+            }
+            Ok(CommitOutcome::NothingToCommit) => {}
+            other => {
+                pass.note(
+                    SharedStatus::Blocked,
+                    format!("commit to {}: {:?}", dev_branch, other),
+                );
+            }
+        }
+        return;
+    }
+    // Dev checked out in ANOTHER worktree: its files cannot be written here
+    // (the current-checkout case returned above). `refuse_checked_out`
+    // already compares ASCII-insensitively across every worktree.
+    if let Err(e) = git_sync::refuse_checked_out(
+        git,
+        &root,
+        dev_branch,
+        "the proposal channel retries on the next pass",
+    ) {
+        pass.note(SharedStatus::Blocked, e);
+        return;
+    }
+    match git_sync::commit_files_to_branch(
+        git,
+        &root,
+        dev_branch,
+        changes,
+        &format!("{}\n\n{}", subject, body),
+        SDH_COMMIT_NAME,
+        SDH_COMMIT_EMAIL,
+    ) {
+        Ok(BranchCommit::Committed { .. }) => {
+            pass.committed = true;
+        }
+        Ok(BranchCommit::NothingToCommit) => {}
+        Ok(BranchCommit::RefMoved) => {
+            pass.note(
+                SharedStatus::Blocked,
+                format!("{} moved; retried next pass", dev_branch),
+            );
+        }
+        Err(e) => {
+            pass.note(
+                SharedStatus::Blocked,
+                format!("commit to {}: {}", dev_branch, e),
+            );
+        }
+    }
+}
+
+/// T-000241 R2: transport the proposal channel for `pass` — inside the
+/// after_fetch hold, after the import and before `adopt_main_canon`.
+///
+/// Contributor side: every own proposal row is resolved against the dev
+/// version (pull / upload / no-op), the receipt overlay is refreshed, and
+/// `remote_ver` is updated from the confirmed origin snapshot. Main side:
+/// pending receipts are written to dev (existing identical ones are reused —
+/// retry is idempotent by construction; a conflicting one is an explicit
+/// error, never overwritten), `pub_state` is confirmed from origin, and a
+/// `proposed` history event is recorded once per newly seen open version.
+fn sync_rule_proposals(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, dev_branch: &str) {
+    let root = pass.root.clone();
+    let local_ref = local_ref(dev_branch);
+    let origin_ref = remote_ref(dev_branch);
+    let Some(dev_tip) = git_sync::rev_parse(git, &root, &local_ref).ok().flatten() else {
+        return; // No local dev yet — the fast-forward creates it this pass.
+    };
+    let known: HashSet<String> = crate::sync::skills::list_skill_templates(db)
+        .map(|v| v.into_iter().map(|(name, _)| name).collect())
+        .unwrap_or_default();
+    let known_fn = |r: &str| known.contains(r);
+    let mut issues = Vec::new();
+    let (dev_proposals, dev_decisions) =
+        read_proposal_catalogs(git, &root, &dev_tip, &known_fn, &mut issues);
+    // The confirmed origin snapshot — `remote_ver` and `pub_state` are only
+    // ever set from it, never from the local tip's guess.
+    let (origin_proposals, origin_decisions) = if pass.fetched
+        && git_sync::rev_parse(git, &root, &origin_ref)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        let mut skip = Vec::new();
+        read_proposal_catalogs(git, &root, &origin_ref, &known_fn, &mut skip)
+    } else {
+        (BTreeMap::new(), BTreeMap::new())
+    };
+    for i in issues {
+        pass.issue(
+            repo_issue(Code::ManagedFileFailed, &pass.repo)
+                .target(rp::RULE_PROPOSALS_REL_DIR)
+                .detail(i),
         );
-        if check && exists {
-            match local_only_commits_are_ours(git, &pass.root, b) {
-                Ok(true) => {}
-                Ok(false) => {
-                    pass.blocked.insert(b.to_ascii_lowercase());
-                    pass.note_diverged(b, false);
-                }
-                Err(e) => {
-                    pass.blocked.insert(b.to_ascii_lowercase());
-                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
-                    pass.issue(issue)
-                }
-            }
-        }
     }
-    if let Err(e) = import_incoming(db, git, pass.repo.id, &pass.root) {
-        // Recurring: `fresh_issues` reports it once until the text changes.
-        let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
-            .target("docs/bug-reports.md")
-            .detail(format!("import of the shared task files: {}", e));
-        pass.issue(issue)
-    }
-    // T-000224 (В4): the owner's committed rule copies are this install's canon.
-    if role == Role::Contributor {
-        let owner = pass
-            .structure
-            .as_ref()
-            .map(|s| (s.main.login.clone(), s.main.dev_branch.clone()));
-        if let Some((main_login, dev_branch)) = owner {
-            match crate::sync::shared_canon::adopt_main_canon(
+
+    match pass.role {
+        Some(Role::Contributor) => {
+            contributor_proposals_transport(
                 db,
                 git,
-                &pass.repo,
-                &pass.root,
-                &main_login,
-                &dev_branch,
-            ) {
-                Ok(done) => {
-                    pass.canon_changed.extend(done.changed);
-                    if !done.errors.is_empty() {
-                        let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
-                            .target("docs/sdh_skills/")
-                            .detail(format!(
-                                "canon of the owner's rules: {}",
-                                done.errors.join("; ")
-                            ));
-                        pass.issue(issue)
-                    }
-                }
-                Err(e) => {
-                    let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
-                        .target("docs/sdh_skills/")
-                        .detail(format!("canon of the owner's rules: {}", e));
-                    pass.issue(issue)
-                }
+                pass,
+                dev_branch,
+                &dev_proposals,
+                &dev_decisions,
+                &origin_proposals,
+                &origin_decisions,
+            );
+        }
+        Some(Role::Main) => {
+            main_decisions_transport(
+                db,
+                git,
+                pass,
+                dev_branch,
+                &dev_proposals,
+                &dev_decisions,
+                &origin_decisions,
+            );
+        }
+        _ => {}
+    }
+}
+
+/// The contributor half: pull / upload own proposals and refresh the
+/// receipt overlay.
+#[allow(clippy::too_many_arguments)]
+fn contributor_proposals_transport(
+    db: &AppDb,
+    git: &GitBinary,
+    pass: &mut RepoPass,
+    dev_branch: &str,
+    dev_proposals: &BTreeMap<String, (String, RuleProposalFile)>,
+    dev_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+    origin_proposals: &BTreeMap<String, (String, RuleProposalFile)>,
+    _origin_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+) {
+    use rp::Effective;
+    let rows = db.list_rule_proposals(pass.repo.id).unwrap_or_default();
+    let mut uploads: Vec<FileChange> = Vec::new();
+    for row in &rows {
+        if !ss::logins_equal(&row.login, &pass.login) {
+            continue; // Single-writer: only this install's own proposals move.
+        }
+        let local_wire = wire_of(row);
+        let dev = dev_proposals.get(&row.file_name);
+        let outcome = match dev {
+            Some((_, d)) => rp::effective_version(&local_wire, d),
+            None => Effective::Local,
+        };
+        match outcome {
+            Effective::Remote => {
+                let (_, d) = dev.expect("dev checked above");
+                let _ = db.pull_rule_proposal(
+                    pass.repo.id,
+                    &row.file_name,
+                    row.seq,
+                    &row.updated_at,
+                    d.seq,
+                    &d.status,
+                    &d.text,
+                    &d.at,
+                );
+            }
+            Effective::Local => {
+                uploads.push(FileChange {
+                    rel_path: PathBuf::from(format!(
+                        "{}/{}",
+                        rp::RULE_PROPOSALS_REL_DIR,
+                        row.file_name
+                    )),
+                    content: Some(rp::canonical_proposal_json(&local_wire).into_bytes()),
+                });
+            }
+            Effective::Same => {}
+        }
+        // A proposal our login has on dev but no row for — created on
+        // another install of the same person: pull it in, still to apply.
+        // (Handled below, after this loop.)
+        // Receipt overlay: only the dev blob sha of THIS version resolves it.
+        if let Some((sha, _)) = dev {
+            let matching = dev_decisions
+                .values()
+                .find(|(_, d)| ss::logins_equal(&d.login, &row.login) && d.decided_rev == *sha);
+            let _ = db.set_rule_proposal_resolved(
+                pass.repo.id,
+                &row.file_name,
+                matching.map(|(_, d)| {
+                    (
+                        d.action.as_str(),
+                        d.decided_by.as_str(),
+                        d.decided_at.as_str(),
+                        d.decided_rev.as_str(),
+                    )
+                }),
+            );
+        } else {
+            let _ = db.set_rule_proposal_resolved(pass.repo.id, &row.file_name, None);
+        }
+        // remote_ver — the confirmed origin tuple for the GC.
+        if let Some((sha, d)) = origin_proposals.get(&row.file_name) {
+            let tuple =
+                serde_json::json!({"seq": d.seq, "status": d.status, "sha": sha}).to_string();
+            let _ = db.set_rule_proposal_remote_ver(pass.repo.id, &row.file_name, Some(&tuple));
+        }
+    }
+    // Own proposals on dev this install never wrote (same person, another
+    // machine): pull in as pending_apply so the local-work sweep applies
+    // their text to the canon.
+    for (file_name, (_, d)) in dev_proposals {
+        if !ss::logins_equal(&d.login, &pass.login) {
+            continue;
+        }
+        if rows.iter().any(|r| r.file_name == *file_name) {
+            continue;
+        }
+        let _ = db.upsert_rule_proposal(&crate::models::RuleProposal {
+            repo_id: pass.repo.id,
+            file_name: file_name.clone(),
+            login: d.login.clone(),
+            rule: d.rule.clone(),
+            seq: d.seq,
+            status: d.status.clone(),
+            local_state: crate::models::proposal_local_state::PENDING_APPLY.to_string(),
+            text: d.text.clone(),
+            at: d.at.clone(),
+            resolved_action: None,
+            resolved_by: None,
+            resolved_at: None,
+            resolved_rev: None,
+            remote_ver: None,
+            updated_at: String::new(),
+        });
+    }
+    commit_to_dev(git, pass, dev_branch, &uploads, PROPOSAL_SUBJECT);
+}
+
+/// The owner half: publish pending receipts and confirm `pub_state` from
+/// origin; record a `proposed` event once per newly seen open version.
+fn main_decisions_transport(
+    db: &AppDb,
+    git: &GitBinary,
+    pass: &mut RepoPass,
+    dev_branch: &str,
+    dev_proposals: &BTreeMap<String, (String, RuleProposalFile)>,
+    dev_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+    origin_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+) {
+    publish_pending_receipts(
+        db,
+        git,
+        pass,
+        dev_branch,
+        dev_proposals,
+        dev_decisions,
+        origin_decisions,
+    );
+    // Owner-side `proposed` history: once per newly seen OPEN version —
+    // note `(<file> seq <n>)` is the dedup key.
+    let mut seen: HashSet<String> = HashSet::new();
+    for (file_name, (_, d)) in dev_proposals {
+        if d.status != proposal_status::OPEN {
+            continue;
+        }
+        let note = format!("{} seq {}", file_name, d.seq);
+        if seen.contains(&note) {
+            continue;
+        }
+        let already = db
+            .list_rule_events(&d.rule)
+            .unwrap_or_default()
+            .iter()
+            .any(|e| {
+                e.kind == crate::db::rule_event::PROPOSED
+                    && e.note.as_deref() == Some(note.as_str())
+            });
+        if already {
+            continue;
+        }
+        seen.insert(note.clone());
+        let label = rule_copy_label_repo(&pass.repo);
+        let _ = db.insert_rule_event(
+            &d.rule,
+            crate::db::rule_event::PROPOSED,
+            Some(&label),
+            Some(&note),
+        );
+    }
+}
+
+/// The publish half of the main-side transport — also the publication
+/// sweep's body: write the missing receipts to dev (an identical existing
+/// one is reused — retry is idempotent by construction; a conflicting one
+/// is an explicit issue, never overwritten), confirm `pub_state` from the
+/// origin snapshot only, and mark `overtaken` the rows whose decided
+/// revision is no longer the open version on dev — a re-proposal passed
+/// them; the immutable receipt still stands where it was committed.
+#[allow(clippy::too_many_arguments)]
+fn publish_pending_receipts(
+    db: &AppDb,
+    git: &GitBinary,
+    pass: &mut RepoPass,
+    dev_branch: &str,
+    dev_proposals: &BTreeMap<String, (String, RuleProposalFile)>,
+    dev_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+    origin_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+) {
+    use crate::models::acceptance_pub_state as ps;
+    let mut writes: Vec<FileChange> = Vec::new();
+    for a in db.list_publishable_rule_acceptances().unwrap_or_default() {
+        if a.repo_id != pass.repo.id {
+            continue;
+        }
+        let name = rp::decision_file_name(&a.rule, &a.proposer_login, &a.decided_rev);
+        match dev_decisions.get(&name) {
+            Some((_, d))
+                if serde_json::to_string(d).ok().as_deref() == Some(a.receipt_json.as_str()) =>
+            {
+                // Identical receipt already on dev — idempotent reuse.
+            }
+            Some((sha, _)) => {
+                pass.issue(
+                    repo_issue(Code::ManagedFileFailed, &pass.repo)
+                        .target(format!("{}/{}", rp::RULE_DECISIONS_REL_DIR, name))
+                        .detail(format!(
+                            "an immutable receipt at this path holds other bytes ({}): never overwritten",
+                            sha
+                        )),
+                );
+            }
+            None => {
+                writes.push(FileChange {
+                    rel_path: PathBuf::from(format!("{}/{}", rp::RULE_DECISIONS_REL_DIR, name)),
+                    content: Some(a.receipt_json.clone().into_bytes()),
+                });
+            }
+        }
+        // Publication is confirmed from origin only.
+        if let Some((_, d)) = origin_decisions.get(&name) {
+            if serde_json::to_string(d).ok().as_deref() == Some(a.receipt_json.as_str()) {
+                let _ = db.set_rule_acceptance_pub_state(
+                    pass.repo.id,
+                    &a.rule,
+                    &a.proposer_login,
+                    &a.decided_rev,
+                    ps::PUBLISHED,
+                );
             }
         }
     }
+    commit_to_dev(git, pass, dev_branch, &writes, DECISION_SUBJECT);
+    // A receipt whose decided revision is no longer the open version on
+    // dev was overtaken by a re-proposal: it stops chasing publication.
+    // The check covers every decided row, published included — `overtaken`
+    // is the receipt's standing, orthogonal to whether origin saw it.
+    for a in db.list_rule_acceptances(pass.repo.id).unwrap_or_default() {
+        if a.pub_state == ps::OVERTAKEN
+            || !matches!(
+                a.status.as_str(),
+                s if s == crate::models::acceptance_status::DECIDED
+                    || s == crate::models::acceptance_status::APPLIED
+                    || s == crate::models::acceptance_status::RENDERED
+                    || s == crate::models::acceptance_status::CONFLICTED
+                    || s == crate::models::acceptance_status::SUPERSEDED
+            )
+        {
+            continue;
+        }
+        let pname = rp::proposal_file_name(&a.rule, &a.proposer_login);
+        if dev_proposals
+            .get(&pname)
+            .is_some_and(|(sha, _)| sha != &a.decided_rev)
+        {
+            let _ = db.set_rule_acceptance_pub_state(
+                pass.repo.id,
+                &a.rule,
+                &a.proposer_login,
+                &a.decided_rev,
+                ps::OVERTAKEN,
+            );
+        }
+    }
+}
+
+/// T-000241: the publication sweep outside a sync pass (startup + list) —
+/// retries this repo's pending/blocked receipts against the CURRENT local
+/// dev tip and the last-seen origin snapshot. No fetch: the next real sync
+/// confirms whatever this sweep could not. Serialized on the policy guard
+/// like every other dev writer. Returns the issues it ran into.
+pub(crate) fn sweep_rule_publications(
+    db: &AppDb,
+    git: &GitBinary,
+    repo: &Repository,
+    root: &Path,
+    dev_branch: &str,
+) -> Vec<String> {
+    let guard = specs_policy_guard(repo.id);
+    let _g = guard.lock().unwrap();
+    let login = db.github_login().unwrap_or_default();
+    let mut pass = new_pass(repo, root, &login);
+    pass.role = Some(Role::Main);
+    let Some(dev_tip) = git_sync::rev_parse(git, root, &local_ref(dev_branch))
+        .ok()
+        .flatten()
+    else {
+        return Vec::new();
+    };
+    let known: HashSet<String> = crate::sync::skills::list_skill_templates(db)
+        .map(|v| v.into_iter().map(|(name, _)| name).collect())
+        .unwrap_or_default();
+    let known_fn = |r: &str| known.contains(r);
+    let mut issues = Vec::new();
+    let (dev_proposals, dev_decisions) =
+        read_proposal_catalogs(git, root, &dev_tip, &known_fn, &mut issues);
+    let origin = remote_ref(dev_branch);
+    let (_, origin_decisions) = if matches!(git_sync::rev_parse(git, root, &origin), Ok(Some(_))) {
+        let mut skip = Vec::new();
+        read_proposal_catalogs(git, root, &origin, &known_fn, &mut skip)
+    } else {
+        (BTreeMap::new(), BTreeMap::new())
+    };
+    publish_pending_receipts(
+        db,
+        git,
+        &mut pass,
+        dev_branch,
+        &dev_proposals,
+        &dev_decisions,
+        &origin_decisions,
+    );
+    issues.extend(
+        pass.issues
+            .iter()
+            .map(|i| i.detail.clone().unwrap_or_else(|| format!("{:?}", i.code))),
+    );
+    issues
+}
+
+/// `rule_copy_label` — pub(crate) re-use without duplicating the impl.
+fn rule_copy_label_repo(repo: &Repository) -> String {
+    crate::sync::skills::rule_copy_label(repo)
 }
 
 /// Bring the CURRENT branch up to `remote`. `Ok(false)` = diverged (needs a
@@ -2492,8 +3979,56 @@ impl SharedSync {
         let passes = std::mem::take(&mut self.passes);
         let mut out = SharedOutcome::default();
         for mut pass in passes {
-            if let (Some(git), Some(_)) = (git, pass.role) {
-                phase_b_repo(db, git, &mut pass);
+            // T-000243 review (fourth pass): ONE guard hold covers phase B
+            // AND the status settlement — a writer that flipped the repo's
+            // shared state between the phases (disable / approve / enable /
+            // the specs setter) cannot land between the policy work and the
+            // status write.
+            let guard = specs_policy_guard(pass.repo.id);
+            let _guard = guard.lock().unwrap();
+            // T-000243 review (sixth pass): settle only when the lifecycle
+            // generation this pass's decisions started under is still
+            // current. A disable that completed — even one that finished
+            // BETWEEN the pass's discovery and its seal — owns the repo's
+            // status (including a `push_failed` it is still retrying), and
+            // so does an enable or a status-resolution action; a stale pass
+            // must not overwrite it. Passes phase B never revalidates (no
+            // git, or a pass refused back in phase A) get the same
+            // protection here. This is NOT a shared-membership check: a
+            // first-discovery `Untrusted` pass or a `retry_disabling` pass
+            // legitimately settles onto a repo that is not shared — only a
+            // lifecycle that MOVED after the pass's decisions began makes
+            // it stale, and the generation sees round trips a state
+            // snapshot cannot.
+            // T-000243 review (thirteenth pass): the same gate covers PHASE
+            // B — a pass whose lifecycle moved (repath, disable, re-enable,
+            // approval) between its decisions and now must not commit or
+            // push from a checkout it no longer owns. The check and phase
+            // B share this one guard hold, so nothing can interleave.
+            let mut stale = pass
+                .lifecycle_gen
+                .is_some_and(|gen| gen != lifecycle_generation(pass.repo.id, &pass.root));
+            // T-000243 review (eighteenth pass): a refused pass's generation
+            // can be unchanged while the structure it refused has since been
+            // repaired and accepted — revalidate the refusal itself under
+            // this hold, or an obsolete `shared_untrusted` settles onto a
+            // repo whose structure is now valid.
+            if !stale && pass.structure_refused.is_some() {
+                if let (Some(git), Some(gh)) = (git, pass.repo.github_name.as_deref()) {
+                    let pinned = ss::read_shared_import(db, pass.repo.id).pinned_dev_branch;
+                    let admins = ss::AdminVerified::load(db);
+                    if matches!(
+                        ss::discover_structure(git, &pass.root, gh, pinned.as_deref(), &admins),
+                        Ok(DiscoverOutcome::Found(_, _))
+                    ) {
+                        stale = true;
+                    }
+                }
+            }
+            if !stale {
+                if let (Some(git), Some(_)) = (git, pass.role) {
+                    phase_b_repo(db, git, &mut pass);
+                }
             }
             let issues = std::mem::take(&mut pass.issues);
             out.issues
@@ -2504,7 +4039,12 @@ impl SharedSync {
                     out.committed.push(name);
                 }
             }
-            settle_status(db, &pass, &mut out);
+            // T-000243 review (third pass): a pass cancelled by phase B's
+            // revalidation settles no status — the writer that changed the
+            // repo's state under the guard owns it (see `RepoPass::cancelled`).
+            if !pass.cancelled && !stale {
+                settle_status(db, &pass, &mut out);
+            }
         }
         out
     }
@@ -2537,17 +4077,377 @@ fn settle_status(db: &AppDb, pass: &RepoPass, out: &mut SharedOutcome) {
 
 /// What a plumbed commit may touch: the role's shared files without the managed
 /// root files, which are committed on the current branch only.
-fn plumb_pathspec(role: Role, login: &str) -> Vec<String> {
-    shared_pathspec(role, login)
+fn plumb_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String> {
+    shared_pathspec(role, login, share_specs)
         .into_iter()
         .filter(|p| !MANAGED_ROOT_FILES.contains(&p.as_str()))
         .collect()
 }
 
+// T-000243 review: a test-only rendezvous inside phase B's policy section —
+// fired after the per-repo guard is taken and before the policy is resolved.
+// Production never installs one; the concurrency tests use it to interleave
+// `set_repo_share_specs` (another thread) with an in-flight phase B without
+// relying on timing. The probe is matched by repo id AND repo root (the temp
+// dir of the test that installed it), so parallel tests of the same process
+// never fire somebody else's rendezvous, and it is consumed by the first pass
+// that sees it (later passes of the same test run normally).
+//
+// T-000243 review (third pass): the registry is a MAP keyed by
+// (repo id, repo root), not a single slot — a single `Option` let one test's
+// install drop another test's sender wholesale, and a test running in
+// parallel (`--test-threads=2`, the default is more) then failed with "the
+// probe never fired: Disconnected". An entry whose test has ended is inert:
+// its key contains a temp dir that no later pass ever matches.
+#[cfg(test)]
+struct PhaseBPolicyProbe {
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+#[cfg(test)]
+static PHASE_B_POLICY_PROBES: OnceLock<Mutex<HashMap<(i64, PathBuf), PhaseBPolicyProbe>>> =
+    OnceLock::new();
+
+/// Install the rendezvous for the repo at `root`: its phase B sends the repo
+/// id on `entered` and then waits for one message on `release` while it holds
+/// the per-repo guard. Installing for a key replaces only that key's probe;
+/// other tests' probes are untouched.
+#[cfg(test)]
+fn install_phase_b_policy_probe(
+    repo: i64,
+    root: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = PHASE_B_POLICY_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo, root.to_path_buf()),
+        PhaseBPolicyProbe { entered, release },
+    );
+}
+
+#[cfg(test)]
+fn phase_b_policy_probe(repo_id: i64, root: &Path) {
+    let cell = PHASE_B_POLICY_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    // The registry lock is never held while the pass waits for the release.
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        g.remove(&(repo_id, root.to_path_buf()))
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        // The pass holds the per-repo guard while it waits, so whatever the
+        // test interleaves here cannot sneak into this section.
+        let _ = p.release.recv();
+    }
+}
+
+// T-000243 review (second pass): the same rendezvous mechanism for the
+// managed `.gitignore` RENDER sites — fired right AFTER the file write, while
+// the per-repo policy guard is still held (the guard must outlive the write,
+// not just the policy read: a render computed with the old policy may not
+// land after an OFF save or overwrite a newer OFF render). The concurrency
+// tests use it to prove a specs save / phase B cannot interleave between the
+// read and the write. Matched by repo id AND repo root, like the phase B
+// probe; production never installs one. T-000243 review (third pass): the
+// registry is a MAP keyed by (repo id, repo root) for the same
+// parallel-tests reason as `PHASE_B_POLICY_PROBES` above.
+#[cfg(test)]
+struct RenderWriteProbe {
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+#[cfg(test)]
+static RENDER_WRITE_PROBES: OnceLock<Mutex<HashMap<(i64, PathBuf), RenderWriteProbe>>> =
+    OnceLock::new();
+
+/// Install the render rendezvous for the repo at `root`: the render sends the
+/// repo id on `entered` after it wrote `.gitignore` (still holding the guard)
+/// and waits for one message on `release`. Installing for a key replaces only
+/// that key's probe; other tests' probes are untouched.
+#[cfg(test)]
+pub(crate) fn install_render_write_probe(
+    repo: i64,
+    root: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = RENDER_WRITE_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo, root.to_path_buf()),
+        RenderWriteProbe { entered, release },
+    );
+}
+
+/// Fire the installed render probe, if any. Callers call this INSIDE the
+/// held policy guard, after the `.gitignore` write.
+#[cfg(test)]
+pub(crate) fn render_write_probe(repo_id: i64, root: &Path) {
+    let cell = RENDER_WRITE_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        g.remove(&(repo_id, root.to_path_buf()))
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        // The render still holds the per-repo guard while it waits.
+        let _ = p.release.recv();
+    }
+}
+
+// T-000243 review (eleventh pass): a rendezvous for `retry_disabling`'s
+// post-fetch window. The fetch is the retry's last read-only step —
+// everything after it mutates (branch refresh, deletion commits, push).
+// The probe fires AFTER the fetch and BEFORE the policy guard is taken,
+// so a test can land a re-enable exactly in the window the review found:
+// the retry must then refuse before its FIRST mutation, not merely before
+// the database cleanup. Matched by (repo id, repo root); fires once.
+#[cfg(test)]
+struct RetryPostFetchProbe {
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+#[cfg(test)]
+static RETRY_POST_FETCH_PROBES: OnceLock<Mutex<HashMap<(i64, PathBuf), RetryPostFetchProbe>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn install_retry_post_fetch_probe(
+    repo: i64,
+    root: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = RETRY_POST_FETCH_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo, root.to_path_buf()),
+        RetryPostFetchProbe { entered, release },
+    );
+}
+
+#[cfg(test)]
+fn retry_post_fetch_probe(repo_id: i64, root: &Path) {
+    let cell = RETRY_POST_FETCH_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        g.remove(&(repo_id, root.to_path_buf()))
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        // The retry has NOT taken the policy guard yet — whatever the test
+        // interleaves here completes before the retry's freshness check.
+        let _ = p.release.recv();
+    }
+}
+
+// T-000243 review (twelfth pass): a rendezvous for `after_fetch`'s branch
+// section — the fast-forwards and `reset_to_origin` there MUTATE refs, so
+// they run under the policy guard gated on the pass's generation. The
+// probe fires AFTER the fetch, BEFORE the guard is taken: a test can land
+// a whole disable + republish in exactly the window the review found.
+// Matched by (repo id, repo root); fires once.
+#[cfg(test)]
+struct AfterFetchProbe {
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+/// Sends the rendezvous release on drop: a panicking interleave inside
+/// `thread::scope` must still free the parked worker, or the scope's join
+/// hangs forever (T-000243 review, fifteenth pass).
+#[cfg(test)]
+struct ReleaseOnDrop(std::sync::mpsc::Sender<i64>);
+
+#[cfg(test)]
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(1);
+    }
+}
+
+#[cfg(test)]
+static AFTER_FETCH_PROBES: OnceLock<Mutex<HashMap<(i64, PathBuf), AfterFetchProbe>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn install_after_fetch_probe(
+    repo: i64,
+    root: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = AFTER_FETCH_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo, root.to_path_buf()),
+        AfterFetchProbe { entered, release },
+    );
+}
+
+#[cfg(test)]
+fn after_fetch_probe(repo_id: i64, root: &Path) {
+    let cell = AFTER_FETCH_PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        g.remove(&(repo_id, root.to_path_buf()))
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        // The pass has NOT taken the policy guard yet — whatever the test
+        // interleaves here completes before the freshness check.
+        let _ = p.release.recv();
+    }
+}
+
+/// T-000243 review (third pass): revalidate a phase-A pass under the phase-B
+/// guard. The pass was captured before the skeleton writes; a writer of the
+/// policy-bearing structure (`approve_join_request`, `disable_shared_mode`,
+/// `enable_shared_mode`, the specs setter) may have completed between the
+/// phases — serialized by the same guard, but only for its own run. The
+/// deferred half therefore re-reads the CURRENT state instead of trusting the
+/// snapshot:
+///
+/// * the shared state from the database: a repo that stopped sharing (the
+///   switch-off landed in between) or whose cached role moved CANCELS the
+///   whole policy section — no structure publish, no commit, no push of the
+///   stale state — and marks the pass so `finish` settles no status from it
+///   either (the writer that won owns the repo's state now);
+/// * the owner's structure from the WORK TREE: an approval that landed in
+///   between wrote its participant there, and `write_main_structure` rebuilds
+///   from `existing` — rebuilding from the phase-A snapshot would silently
+///   drop the participant and re-publish the stale list. A file that is
+///   present but unusable fails closed exactly like phase A (`untrusted`,
+///   no policy work this pass). The recipients follow the refreshed
+///   structure, so a participant approved in between is plumbed and pushed
+///   in this very pass, whenever its branch already exists locally (a fresh
+///   participant's branch is still created by the next phase A).
+///
+/// * a HELPER's structure is re-DISCOVERED, not re-read from the work tree:
+///   another SharedSync of this install may have fetched and accepted a
+///   NEWER authoritative copy between the phases (its fetch already moved
+///   the remote-tracking refs), so the phase-A snapshot may carry a stale
+///   ON — or miss a newer refusal — exactly like the owner's work-tree file
+///   could. Discovery runs the same `discover_structure` phase A ran,
+///   against the pinned / matching origin ref. A structure that derives a
+///   DIFFERENT role for this install (approved elsewhere, removed) or is
+///   gone entirely CANCELS the pass — the next phase A re-derives
+///   everything; a refusal fails closed with the untrusted status, as in
+///   phase A.
+///
+/// Returns `true` when the pass may proceed.
+fn revalidate_pass_under_guard(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) -> bool {
+    let Some(role) = pass.role else { return false };
+    let state = match db.get_shared_state(pass.repo.id) {
+        Ok(s) => s,
+        Err(_) => {
+            pass.cancelled = true;
+            return false;
+        }
+    };
+    let role_still = match role {
+        Role::Main => state.shared_mode,
+        Role::Contributor => {
+            !state.shared_mode && state.shared_role.as_deref() == Some("contributor")
+        }
+        Role::Pending => !state.shared_mode && state.shared_role.as_deref() == Some("pending"),
+    };
+    if !role_still {
+        pass.cancelled = true;
+        return false;
+    }
+    match role {
+        Role::Main => {
+            let Some(gh) = pass.repo.github_name.clone() else {
+                pass.cancelled = true;
+                return false;
+            };
+            match ss::read_structure_file(&pass.root, &gh, &ss::AdminVerified::load(db)) {
+                Ok(s) => {
+                    pass.structure = s;
+                    if let Some(own) = pass.own_branch.clone() {
+                        let mut rec = vec![own];
+                        if let Some(s) = &pass.structure {
+                            rec.extend(s.participants.iter().map(|p| p.branch.clone()));
+                        }
+                        pass.recipients = clean_recipients(rec);
+                    }
+                }
+                Err(reason) => {
+                    pass.note_untrusted(reason);
+                    pass.role = None;
+                    return false;
+                }
+            }
+        }
+        Role::Contributor | Role::Pending => {
+            let (Some(gh), Some(_)) = (pass.repo.github_name.clone(), pass.repo.local_path.clone())
+            else {
+                // Phase A could not have discovered without these either;
+                // the snapshot is all there is.
+                return true;
+            };
+            let pinned = ss::read_shared_import(db, pass.repo.id).pinned_dev_branch;
+            let admins = ss::AdminVerified::load(db);
+            match ss::discover_structure(git, &pass.root, &gh, pinned.as_deref(), &admins) {
+                Ok(DiscoverOutcome::Found(s, _)) => {
+                    if ss::derive_role(Some(&s), Some(pass.login.as_str())) != Some(role) {
+                        pass.cancelled = true;
+                        return false;
+                    }
+                    let main_dev = s.main.dev_branch.clone();
+                    pass.structure = Some(s);
+                    if let Some(own) = pass.own_branch.clone() {
+                        pass.recipients = match role {
+                            Role::Contributor => clean_recipients(vec![own, main_dev]),
+                            _ => clean_recipients(vec![main_dev]),
+                        };
+                    }
+                }
+                Ok(DiscoverOutcome::NotFound) => {
+                    pass.cancelled = true;
+                    return false;
+                }
+                Ok(DiscoverOutcome::Untrusted(reason)) | Err(reason) => {
+                    pass.note_untrusted(reason);
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     let Some(role) = pass.role else { return };
+    // T-000243 review: one coherent policy snapshot for the whole
+    // policy-sensitive half of the pass. The CALLER (`SharedSync::finish`)
+    // holds the per-repo guard from here to the status settlement — the
+    // structure publish (which carries the flag), the `.gitignore`-driven
+    // enumeration, the pathspecs and every commit and push of THIS repo —
+    // so `set_repo_share_specs` (another thread) is never acknowledged in
+    // the middle of it: either this whole section completes under the old
+    // flag and the setter applies after it, or the setter lands first and
+    // this section reads the new flag. The managed `.gitignore` render of
+    // `project_sync` takes the same guard, so a render cannot read a flag
+    // that is being written either. The residual window is a render that
+    // finished with the old policy just before the setter landed: the file
+    // on disk is then stale until the next render, but nothing is committed
+    // with it (phase B resolves the policy again under the guard), so it
+    // self-heals without ever publishing the wrong files.
+    #[cfg(test)]
+    phase_b_policy_probe(pass.repo.id, &pass.root);
     // Same guard as phase A, checked again: the repo may have changed since.
     if !repo_ready(git, &pass.root) {
+        return;
+    }
+    // T-000243 review (third pass): REVALIDATE the pass under the guard — a
+    // writer of the policy-bearing structure (`approve_join_request`,
+    // `disable_shared_mode`, `enable_shared_mode`) may have completed BETWEEN
+    // the phases; each of them takes this same guard, but only for its own
+    // run, so the phase-A snapshot may not be trusted by the deferred half.
+    if !revalidate_pass_under_guard(db, git, pass) {
         return;
     }
     let root = pass.root.clone();
@@ -2587,11 +4487,45 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
         Role::Contributor => {}
     }
 
+    // T-000190: publish this install's app version — written before the
+    // recipients check so the same scoped commit carries it, and only on a
+    // bytes change so a steady state produces no commit churn. An install
+    // without a validated login writes nothing (never a guessed file).
+    if ss::is_valid_request_login(&login) {
+        if let Err(e) = write_own_app_version(&root, &login) {
+            let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                .target(APP_VERSIONS_REL_DIR)
+                .detail(e);
+            pass.issue(issue);
+        }
+    }
+
     if pass.recipients.is_empty() {
         return;
     }
-    let pathspec = shared_pathspec(role, &login);
-    let plumb_spec = plumb_pathspec(role, &login);
+    // T-000243: resolved HERE, not carried from phase A — a toggle between the
+    // phases must not leave the old `on` in this deferred half of the pass
+    // (the owner's setting is read fresh from the database). The per-repo
+    // guard taken above makes this read and everything derived from it one
+    // coherent snapshot against the setter.
+    let share_specs = match effective_share_specs(db, &pass.repo, pass.structure.as_ref()) {
+        Ok(v) => v,
+        Err(e) => {
+            // T-000243 review: a structure that is present but unusable
+            // (malformed / untrusted) must not become a guessed `on` — no
+            // shared file of this repo is committed this pass and the issue
+            // says why. The repo is reported, never silently rendered.
+            pass.issue(
+                repo_issue(Code::SharedUntrusted, &pass.repo)
+                    .target(STRUCTURE_REL_PATH)
+                    .detail(e),
+            );
+            return;
+        }
+    };
+    diagnose_specs_blocking(git, pass, role, share_specs);
+    let pathspec = shared_pathspec(role, &login, share_specs);
+    let plumb_spec = plumb_pathspec(role, &login, share_specs);
     let approved: Vec<String> = match (role, &pass.structure) {
         (Role::Main, Some(s)) => s.participants.iter().map(|p| p.login.clone()).collect(),
         _ => Vec::new(),
@@ -2614,23 +4548,54 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     for b in &recipients {
         let is_current = cur.as_deref().is_some_and(|c| same_branch(c, b));
         if is_current {
-            if active.is_empty() {
+            // T-000244: markers this branch still tracks leave it as deletions
+            // — even with nothing else to commit and with `docs/sdh_skills/`
+            // gone from disk (the list is read from HEAD). The same sync
+            // subject and identity as every other commit of this pass, so the
+            // branch still reads as holding nothing but our own sync commits.
+            let markers = match list_markers_in_rev(git, &root, "HEAD") {
+                Ok(m) => m,
+                Err(e) => {
+                    let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                    pass.issue(issue);
+                    continue;
+                }
+            };
+            if active.is_empty() && markers.is_empty() {
                 continue;
             }
-            let mut paths: Vec<PathBuf> = active.iter().map(PathBuf::from).collect();
-            paths.extend(exclude_specs(&active).into_iter().map(PathBuf::from));
+            let paths: Vec<PathBuf> = active.iter().map(PathBuf::from).collect();
             let (subject, body) = commit_message(&login);
             let pre_head = git_sync::rev_parse(git, &root, "HEAD").ok().flatten();
-            match commit_paths(
-                git,
-                &root,
-                b,
-                &paths,
-                &subject,
-                Some(&body),
-                SDH_COMMIT_NAME,
-                SDH_COMMIT_EMAIL,
-            ) {
+            let outcome = if markers.is_empty() {
+                let mut pathspec: Vec<PathBuf> = paths.clone();
+                pathspec.extend(exclude_specs(&active).into_iter().map(PathBuf::from));
+                commit_paths(
+                    git,
+                    &root,
+                    b,
+                    &pathspec,
+                    &subject,
+                    Some(&body),
+                    SDH_COMMIT_NAME,
+                    SDH_COMMIT_EMAIL,
+                )
+            } else {
+                // Index-only: the commit is built from HEAD plus the allowed
+                // shared paths, minus every marker it holds. A live marker can
+                // therefore be deleted but never added or modified.
+                commit_paths_index_only(
+                    git,
+                    &root,
+                    b,
+                    &paths,
+                    &subject,
+                    Some(&body),
+                    SDH_COMMIT_NAME,
+                    SDH_COMMIT_EMAIL,
+                )
+            };
+            match outcome {
                 Ok(CommitOutcome::Committed { .. }) => {
                     pass.committed = true;
                     // Our own content: it needs no import (spec R11 step 3).
@@ -2663,7 +4628,7 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     }
 
     if pass.net_ok {
-        push_recipients(git, pass, cur.as_deref());
+        push_recipients(db, git, pass, cur.as_deref());
     }
 }
 
@@ -2698,7 +4663,7 @@ fn prune_approved_requests(root: &Path, s: &ProjectStructure) {
 
 /// Push the recipient branches whose tip origin does not have. A non-current
 /// branch that holds anything but our own sync commits is never pushed.
-fn push_recipients(git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
+fn push_recipients(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
     let root = pass.root.clone();
     let mut to_push: Vec<String> = Vec::new();
     for b in pass.recipients.clone() {
@@ -2739,11 +4704,30 @@ fn push_recipients(git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
                         let current = cur.is_some_and(|c| same_branch(c, &branch));
                         pass.note_diverged(&branch, current)
                     }
-                    PushOutcome::RejectedProtected(m) => pass.note_push_rejected(&branch, m),
-                    PushOutcome::RejectedOther(m) => pass.note(SharedStatus::PushFailed, m),
+                    PushOutcome::RejectedProtected(m) => {
+                        pass.note_push_rejected(&branch, m);
+                        mark_receipts_blocked(db, pass, &branch);
+                    }
+                    PushOutcome::RejectedOther(m) => {
+                        pass.note(SharedStatus::PushFailed, m);
+                        mark_receipts_blocked(db, pass, &branch);
+                    }
                 }
             }
         }
+    }
+}
+
+/// T-000241: a permanent refusal of the shared dev branch keeps this repo's
+/// committed receipts from reaching origin — mark their `pub_state`
+/// `blocked` so the UI shows it. They stay in the retry queue (`pending` +
+/// `blocked` are both publishable); an origin-confirmed receipt still
+/// settles `published`. A non-fast-forward is a fixable divergence, not a
+/// refusal, and never lands here.
+fn mark_receipts_blocked(db: &AppDb, pass: &RepoPass, branch: &str) {
+    let dev = pass.structure.as_ref().map(|s| s.main.dev_branch.as_str());
+    if dev.is_some_and(|d| same_branch(d, branch)) {
+        let _ = db.block_pending_rule_acceptances(pass.repo.id);
     }
 }
 
@@ -2754,9 +4738,13 @@ fn push_recipients(git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
 /// Paths probed for a user-section `.gitignore` line that still ignores them.
 /// Folders are probed through a file inside, since a folder pattern
 /// (`dir/`) only matches something git knows to be a folder.
-fn probe_paths() -> Vec<String> {
+/// T-000243: with the specs policy off, `docs/superpowers/` is not a shared
+/// path — a user rule ignoring it is the user's own business and is neither
+/// probed nor offered for removal.
+fn probe_paths(share_specs: bool) -> Vec<String> {
     let mut v: Vec<String> = SHARED_UNIGNORED_LINES
         .iter()
+        .filter(|l| share_specs || **l != SPECS_IGNORE_LINE)
         .map(|l| {
             if l.ends_with('/') {
                 format!("{}sdh-probe.md", l)
@@ -2788,12 +4776,16 @@ fn managed_block_lines(text: &str) -> HashSet<u32> {
     set
 }
 
-/// User-section lines of the repo's own `.gitignore` that still ignore a shared
-/// path. Lines of the managed block are not reported (the sync rewrites it).
-pub fn blocking_ignore_lines(git: &GitBinary, root: &Path) -> Result<Vec<IgnoreLine>, String> {
-    let probes = probe_paths();
+/// User-section lines of the repo's own `.gitignore` that still ignore one of
+/// `probes` (a file path, probed with `git check-ignore -v`). Lines of the
+/// managed block are not reported (the sync rewrites it).
+fn ignoring_lines(
+    git: &GitBinary,
+    root: &Path,
+    probes: &[String],
+) -> Result<Vec<IgnoreLine>, String> {
     let mut input = Vec::new();
-    for p in &probes {
+    for p in probes {
         input.extend_from_slice(p.as_bytes());
         input.push(0);
     }
@@ -2843,6 +4835,64 @@ pub fn blocking_ignore_lines(git: &GitBinary, root: &Path) -> Result<Vec<IgnoreL
         .collect())
 }
 
+/// User-section lines of the repo's own `.gitignore` that still ignore a shared
+/// path. T-000243: `share_specs` filters the specs folder out of the probe set
+/// when the policy is off (see `probe_paths`).
+pub fn blocking_ignore_lines(
+    git: &GitBinary,
+    root: &Path,
+    share_specs: bool,
+) -> Result<Vec<IgnoreLine>, String> {
+    ignoring_lines(git, root, &probe_paths(share_specs))
+}
+
+/// T-000243 review: user-section lines that still ignore `docs/superpowers/`
+/// while the effective policy shares it. The shared enumeration honours
+/// `.gitignore` (`ls-files --others --exclude-standard`), so such a rule makes
+/// the folder silently never travel — the recurring pass diagnoses it here,
+/// while the removal itself stays behind the explicit-confirmation preflight
+/// flow of the shared switch. Covers a repo that was enabled with the flag off
+/// and switched on later, and one that upgraded to this feature already shared.
+fn specs_blocking_lines(git: &GitBinary, root: &Path) -> Result<Vec<IgnoreLine>, String> {
+    ignoring_lines(git, root, &[format!("{}sdh-probe.md", SPECS_IGNORE_LINE)])
+}
+
+/// The recurring diagnosis of the ON policy: user rules that keep the specs
+/// folder ignored are reported once per change (`fresh_issues`), never removed.
+fn diagnose_specs_blocking(git: &GitBinary, pass: &mut RepoPass, role: Role, share_specs: bool) {
+    if !share_specs || role == Role::Pending {
+        return;
+    }
+    let blocking = match specs_blocking_lines(git, &pass.root) {
+        Ok(b) => b,
+        Err(e) => {
+            pass.issue(
+                repo_issue(Code::ManagedFileFailed, &pass.repo)
+                    .target(".gitignore")
+                    .detail(format!(
+                        "could not check whether docs/superpowers/ is ignored: {}",
+                        e
+                    )),
+            );
+            return;
+        }
+    };
+    if blocking.is_empty() {
+        return;
+    }
+    let rules: Vec<&str> = blocking.iter().map(|l| l.text.as_str()).collect();
+    pass.issue(
+        repo_issue(Code::ManagedFileFailed, &pass.repo)
+            .target(".gitignore")
+            .detail(format!(
+                "user rule(s) [{}] still ignore docs/superpowers/: the specs policy is on but the \
+             folder is ignored, so specs never travel. Remove the rule(s) in the preflight of \
+             the shared switch (or switch the specs off); they are never removed automatically",
+                rules.join(", ")
+            )),
+    );
+}
+
 fn repo_root(repo: &Repository) -> Result<PathBuf, String> {
     let p = repo
         .local_path
@@ -2875,8 +4925,12 @@ pub fn shared_mode_preflight(
         .map_err(|e| e.to_string())?
         .map(|b| b.trim().to_string())
         .filter(|b| !b.is_empty());
+    // T-000243: the owner's own stored policy — preflight also runs before a
+    // role exists, and with specs opted out the folder is not a shared path,
+    // so a user rule ignoring it is not a blocker to offer for removal.
+    let share_specs = own_share_specs(db, repo_id);
     Ok(SharedPreflight {
-        blocking_lines: blocking_ignore_lines(git, &root)?,
+        blocking_lines: blocking_ignore_lines(git, &root, share_specs)?,
         missing_project: repo.project_id.is_none(),
         missing_dev_branch: branch.is_none(),
     })
@@ -2908,7 +4962,6 @@ pub fn enable_shared_mode(
     remove_lines: bool,
 ) -> Result<(), String> {
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
-    let root = repo_root(&repo)?;
     let login = db.github_login().ok_or_else(|| {
         "the GitHub login of this install is unknown - save the token again".to_string()
     })?;
@@ -2916,10 +4969,27 @@ pub fn enable_shared_mode(
         .github_name
         .clone()
         .ok_or_else(|| "shared mode needs a GitHub repository".to_string())?;
+    // T-000243 review (second pass): the whole read→build→write sequence of
+    // the POLICY-BEARING structure runs under the per-repo guard (see
+    // `specs_policy_guard`). Without it an enable could interleave with a
+    // specs save / a sync's policy section: the structure built from the old
+    // flag would be written after the sync already published the new one, and
+    // the next pass would commit the stale policy. The DB flips sit inside
+    // the guard as well, so the mode and the published structure are one
+    // coherent snapshot.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
+    // T-000243 review (ninth pass): re-read the binding UNDER the guard —
+    // a repath that completed while this command queued must not leave the
+    // structure work (or the generation bump) on the obsolete checkout.
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let root = repo_root(&repo)?;
     let existing = ss::read_structure_file(&root, &gh, &ss::AdminVerified::load(db))?;
     // Validates: owner or administrator, project, dev branch.
     let built = ss::build_structure(db, repo_id, &login, existing.as_ref())?;
-    let blocking = blocking_ignore_lines(git, &root)?;
+    // T-000243: the blocking check follows the policy being published — with
+    // specs opted out the folder stays ignored and its rules are no blocker.
+    let blocking = blocking_ignore_lines(git, &root, own_share_specs(db, repo_id))?;
     if !blocking.is_empty() {
         if !remove_lines {
             return Err(format!(
@@ -2933,6 +5003,9 @@ pub fn enable_shared_mode(
         .map_err(|e| e.to_string())?;
     db.set_shared_role(repo_id, Some("main"))
         .map_err(|e| e.to_string())?;
+    // T-000243 review (sixth pass): the lifecycle moved — passes sealed
+    // under the pre-enable generation settle no status.
+    bump_lifecycle_generation(repo_id, &root);
     ss::write_structure_if_changed(&root, &built)?;
     register_merge_driver(git, &root)?;
     // A deletion of `.sdh/` that never reached the remote is obsolete now: the
@@ -2942,6 +5015,83 @@ pub fn enable_shared_mode(
         ss::write_shared_import(db, repo_id, &imp)?;
     }
     Ok(())
+}
+
+/// T-000243: store the owner's `docs/superpowers/` choice for `repo_id`.
+/// Refused unless this install knows its GitHub login and may act as the
+/// repo's main — the owner, or an administrator verified by the frontend (the
+/// same trust rule as switching shared mode on) — so a contributor, a pending
+/// helper or an unknown login cannot flip the flag, not even through a direct
+/// IPC call. The ROLE is refused before the capability: a verified
+/// administrator of an organization this install participates in as a
+/// contributor / pending helper is still not that repo's main here.
+/// Settable before sharing is enabled; the structure publish, the
+/// `.gitignore` render and the pathspecs follow on the next sync. The write
+/// and its diagnosis run under the per-repo policy guard, so the answer is
+/// never given while a sync's policy section could still commit the old flag.
+/// Returns a warning note when the flag was switched ON for a repo that
+/// already shares and user rules still keep the folder ignored.
+pub fn set_repo_share_specs(db: &AppDb, repo_id: i64, on: bool) -> Result<Option<String>, String> {
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let gh = repo
+        .github_name
+        .clone()
+        .ok_or_else(|| "the specs switch needs a repository linked to GitHub".to_string())?;
+    let login = db.github_login().ok_or_else(|| {
+        "the GitHub login of this install is unknown - save the token again".to_string()
+    })?;
+    // T-000243 review: serialize with the sync's policy section of this repo
+    // (see `specs_policy_guard`) — one coherent snapshot, either order. The
+    // guard is taken before the role read and the capability check, so the
+    // whole check+write pair stays atomic against a sync in flight.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
+    // Re-read the binding under the guard: the checkout check below must
+    // run against the CURRENT local path (T-000243 review, ninth pass).
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    // The ROLE is refused before the capability: a verified administrator of
+    // an organization this install participates in as a contributor / pending
+    // helper is still not that repo's main here. Read under the guard, so the
+    // role cannot be settled mid-check.
+    let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if matches!(
+        state.shared_role.as_deref(),
+        Some("contributor") | Some("pending")
+    ) {
+        return Err(format!(
+            "the specs switch belongs to the repo's main: this install participates in {} as a {}",
+            gh,
+            state.shared_role.unwrap_or_default()
+        ));
+    }
+    if !ss::can_enable_shared(&gh, &login, &ss::AdminVerified::load(db)) {
+        return Err(ss::refusal_not_owner_or_admin(&login, &gh));
+    }
+    // T-000243 review: switching a repo that already shares ON while user
+    // rules still ignore the folder would silently keep the specs local (the
+    // shared enumeration honours .gitignore) — the next sync diagnoses it as
+    // an issue, and the setter says it right away. A repo without a usable
+    // checkout (preconfiguration before the first clone) has nothing to check.
+    let note = if on && is_shared_state(&state) {
+        crate::git_ops::cached_git()
+            .and_then(|git| repo_root(&repo).ok().map(|root| (git, root)))
+            .and_then(|(git, root)| specs_blocking_lines(&git, &root).ok())
+            .filter(|lines| !lines.is_empty())
+            .map(|lines| {
+                let rules: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+                format!(
+                    "docs/superpowers/ is still ignored by user .gitignore rule(s) [{}]: the \
+                     specs will not travel until they are removed in the preflight of the \
+                     shared switch",
+                    rules.join(", ")
+                )
+            })
+    } else {
+        None
+    };
+    db.set_repo_share_specs(repo_id, on)
+        .map_err(|e| e.to_string())?;
+    Ok(note)
 }
 
 /// Tracked files only (no untracked ones) under `paths`.
@@ -2958,16 +5108,35 @@ pub(super) fn ls_files_tracked(
     )?))
 }
 
+/// Every `.sdh/` path a disable removes: the structure, the join-request
+/// queue and the T-000241 proposal channel's two catalogs.
+fn sdh_tracked_paths() -> Vec<String> {
+    vec![
+        STRUCTURE_REL_PATH.to_string(),
+        REQUESTS_REL_DIR.to_string(),
+        rp::RULE_PROPOSALS_REL_DIR.to_string(),
+        rp::RULE_DECISIONS_REL_DIR.to_string(),
+        APP_VERSIONS_REL_DIR.to_string(),
+    ]
+}
+
 fn remove_sdh_files(root: &Path) {
     let _ = std::fs::remove_file(root.join(STRUCTURE_REL_PATH));
-    if let Ok(entries) = std::fs::read_dir(root.join(REQUESTS_REL_DIR)) {
-        for e in entries.flatten() {
-            if matches!(e.file_type(), Ok(t) if t.is_file()) {
-                let _ = std::fs::remove_file(e.path());
+    for dir in [
+        REQUESTS_REL_DIR,
+        rp::RULE_PROPOSALS_REL_DIR,
+        rp::RULE_DECISIONS_REL_DIR,
+        APP_VERSIONS_REL_DIR,
+    ] {
+        if let Ok(entries) = std::fs::read_dir(root.join(dir)) {
+            for e in entries.flatten() {
+                if matches!(e.file_type(), Ok(t) if t.is_file()) {
+                    let _ = std::fs::remove_file(e.path());
+                }
             }
         }
+        let _ = std::fs::remove_dir(root.join(dir));
     }
-    let _ = std::fs::remove_dir(root.join(REQUESTS_REL_DIR));
     let _ = std::fs::remove_dir(root.join(".sdh"));
 }
 
@@ -2984,13 +5153,32 @@ pub fn disable_shared_mode(
     git: &GitBinary,
     repo_id: i64,
 ) -> Result<SharedDisableResult, String> {
-    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
-    let root = repo_root(&repo)?;
     let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
     if !state.shared_mode || state.shared_role.as_deref().is_some_and(|r| r != "main") {
         return Err("shared mode can only be switched off by the owner of the repo".into());
     }
-    let sdh = vec![STRUCTURE_REL_PATH.to_string(), REQUESTS_REL_DIR.to_string()];
+    // T-000243 review (second pass): the switch-off DELETES the policy-bearing
+    // structure (a commit and a push of the deletion), so it is serialized
+    // with everything else that reads or writes it — phase B's policy section
+    // (the guard spans its commit + push too), the specs setter, enable and
+    // the approval. Without the guard a phase B publishing the structure
+    // could interleave with the deletion commit and resurrect `.sdh/`.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
+    // T-000243 review (ninth pass): same rebind rule as enable — the
+    // checkout this deletion commits to is the CURRENT binding, read
+    // under the guard, and the generation bump keys off it.
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let root = repo_root(&repo)?;
+    // T-000243 review (third pass): the operation-validity check is repeated
+    // UNDER the guard — a first disable (or the approval) that queued on it
+    // before must not be followed by a second run acting on the stale state
+    // read above.
+    let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if !state.shared_mode || state.shared_role.as_deref().is_some_and(|r| r != "main") {
+        return Err("shared mode can only be switched off by the owner of the repo".into());
+    }
+    let sdh = sdh_tracked_paths();
     let tracked = ls_files_tracked(git, &root, &sdh)?;
     // The participants' branches carry `.sdh/` too (the sync plumbed it there):
     // read them before the file is gone.
@@ -3088,6 +5276,14 @@ pub fn disable_shared_mode(
         .map_err(|e| e.to_string())?;
     db.set_shared_status(repo_id, None)
         .map_err(|e| e.to_string())?;
+    // T-000241: the proposal channel's local state dies with the share —
+    // the catalogs are deleted on dev by the commit above, the tables
+    // (proposals, acceptances, seq) are cleaned here.
+    let _ = db.delete_rule_proposal_state(repo_id);
+    // T-000243 review (sixth pass): the lifecycle moved — passes sealed
+    // under the pre-disable generation settle no status (this covers the
+    // `disabling` marker write below as well: same transition).
+    bump_lifecycle_generation(repo_id, &root);
 
     // The same deletion on every participant branch (BUG-3): a contributor
     // whose own branch kept `.sdh/project.json` would otherwise carry it for
@@ -3279,7 +5475,6 @@ pub fn approve_join_request(
     if !state.shared_mode {
         return Err("only the owner of a shared repo can approve join requests".into());
     }
-    let root = repo_root(&repo)?;
     let gh = repo
         .github_name
         .clone()
@@ -3287,6 +5482,28 @@ pub fn approve_join_request(
     let me = db
         .github_login()
         .ok_or_else(|| "the GitHub login of this install is unknown".to_string())?;
+    // T-000243 review (second pass): the approval rebuilds and writes the
+    // POLICY-BEARING structure, so it takes the same per-repo guard as phase B
+    // and the specs setter. Unguarded, an approval built with the old flag
+    // could land after a sync's policy section (or after a specs save) and
+    // publish / commit a stale policy — or clobber the sync's structure write
+    // mid-section. All the request reading, the build and the write sit
+    // inside the guard.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
+    // T-000243 review (ninth pass): re-read the binding under the guard —
+    // the structure write below must land on the CURRENT checkout.
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let root = repo_root(&repo)?;
+    // T-000243 review (third pass): the sharing check is repeated UNDER the
+    // guard — a disable queued on it between the read above and here must not
+    // be followed by an approval that writes the structure back over the
+    // deletion it committed. Everything below reads the state the guard
+    // protects.
+    let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if !state.shared_mode {
+        return Err("only the owner of a shared repo can approve join requests".into());
+    }
     let existing = ss::read_structure_file(&root, &gh, &ss::AdminVerified::load(db))?;
     let base = ss::build_structure(db, repo_id, &me, existing.as_ref())?;
     let req = all_join_requests(db, git, &root, &gh, Some(&base.main.dev_branch))
@@ -3327,11 +5544,39 @@ pub fn accept_new_main_branch(db: &AppDb, repo_id: i64) -> Result<(), String> {
     if !changed {
         return Err("the owner's dev branch has not changed: nothing to accept".into());
     }
+    // T-000243 review (sixth pass): accepting a new main branch clears the
+    // pin AND the status — a lifecycle-resolution action. It ran unguarded,
+    // so an older pass could settle afterwards and restore the rejection
+    // the user just accepted. Serialize the mutation with `finish`'s
+    // freshness check and bump the generation. The generation key uses the
+    // recorded local path (not `repo_root`): this command is DB-only and
+    // must not start failing on a repo without a git checkout. The path is
+    // read UNDER the guard so a concurrent repath cannot split the key
+    // from the bump (T-000243 review, eighth pass).
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let key_root = PathBuf::from(repo.local_path.clone().unwrap_or_default());
+    // T-000243 review (seventh pass): the eligibility check above ran
+    // BEFORE the guard — a sync may have settled a different status in
+    // between. Re-verify under the guard, or this accept would clear a
+    // status that is no longer the refused dev-branch one.
+    let st = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    let still_changed = st.shared_status.as_deref() == Some(SharedStatus::Untrusted.as_str())
+        && st
+            .shared_status_detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with(ss::DEV_BRANCH_CHANGED_PREFIX));
+    if !still_changed {
+        return Err("the owner's dev branch has not changed: nothing to accept".into());
+    }
     let mut v = ss::read_shared_import(db, repo_id);
     v.pinned_dev_branch = None;
     ss::write_shared_import(db, repo_id, &v)?;
     db.set_shared_status(repo_id, None)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    bump_lifecycle_generation(repo_id, &key_root);
+    Ok(())
 }
 
 /// The "merge" button: merge `origin/<current branch>` into the current branch
@@ -3343,6 +5588,12 @@ pub fn merge_shared_upstream(
     git: &GitBinary,
     repo_id: i64,
 ) -> Result<SharedMergeResult, String> {
+    // T-000243 review (tenth pass): the guard spans binding read, merge
+    // driver registration, the merge itself AND the status settlement —
+    // a repath that landed mid-merge must not let the OLD checkout's
+    // result clear the NEW binding's status or bump its generation.
+    let guard = specs_policy_guard(repo_id);
+    let _guard = guard.lock().unwrap();
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
     let root = repo_root(&repo)?;
     let cur = current_branch(git, &root)?
@@ -3356,10 +5607,16 @@ pub fn merge_shared_upstream(
             files: vec![],
         },
         MergeOutcome::Merged => {
+            // T-000243 review (seventh pass): a successful merge invalidates
+            // every pre-merge observation — bump unconditionally, whether or
+            // not `needs_manual_merge` was persisted. `root` IS the guarded
+            // binding, so the clear and the bump apply to the checkout that
+            // was actually merged.
             let st = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
             if st.shared_status.as_deref() == Some(SharedStatus::NeedsManualMerge.as_str()) {
                 let _ = db.set_shared_status(repo_id, None);
             }
+            bump_lifecycle_generation(repo_id, &root);
             SharedMergeResult {
                 outcome: "merged".into(),
                 files: vec![],
@@ -3474,9 +5731,64 @@ fn activity_log(git: &GitBinary, root: &Path, branch: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// `.sdh/app-versions/<login>.json` = `{"app_version":"<ver>"}\n` — the file's
+/// whole contract is the version string: no timestamp, no paths, nothing
+/// machine-local. Written only on a bytes change so a steady state never
+/// produces commit churn.
+fn write_own_app_version(root: &Path, login: &str) -> Result<(), String> {
+    let path = root.join(app_version_rel_path(login));
+    let body = format!("{{\"app_version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION"));
+    if std::fs::read(&path).is_ok_and(|cur| cur == body.as_bytes()) {
+        return Ok(());
+    }
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("{}: {}", p.display(), e))?;
+    }
+    std::fs::write(&path, body.as_bytes()).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// The `app_version` string out of a version file's JSON; `None` for malformed
+/// input — a version is reported, never guessed (T-000190).
+fn parse_app_version(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    v.get("app_version")?.as_str().map(|s| s.to_string())
+}
+
+/// `<lowercased login> -> app_version` from `.sdh/app-versions/` at `rev` —
+/// typically `refs/remotes/origin/<dev>`, the last known state when offline.
+/// An install whose login produced no file (an old binary, a malformed file)
+/// is simply absent — the UI shows "unknown", never a guessed version.
+fn app_versions_at(git: &GitBinary, root: &Path, rev: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(files) = ls_tree(git, root, rev, &[APP_VERSIONS_REL_DIR.to_string()]) else {
+        return out;
+    };
+    for path in files.keys() {
+        let Some(name) = path.rsplit('/').next() else {
+            continue;
+        };
+        let Some(login) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if !ss::is_valid_request_login(login) {
+            continue;
+        }
+        let Ok(Some(bytes)) =
+            git_sync::show_file_capped(git, root, rev, path, MAX_APP_VERSION_BYTES)
+        else {
+            continue;
+        };
+        if let Some(v) = parse_app_version(&String::from_utf8_lossy(&bytes)) {
+            out.insert(login.to_ascii_lowercase(), v);
+        }
+    }
+    out
+}
+
 /// Owner's view (T-000237): per participant, the time of the newest commit with
 /// their `SDH-Participant` trailer on their own branch or on the owner's dev
-/// branch. Does not fetch: the sync does.
+/// branch, plus (T-000190) the app version their install last published on the
+/// dev branch. Does not fetch: the sync does.
 pub fn participants_activity(
     db: &AppDb,
     git: &GitBinary,
@@ -3491,21 +5803,47 @@ pub fn participants_activity(
     };
     let root = Path::new(lp);
     let dev_log = activity_log(git, root, &structure.main.dev_branch);
-    Ok(structure
-        .participants
-        .iter()
-        .map(|p| {
-            let own_log = activity_log(git, root, &p.branch);
-            let last = latest_participant_commit(&own_log, &p.login)
-                .into_iter()
-                .chain(latest_participant_commit(&dev_log, &p.login))
-                .max();
-            ParticipantActivity {
-                login: p.login.clone(),
-                last_at: last.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-            }
-        })
-        .collect())
+    let versions = app_versions_at(git, root, &remote_ref(&structure.main.dev_branch));
+    let version_of = |login: &str| versions.get(&login.to_ascii_lowercase()).cloned();
+    let dev_last = |login: &str| {
+        latest_participant_commit(&dev_log, login)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    };
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    // The owner's own install publishes a version file like anyone else.
+    rows.push(ParticipantActivity {
+        app_version: version_of(&structure.main.login),
+        last_at: dev_last(&structure.main.login),
+        login: structure.main.login.clone(),
+    });
+    seen.insert(structure.main.login.to_ascii_lowercase());
+    for p in &structure.participants {
+        let own_log = activity_log(git, root, &p.branch);
+        let last = latest_participant_commit(&own_log, &p.login)
+            .into_iter()
+            .chain(latest_participant_commit(&dev_log, &p.login))
+            .max();
+        seen.insert(p.login.to_ascii_lowercase());
+        rows.push(ParticipantActivity {
+            app_version: version_of(&p.login),
+            last_at: last.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            login: p.login.clone(),
+        });
+    }
+    // A pending helper also publishes its version file — its login has a file
+    // on dev before it ever appears in `participants`.
+    for (login_lower, version) in &versions {
+        if seen.contains(login_lower) {
+            continue;
+        }
+        rows.push(ParticipantActivity {
+            app_version: Some(version.clone()),
+            last_at: dev_last(login_lower),
+            login: login_lower.clone(),
+        });
+    }
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -3663,6 +6001,7 @@ pub(crate) mod test_support {
             g(&self.main_dir, &["commit", "-q", "-m", "structure"]);
             g(&self.main_dir, &["push", "-q", "origin", "dev"]);
             self.sync_helper(); // contributor now
+            self.catch_up_main();
         }
 
         /// The same state reached through real syncs of both installs.
@@ -3673,6 +6012,16 @@ pub(crate) mod test_support {
             approve_join_request(&self.main_db, Some(&gb()), self.main_repo, "helper").unwrap();
             self.sync_main(); // approval committed + pushed
             self.sync_helper(); // contributor now
+            self.catch_up_main();
+        }
+
+        /// A contributor's first sync publishes `.sdh/app-versions/<login>.json`
+        /// on dev: the owner's clone is a commit behind until it fetches. The
+        /// fixture restores the old invariant so a raw push or a disable still
+        /// fast-forwards instead of being refused.
+        fn catch_up_main(&self) {
+            g(&self.main_dir, &["fetch", "-q", "origin", "dev"]);
+            g(&self.main_dir, &["merge", "-q", "--ff-only", "origin/dev"]);
         }
     }
 
@@ -3776,6 +6125,7 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::fs;
+    use std::process::Command;
 
     // ----- T-000227: administrator checks and eligibility ---------------------
 
@@ -3984,11 +6334,16 @@ mod tests {
 
     #[test]
     fn gitignore_block_for_a_shared_repo_drops_exactly_the_shared_paths() {
+        // A non-shared repo keeps the template, whatever the policy would be.
         assert_eq!(
-            gitignore_template_for(GITIGNORE_TMPL, false),
+            gitignore_template_for(GITIGNORE_TMPL, false, true),
             GITIGNORE_TMPL
         );
-        let shared = gitignore_template_for(GITIGNORE_TMPL, true);
+        assert_eq!(
+            gitignore_template_for(GITIGNORE_TMPL, false, false),
+            GITIGNORE_TMPL
+        );
+        let shared = gitignore_template_for(GITIGNORE_TMPL, true, true);
         for line in SHARED_UNIGNORED_LINES {
             assert!(
                 GITIGNORE_TMPL.lines().any(|l| l.trim() == *line),
@@ -4007,7 +6362,6 @@ mod tests {
             ".claude/",
             "docs/project.md",
             "docs/codex/",
-            "docs/superpowers/",
         ] {
             assert!(
                 shared.lines().any(|l| l.trim() == kept),
@@ -4015,6 +6369,11 @@ mod tests {
                 kept
             );
         }
+        // T-000243: opted out of specs, the shared render keeps ignoring the
+        // folder (the template line survives the shared drop).
+        let off = gitignore_template_for(GITIGNORE_TMPL, true, false);
+        assert!(off.lines().any(|l| l.trim() == "docs/superpowers/"));
+        assert!(!off.lines().any(|l| l.trim() == "docs/sdh_skills/"));
     }
 
     #[test]
@@ -4033,7 +6392,7 @@ mod tests {
     #[test]
     fn rendered_gitignore_block_is_stable_on_rewrite() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tpl = gitignore_template_for(GITIGNORE_TMPL, true);
+        let tpl = gitignore_template_for(GITIGNORE_TMPL, true, true);
         assert!(crate::sync::sync_gitignore_section(&tpl, tmp.path()).unwrap());
         let first = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         assert!(!first.contains("docs/todo.md"));
@@ -4044,6 +6403,1421 @@ mod tests {
             first,
             fs::read_to_string(tmp.path().join(".gitignore")).unwrap()
         );
+    }
+
+    // ----- T-000243: the specs policy in the managed render -------------------
+
+    /// Off must guarantee the ignore even when the custom (or empty) template
+    /// lacks the line; on with an empty template must not leave a stale managed
+    /// ignore rule behind. The user's own block is preserved throughout.
+    #[test]
+    fn off_render_ensures_the_specs_ignore_with_custom_and_empty_templates() {
+        // A custom template without the line: the off render carries it anyway.
+        let custom = gitignore_template_for("target\nnode_modules\n", true, false);
+        assert!(custom.lines().any(|l| l.trim() == "docs/superpowers/"));
+        // An empty template: the managed render is exactly the ensured rule.
+        assert_eq!(gitignore_template_for("", true, false), "docs/superpowers/");
+        // On with an empty template renders nothing at all.
+        assert_eq!(gitignore_template_for("", true, true), "");
+        // A non-shared repo is untouched, whatever the policy.
+        assert_eq!(gitignore_template_for("", false, false), "");
+
+        // The whole on/off/on cycle over a user .gitignore: the managed state
+        // follows the flag every time and the user's lines survive.
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), "# mine\n*.log\n").unwrap();
+        let on = gitignore_template_for(GITIGNORE_TMPL, true, true);
+        let off = gitignore_template_for(GITIGNORE_TMPL, true, false);
+        assert!(crate::sync::sync_gitignore_section(&on, tmp.path()).unwrap());
+        let text_on = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(!text_on.contains("docs/superpowers/"));
+        assert!(text_on.contains("# mine") && text_on.contains("*.log"));
+
+        assert!(crate::sync::sync_gitignore_section(&off, tmp.path()).unwrap());
+        let text_off = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(
+            text_off.matches("docs/superpowers/").count(),
+            1,
+            "off keeps exactly one ignore of the folder:\n{}",
+            text_off
+        );
+        assert!(text_off.contains("# mine") && text_off.contains("*.log"));
+        // Re-rendering the same policy is idempotent.
+        assert!(!crate::sync::sync_gitignore_section(&off, tmp.path()).unwrap());
+
+        assert!(crate::sync::sync_gitignore_section(&on, tmp.path()).unwrap());
+        let back_on = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(!back_on.contains("docs/superpowers/"));
+        assert!(back_on.contains("# mine") && back_on.contains("*.log"));
+    }
+
+    /// The empty-template corner of the same contract: a managed block written
+    /// by an off render is removed when the policy turns on and the custom
+    /// template renders nothing — off → on must not keep the stale rule.
+    #[test]
+    fn an_empty_template_does_not_keep_a_stale_managed_specs_rule() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // off: the ensured rule lands in the managed block
+        assert!(crate::sync::sync_gitignore_section(
+            &gitignore_template_for("", true, false),
+            tmp.path()
+        )
+        .unwrap());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
+            "# --- solo-dev-hub:begin ---\ndocs/superpowers/\n# --- solo-dev-hub:end ---\n"
+        );
+        // on with the same empty template: the block is gone, not kept
+        assert!(crate::sync::sync_gitignore_section(
+            &gitignore_template_for("", true, true),
+            tmp.path()
+        )
+        .unwrap());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
+            ""
+        );
+        // and an absent file stays absent
+        let fresh = tempfile::TempDir::new().unwrap();
+        assert!(!crate::sync::sync_gitignore_section(
+            &gitignore_template_for("", true, true),
+            fresh.path()
+        )
+        .unwrap());
+        assert!(!fresh.path().join(".gitignore").exists());
+    }
+
+    /// The setter's authority: the owner and a verified administrator may flip
+    /// the flag; a contributor, a pending helper and an unknown login are
+    /// refused — the same trust rule as enabling sharing. T-000243 review: the
+    /// ROLE is refused before the CAPABILITY, so even a verified administrator
+    /// of the organization cannot flip the policy of a repo this install
+    /// participates in as a contributor / pending helper.
+    #[test]
+    fn the_specs_switch_is_stored_for_the_owner_or_a_verified_admin_only() {
+        // The owner of the repo.
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "Owner").unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        set_repo_share_specs(&db, repo.id, false).unwrap();
+        assert!(!db.get_shared_state(repo.id).unwrap().share_specs);
+        set_repo_share_specs(&db, repo.id, true).unwrap();
+        assert!(db.get_shared_state(repo.id).unwrap().share_specs);
+
+        // A verified administrator of an organization's repo may too.
+        let (org_db, org_repo) = org_db("boss");
+        let err = set_repo_share_specs(&org_db, org_repo.id, false).unwrap_err();
+        assert!(err.contains("repo owner or an administrator"), "{}", err);
+        ss::record_admin_verification(&org_db, "Acme-Org/web", "boss", true).unwrap();
+        set_repo_share_specs(&org_db, org_repo.id, false).unwrap();
+        assert!(!org_db.get_shared_state(org_repo.id).unwrap().share_specs);
+
+        // T-000243 review: the same verified administrator is refused while
+        // this install's ROLE in that repo is contributor or pending — the
+        // capability alone is not the contract, and the role is checked first.
+        // (The stored value is false by now, so a refused `true` proves that
+        // nothing was written.)
+        for role in ["contributor", "pending"] {
+            org_db.set_shared_role(org_repo.id, Some(role)).unwrap();
+            let err = set_repo_share_specs(&org_db, org_repo.id, true).unwrap_err();
+            assert!(err.contains("participates in Acme-Org/web as a"), "{}", err);
+            assert!(!org_db.get_shared_state(org_repo.id).unwrap().share_specs);
+        }
+        // Back on the owner's side of the role, the same admin may set it.
+        org_db.set_shared_role(org_repo.id, Some("main")).unwrap();
+        set_repo_share_specs(&org_db, org_repo.id, false).unwrap();
+        assert!(!org_db.get_shared_state(org_repo.id).unwrap().share_specs);
+
+        // A contributor (a helper on somebody else's repo) and a pending
+        // helper are refused; nothing is stored either way.
+        let helper = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        helper.set_setting("github_login", "helper").unwrap();
+        helper
+            .upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let hrepo = helper.get_repository_by_name("Owner/api").unwrap();
+        helper
+            .set_shared_role(hrepo.id, Some("contributor"))
+            .unwrap();
+        assert!(set_repo_share_specs(&helper, hrepo.id, false).is_err());
+        helper.set_shared_role(hrepo.id, Some("pending")).unwrap();
+        assert!(set_repo_share_specs(&helper, hrepo.id, true).is_err());
+        assert!(helper.get_shared_state(hrepo.id).unwrap().share_specs);
+
+        // An unknown login is refused before anything is checked.
+        let no_login = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        no_login
+            .upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let nrepo = no_login.get_repository_by_name("Owner/api").unwrap();
+        let err = set_repo_share_specs(&no_login, nrepo.id, false).unwrap_err();
+        assert!(err.contains("unknown"), "{}", err);
+        // A repo without a GitHub name has no specs policy at all.
+        no_login.set_setting("github_login", "Owner").unwrap();
+        no_login
+            .upsert_repository("local-only", None, None, None, None, None)
+            .unwrap();
+        let local = no_login.get_repository_by_name("local-only").unwrap();
+        assert!(set_repo_share_specs(&no_login, local.id, false).is_err());
+    }
+
+    /// `effective_share_specs`: the owner's own stored setting wins on the
+    /// owner's install; a helper's install takes the owner's published flag
+    /// for THIS repo from the validated structure, defaulting to on. A
+    /// structure that IS present but unusable is an error (see the test below),
+    /// never a silent `on`.
+    #[test]
+    fn effective_specs_follow_the_owner_db_on_main_and_the_structure_on_helpers() {
+        // Owner: its own DB row, even when the (stale) structure says else.
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "Owner").unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        db.set_shared_mode(repo.id, true).unwrap();
+        db.set_shared_role(repo.id, Some("main")).unwrap();
+        let mut st = sample_structure();
+        st.repos[0].share_specs = Some(true);
+        assert!(effective_share_specs(&db, &repo, Some(&st)).unwrap());
+        db.set_repo_share_specs(repo.id, false).unwrap();
+        assert!(!effective_share_specs(&db, &repo, Some(&st)).unwrap());
+
+        // Helper: the flag comes from the structure, per repo; a repo the
+        // structure does not list means the default on.
+        let helper = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        helper.set_setting("github_login", "helper").unwrap();
+        helper
+            .upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let hrepo = helper.get_repository_by_name("Owner/api").unwrap();
+        helper
+            .set_shared_role(hrepo.id, Some("contributor"))
+            .unwrap();
+        // The helper's own DB is irrelevant — even an explicit local off.
+        helper.set_repo_share_specs(hrepo.id, false).unwrap();
+        let mut on_struct = sample_structure();
+        on_struct.repos[0].share_specs = Some(true);
+        assert!(effective_share_specs(&helper, &hrepo, Some(&on_struct)).unwrap());
+        let mut off_struct = sample_structure();
+        off_struct.repos[0].share_specs = Some(false);
+        assert!(!effective_share_specs(&helper, &hrepo, Some(&off_struct)).unwrap());
+        let mut legacy = sample_structure();
+        legacy.repos[0].share_specs = None; // legacy structure: default on
+        assert!(effective_share_specs(&helper, &hrepo, Some(&legacy)).unwrap());
+        // No structure at all: the default on.
+        assert!(effective_share_specs(&helper, &hrepo, None).unwrap());
+    }
+
+    /// T-000243 review: a work-tree structure that IS present but cannot be
+    /// used (malformed JSON, a wrong field type) is an error — the callers
+    /// block the render / commit on it instead of guessing `on`, which would
+    /// publish specs nobody opted in to. An absent file keeps the default on.
+    #[test]
+    fn an_unreadable_worktree_structure_is_an_error_not_a_silent_on() {
+        let helper = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        helper.set_setting("github_login", "helper").unwrap();
+        helper
+            .upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let hrepo = helper.get_repository_by_name("Owner/api").unwrap();
+        helper
+            .set_shared_role(hrepo.id, Some("contributor"))
+            .unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        helper
+            .set_repo_local_path(hrepo.id, Some(dir.path().to_str().unwrap()))
+            .unwrap();
+        // The row is re-read: the policy resolver looks at the repo's own
+        // `local_path`, which was empty when the row above was fetched.
+        let hrepo = helper.get_repository_by_name("Owner/api").unwrap();
+        // No file at all: the legacy default on.
+        assert!(effective_share_specs(&helper, &hrepo, None).unwrap());
+        // Malformed JSON in the trusted place: an error.
+        write(dir.path(), ".sdh/project.json", "{ not json");
+        let err = effective_share_specs(&helper, &hrepo, None).unwrap_err();
+        assert!(err.contains("invalid JSON"), "{}", err);
+        // A wrong field type is the same refusal, not a fallback (the spec:
+        // «неверный тип — ошибка, не fallback on»).
+        write(
+            dir.path(),
+            ".sdh/project.json",
+            "{\"format\":1,\"project\":{\"name\":\"Acme\",\"type\":\"standard\"},\
+             \"main\":{\"login\":\"Owner\",\"dev_branch\":\"dev\"},\
+             \"repos\":[{\"github\":\"Owner/api\",\"role\":\"server\",\
+             \"share_specs\":\"yes\"}],\"microservices\":[],\"participants\":[]}",
+        );
+        let err = effective_share_specs(&helper, &hrepo, None).unwrap_err();
+        assert!(err.contains("invalid JSON"), "{}", err);
+        // T-000243 review (second pass): an explicit `null` is a wrong type,
+        // not "absent" — the default-on is granted only to a MISSING field,
+        // so this must be the same refusal, never a silent on.
+        write(
+            dir.path(),
+            ".sdh/project.json",
+            "{\"format\":1,\"project\":{\"name\":\"Acme\",\"type\":\"standard\"},\
+             \"main\":{\"login\":\"Owner\",\"dev_branch\":\"dev\"},\
+             \"repos\":[{\"github\":\"Owner/api\",\"role\":\"server\",\
+             \"share_specs\":null}],\"microservices\":[],\"participants\":[]}",
+        );
+        let err = effective_share_specs(&helper, &hrepo, None).unwrap_err();
+        assert!(err.contains("share_specs"), "{}", err);
+        assert!(err.contains("null"), "{}", err);
+        // And an untrusted source (a main this install cannot verify) is not a
+        // policy either: still an error, never `on`.
+        write(
+            dir.path(),
+            ".sdh/project.json",
+            "{\"format\":1,\"project\":{\"name\":\"Acme\",\"type\":\"standard\"},\
+             \"main\":{\"login\":\"stranger\",\"dev_branch\":\"dev\"},\
+             \"repos\":[{\"github\":\"Owner/api\",\"role\":\"server\",\"share_specs\":true}],\
+             \"microservices\":[],\"participants\":[]}",
+        );
+        let err = effective_share_specs(&helper, &hrepo, None).unwrap_err();
+        assert!(err.contains("stranger"), "{}", err);
+    }
+
+    // ----- T-000243 review: the setter cannot interleave with phase B ---------
+
+    /// The per-repo policy guard really excludes: while a sync's policy section
+    /// holds it, `set_repo_share_specs` (a Tauri command on another thread) is
+    /// not answered, and it completes as soon as the section is over. This is
+    /// the lock the two interleavings below rely on.
+    #[test]
+    fn the_specs_setter_waits_for_the_syncs_policy_section() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "Owner").unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        db.set_shared_mode(repo.id, true).unwrap();
+        let guard = specs_policy_guard(repo.id);
+        let held = guard.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = tx.send(set_repo_share_specs(&db, repo.id, false));
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "the setter must not be acknowledged while the policy section runs"
+            );
+            drop(held);
+            assert!(rx.recv_timeout(Duration::from_secs(30)).is_ok());
+        });
+        assert!(!db.get_shared_state(repo.id).unwrap().share_specs);
+    }
+
+    /// Interleaving (a) — the setter arrives while phase B is already inside
+    /// its policy section: the guard forces one of the two orders, so the pass
+    /// that resolved `on` commits the WHOLE policy coherently (the spec travels,
+    /// the structure publishes on) and only then is the off acknowledged. No
+    /// half-applied state is ever observable.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_specs_toggle_mid_phase_b_commits_the_old_policy_then_persists_off() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_phase_b_policy_probe(fx.main_repo, &fx.main_dir, entered_tx, release_rx);
+
+        let out = std::thread::scope(|s| {
+            // Phase B of the sync runs here; inside its policy section it hands
+            // the repo id over and waits for the release.
+            let sync = s.spawn(|| fx.sync_main());
+            let in_section = entered_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("phase B never entered its policy section (the probe did not fire)");
+            assert_eq!(in_section, fx.main_repo);
+            // The OFF setter starts while phase B is inside the section: the
+            // guard is held, so it cannot be acknowledged until the section
+            // (structure publish, pathspec commits) is over.
+            let setter = s.spawn(|| set_repo_share_specs(&fx.main_db, fx.main_repo, false));
+            release_tx.send(1).unwrap();
+            let out = sync.join().unwrap();
+            assert!(
+                setter.join().unwrap().is_ok(),
+                "the setter must finish right after the policy section"
+            );
+            out
+        });
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        // The whole ON policy of that pass landed ...
+        assert!(fx
+            .remote_file("dev", "docs/superpowers/specs/x.md")
+            .is_some());
+        assert!(fx
+            .remote_file("dev", ".sdh/project.json")
+            .unwrap()
+            .contains("\"share_specs\": true"));
+        // ... and the off is persisted after it: one coherent order, no
+        // half-on pass and no half-off commit.
+        assert!(
+            !fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .share_specs
+        );
+        // The next pass follows the new flag alone.
+        fx.sync_main();
+        write(&fx.main_dir, "docs/superpowers/specs/after.md", "# after\n");
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("dev", "docs/superpowers/specs/after.md"),
+            None,
+            "after the off, a new spec must not travel"
+        );
+        assert!(fx
+            .remote_file("dev", "docs/superpowers/specs/x.md")
+            .is_some());
+    }
+
+    /// Interleaving (b) — the setter completes first: every policy-sensitive
+    /// step of the sync that follows sees the new flag, so a spec that exists
+    /// already stays local and nothing is published with the old `on`.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_specs_toggle_before_phase_b_is_seen_by_the_whole_pass() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        // No warning note: this repo is already shared, but its `.gitignore`
+        // carries no user rule that hides the folder.
+        assert!(set_repo_share_specs(&fx.main_db, fx.main_repo, false)
+            .unwrap()
+            .is_none());
+        let out = fx.sync_main();
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert_eq!(fx.remote_file("dev", "docs/superpowers/specs/x.md"), None);
+        // The published structure carries the off the helper will accept.
+        assert!(fx
+            .remote_file("dev", ".sdh/project.json")
+            .unwrap()
+            .contains("\"share_specs\": false"));
+    }
+
+    /// T-000243 review (second pass): `approve_join_request` and
+    /// `enable_shared_mode` also write the policy-bearing structure, so they
+    /// take the same per-repo guard as phase B and the specs setter. The
+    /// deterministic order (the probe parks phase B inside its policy
+    /// section): phase B (still ON, without the new participant) → the
+    /// approval (adds `helper2`) → the OFF setter → one more sync. Whatever
+    /// order the queued writers wake in, nothing COMMITTED after the OFF save
+    /// says on again, and the approval is never clobbered by phase B's stale
+    /// structure snapshot. Without the guard the approval ran to completion
+    /// DURING the parked section and phase B's rebuild (from the phase-A
+    /// snapshot) silently dropped the new participant — the blocking
+    /// assertions below fail without it.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_approval_and_a_specs_toggle_never_publish_a_stale_on_structure() {
+        let fx = two_installs();
+        fx.make_participant();
+        // A second helper asks to join; the request waits in the owner's tree.
+        write(
+            &fx.main_dir,
+            ".sdh/requests/helper2.json",
+            "{\"login\":\"helper2\",\"branch\":\"helper2-dev\"}\n",
+        );
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_phase_b_policy_probe(fx.main_repo, &fx.main_dir, entered_tx, release_rx);
+        let (ap_tx, ap_rx) = std::sync::mpsc::channel();
+        let (en_tx, en_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|s| {
+            let sync = s.spawn(|| fx.sync_main());
+            let in_section = entered_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("phase B never entered its policy section (the probe did not fire)");
+            assert_eq!(in_section, fx.main_repo);
+            // Both structure writers queue on the guard phase B holds.
+            s.spawn(|| {
+                let _ = ap_tx.send(approve_join_request(
+                    &fx.main_db,
+                    Some(&gb()),
+                    fx.main_repo,
+                    "helper2",
+                ));
+            });
+            s.spawn(|| {
+                let _ = en_tx.send(enable_shared_mode(&fx.main_db, &gb(), fx.main_repo, false));
+            });
+            assert!(
+                ap_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "the approval must wait for the per-repo policy guard"
+            );
+            assert!(
+                en_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "enable must wait for the per-repo policy guard"
+            );
+            release_tx.send(1).unwrap();
+            let out = sync.join().unwrap();
+            assert!(out.issues.is_empty(), "{:?}", out.issues);
+            assert!(
+                ap_rx.recv_timeout(Duration::from_secs(60)).unwrap().is_ok(),
+                "the approval must finish right after the policy section"
+            );
+            assert!(
+                en_rx.recv_timeout(Duration::from_secs(60)).unwrap().is_ok(),
+                "enable must finish right after the policy section"
+            );
+        });
+        // The OFF save happens after the guarded writers: whatever they wrote,
+        // the next pass publishes the new policy coherently — a stale ON
+        // structure is never committed after the save.
+        assert!(set_repo_share_specs(&fx.main_db, fx.main_repo, false)
+            .unwrap()
+            .is_none());
+        let out = fx.sync_main();
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        let published = fx.remote_file("dev", ".sdh/project.json").unwrap();
+        assert!(
+            published.contains("\"share_specs\": false"),
+            "the structure committed after the OFF save must be off:\n{}",
+            published
+        );
+        assert!(
+            published.contains("helper2"),
+            "the approval must survive the interleaving:\n{}",
+            published
+        );
+    }
+
+    /// T-000243 review (third pass), ordering (a): phase A captures the pass;
+    /// the approval — a writer of the policy-bearing structure — completes
+    /// BETWEEN the phases (it takes the same per-repo guard, but only for its
+    /// own run; phase B is driven directly here, `run_phase_a` then `finish`).
+    /// Phase B used to rebuild the structure from the phase-A snapshot and
+    /// re-publish it, silently dropping the participant the approval added;
+    /// under the revalidation it re-reads the work-tree file the approval
+    /// wrote and publishes the approval instead.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_approval_between_phase_a_and_phase_b_survives_phase_b() {
+        let fx = two_installs();
+        fx.make_participant();
+        // A second helper asks to join; the request waits in the owner's tree.
+        write(
+            &fx.main_dir,
+            ".sdh/requests/helper2.json",
+            "{\"login\":\"helper2\",\"branch\":\"helper2-dev\"}\n",
+        );
+
+        // Phase A runs to completion and captures the OLD participant list.
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        // The approval lands between the phases.
+        approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper2").unwrap();
+        let approved =
+            fs::read_to_string(fx.main_dir.join(".sdh/project.json")).unwrap_or_default();
+        assert!(approved.contains("helper2"), "{}", approved);
+
+        // The deferred phase B publishes the approval, never clobbers it.
+        let out = shared.finish(&fx.main_db, Some(&gb()));
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        let published = fx.remote_file("dev", ".sdh/project.json").unwrap();
+        assert!(
+            published.contains("helper2"),
+            "the approval must survive phase B:\n{}",
+            published
+        );
+        // and the request file of the approved participant stays gone
+        assert!(!fx.main_dir.join(".sdh/requests/helper2.json").exists());
+    }
+
+    /// T-000243 review (third pass), ordering (b): `disable_shared_mode`
+    /// completes between the phases — the deletion of `.sdh/` is committed
+    /// and pushed and the database flipped. The deferred phase-B pass of the
+    /// run that captured the repo while sharing was on must NOT re-publish
+    /// `.sdh/project.json` (the stale Main pass used to rebuild and commit
+    /// the structure right over the deletion) — the revalidation cancels its
+    /// whole policy section.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_disable_between_phase_a_and_phase_b_cancels_the_deferred_pass() {
+        let fx = two_installs();
+        fx.make_participant();
+
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        // Sharing is switched off between the phases.
+        disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!fx.main_dir.join(".sdh/project.json").exists());
+        assert_eq!(fx.remote_file("dev", ".sdh/project.json"), None);
+
+        // The deferred phase B of the pass captured while sharing was on.
+        let out = shared.finish(&fx.main_db, Some(&gb()));
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(
+            !fx.main_dir.join(".sdh/project.json").exists(),
+            "phase B must not resurrect the structure after the switch-off"
+        );
+        assert_eq!(
+            fx.remote_file("dev", ".sdh/project.json"),
+            None,
+            "the deletion must stand on origin/dev"
+        );
+        assert!(
+            !fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .shared_mode
+        );
+        // and the repo settled no status from the cancelled pass
+        assert_eq!(fx.main_status(), None);
+    }
+
+    /// T-000243 review (fourth pass): two SharedSyncs of the SAME helper
+    /// install race. Pass A captures the ON structure in phase A; the owner
+    /// then publishes OFF and pass B accepts it whole; A resumes — its
+    /// phase-B revalidation must discover the NEWER authoritative structure
+    /// instead of committing with the stale ON snapshot, and the render must
+    /// resolve the same fresh policy.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_stale_helper_pass_follows_the_newer_authoritative_policy() {
+        let fx = two_installs();
+        fx.make_participant();
+        let git = gb();
+        // A spec the helper could publish if its stale ON snapshot were used.
+        write(&fx.helper_dir, "docs/superpowers/specs/x.md", "# x\n");
+        // Pass A: phase A only — the ON structure is captured.
+        let project = fx
+            .helper_db
+            .list_all_repos()
+            .unwrap()
+            .into_iter()
+            .find_map(|r| r.project_id);
+        let shared_a = run_phase_a(&fx.helper_db, Some(&git), project);
+        // The owner turns specs OFF and publishes it; pass B accepts it.
+        fx.main_db
+            .set_repo_share_specs(fx.main_repo, false)
+            .unwrap();
+        fx.sync_main();
+        fx.sync_helper();
+        // And THIS sync's render — the one holding the stale ON snapshot —
+        // resolves the same fresh policy: a helper's answer is always
+        // authoritative discovery, never the phase-A structure.
+        let repo = fx.helper_db.get_repository(fx.helper_repo).unwrap();
+        let state = shared_a
+            .render_state_of(&fx.helper_db, Some(&git), &repo)
+            .unwrap();
+        assert!(
+            !effective_share_specs(&fx.helper_db, &repo, state.as_ref()).unwrap(),
+            "the render must resolve the newer OFF, not the phase-A ON"
+        );
+        // Pass A resumes: phase B must see OFF — no specs commit of its own.
+        let out_a = shared_a.finish(&fx.helper_db, Some(&git));
+        assert!(out_a.issues.is_empty(), "{:?}", out_a.issues);
+        assert_eq!(
+            fx.remote_file("helper-dev", "docs/superpowers/specs/x.md"),
+            None,
+            "the stale ON pass must not publish the helper's spec"
+        );
+        assert_eq!(fx.remote_file("dev", "docs/superpowers/specs/x.md"), None);
+    }
+
+    /// T-000243 review (fourth pass): without a git binary a HELPER's specs
+    /// policy cannot be discovered — `render_structure_opt` refuses instead
+    /// of letting a possibly stale work-tree copy answer. The owner's own
+    /// policy needs no discovery and still resolves.
+    #[test]
+    fn render_structure_opt_refuses_a_helper_without_git() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "helper").unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        let err = render_structure_opt(&db, None, &repo).unwrap_err();
+        assert!(err.contains("git is unavailable"), "{}", err);
+        // The owner side answers from its own row — no git needed.
+        db.set_shared_role(repo.id, Some("main")).unwrap();
+        db.set_shared_mode(repo.id, true).unwrap();
+        assert!(render_structure_opt(&db, None, &repo).unwrap().is_none());
+    }
+
+    /// T-000243 review (fourth pass): a pass phase A REFUSED never entered
+    /// phase B (`role` is `None`), so `finish` used to settle its stale
+    /// untrusted status even after a disable that completed between the
+    /// phases had already owned the repo's state. The settlement now happens
+    /// under the same guard and only while the lifecycle the pass was sealed
+    /// under is still current — the disable moved it, so the pass is stale.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_disable_between_the_phases_keeps_the_disabled_status() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The owner's structure turns unusable: phase A refuses the pass.
+        write(&fx.main_dir, ".sdh/project.json", "{ not json");
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        // Sharing is switched off between the phases.
+        disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(
+            !fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .shared_mode
+        );
+        let _out = shared.finish(&fx.main_db, Some(&gb()));
+        assert_eq!(
+            fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .shared_status,
+            None,
+            "the disabled repo's status belongs to the disable, not the stale pass"
+        );
+    }
+
+    /// T-000243 review (sixth pass): a FAILED disable followed by a
+    /// re-enable is a lifecycle ROUND TRIP — the state fields end where
+    /// they started, which a state snapshot cannot see. The generation
+    /// can: the pass sealed before the disable must not settle over the
+    /// `push_failed` the disable left behind.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_disable_reenable_round_trip_still_makes_the_pass_stale() {
+        let fx = two_installs();
+        fx.enable_main();
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        // The disable cannot push: it flips the state AND leaves push_failed.
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+        let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!res.pushed, "{:?}", res);
+        assert_eq!(fx.main_status().as_deref(), Some("push_failed"));
+        // Sharing is switched back on before the stale pass finishes: mode
+        // and role return to exactly what the pass was created under.
+        enable_shared_mode(&fx.main_db, &gb(), fx.main_repo, false).unwrap();
+        fs::remove_file(&hook).unwrap();
+        let _out = shared.finish(&fx.main_db, Some(&gb()));
+        assert_eq!(
+            fx.main_status().as_deref(),
+            Some("push_failed"),
+            "the round-tripped lifecycle must still count as moved"
+        );
+    }
+
+    /// T-000243 review (sixth pass): a successful disable retry clears the
+    /// `disabling` marker and the status; an OLDER retry pass that failed
+    /// before the clear must not settle its obsolete `push_failed` back.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_successful_retry_supersedes_an_older_retry_failure() {
+        let fx = two_installs();
+        fx.enable_main();
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+        let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!res.pushed, "{:?}", res);
+        // Pass A: phase A only — its retry of the pending deletion fails
+        // again while the hook still blocks pushes.
+        let shared_a = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        // A second sync's retry succeeds before pass A finishes.
+        fs::remove_file(&hook).unwrap();
+        fx.sync_main();
+        assert_eq!(fx.main_status(), None);
+        // Pass A resumes: its PushFailed note is obsolete — the deletion
+        // already reached origin and the marker is gone.
+        let _out = shared_a.finish(&fx.main_db, Some(&gb()));
+        assert_eq!(
+            fx.main_status(),
+            None,
+            "the superseded retry failure must not be restored"
+        );
+    }
+
+    /// T-000243 review (eleventh pass): the retry's fetch is its last
+    /// read-only step — a re-enable landing while it runs must stop the
+    /// retry BEFORE the first mutation (no branch refresh, no deletion
+    /// commit, no push), not merely before the marker cleanup. The probe
+    /// parks the retry in exactly that window.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_reenable_during_the_retry_fetch_stops_it_before_any_mutation() {
+        let fx = two_installs();
+        fx.enable_main();
+        // The disable cannot push: the `.sdh/` deletion stays pending.
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+        let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!res.pushed, "{:?}", res);
+        assert!(ss::read_shared_import(&fx.main_db, fx.main_repo)
+            .disabling
+            .is_some());
+        let head_before = g(&fx.main_dir, &["rev-parse", "HEAD"]);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_retry_post_fetch_probe(fx.main_repo, &fx.main_dir, entered_tx, release_rx);
+
+        let out = std::thread::scope(|s| {
+            // Phase A reaches the pending-disable retry; inside its
+            // post-fetch window it hands the repo id over and waits.
+            let sync = s.spawn(|| run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id)));
+            let in_window = entered_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the retry never reached its post-fetch window");
+            assert_eq!(in_window, fx.main_repo);
+            // The re-enable lands while the retry is between fetch and the
+            // guard: it bumps the lifecycle generation and clears the
+            // pending-disable marker.
+            enable_shared_mode(&fx.main_db, &gb(), fx.main_repo, false).unwrap();
+            release_tx.send(1).unwrap();
+            sync.join().unwrap()
+        });
+        fs::remove_file(&hook).unwrap();
+        assert!(
+            out.passes.is_empty(),
+            "the obsolete retry must not even produce a pass, got {:?}",
+            out.passes.len()
+        );
+
+        // The stale retry mutated NOTHING: no local deletion commit, the
+        // structure is still tracked locally and still on origin.
+        assert_eq!(
+            g(&fx.main_dir, &["rev-parse", "HEAD"]),
+            head_before,
+            "the obsolete retry must not commit the `.sdh/` deletion"
+        );
+        assert!(fx.main_dir.join(".sdh/project.json").is_file());
+        assert!(fx.remote_file("dev", ".sdh/project.json").is_some());
+        // And it settled no status of its own: the repo is shared again.
+        assert!(
+            fx.main_db
+                .get_shared_state(fx.main_repo)
+                .unwrap()
+                .shared_mode
+        );
+    }
+
+    /// T-000243 review (twelfth pass): phase A's branch section may
+    /// `reset_to_origin` a non-current branch — rolling it back over a
+    /// disable's unpushed deletion commit if the disable lands between the
+    /// pass's fetch and its ref updates. The section now runs under the
+    /// policy guard gated on the pass's generation: a lifecycle that moved
+    /// meanwhile makes every mutation obsolete BEFORE the first ref update.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_phase_a_reset_cannot_roll_back_an_in_flight_disable() {
+        let fx = two_installs();
+        fx.enable_main();
+        // A feature branch is checked out: `dev` stays a non-current ref —
+        // exactly the branch the phase-A reset path may move.
+        g(&fx.main_dir, &["checkout", "-q", "-b", "feature"]);
+        // The disable's push is refused, so its `.sdh/` deletion on `dev`
+        // stays pending behind the marker.
+        let hook = block_pushes_to(&fx, "refs/heads/dev");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_after_fetch_probe(fx.main_repo, &fx.main_dir, entered_tx, release_rx);
+
+        let mut deletion = String::new();
+        std::thread::scope(|s| {
+            // Phase A runs to `after_fetch` and parks before its guarded
+            // branch section. `_release` frees the worker even when an
+            // assertion below panics — `thread::scope` would otherwise
+            // wait forever on a still-parked worker (T-000243 review,
+            // fifteenth pass).
+            let _release = ReleaseOnDrop(release_tx);
+            let sync = s.spawn(|| run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id)));
+            let in_window = entered_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("phase A never reached its branch section");
+            assert_eq!(in_window, fx.main_repo);
+            // The disable lands inside the window: deletion commit D on
+            // `dev`, sharing off, generation bumped, push still blocked.
+            let res = disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+            assert!(!res.pushed, "{:?}", res);
+            deletion = g(&fx.main_dir, &["rev-parse", "dev"]);
+            assert!(ss::read_shared_import(&fx.main_db, fx.main_repo)
+                .disabling
+                .is_some());
+            // A participant's commit C — a child of the pre-disable tip,
+            // still carrying `.sdh/` — lands on origin/dev, and the local
+            // remote-tracking ref sees it.
+            fs::remove_file(&hook).unwrap();
+            let p = g(&fx.main_dir, &["rev-parse", "origin/dev"]);
+            let tree = g(&fx.main_dir, &["rev-parse", &format!("{}^{{tree}}", p)]);
+            let c = g(
+                &fx.main_dir,
+                &["commit-tree", &tree, "-p", &p, "-m", "participant work"],
+            );
+            g(
+                &fx.main_dir,
+                &["push", "-q", "origin", &format!("{}:dev", c)],
+            );
+            g(&fx.main_dir, &["fetch", "-q", "origin"]);
+            drop(_release);
+            sync.join().unwrap();
+        });
+
+        // The stale pass must not have reset `dev` over the disable's
+        // deletion: the branch still points at D, the marker still waits
+        // for the retry, and no backup ref was created by a reset.
+        assert_eq!(
+            g(&fx.main_dir, &["rev-parse", "dev"]),
+            deletion,
+            "the obsolete pass must not roll dev back over the disable's commit"
+        );
+        assert!(ss::read_shared_import(&fx.main_db, fx.main_repo)
+            .disabling
+            .is_some());
+        let backup = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "refs/sdh-backup/dev"])
+            .current_dir(&fx.main_dir)
+            .output()
+            .unwrap();
+        assert!(
+            !backup.status.success(),
+            "reset_to_origin must not have run for the stale pass"
+        );
+    }
+
+    /// T-000243 review (thirteenth pass): the generation gate covers PHASE
+    /// B too — a pass captured before a repath must not commit or push
+    /// from the checkout it no longer owns. Before the fix the deferred
+    /// half still ran (only the status settlement was suppressed), so the
+    /// old checkout's files, refs and remote all stayed untouched is the
+    /// assertion that matters.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_repathed_repo_makes_its_phase_a_pass_skip_phase_b() {
+        let fx = two_installs();
+        fx.enable_main();
+        // A spec waits for phase B to carry it to origin.
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        let shared = run_phase_a(&fx.main_db, Some(&gb()), Some(fx.project_id));
+        let dev_before = g(&fx.main_dir, &["rev-parse", "dev"]);
+        // The checkout is rebound while the pass waits for phase B.
+        rebind_local_path(
+            &fx.main_db,
+            fx.main_repo,
+            Some(fx.helper_dir.to_str().unwrap()),
+        )
+        .unwrap();
+        let _out = shared.finish(&fx.main_db, Some(&gb()));
+        assert_eq!(
+            g(&fx.main_dir, &["rev-parse", "dev"]),
+            dev_before,
+            "the stale pass must not commit from the old checkout"
+        );
+        assert_eq!(
+            fx.remote_file("dev", "docs/superpowers/specs/x.md"),
+            None,
+            "the stale pass must not push from the old checkout"
+        );
+    }
+
+    /// T-000243 review (fourteenth pass): `after_fetch` released the policy
+    /// guard after the branch section and THEN ran `import_incoming` and the
+    /// canon adoption — a repath landing in that window let an obsolete pass
+    /// import the old checkout's rows and reconcile them into the NEW
+    /// binding's `docs/bug-reports.md`. The whole side-effecting tail now
+    /// sits inside the same guarded, freshness-gated hold.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_repath_during_after_fetch_stops_the_import_from_the_old_checkout() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        fx.sync_main();
+        let imp_before = ss::read_shared_import(&fx.main_db, fx.main_repo);
+        let helper_bugs_before =
+            fs::read_to_string(fx.helper_dir.join("docs/bug-reports.md")).unwrap_or_default();
+
+        // A bug row the pass's checkout holds in HEAD but the import has not
+        // seen yet — exactly what `import_incoming` would pick up.
+        write(
+            &fx.main_dir,
+            "docs/bug-reports.md",
+            &bugs_md(&[note(
+                "B-500001",
+                "committed in the stale checkout",
+                "created",
+                0,
+            )]),
+        );
+        g(&fx.main_dir, &["add", "docs/bug-reports.md"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "bug row"]);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_after_fetch_probe(fx.main_repo, &fx.main_dir, entered_tx, release_rx);
+        let project = fx
+            .main_db
+            .list_all_repos()
+            .unwrap()
+            .into_iter()
+            .find_map(|r| r.project_id);
+        std::thread::scope(|s| {
+            let _release = ReleaseOnDrop(release_tx);
+            let sync = s.spawn(|| run_phase_a(&fx.main_db, Some(&gb()), project));
+            let in_window = entered_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("phase A never reached after_fetch");
+            assert_eq!(in_window, fx.main_repo);
+            // The checkout is rebound while the pass waits before its
+            // guarded section: the generation moves under both spellings.
+            rebind_local_path(
+                &fx.main_db,
+                fx.main_repo,
+                Some(fx.helper_dir.to_str().unwrap()),
+            )
+            .unwrap();
+            drop(_release);
+            sync.join().unwrap();
+        });
+
+        // The stale pass imported NOTHING: no row in the database, no blob
+        // bookkeeping, and the new binding's bug file was not regenerated
+        // with the old checkout's rows.
+        assert!(
+            fx.main_db
+                .get_bug_by_display_id(fx.main_repo, "B-500001")
+                .unwrap()
+                .is_none(),
+            "the obsolete pass must not import the old checkout's bug row"
+        );
+        let imp_after = ss::read_shared_import(&fx.main_db, fx.main_repo);
+        assert_eq!(
+            imp_after.blobs.get("docs/bug-reports.md"),
+            imp_before.blobs.get("docs/bug-reports.md"),
+            "the import bookkeeping must not move for a stale pass"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.helper_dir.join("docs/bug-reports.md")).unwrap_or_default(),
+            helper_bugs_before,
+            "reconcile must not write the old checkout's rows into the new binding"
+        );
+    }
+
+    /// T-000243 review (sixth pass): `accept_new_main_branch` resolves the
+    /// status between phase A and `finish` — the generation bump makes the
+    /// older refused pass stale, so it cannot restore the rejection the
+    /// user just accepted.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_accepted_main_branch_is_not_restored_by_a_stale_pass() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The owner moves the dev branch: the helper's pin now refuses it.
+        let structure = fs::read_to_string(fx.main_dir.join(".sdh/project.json")).unwrap();
+        let moved = structure.replace("\"dev_branch\": \"dev\"", "\"dev_branch\": \"next\"");
+        assert_ne!(moved, structure, "the fixture structure must carry the pin");
+        write(&fx.main_dir, ".sdh/project.json", &moved);
+        g(&fx.main_dir, &["add", ".sdh"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "move dev branch"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        // The first sync settles the untrusted status; a second phase A
+        // captures the same refusal in a fresh pass.
+        fx.sync_helper();
+        assert_eq!(fx.helper_status().as_deref(), Some("shared_untrusted"));
+        let project = fx
+            .helper_db
+            .list_all_repos()
+            .unwrap()
+            .into_iter()
+            .find_map(|r| r.project_id);
+        let shared = run_phase_a(&fx.helper_db, Some(&gb()), project);
+        // The user accepts the new branch: pin and status are cleared.
+        accept_new_main_branch(&fx.helper_db, fx.helper_repo).unwrap();
+        assert_eq!(fx.helper_status(), None);
+        // The stale pass must not settle the refusal back.
+        let _out = shared.finish(&fx.helper_db, Some(&gb()));
+        assert_eq!(
+            fx.helper_status(),
+            None,
+            "the accepted branch must not be refused again by a stale pass"
+        );
+    }
+
+    /// T-000243 review (seventh pass): an obsolete disable retry must not
+    /// clear a NEWER pending-disable marker. `clear_disabling` verifies the
+    /// lifecycle generation it was started under — a re-enable plus a fresh
+    /// disable bumped it meanwhile, so the old retry's cleanup is refused.
+    #[test]
+    fn an_obsolete_retry_cannot_clear_a_newer_disable_marker() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let mut imp = ss::SharedImport::default();
+        imp.disabling = Some("dev".into());
+        ss::write_shared_import(&db, repo.id, &imp).unwrap();
+        // The retry pass starts under the current generation…
+        let gen0 = lifecycle_generation(repo.id, root);
+        // …then a newer lifecycle lands: re-enable + a fresh disable.
+        bump_lifecycle_generation(repo.id, root);
+        bump_lifecycle_generation(repo.id, root);
+        assert_eq!(
+            clear_disabling(&db, repo.id, root, gen0).unwrap(),
+            false,
+            "the obsolete retry must leave the newer marker alone"
+        );
+        assert_eq!(
+            ss::read_shared_import(&db, repo.id).disabling.as_deref(),
+            Some("dev")
+        );
+        // The retry of the CURRENT operation may clear it.
+        let now = lifecycle_generation(repo.id, root);
+        assert_eq!(clear_disabling(&db, repo.id, root, now).unwrap(), true);
+        assert!(ss::read_shared_import(&db, repo.id).disabling.is_none());
+    }
+
+    /// T-000243 review (seventh pass): the generation key carries the local
+    /// path — rebinding the repo must stale passes keyed by the old
+    /// spelling, on both sides of the change. Eighth pass: the rebind is
+    /// one guarded operation, so the invalidation cannot be split from
+    /// the binding write.
+    #[test]
+    fn a_repathed_repo_invalidates_passes_keyed_by_the_old_path() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        db.set_repo_local_path(repo.id, Some("/old/root")).unwrap();
+        let old = Path::new("/old/root");
+        let new = Path::new("/new/root");
+        let g_old = lifecycle_generation(repo.id, old);
+        let g_new = lifecycle_generation(repo.id, new);
+        rebind_local_path(&db, repo.id, Some("/new/root")).unwrap();
+        assert_ne!(
+            lifecycle_generation(repo.id, old),
+            g_old,
+            "a pass captured under the old path must go stale"
+        );
+        assert_ne!(lifecycle_generation(repo.id, new), g_new);
+        // Ninth pass: a spelling that differs only by a trailing separator
+        // compares EQUAL under `Path` but is a DIFFERENT literal generation
+        // key — both spellings must be bumped, never normalized away.
+        let g_trailing = lifecycle_generation(repo.id, Path::new("/new/root/"));
+        rebind_local_path(&db, repo.id, Some("/new/root/")).unwrap();
+        assert_ne!(
+            lifecycle_generation(repo.id, Path::new("/new/root/")),
+            g_trailing,
+            "the new spelling's own key must be bumped too"
+        );
+    }
+
+    /// T-000243 review (eighth pass): an OBSOLETE phase-A cleanup — one
+    /// whose `NotFound` observation predates a newer accepted structure —
+    /// must not erase the role the newer lifecycle established. The
+    /// freshness gate compares the cleanup's expected generation with the
+    /// current one under the guard.
+    #[test]
+    fn an_obsolete_cleanup_cannot_erase_a_newer_role() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        // Sync A observed `NotFound` under generation g0 and paused…
+        let g0 = lifecycle_generation(repo.id, root);
+        // …then the owner republished and sync B accepted: a NEW lifecycle.
+        db.set_shared_role(repo.id, Some("pending")).unwrap();
+        bump_lifecycle_generation(repo.id, root);
+        // A resumes: its cleanup is obsolete — the gate refuses the write.
+        assert_eq!(foreign_state_cleanup(&db, repo.id, root, g0), 0);
+        assert_eq!(
+            db.get_shared_state(repo.id).unwrap().shared_role.as_deref(),
+            Some("pending"),
+            "the newer accepted role must survive the obsolete cleanup"
+        );
+        // The same cleanup under the CURRENT generation does clear — and
+        // reports its bump count so a same-pass pin cleanup stays gated
+        // on the RESULT (ninth pass).
+        let now = lifecycle_generation(repo.id, root);
+        assert_eq!(foreign_state_cleanup(&db, repo.id, root, now), 1);
+        assert_eq!(db.get_shared_state(repo.id).unwrap().shared_role, None);
+        assert_eq!(
+            lifecycle_generation(repo.id, root),
+            now + 1,
+            "the reported bump count matches the generation move"
+        );
+    }
+
+    /// T-000243 review (eighth pass): the pass's own transition is gated
+    /// the same way — a stale `expected` skips the write entirely.
+    #[test]
+    fn a_stale_expected_generation_skips_the_passs_own_transition() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let g0 = lifecycle_generation(repo.id, root);
+        let mut pass = new_pass(&repo, root, "me");
+        // A foreign lifecycle lands before the pass's own write.
+        bump_lifecycle_generation(repo.id, root);
+        pass_role_transition(&mut pass, &db, Some("contributor"), g0);
+        assert_eq!(
+            db.get_shared_state(repo.id).unwrap().shared_role,
+            None,
+            "the obsolete transition must not write"
+        );
+        assert_eq!(pass.own_bumps, 0, "and must not count a bump it skipped");
+    }
+
+    /// T-000243 review (seventh pass): a newer phase-A `NotFound` cleanup
+    /// (belongs to no pass) clears the cached role — an OLDER pass refused
+    /// as untrusted must not settle `shared_untrusted` back over it.
+    #[test]
+    fn a_newer_not_found_cleanup_stales_an_older_refused_pass() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let mut pass = new_pass(&repo, root, "me");
+        pass.note_untrusted("structure refused".into());
+        let g0 = lifecycle_generation(repo.id, root);
+        pass.seal_lifecycle_gen(g0);
+        // The newer sync's phase A finds no structure at all: the cleanup
+        // is a lifecycle transition even though it produces no pass. Its
+        // own generation is still current, so the gate lets it through.
+        foreign_state_cleanup(&db, repo.id, root, g0);
+        let mut sync = SharedSync::empty();
+        sync.passes.push(pass);
+        let _out = sync.finish(&db, None);
+        assert_eq!(
+            db.get_shared_state(repo.id).unwrap().shared_status,
+            None,
+            "the stale refusal must not be restored over the cleanup"
+        );
+    }
+
+    /// T-000243 review (seventh pass): the counterpart — a pass's OWN
+    /// lifecycle transition (role adoption) bumps the generation too, but
+    /// `seal_lifecycle_gen` forgives exactly its own bumps, so the pass
+    /// still settles its status.
+    #[test]
+    fn a_passs_own_role_adoption_does_not_stale_it() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let g0 = lifecycle_generation(repo.id, root);
+        let mut pass = new_pass(&repo, root, "me");
+        pass_role_transition(&mut pass, &db, Some("contributor"), g0);
+        pass.note(SharedStatus::NoOwnBranch, "");
+        pass.seal_lifecycle_gen(g0);
+        let mut sync = SharedSync::empty();
+        sync.passes.push(pass);
+        let _out = sync.finish(&db, None);
+        assert_eq!(
+            db.get_shared_state(repo.id)
+                .unwrap()
+                .shared_status
+                .as_deref(),
+            Some("no_own_branch"),
+            "the pass's own transition must not stale it"
+        );
+    }
+
+    /// T-000243 review (eighteenth pass): the auto-commit branch IS the
+    /// pass's own branch — changing or clearing it mid-pass must bump the
+    /// lifecycle generation, or phase B keeps committing and pushing to
+    /// the branch set the pass captured.
+    #[test]
+    fn changing_the_autocommit_branch_bumps_the_lifecycle_generation() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        db.set_repo_local_path(repo.id, Some(dir.path().to_str().unwrap()))
+            .unwrap();
+        let stored = db.get_repository(repo.id).unwrap().local_path.unwrap();
+        let root = Path::new(&stored);
+        let g0 = lifecycle_generation(repo.id, root);
+        set_autocommit_branch_guarded(&db, repo.id, Some("dev")).unwrap();
+        assert!(
+            lifecycle_generation(repo.id, root) > g0,
+            "setting the branch must stale in-flight passes"
+        );
+        let g1 = lifecycle_generation(repo.id, root);
+        set_autocommit_branch_guarded(&db, repo.id, Some("dev")).unwrap();
+        assert_eq!(
+            lifecycle_generation(repo.id, root),
+            g1,
+            "a no-op set must not stale passes"
+        );
+        set_autocommit_branch_guarded(&db, repo.id, None).unwrap();
+        assert!(
+            lifecycle_generation(repo.id, root) > g1,
+            "clearing the branch must stale in-flight passes"
+        );
+    }
+
+    /// T-000243 review (second pass): every writer of the policy-bearing
+    /// structure waits for the per-repo guard — `enable_shared_mode`,
+    /// `approve_join_request` and `disable_shared_mode` (it commits the
+    /// deletion of `.sdh/`) are not answered while a policy section holds it.
+    /// The end-to-end interleaving with phase B and the OFF setter is
+    /// `an_approval_and_a_specs_toggle_never_publish_a_stale_on_structure`.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn structure_writers_wait_for_the_policy_guard() {
+        let db = AppDb::new(PathBuf::from(":memory:")).unwrap();
+        db.set_setting("github_login", "Owner").unwrap();
+        db.upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        let repo = db.get_repository_by_name("Owner/api").unwrap();
+        // A bare folder with a `.git` entry passes `repo_root`; every writer
+        // then reaches the guard without spawning git (they fail fast on the
+        // missing project / dev branch / checkout only after the release).
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        db.set_repo_local_path(repo.id, Some(dir.path().to_str().unwrap()))
+            .unwrap();
+        db.set_shared_mode(repo.id, true).unwrap();
+        db.set_shared_role(repo.id, Some("main")).unwrap();
+
+        let guard = specs_policy_guard(repo.id);
+        let (en_tx, en_rx) = std::sync::mpsc::channel();
+        let (ap_tx, ap_rx) = std::sync::mpsc::channel();
+        let (di_tx, di_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let held = guard.lock().unwrap();
+            s.spawn(|| {
+                let _ = en_tx.send(enable_shared_mode(&db, &gb(), repo.id, false));
+            });
+            s.spawn(|| {
+                let _ = ap_tx.send(approve_join_request(&db, Some(&gb()), repo.id, "someone"));
+            });
+            s.spawn(|| {
+                let _ = di_tx.send(disable_shared_mode(&db, &gb(), repo.id));
+            });
+            assert!(
+                en_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "enable must wait for the policy guard"
+            );
+            assert!(
+                ap_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "the approval must wait for the policy guard"
+            );
+            assert!(
+                di_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "disable must wait for the policy guard"
+            );
+            // Release before the scope joins the writers.
+            drop(held);
+        });
+    }
+
+    /// T-000243 review (already-shared repos): a user rule that keeps the
+    /// folder ignored while the effective policy is ON must not silently kill
+    /// the transport — the recurring pass diagnoses it (once per change) and
+    /// never removes the rule by itself.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_user_rule_ignoring_specs_is_diagnosed_while_the_policy_is_on() {
+        let fx = two_installs();
+        fx.make_participant();
+        // This repo's own case: a user rule that hides the folder without
+        // naming it, kept by the owner on purpose (never auto-removed).
+        write(&fx.main_dir, ".gitignore", "superpowers/\n");
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+
+        // Enabled with OFF: the folder is not a shared path, its rules are the
+        // user's own business — no diagnostic, no note, nothing travels.
+        assert!(set_repo_share_specs(&fx.main_db, fx.main_repo, false)
+            .unwrap()
+            .is_none());
+        let out = fx.sync_main();
+        assert!(
+            !out.issues
+                .iter()
+                .any(|i| i.target.as_deref() == Some(".gitignore")),
+            "{:?}",
+            out.issues
+        );
+        assert_eq!(fx.remote_file("dev", "docs/superpowers/specs/x.md"), None);
+
+        // Flipped ON later, after the repo is already shared: the setter says
+        // right away that user rules still hide the folder ...
+        let note = set_repo_share_specs(&fx.main_db, fx.main_repo, true)
+            .unwrap()
+            .expect("the ON transition of an already-shared repo must warn");
+        assert!(note.contains("superpowers/"), "{}", note);
+        // ... and the recurring pass diagnoses it instead of silently sending
+        // nothing.
+        let out = fx.sync_main();
+        let diag = out
+            .issues
+            .iter()
+            .find(|i| {
+                i.code == Code::ManagedFileFailed && i.target.as_deref() == Some(".gitignore")
+            })
+            .expect("the silently blocked specs must be diagnosed");
+        assert!(
+            diag.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("superpowers/"),
+            "{:?}",
+            diag
+        );
+        // The rule survived: removal stays behind the preflight confirmation.
+        assert_eq!(
+            fs::read_to_string(fx.main_dir.join(".gitignore")).unwrap(),
+            "superpowers/\n"
+        );
+        // And nothing was silently committed: the folder is ignored, so no
+        // specs pathspec had anything to send.
+        assert_eq!(fx.remote_file("dev", "docs/superpowers/specs/x.md"), None);
+        assert_eq!(
+            g(&fx.main_dir, &["ls-files", "--", "docs/superpowers/"]),
+            ""
+        );
+
+        // Opting out stops the diagnosis: the folder is the user's own
+        // business again, no issue, no noise.
+        set_repo_share_specs(&fx.main_db, fx.main_repo, false).unwrap();
+        let out = fx.sync_main();
+        assert!(
+            !out.issues
+                .iter()
+                .any(|i| i.target.as_deref() == Some(".gitignore")),
+            "{:?}",
+            out.issues
+        );
+    }
+
+    fn sample_structure() -> ProjectStructure {
+        ProjectStructure {
+            format: 1,
+            project: ss::StructProject {
+                name: "Acme".into(),
+                project_type: "standard".into(),
+            },
+            main: ss::StructMain {
+                login: "Owner".into(),
+                dev_branch: "dev".into(),
+            },
+            repos: vec![ss::StructRepo {
+                github: "Owner/api".into(),
+                role: "server".into(),
+                share_specs: None,
+            }],
+            microservices: vec![],
+            participants: vec![],
+        }
     }
 
     #[test]
@@ -4078,6 +7852,7 @@ mod tests {
             shared_role: role.map(String::from),
             shared_status: None,
             shared_status_detail: None,
+            share_specs: true,
         };
         assert!(!is_shared_state(&st(false, None)));
         assert!(is_shared_state(&st(true, None)));
@@ -4089,7 +7864,7 @@ mod tests {
 
     #[test]
     fn pathspec_per_role() {
-        let main = shared_pathspec(Role::Main, "Owner");
+        let main = shared_pathspec(Role::Main, "Owner", true);
         for p in [
             "docs/todo.md",
             "docs/done.md",
@@ -4102,21 +7877,116 @@ mod tests {
             ".sdh/project.json",
             ".sdh/requests",
             "docs/sdh_skills",
+            "docs/superpowers",
         ] {
             assert!(main.iter().any(|x| x == p), "main lacks {}", p);
         }
         assert_eq!(exclude_specs(&main).len(), 2);
 
-        let contributor = shared_pathspec(Role::Contributor, "helper");
+        // T-000243: the specs folder leaves the pathspec of BOTH roles when the
+        // policy is off; `docs/sdh_skills/` stays main-only either way.
+        let main_off = shared_pathspec(Role::Main, "Owner", false);
+        assert!(!main_off.iter().any(|x| x == "docs/superpowers"));
+        assert!(main_off.iter().any(|x| x == "docs/sdh_skills"));
+
+        let contributor = shared_pathspec(Role::Contributor, "helper", true);
         assert!(contributor.iter().any(|x| x == "docs/todo.md"));
-        assert!(!contributor.iter().any(|x| x.starts_with(".sdh")));
+        assert!(contributor.iter().any(|x| x == "docs/superpowers"));
+        // T-000190: the only `.sdh` path of a non-main role is its own
+        // version file — never the owner-only structure or requests dir.
+        assert!(contributor
+            .iter()
+            .all(|x| !x.starts_with(".sdh") || x == ".sdh/app-versions/helper.json"));
         assert!(!contributor.iter().any(|x| x == "docs/sdh_skills"));
         assert!(exclude_specs(&contributor).is_empty());
 
+        let contributor_off = shared_pathspec(Role::Contributor, "helper", false);
+        assert!(!contributor_off.iter().any(|x| x == "docs/superpowers"));
+
+        // A pending helper sends only its request and its own version file —
+        // specs never travel for it, whatever the flag says.
+        for flag in [true, false] {
+            assert_eq!(
+                shared_pathspec(Role::Pending, "helper", flag),
+                vec![
+                    ".sdh/requests/helper.json".to_string(),
+                    ".sdh/app-versions/helper.json".to_string(),
+                ]
+            );
+        }
+
+        // An empty or unsafe login must not produce `.sdh/app-versions/.json`:
+        // the path is skipped, never guessed (preflight callers pass "").
+        assert!(shared_pathspec(Role::Main, "", true)
+            .iter()
+            .all(|x| !x.starts_with(APP_VERSIONS_REL_DIR)));
         assert_eq!(
-            shared_pathspec(Role::Pending, "helper"),
-            vec![".sdh/requests/helper.json".to_string()]
+            shared_pathspec(Role::Pending, "", true),
+            vec![".sdh/requests/.json".to_string()]
         );
+    }
+
+    // ----- app versions (T-000190) ------------------------------------------
+
+    #[test]
+    fn own_app_version_writes_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_own_app_version(tmp.path(), "Helper").unwrap();
+        let path = tmp.path().join(".sdh/app-versions/helper.json");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body,
+            format!("{{\"app_version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION"))
+        );
+        // Same bytes — no rewrite (the mtime must not move).
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        write_own_app_version(tmp.path(), "Helper").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn app_version_parse_is_never_guessed() {
+        assert_eq!(parse_app_version("{}"), None);
+        assert_eq!(parse_app_version("not json"), None);
+        assert_eq!(parse_app_version("{\"app_version\":1}"), None);
+        assert_eq!(
+            parse_app_version("{\"app_version\":\"1.23.0\"}").as_deref(),
+            Some("1.23.0")
+        );
+    }
+
+    /// T-000190: both installs publish `.sdh/app-versions/<login>.json` on the
+    /// dev branch, and the owner's activity listing reports them.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn app_versions_reach_dev_and_the_activity() {
+        let fx = two_installs();
+        fx.make_participant_via_syncs();
+        // The owner's next pass merges the helper branch into dev — the
+        // contributor's version file lands there with the rest of its share.
+        fx.sync_main();
+        for login in ["owner", "helper"] {
+            let full = format!("{}/{}.json", APP_VERSIONS_REL_DIR, login);
+            let body = fx
+                .remote_file("dev", &full)
+                .unwrap_or_else(|| panic!("{} missing on dev", full));
+            assert_eq!(
+                body,
+                format!("{{\"app_version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION")),
+                "{} on dev",
+                full
+            );
+        }
+        // A steady-state sync writes nothing new.
+        fx.sync_main();
+        let rows = participants_activity(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        let by_login: HashMap<String, Option<String>> = rows
+            .iter()
+            .map(|r| (r.login.to_ascii_lowercase(), r.app_version.clone()))
+            .collect();
+        let want = Some(env!("CARGO_PKG_VERSION").to_string());
+        assert_eq!(by_login.get("owner"), Some(&want));
+        assert_eq!(by_login.get("helper"), Some(&want));
     }
 
     // ----- owner side ---------------------------------------------------------
@@ -4293,12 +8163,15 @@ mod tests {
         let head_before = g(&fx.helper_dir, &["rev-parse", "HEAD"]);
         write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
         write(&fx.helper_dir, "docs/server-api/api.md", "# API\n");
+        // T-000243: a spec file of a pending helper never travels either,
+        // whatever the specs flag says.
+        write(&fx.helper_dir, "docs/superpowers/specs/p.md", "# p\n");
         let out = fx.sync_helper();
 
         let changed = g(&fx.origin, &["diff", "--name-only", &before, "dev"]);
         assert_eq!(
             changed.lines().collect::<Vec<_>>(),
-            vec![".sdh/requests/helper.json"]
+            vec![".sdh/app-versions/helper.json", ".sdh/requests/helper.json"]
         );
         assert!(fx
             .remote_file("dev", ".sdh/requests/helper.json")
@@ -4771,6 +8644,427 @@ mod tests {
             None
         );
         assert_eq!(fx.remote_file("dev", "docs/sdh_skills/sdh-y.md"), None);
+    }
+
+    // ----- T-000243: docs/superpowers/ in the shared set -----------------------
+
+    /// Preflight treats the rules that hide the specs folder exactly per the
+    /// specs flag: while specs are shared they are blockers a user must confirm
+    /// to remove; opted out, the folder is not a shared path and its rules are
+    /// the user's own business. A rule of the managed block is never reported.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn preflight_treats_superpowers_rules_per_the_specs_flag() {
+        let fx = two_installs();
+        // A user rule like this repo's own `superpowers/`: it hides
+        // docs/superpowers/ without naming it.
+        write(&fx.main_dir, ".gitignore", "superpowers/\n");
+        let pre = shared_mode_preflight(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert_eq!(
+            pre.blocking_lines,
+            vec![IgnoreLine {
+                line_no: 1,
+                text: "superpowers/".into()
+            }],
+            "while specs are shared, a rule hiding the folder blocks them"
+        );
+        // The direct spelling is diagnosed the same way.
+        write(&fx.main_dir, ".gitignore", "docs/superpowers/\n");
+        let pre = shared_mode_preflight(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert_eq!(
+            pre.blocking_lines,
+            vec![IgnoreLine {
+                line_no: 1,
+                text: "docs/superpowers/".into()
+            }]
+        );
+
+        // Opted out: the very same rules are no blockers and are not offered
+        // for removal — the folder is meant to stay ignored.
+        fx.main_db
+            .set_repo_share_specs(fx.main_repo, false)
+            .unwrap();
+        let pre = shared_mode_preflight(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(pre.blocking_lines.is_empty(), "{:?}", pre.blocking_lines);
+        // And back on, they are blockers again (diagnosed, never auto-removed).
+        fx.main_db.set_repo_share_specs(fx.main_repo, true).unwrap();
+        let pre = shared_mode_preflight(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert_eq!(pre.blocking_lines.len(), 1);
+
+        // A managed-only rule is the sync's own business, not the user's.
+        write(
+            &fx.main_dir,
+            ".gitignore",
+            "# --- solo-dev-hub:begin ---\ndocs/superpowers/\n# --- solo-dev-hub:end ---\n",
+        );
+        let pre = shared_mode_preflight(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(pre.blocking_lines.is_empty(), "{:?}", pre.blocking_lines);
+    }
+
+    /// Part 1: while the policy shares specs, they travel both ways — the
+    /// owner's specs, plans and HTML mockups reach the contributor, the
+    /// contributor's own specs reach the owner, and two sides adding different
+    /// spec files both survive (no merge driver, different files never collide).
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn specs_travel_between_owner_and_contributor_while_shared() {
+        let fx = two_installs();
+        fx.make_participant();
+
+        // Owner -> contributor: a spec, a plan and an HTML mockup.
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# spec\n");
+        write(&fx.main_dir, "docs/superpowers/plans/p.md", "# plan\n");
+        write(
+            &fx.main_dir,
+            "docs/superpowers/mockups/m.html",
+            "<html><body>mock</body></html>\n",
+        );
+        fx.sync_main();
+        for branch in ["dev", "helper-dev"] {
+            for path in [
+                "docs/superpowers/specs/x.md",
+                "docs/superpowers/plans/p.md",
+                "docs/superpowers/mockups/m.html",
+            ] {
+                assert!(
+                    fx.remote_file(branch, path).is_some(),
+                    "{} lacks {}",
+                    branch,
+                    path
+                );
+            }
+        }
+        fx.sync_helper();
+        assert!(fx.helper_dir.join("docs/superpowers/specs/x.md").is_file());
+        assert!(fx
+            .helper_dir
+            .join("docs/superpowers/mockups/m.html")
+            .is_file());
+
+        // Contributor -> owner: its own spec travels back.
+        write(
+            &fx.helper_dir,
+            "docs/superpowers/specs/helper.md",
+            "# helper spec\n",
+        );
+        fx.sync_helper();
+        fx.sync_main();
+        assert!(fx
+            .main_dir
+            .join("docs/superpowers/specs/helper.md")
+            .is_file());
+
+        // Two sides add DIFFERENT spec files: both survive everywhere.
+        write(&fx.main_dir, "docs/superpowers/specs/mine.md", "# mine\n");
+        write(
+            &fx.helper_dir,
+            "docs/superpowers/specs/theirs.md",
+            "# theirs\n",
+        );
+        fx.sync_main();
+        fx.sync_helper();
+        fx.sync_main();
+        fx.sync_helper();
+        for branch in ["dev", "helper-dev"] {
+            for path in [
+                "docs/superpowers/specs/mine.md",
+                "docs/superpowers/specs/theirs.md",
+            ] {
+                assert!(
+                    fx.remote_file(branch, path).is_some(),
+                    "{} lacks {}",
+                    branch,
+                    path
+                );
+            }
+        }
+        assert!(fx
+            .main_dir
+            .join("docs/superpowers/specs/theirs.md")
+            .is_file());
+        // The helper committed `theirs.md` while origin/helper-dev had already
+        // taken main's plumbed `mine.md` commit, so its own branch diverged —
+        // the transport's designed state, identical for every shared path in
+        // this interleaving (see `main_plumbs_a_merged_todo_into_a_participant_
+        // branch`): the files travelled (both remotes, and main's checkout got
+        // theirs.md), the helper's checkout waits for the Merge button.
+        assert_eq!(
+            fx.helper_status().as_deref(),
+            Some("needs_manual_merge"),
+            "the diverged own branch is reported, not silently merged"
+        );
+        assert_eq!(
+            fx.helper_status_detail().as_deref(),
+            Some(r#"{"branch":"helper-dev","current":true}"#)
+        );
+        // Two sides adding DIFFERENT spec files: the merge keeps both (specs
+        // carry no merge driver; different files never collide).
+        let res = merge_shared_upstream(&fx.helper_db, &gb(), fx.helper_repo).unwrap();
+        assert_eq!(res.outcome, "merged");
+        assert!(fx
+            .helper_dir
+            .join("docs/superpowers/specs/mine.md")
+            .is_file());
+        assert!(fx
+            .helper_dir
+            .join("docs/superpowers/specs/theirs.md")
+            .is_file());
+        fx.sync_helper();
+        assert_eq!(fx.helper_status(), None);
+        // After the merge both files live on every branch.
+        for branch in ["dev", "helper-dev"] {
+            for path in [
+                "docs/superpowers/specs/mine.md",
+                "docs/superpowers/specs/theirs.md",
+            ] {
+                assert!(fx.remote_file(branch, path).is_some());
+            }
+        }
+    }
+
+    /// Part 2, the owner's case: opting out BEFORE the first specs commit keeps
+    /// the folder out of the transport on both installs — nothing under
+    /// docs/superpowers/ reaches origin/dev or the participant branch, while
+    /// todo keeps travelling and no file is ever tracked.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn specs_opted_out_before_the_first_commit_never_leave_the_install() {
+        let fx = two_installs();
+        // The owner's choice is stored before sharing is even enabled.
+        fx.main_db
+            .set_repo_share_specs(fx.main_repo, false)
+            .unwrap();
+        // T-000243 review: the spec files of both installs exist BEFORE the
+        // structure / join syncs, so the first syncs of the transport run over
+        // pre-existing files (a bug exposing them at the first render or commit
+        // is caught here, not only by files written later).
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        write(&fx.helper_dir, "docs/superpowers/specs/y.md", "# y\n");
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        fx.make_participant();
+        // ... and is published in the trusted structure the helper accepts.
+        assert!(fx
+            .remote_file("dev", ".sdh/project.json")
+            .unwrap()
+            .contains("\"share_specs\": false"));
+
+        fx.sync_main();
+        fx.sync_helper();
+        fx.sync_main();
+
+        for branch in ["dev", "helper-dev"] {
+            for path in ["docs/superpowers/specs/x.md", "docs/superpowers/specs/y.md"] {
+                assert_eq!(
+                    fx.remote_file(branch, path),
+                    None,
+                    "{} must not carry {}",
+                    branch,
+                    path
+                );
+            }
+            // The contributor-mode backbone is untouched by the flag.
+            assert!(fx
+                .remote_file(branch, "docs/todo.md")
+                .unwrap()
+                .contains("T-500000"));
+        }
+        // Never tracked on either clone.
+        assert!(g(&fx.main_dir, &["ls-files", "--", "docs/superpowers/"])
+            .trim()
+            .is_empty());
+        assert!(g(&fx.helper_dir, &["ls-files", "--", "docs/superpowers/"])
+            .trim()
+            .is_empty());
+        // The helper's own database still says the default on: the accepted
+        // structure overrode it before any path was computed.
+        assert!(
+            fx.helper_db
+                .get_shared_state(fx.helper_repo)
+                .unwrap()
+                .share_specs
+        );
+    }
+
+    /// Part 2, off AFTER specs were committed: the files stay tracked, local
+    /// edits stay visible modifications, the history stays reachable — and no
+    /// NEW SDH commit carries the folder on the current branch or a recipient
+    /// branch, for either role. On resumes sharing.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn off_keeps_committed_specs_tracked_and_out_of_new_sync_commits() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        fx.sync_main();
+        assert!(fx
+            .remote_file("dev", "docs/superpowers/specs/x.md")
+            .is_some());
+        fx.sync_helper();
+        assert!(fx.helper_dir.join("docs/superpowers/specs/x.md").is_file());
+
+        // The owner opts out and edits the file.
+        fx.main_db
+            .set_repo_share_specs(fx.main_repo, false)
+            .unwrap();
+        write(
+            &fx.main_dir,
+            "docs/superpowers/specs/x.md",
+            "# x edited by owner\n",
+        );
+        fx.sync_main();
+        // Tracked (off never untracks) and visibly modified, but carried by no
+        // new commit: a plain work-tree modification, nothing staged. (`g()`
+        // trims the leading space of a porcelain line, so judge via diff.)
+        assert_eq!(
+            g(&fx.main_dir, &["ls-files", "--", "docs/superpowers/"]).trim(),
+            "docs/superpowers/specs/x.md"
+        );
+        assert_eq!(
+            g(
+                &fx.main_dir,
+                &["diff", "--name-only", "--", "docs/superpowers/"]
+            ),
+            "docs/superpowers/specs/x.md",
+            "the edit stays a visible local modification"
+        );
+        assert_eq!(
+            g(
+                &fx.main_dir,
+                &["diff", "--cached", "--name-only", "--", "docs/superpowers/"]
+            ),
+            "",
+            "nothing under the folder is staged into a new commit"
+        );
+        // The edit reached no NEW commit, on the current branch (dev) or the
+        // participant branch (helper-dev).
+        for branch in ["dev", "helper-dev"] {
+            assert_eq!(
+                fx.remote_file(branch, "docs/superpowers/specs/x.md")
+                    .as_deref(),
+                Some("# x\n"),
+                "{} must keep the last shared version",
+                branch
+            );
+        }
+        // The history of the file is intact.
+        assert!(g(
+            &fx.main_dir,
+            &["log", "--oneline", "--", "docs/superpowers/"]
+        )
+        .contains("sdh-sync"));
+
+        // The contributor accepts the opt-out from the structure; its own edit
+        // stays local too, while todo keeps travelling.
+        fx.sync_helper();
+        write(
+            &fx.helper_dir,
+            "docs/superpowers/specs/x.md",
+            "# x edited by helper\n",
+        );
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500001"]));
+        fx.sync_helper();
+        for branch in ["helper-dev", "dev"] {
+            assert_eq!(
+                fx.remote_file(branch, "docs/superpowers/specs/x.md")
+                    .as_deref(),
+                Some("# x\n")
+            );
+        }
+        assert!(fx
+            .remote_file("helper-dev", "docs/todo.md")
+            .unwrap()
+            .contains("T-500001"));
+
+        // On resumes sharing: the owner's edit finally travels. One more OFF
+        // sync first, so dev is up to date with the helper's todo plumb — a
+        // dirty specs file is outside the off pathspec, so the fast-forward
+        // runs and leaves the work-tree edit alone (the incoming commit never
+        // touched the file).
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("dev", "docs/superpowers/specs/x.md")
+                .as_deref(),
+            Some("# x\n"),
+            "the off sync still carries no specs"
+        );
+        fx.main_db.set_repo_share_specs(fx.main_repo, true).unwrap();
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("dev", "docs/superpowers/specs/x.md")
+                .as_deref(),
+            Some("# x edited by owner\n")
+        );
+    }
+
+    /// A specs commit created while the policy was ON but not yet pushed stays
+    /// ours after the owner opts out: the branch is judged by the historical
+    /// SDH allow-list, not by the current send set, so the pending commit is
+    /// pushed as it is (off filters future commits only).
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_unsent_specs_commit_made_while_on_is_still_ours_after_off() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The push of the participant branch is refused: main's plumbed commit
+        // carrying a spec stays local (created, not yet sent).
+        let hook = block_pushes_to(&fx, "refs/heads/helper-dev");
+        write(&fx.main_dir, "docs/superpowers/specs/x.md", "# x\n");
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("helper-dev", "docs/superpowers/specs/x.md"),
+            None
+        );
+        fs::remove_file(&hook).unwrap();
+
+        // The owner opts out; the already-created commit is not filtered away.
+        fx.main_db
+            .set_repo_share_specs(fx.main_repo, false)
+            .unwrap();
+        fx.sync_main();
+        assert_eq!(
+            fx.remote_file("helper-dev", "docs/superpowers/specs/x.md")
+                .as_deref(),
+            Some("# x\n")
+        );
+    }
+
+    /// A missing (or empty) specs folder on either side is a successful no-op —
+    /// no "pathspec did not match" — and a first file then travels normally.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_missing_specs_folder_is_a_noop_and_new_files_then_travel() {
+        let fx = two_installs();
+        fx.make_participant();
+        // No specs folder on either side: both syncs are clean no-ops for the
+        // folder — no "pathspec did not match", no bogus commit. (The first
+        // owner sync after `make_participant` still plumbs the shared
+        // structure into the participant branch, an ordinary transport step
+        // that has nothing to do with specs, so `committed` is not asserted.)
+        let out = fx.sync_main();
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        for branch in ["dev", "helper-dev"] {
+            assert!(
+                g(&fx.origin, &["ls-tree", "-r", "--name-only", branch])
+                    .lines()
+                    .all(|l| !l.starts_with("docs/superpowers/")),
+                "{} carries specs without the folder existing",
+                branch
+            );
+        }
+        let out = fx.sync_helper();
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+
+        write(
+            &fx.helper_dir,
+            "docs/superpowers/specs/first.md",
+            "# first\n",
+        );
+        fx.sync_helper();
+        fx.sync_main();
+        assert!(fx
+            .main_dir
+            .join("docs/superpowers/specs/first.md")
+            .is_file());
     }
 
     // ----- review round: guards, classifier, throttles ------------------------------
@@ -6093,6 +10387,61 @@ mod tests {
         assert!(got.contains("T-000002"));
     }
 
+    /// T-000245: both histories held `rel` once (same bytes) and `other`
+    /// dropped it — the shape an `.ack/<key>` marker leaves after a revision
+    /// reset. `saw_deletion` merges the deletion into HEAD first (the merge
+    /// base then lacks the file) and re-creates it in the work tree; `false`
+    /// keeps the marker tracked on HEAD (this checkout never saw the reset).
+    fn plumb_recreated_file(saw_deletion: bool) -> Option<String> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        let rel = "docs/InOutBox/inbox/ms/ANNOUNCE-001_x.md.ack/helper";
+        write(d, rel, "");
+        g(d, &["add", rel]);
+        g(d, &["commit", "-q", "-m", "v1 ack"]);
+        if saw_deletion {
+            // The reset is an ancestor of HEAD: dev deleted the file before
+            // `other` branched off, so the merge base holds no copy of it.
+            g(d, &["rm", "-q", rel]);
+            g(d, &["commit", "-q", "-m", "reset"]);
+            g(d, &["checkout", "-q", "-b", "other"]);
+            g(d, &["checkout", "-q", "dev"]);
+            write(d, rel, "");
+        } else {
+            // The stale case: `other` deleted the file while this checkout
+            // still tracks the old copy — its bytes equal the merge base's.
+            g(d, &["checkout", "-q", "-b", "other"]);
+            g(d, &["rm", "-q", rel]);
+            g(d, &["commit", "-q", "-m", "reset"]);
+            g(d, &["checkout", "-q", "dev"]);
+        }
+        let spec = vec!["docs/InOutBox".to_string()];
+        plumb_into_branch(&gb(), d, "other", &spec, "me", &[]).unwrap();
+        if g(d, &["ls-tree", "--name-only", "other", "--", rel]).is_empty() {
+            None
+        } else {
+            Some(g(d, &["show", &format!("other:{}", rel)]))
+        }
+    }
+
+    #[test]
+    fn a_byte_identical_file_recreated_after_its_deletion_republishes() {
+        // The deletion is an ancestor of HEAD — the file is absent at the
+        // merge base — so identical bytes mean fresh intent, not a stale
+        // copy: without this a re-acknowledgement can never leave the install.
+        assert_eq!(plumb_recreated_file(true).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_still_tracked_copy_the_branch_deleted_stays_deleted() {
+        // Same bytes, but the file is still at the merge base: this checkout
+        // never saw the deletion — the branch's deletion wins.
+        assert_eq!(plumb_recreated_file(false), None);
+    }
+
     fn done_md(ids: &[&str]) -> String {
         let mut s = String::from("## 2026-10-20\n\n");
         for id in ids {
@@ -6332,5 +10681,823 @@ mod tests {
         assert!(!codes(&again).contains(&Code::ManagedFileFailed));
         let file = fs::read_to_string(fx.main_dir.join("docs/bug-reports.md")).unwrap();
         assert!(!file.contains("B-500002"));
+    }
+
+    // ----- T-000244: markers leave the shared branches as deletions only -----
+
+    /// A commit this app could have made itself: the sync subject, the
+    /// participant trailer and the SDH author, so a recipient branch still reads
+    /// as holding nothing but our own sync commits.
+    fn commit_as_sdh(dir: &Path, login: &str) {
+        g(dir, &["add", "-A", "."]);
+        g(
+            dir,
+            &[
+                "-c",
+                "user.name=Solo Dev Hub",
+                "-c",
+                "user.email=noreply@solodevhub.app",
+                "commit",
+                "-q",
+                "-m",
+                &format!(
+                    "chore(sdh-sync): sync shared files\n\nShared project files merged and synced by Solo Dev Hub.\n\nSDH-Participant: {}",
+                    login
+                ),
+            ],
+        );
+    }
+
+    /// The marker files a branch still tracks in the bare remote.
+    fn remote_markers(fx: &TwoInstalls, branch: &str) -> Vec<String> {
+        use std::process::Command;
+        let out = Command::new("git")
+            .args([
+                "ls-tree",
+                "-r",
+                "--name-only",
+                branch,
+                "--",
+                "docs/sdh_skills/",
+            ])
+            .current_dir(&fx.origin)
+            .output()
+            .unwrap()
+            .stdout;
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter(|l| l.ends_with(".approved") || l.ends_with(".conflict"))
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn main_delivers_a_marker_deletion_from_his_current_branch() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The owner's agent committed the marker together with the rule edit.
+        write(&fx.main_dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write(
+            &fx.main_dir,
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved in chat\n",
+        );
+        g(&fx.main_dir, &["add", "-A", "."]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "edit + marker"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        // The refresh sweep staged the deletion; nothing else is left to commit.
+        g(
+            &fx.main_dir,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "docs/sdh_skills/sdh-alpha.md.approved",
+            ],
+        );
+
+        let out = fx.sync_main();
+
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(
+            remote_markers(&fx, "dev").is_empty(),
+            "the deletion reached the bare remote"
+        );
+        assert_eq!(
+            fx.remote_file("dev", "docs/sdh_skills/sdh-alpha.md")
+                .as_deref(),
+            Some("ALPHA\n"),
+            "the rule copy still travels"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.main_dir.join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap(),
+            "approved in chat\n",
+            "the live marker is kept byte-for-byte"
+        );
+        // Nothing about the marker is left staged: the delivered deletion is
+        // not a permanent `git status` line, and the live file is now simply
+        // untracked.
+        let status = g(&fx.main_dir, &["status", "--porcelain"]);
+        assert!(
+            !status
+                .lines()
+                .any(|l| l.starts_with('D') && l.contains(".approved")),
+            "no staged marker deletion is left: {}",
+            status
+        );
+        assert!(
+            status.contains("?? docs/sdh_skills/sdh-alpha.md.approved"),
+            "{}",
+            status
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn main_never_adds_a_marker_not_even_a_modified_one() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write(
+            &fx.main_dir,
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved\n",
+        );
+        g(&fx.main_dir, &["add", "-A", "."]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "edit + marker"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        // A live marker of another rule, and the tracked one rewritten.
+        write(
+            &fx.main_dir,
+            "docs/sdh_skills/sdh-beta.md.approved",
+            "approved\n",
+        );
+        fs::write(
+            fx.main_dir.join("docs/sdh_skills/sdh-alpha.md.approved"),
+            "MODIFIED\n",
+        )
+        .unwrap();
+
+        let out = fx.sync_main();
+
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(remote_markers(&fx, "dev").is_empty(), "nothing was added");
+        assert!(
+            fx.remote_file("dev", "docs/sdh_skills/sdh-alpha.md")
+                .is_some(),
+            "the copy itself still travels"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.main_dir.join("docs/sdh_skills/sdh-alpha.md.approved")).unwrap(),
+            "MODIFIED\n",
+            "the local marker keeps its new text"
+        );
+        assert!(fx
+            .main_dir
+            .join("docs/sdh_skills/sdh-beta.md.approved")
+            .exists());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn main_plumbs_a_marker_deletion_into_a_participants_branch() {
+        let fx = two_installs();
+        fx.make_participant();
+        // The helper's branch carries a marker committed by a sync-shaped
+        // commit; the helper's own sync swept it out of its index.
+        write(&fx.helper_dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write(
+            &fx.helper_dir,
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved\n",
+        );
+        commit_as_sdh(&fx.helper_dir, "helper");
+        g(&fx.helper_dir, &["push", "-q", "origin", "helper-dev"]);
+        g(
+            &fx.helper_dir,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "docs/sdh_skills/sdh-alpha.md.approved",
+            ],
+        );
+
+        let out = fx.sync_main();
+
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(
+            remote_markers(&fx, "helper-dev").is_empty(),
+            "the plumbed deletion reached the participant's branch"
+        );
+        assert!(
+            fx.remote_file("helper-dev", "docs/sdh_skills/sdh-alpha.md")
+                .is_some(),
+            "the rule copy is not deleted with it"
+        );
+        assert_eq!(
+            fx.remote_file("dev", "docs/sdh_skills/sdh-alpha.md"),
+            None,
+            "the owner never publishes a rule copy he does not have"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn contributor_delivers_a_marker_deletion_without_any_shared_content() {
+        let fx = two_installs();
+        fx.make_participant();
+        // A contributor's checkout has no shared content at all: only the
+        // deletion can travel, and it must — a branch may not keep a marker.
+        write(
+            &fx.helper_dir,
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved\n",
+        );
+        commit_as_sdh(&fx.helper_dir, "helper");
+        g(&fx.helper_dir, &["push", "-q", "origin", "helper-dev"]);
+        g(
+            &fx.helper_dir,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "docs/sdh_skills/sdh-alpha.md.approved",
+            ],
+        );
+
+        let out = fx.sync_helper();
+
+        assert!(out.issues.is_empty(), "{:?}", out.issues);
+        assert!(remote_markers(&fx, "helper-dev").is_empty());
+        assert_eq!(
+            fx.remote_file("helper-dev", "docs/sdh_skills/sdh-alpha.md"),
+            None,
+            "a contributor still publishes no rule copies"
+        );
+        assert!(
+            fx.helper_dir
+                .join("docs/sdh_skills/sdh-alpha.md.approved")
+                .exists(),
+            "the local marker survives the delivery"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn pending_helper_plumbs_a_marker_deletion_out_of_mains_dev() {
+        let fx = two_installs();
+        fx.enable_main();
+        // The owner's agent committed a marker into dev before the helper joined.
+        write(&fx.main_dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write(
+            &fx.main_dir,
+            "docs/sdh_skills/sdh-alpha.md.conflict",
+            "# Hand-back not taken: conflict\n",
+        );
+        g(&fx.main_dir, &["add", "-A", "."]);
+        g(
+            &fx.main_dir,
+            &["commit", "-q", "-m", "reason file committed"],
+        );
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+
+        let out = fx.sync_helper();
+
+        // A pending helper always reports its pending status; that is the only
+        // issue of this pass.
+        assert_eq!(
+            codes(&out),
+            vec![Code::SharedPendingApproval],
+            "{:?}",
+            out.issues
+        );
+        assert!(
+            remote_markers(&fx, "dev").is_empty(),
+            "the pending helper's sync removed the marker from dev"
+        );
+        assert!(
+            fx.remote_file("dev", "docs/sdh_skills/sdh-alpha.md")
+                .is_some(),
+            "the copy stays"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_marker_deletion_keeps_the_sync_commit_shape_of_the_branch() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.main_dir, "docs/sdh_skills/sdh-alpha.md", "ALPHA\n");
+        write(
+            &fx.main_dir,
+            "docs/sdh_skills/sdh-alpha.md.approved",
+            "approved\n",
+        );
+        g(&fx.main_dir, &["add", "-A", "."]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "edit + marker"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        g(
+            &fx.main_dir,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "docs/sdh_skills/sdh-alpha.md.approved",
+            ],
+        );
+        fx.sync_main();
+
+        // The deletion commit has the sync subject, the SDH author and the
+        // participant trailer, and touches shared paths only — so the guard
+        // that keeps a recipient branch pushable still accepts the branch.
+        let shown = g(
+            &fx.main_dir,
+            &["show", "-s", "--format=%an%n%ae%n%s", "HEAD"],
+        );
+        assert!(shown.contains("Solo Dev Hub"), "{}", shown);
+        assert!(
+            shown.contains("chore(sdh-sync): sync shared files"),
+            "{}",
+            shown
+        );
+        assert!(
+            g(&fx.main_dir, &["show", "-s", "--format=%b", "HEAD"])
+                .contains("SDH-Participant: Owner"),
+            "the participant trailer is in the body"
+        );
+        assert!(
+            g(
+                &fx.main_dir,
+                &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]
+            )
+            .lines()
+            .all(|f| f.starts_with("docs/sdh_skills/") || f.starts_with(APP_VERSIONS_REL_DIR)),
+            "the commit touches shared paths only"
+        );
+        // And the next sync is a no-op that pushes nothing new.
+        let before = fx.remote_rev("dev").unwrap();
+        let again = fx.sync_main();
+        assert!(again.issues.is_empty(), "{:?}", again.issues);
+        assert_eq!(fx.remote_rev("dev").unwrap(), before);
+    }
+
+    // ----- T-000241: the rule-proposal channel -------------------------------
+
+    /// A rule both installs know — proposal validation refuses unknown
+    /// `sdh-*` names.
+    fn seed_rule(db: &AppDb) {
+        db.upsert_template_file("_global", "skill.sdh-alpha.md.tmpl", "CANON", false)
+            .unwrap();
+    }
+
+    /// The contributor's atomic create+apply — what `propose_up` commits.
+    fn propose(fx: &TwoInstalls, text: &str) {
+        fx.helper_db
+            .create_rule_proposal_txn(
+                fx.helper_repo,
+                "sdh-alpha.helper.json",
+                "helper",
+                "sdh-alpha",
+                text,
+                "2026-11-08T00:00:00Z",
+                None,
+                "Owner",
+            )
+            .unwrap();
+    }
+
+    fn proposal_dev_sha(dir: &Path) -> String {
+        git_sync::blob_sha_at(
+            &gb(),
+            dir,
+            "refs/heads/dev",
+            ".sdh/rule-proposals/sdh-alpha.helper.json",
+        )
+        .unwrap()
+        .expect("the proposal file is on dev")
+    }
+
+    fn dev_text(dir: &Path, path: &str) -> Option<String> {
+        git_sync::show_file(&gb(), dir, "refs/heads/dev", path)
+            .unwrap()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    fn receipt_path(rev: &str) -> String {
+        format!(".sdh/rule-decisions/sdh-alpha.helper.{}.json", rev)
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_contributor_proposal_reaches_dev_and_the_owner_lists_it() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        // The upload rode the dev branch to origin.
+        let remote = fx
+            .remote_file("dev", ".sdh/rule-proposals/sdh-alpha.helper.json")
+            .expect("the proposal reached origin/dev");
+        let wire: crate::models::RuleProposalFile = serde_json::from_str(&remote).unwrap();
+        assert_eq!(wire.status, "open");
+        assert_eq!(wire.text, "PROPOSED");
+        assert_eq!(wire.seq, 1);
+        fx.sync_main();
+        // The owner records the open version once.
+        assert!(fx
+            .main_db
+            .list_rule_events("sdh-alpha")
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == crate::db::rule_event::PROPOSED));
+        // The owner-side list reads it off the local dev tip with its CAS.
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        let list =
+            crate::commands::rule_proposals::list_owner_proposals(&fx.main_db, Some(&gb()), &repo)
+                .unwrap();
+        let p = list
+            .iter()
+            .find(|v| v.file_name == "sdh-alpha.helper.json")
+            .expect("listed");
+        assert_eq!(p.status, "open");
+        assert_eq!(
+            p.rev.as_deref(),
+            Some(proposal_dev_sha(&fx.main_dir).as_str())
+        );
+        assert!(p.resolved_action.is_none());
+        // The contributor's list flags the version as on dev AND origin.
+        let repo = fx.helper_db.get_repository(fx.helper_repo).unwrap();
+        let list = crate::commands::rule_proposals::list_contributor_proposals(
+            &fx.helper_db,
+            Some(&gb()),
+            &repo,
+        )
+        .unwrap();
+        let p = &list[0];
+        assert!(p.on_dev, "{:?}", p);
+        assert!(p.on_origin, "{:?}", p);
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_accepted_proposal_applies_the_canon_and_the_receipt_reaches_the_contributor() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        let a = crate::commands::rule_proposals::decide(
+            &fx.main_db,
+            fx.main_repo,
+            "sdh-alpha",
+            "helper",
+            &rev,
+            "accept",
+        )
+        .unwrap();
+        assert_eq!(a.status, "rendered", "{:?}", a);
+        // Canon applied from the immutable snapshot, receipt on dev.
+        assert_eq!(
+            fx.main_db
+                .get_template_file("_global", "skill.sdh-alpha.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            "PROPOSED"
+        );
+        let receipt = dev_text(&fx.main_dir, &receipt_path(&rev)).expect("receipt on dev");
+        let d: crate::models::RuleDecisionFile = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(d.action, "accept");
+        assert_eq!(d.decided_rev, rev);
+        // Publish + fetch: pub_state confirms from origin — the pass that
+        // pushed read origin BEFORE its own push, so the confirmation lands
+        // on the next look at `refs/remotes/origin/dev` (the sweep reads the
+        // same remote-tracking ref the push just updated).
+        fx.sync_main();
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        sweep_rule_publications(&fx.main_db, &gb(), &repo, &fx.main_dir, "dev");
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.pub_state, "published", "{:?}", a);
+        fx.sync_helper();
+        let p = fx
+            .helper_db
+            .get_rule_proposal(fx.helper_repo, "sdh-alpha.helper.json")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.resolved_action.as_deref(), Some("accept"));
+        assert_eq!(p.resolved_by.as_deref(), Some("owner"));
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_prepared_row_resumes_decided_when_the_receipt_is_already_there() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        // Crash-sim: the receipt reached dev but the row still says
+        // `prepared` — the resume must find the identical receipt and
+        // continue at `decided`, never re-commit it.
+        let receipt = serde_json::to_string(&crate::models::RuleDecisionFile {
+            format: 1,
+            action: "accept".into(),
+            login: "helper".into(),
+            rule: "sdh-alpha".into(),
+            decided_by: "owner".into(),
+            decided_at: "2026-11-08T00:00:00Z".into(),
+            decided_rev: rev.clone(),
+            seq: 1,
+        })
+        .unwrap();
+        write(&fx.main_dir, &receipt_path(&rev), &receipt);
+        g(&fx.main_dir, &["add", ".sdh/rule-decisions"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "receipt"]);
+        fx.main_db
+            .insert_rule_acceptance(&crate::models::RuleAcceptance {
+                repo_id: fx.main_repo,
+                rule: "sdh-alpha".into(),
+                proposer_login: "helper".into(),
+                decided_rev: rev.clone(),
+                action: "accept".into(),
+                receipt_json: receipt.clone(),
+                proposal_text: "PROPOSED".into(),
+                status: "prepared".into(),
+                pub_state: "pending".into(),
+                base_canon_hash: rp::sha256_hex(b"CANON"),
+                canon_hash: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+        let (resumed, issues) = crate::commands::rule_proposals::sweep_acceptances(
+            &fx.main_db,
+            &gb(),
+            &fx.main_dir,
+            fx.main_repo,
+            "dev",
+            None,
+        );
+        assert!(issues.is_empty(), "{:?}", issues);
+        assert_eq!(resumed, 1);
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        // Identical receipt → decided → canon applied → rendered, all in
+        // one resume.
+        assert_eq!(a.status, "rendered", "{:?}", a);
+        assert_eq!(
+            fx.main_db
+                .get_template_file("_global", "skill.sdh-alpha.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            "PROPOSED"
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_prepared_row_expires_only_when_no_receipt_exists() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        // The proposal moved past the rev this row decided on — with no
+        // receipt at its path, `prepared` expires and stays out of the
+        // publication queue forever.
+        let stale = "0".repeat(40);
+        let receipt = serde_json::to_string(&crate::models::RuleDecisionFile {
+            format: 1,
+            action: "accept".into(),
+            login: "helper".into(),
+            rule: "sdh-alpha".into(),
+            decided_by: "owner".into(),
+            decided_at: "2026-11-08T00:00:00Z".into(),
+            decided_rev: stale.clone(),
+            seq: 1,
+        })
+        .unwrap();
+        fx.main_db
+            .insert_rule_acceptance(&crate::models::RuleAcceptance {
+                repo_id: fx.main_repo,
+                rule: "sdh-alpha".into(),
+                proposer_login: "helper".into(),
+                decided_rev: stale.clone(),
+                action: "accept".into(),
+                receipt_json: receipt,
+                proposal_text: "PROPOSED".into(),
+                status: "prepared".into(),
+                pub_state: "pending".into(),
+                base_canon_hash: "x".into(),
+                canon_hash: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        let out = crate::commands::rule_proposals::sweep_repo_rule_channel(
+            &fx.main_db,
+            Some(&gb()),
+            fx.main_repo,
+            None,
+        );
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &stale)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.status, "expired", "{:?} {:?}", a, out.issues);
+        assert!(fx
+            .main_db
+            .list_publishable_rule_acceptances()
+            .unwrap()
+            .iter()
+            .all(|x| x.decided_rev != stale));
+        let _ = repo;
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_receipt_erased_by_a_divergence_reset_is_republished_from_the_row() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        crate::commands::rule_proposals::decide(
+            &fx.main_db,
+            fx.main_repo,
+            "sdh-alpha",
+            "helper",
+            &rev,
+            "accept",
+        )
+        .unwrap();
+        // The receipt was committed but lost to a reset — the file is gone
+        // from dev while the row says decided+pending.
+        let rel = receipt_path(&rev);
+        g(&fx.main_dir, &["rm", "-q", &rel]);
+        g(
+            &fx.main_dir,
+            &["commit", "-q", "-m", "reset the receipt away"],
+        );
+        assert!(dev_text(&fx.main_dir, &rel).is_none());
+        // The publication sweep recreates the commit from `receipt_json`
+        // without rolling the row back.
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        let issues = sweep_rule_publications(&fx.main_db, &gb(), &repo, &fx.main_dir, "dev");
+        assert!(issues.is_empty(), "{:?}", issues);
+        assert!(dev_text(&fx.main_dir, &rel).is_some());
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.status, "rendered");
+        assert_eq!(a.pub_state, "pending");
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_permanent_push_refusal_marks_the_receipt_blocked() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        crate::commands::rule_proposals::decide(
+            &fx.main_db,
+            fx.main_repo,
+            "sdh-alpha",
+            "helper",
+            &rev,
+            "accept",
+        )
+        .unwrap();
+        // A permanent refusal on refs/heads/dev — the protected-branch
+        // shape — marks every pending receipt of this repo `blocked`.
+        let hook = fx.origin.join("hooks/update");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nif [ \"$1\" = \"refs/heads/dev\" ]; then\n  echo \"error: GH006: Protected branch update failed for $1\" >&2\n  exit 1\nfi\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fx.sync_main();
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.pub_state, "blocked", "{:?}", a);
+        // The queue keeps it — `blocked` is retryable, not terminal.
+        assert!(fx
+            .main_db
+            .list_publishable_rule_acceptances()
+            .unwrap()
+            .iter()
+            .any(|x| x.decided_rev == rev));
+        // The refusal lifted: the next push carries dev, the next sync's
+        // origin check settles `published`.
+        fs::remove_file(&hook).unwrap();
+        fx.sync_main();
+        fx.sync_main();
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.pub_state, "published", "{:?}", a);
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn disable_removes_the_catalogs_from_dev_and_cleans_the_tables() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        crate::commands::rule_proposals::decide(
+            &fx.main_db,
+            fx.main_repo,
+            "sdh-alpha",
+            "helper",
+            &rev,
+            "accept",
+        )
+        .unwrap();
+        fx.sync_main();
+        assert!(dev_text(&fx.main_dir, &receipt_path(&rev)).is_some());
+        assert!(!fx
+            .main_db
+            .list_rule_acceptances(fx.main_repo)
+            .unwrap()
+            .is_empty());
+        disable_shared_mode(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        // Both catalogs left dev with the rest of `.sdh/`…
+        assert_eq!(fx.remote_file("dev", &receipt_path(&rev)), None);
+        assert_eq!(
+            fx.remote_file("dev", ".sdh/rule-proposals/sdh-alpha.helper.json"),
+            None
+        );
+        // …and the local state died with the share.
+        assert!(fx
+            .main_db
+            .list_rule_acceptances(fx.main_repo)
+            .unwrap()
+            .is_empty());
+        assert!(fx
+            .main_db
+            .list_rule_proposals(fx.main_repo)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_withdrawn_proposal_uploads_and_the_owner_sees_the_terminal_state() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        // The contributor withdraws — its own file, a terminal version at
+        // the SAME seq.
+        fx.helper_db
+            .set_rule_proposal_status(fx.helper_repo, "sdh-alpha.helper.json", "withdrawn")
+            .unwrap();
+        fx.sync_helper();
+        let remote = fx
+            .remote_file("dev", ".sdh/rule-proposals/sdh-alpha.helper.json")
+            .expect("the withdrawn version reached origin/dev");
+        let wire: crate::models::RuleProposalFile = serde_json::from_str(&remote).unwrap();
+        assert_eq!(wire.status, "withdrawn");
+        assert_eq!(wire.seq, 1);
+        fx.sync_main();
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        let list =
+            crate::commands::rule_proposals::list_owner_proposals(&fx.main_db, Some(&gb()), &repo)
+                .unwrap();
+        let p = list
+            .iter()
+            .find(|v| v.file_name == "sdh-alpha.helper.json")
+            .expect("listed");
+        assert_eq!(p.status, "withdrawn");
     }
 }

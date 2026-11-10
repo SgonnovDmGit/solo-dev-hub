@@ -45,6 +45,30 @@ pub fn set_shared_admin_verified(
     crate::sync::shared_structure::record_admin_verification(&db, &repo_full_name, &login, admin)
 }
 
+/// T-000243: the owner's per-repo `docs/superpowers/` switch (the checkbox
+/// next to the shared-mode switch). The backend re-checks the authority — a
+/// known GitHub login and owner / verified-administrator rights for the repo,
+/// the same trust rule as enabling sharing — so a contributor, a pending
+/// helper or an unknown login is refused, also through a direct IPC call.
+/// Settable before sharing is enabled; the next sync publishes the flag in
+/// `.sdh/project.json`, re-renders `.gitignore` and narrows the pathspecs.
+///
+/// T-000243 review (second pass): `(async)` like the neighbours. The setter
+/// waits on the per-repo policy guard, which phase B holds across its commit
+/// and push (network, up to the git timeouts) — as a plain synchronous
+/// command that wait ran on the Tauri main/UI thread and froze the window for
+/// as long as the sync was in flight. `(async)` runs the body on the async
+/// runtime's worker thread, so only this call waits; the UI stays responsive
+/// (the TS `invoke` was already async, nothing changes for the frontend).
+#[tauri::command(async)]
+pub fn set_repo_share_specs(
+    db: State<AppDb>,
+    repo_id: i64,
+    share_specs: bool,
+) -> Result<Option<String>, String> {
+    shared::set_repo_share_specs(&db, repo_id, share_specs)
+}
+
 /// Switch shared mode off; the deletion of `.sdh/` is committed and pushed now.
 #[tauri::command(async)]
 pub fn disable_shared_mode(db: State<AppDb>, repo_id: i64) -> Result<SharedDisableResult, String> {
@@ -62,7 +86,9 @@ pub fn approve_join_request(
 }
 
 /// Contributor: trust the owner's changed dev branch.
-#[tauri::command]
+/// Async: it waits on the per-repo policy guard, which phase B holds across
+/// git/network work — a sync command would freeze the UI thread.
+#[tauri::command(async)]
 pub fn accept_new_main_branch(db: State<AppDb>, repo_id: i64) -> Result<(), String> {
     shared::accept_new_main_branch(&db, repo_id)
 }

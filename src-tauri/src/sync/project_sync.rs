@@ -223,6 +223,7 @@ fn write_repo_skeletons(
     tpl: &SkeletonTemplates,
     quiet_conflicts: &[String],
     shared: &sync::shared::SharedSync,
+    git: Option<&crate::git_ops::GitBinary>,
     c: &mut SyncCounters,
 ) {
     let role = repo.role.as_deref();
@@ -237,7 +238,11 @@ fn write_repo_skeletons(
         c.push(file_issue("docs/project.md", e));
     }
     // F-000044: the shared-repo block (owner, branch, this install's band).
-    let shared_block = sync::shared_block_for(db, repo, shared.structure_of(repo.id));
+    let shared_structure = shared.structure_of(repo.id);
+    // The SharedSync itself, kept reachable under its own name — `shared`
+    // below is shadowed by the shared-or-not bool.
+    let shared_sync = shared;
+    let shared_block = sync::shared_block_for(db, repo, shared_structure);
     if let Err(e) = sync::update_claude_md_section(
         db,
         Some(md_project_id),
@@ -247,35 +252,368 @@ fn write_repo_skeletons(
     ) {
         c.push(file_issue("CLAUDE.md", e));
     }
-    // Runs only after `refresh_rules` collected across the portfolio (see
-    // `run_project_sync_in`); a copy still flagged after that is held, not written.
-    // After an uptake the refresh has already rendered and reported this repo;
-    // `push` keeps each held copy to one line. T-000206: copies of a conflict
-    // already reported by an earlier pass stay quiet here too.
-    // Р16: not in a repo where this install is a contributor or a pending
-    // helper -- the owner's copies are the ones git carries there.
-    if !sync::skips_rule_copies(db, repo.id) {
-        match sync::render_skills_to_repo(db, base) {
-            Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
-            Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
-        }
-    }
     // F-000044: a shared repo (any role) renders the blocks without the shared
     // paths; the same text for the owner and for contributors, so it never churns.
-    let shared = sync::shared::is_shared_repo(db, repo.id);
-    let gitignore = sync::shared::gitignore_template_for(&tpl.gitignore, shared);
-    let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
-    if let Err(e) = sync::sync_gitignore_section(&gitignore, base) {
-        c.push(file_issue(".gitignore", e));
+    // T-000243: the render drops `docs/superpowers/` only while the effective
+    // policy shares it; opted out, the managed render keeps ignoring the folder.
+    // T-000243 review (second pass): the guard spans the policy read AND the
+    // `.gitignore` WRITE below — binding it inside the `else` let it drop
+    // before the write, so an old-ON render could land after an OFF save or
+    // overwrite a newer OFF render.
+    // The structure state comes from phase A's discovery as a TRI-STATE: a
+    // REFUSED structure (malformed / untrusted authoritative copy) skips the
+    // render with an issue instead of re-reading the work tree, whose stale
+    // policy is exactly what the refusal rejected. T-000243 review (third
+    // pass): a shared repo with NO pass in this SharedSync (phase A is
+    // project-scoped — the server repo of a connected microservice belongs to
+    // another project) is discovered HERE, under the render guard, the same
+    // authoritative way phase A would have; the work-tree file alone may be a
+    // stale copy whose policy the fetched origin ref has replaced or refused.
+    // T-000243 review (fifteenth pass): the guard is taken for EVERY repo,
+    // before the membership read — `is_shared_repo` is lifecycle state a
+    // disable / enable / repath moves under the same guard, so reading it
+    // first let a stale render keep `shared = true` after the repo left
+    // shared mode and write the shared-mode blocks anyway. The fresh
+    // membership decision and BOTH managed-block writes (.gitignore AND
+    // .gitattributes) stay inside the one hold.
+    let policy_guard = sync::shared::specs_policy_guard(repo.id);
+    let _policy = policy_guard.lock().unwrap();
+    // T-000243 review (sixteenth pass): the binding itself is lifecycle
+    // state — re-read it under the guard. A repath that landed since the
+    // caller captured `repo`/`base` makes every managed-block write below
+    // target a detached checkout, so a stale binding skips them all.
+    let binding_fresh = db
+        .get_repository(repo.id)
+        .map(|r| r.local_path == repo.local_path)
+        .unwrap_or(false);
+    let shared = binding_fresh && sync::shared::is_shared_repo(db, repo.id);
+    let gitignore = if !binding_fresh {
+        None
+    } else if !shared {
+        Some(sync::shared::gitignore_template_for(
+            &tpl.gitignore,
+            false,
+            true,
+        ))
+    } else {
+        match shared_sync.render_state_of(db, git, repo) {
+            // Accepted by phase A (or the just-run discovery), or no structure
+            // anywhere (the legacy default; `None` re-reads the work tree the
+            // same validated way).
+            Ok(state) => match sync::shared::effective_share_specs(db, repo, state.as_ref()) {
+                Ok(share_specs) => Some(sync::shared::gitignore_template_for(
+                    &tpl.gitignore,
+                    true,
+                    share_specs,
+                )),
+                Err(e) => {
+                    c.push(file_issue(".gitignore", e));
+                    None
+                }
+            },
+            // Refused: no `.gitignore` is written for this repo this pass.
+            Err(reason) => {
+                c.push(file_issue(".gitignore", reason));
+                None
+            }
+        }
+    };
+    if let Some(gitignore) = gitignore {
+        if let Err(e) = sync::sync_gitignore_section(&gitignore, base) {
+            c.push(file_issue(".gitignore", e));
+        }
     }
-    if let Err(e) = sync::sync_gitattributes_section(&gitattributes, base) {
-        c.push(file_issue(".gitattributes", e));
+    if shared {
+        // Test rendezvous: fires while the guard is still held, right after
+        // the write (see `render_write_probe`).
+        #[cfg(test)]
+        sync::shared::render_write_probe(repo.id, base);
     }
+    if binding_fresh {
+        // T-000243 review (seventeenth pass): the skill-copy render moved
+        // inside this hold — `skips_rule_copies` is lifecycle state, and an
+        // unguarded render could overwrite owner copies a concurrent shared
+        // sync had just fast-forwarded in. `refresh_rules` stays outside:
+        // it holds `rules_guard`, which must never nest inside this one.
+        // A copy still flagged after the portfolio collection is held, not
+        // written; after an uptake the refresh already rendered and
+        // reported this repo, so `push` keeps each held copy to one line.
+        // Р16: not in a repo where this install is a contributor or a
+        // pending helper -- the owner's copies are the ones git carries.
+        if !sync::skips_rule_copies(db, repo.id) {
+            match sync::render_skills_to_repo(db, base) {
+                Ok(r) => c.extend(r.held_issues(&sync::rule_copy_label(repo), quiet_conflicts)),
+                Err(e) => c.push(file_issue("docs/sdh_skills/", e)),
+            }
+        }
+        let gitattributes = sync::shared::gitattributes_template_for(&tpl.gitattributes, shared);
+        if let Err(e) = sync::sync_gitattributes_section(&gitattributes, base) {
+            c.push(file_issue(".gitattributes", e));
+        }
+    }
+    drop(_policy);
+    drop(policy_guard);
     if let Err(e) = sync::copy_doc_skeleton_if_missing(&tpl.todo, base, "todo.md") {
         c.push(file_issue("docs/todo.md", e));
     }
     if let Err(e) = sync::copy_doc_skeleton_if_missing(&tpl.bug_reports, base, "bug-reports.md") {
         c.push(file_issue("docs/bug-reports.md", e));
+    }
+}
+
+/// T-000190: replay `renamed`'s repo renames on this side's InOutBox parents —
+/// `outbox/<peer>/`, `inbox/<peer>/` and `pact/<peer>/` are all keyed by the
+/// counterparty's canonical name, exactly like the legacy folders were.
+/// Registry files are agent-owned and never moved here.
+fn replay_inoutbox_renames(db: &AppDb, base: &Path, renamed: &Repository, c: &mut SyncCounters) {
+    let Ok(renames) = db.list_renames_for_repo(renamed.id) else {
+        return; // a failed lookup keeps the dirs as they are — never a guess
+    };
+    let root = base.join("docs").join("InOutBox");
+    for lane in ["outbox", "inbox", "pact"] {
+        let parent = root.join(lane);
+        for r in &renames {
+            match sync::replay_rename_in_dir(&parent, &r.old_canonical, &r.new_canonical) {
+                Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
+                Ok(sync::RenameOutcome::NoOp) => {}
+                Ok(sync::RenameOutcome::Collision) => {
+                    c.push(rename_collision(
+                        &r.old_canonical,
+                        &r.new_canonical,
+                        &parent,
+                    ));
+                    // The new-named lane dir is live and never empties, so
+                    // the collision would never resolve itself — merge the
+                    // old dir's files into the live dir for the same peer.
+                    let mut w = Vec::new();
+                    match sync::merge_channel_dir(
+                        &parent.join(&r.old_canonical),
+                        &parent.join(&r.new_canonical),
+                        &mut w,
+                    ) {
+                        Ok(n) => c.migrated += n,
+                        Err(e) => {
+                            c.push(migration_issue(&r.old_canonical, e));
+                        }
+                    }
+                    c.extend(w);
+                }
+                Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
+            }
+        }
+    }
+}
+
+/// Fold a unified channel pass into the project counters — the same mapping
+/// `run_peer_channels` already uses (prunes and teardowns are structural).
+fn fold_channel(o: sync::PeerChannelOutcome, c: &mut SyncCounters) {
+    c.copied += o.copied;
+    c.migrated += o.pruned;
+    c.auto_closed.extend(o.closed);
+    c.extend(o.errors);
+}
+
+/// The pre-T-000190 REQ copy on the legacy role-named dirs — the fallback a
+/// rolled-back pair migration leaves running for one more pass. Same contract
+/// as before: `.impl.md` auto-close, REQ bodies sender→recipient, responses back.
+fn sync_req_pair_legacy(
+    sender_dir: &Path,
+    recipient_dir: &Path,
+    sender_label: &str,
+    recipient_label: &str,
+    c: &mut SyncCounters,
+) {
+    match sync::auto_close_impl_pairs(sender_dir, recipient_dir) {
+        Ok(closed) => c.auto_closed.extend(closed),
+        Err(e) => c.push(auto_close_failed(sender_label, e)),
+    }
+    for req_file in sync::scan_requirements(sender_dir) {
+        let src = sender_dir.join(&req_file);
+        let dst = recipient_dir.join(&req_file);
+        match sync::copy_file_if_changed(&src, &dst) {
+            Ok(true) => c.copied += 1,
+            Ok(false) => {}
+            Err(e) => c.push(copy_failed(&req_file, recipient_label, e)),
+        }
+    }
+    for resp_file in sync::scan_responses(recipient_dir) {
+        let src = recipient_dir.join(&resp_file);
+        let dst = sender_dir.join(&resp_file);
+        match sync::copy_file_if_changed(&src, &dst) {
+            Ok(true) => c.responses += 1,
+            Ok(false) => {}
+            Err(e) => c.push(copy_failed(&resp_file, sender_label, e)),
+        }
+    }
+}
+
+/// Forward-slash repo-relative path for git calls (`git log -- <path>`).
+fn fwd_rel(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Names of legacy announcement files whose new-layout body was already
+/// delivered and then cleaned: re-creating the body from the leftover
+/// projection would resurrect an acknowledged announcement, so these names
+/// are barred from re-migration — the projection retire pass owns them.
+fn closed_announce_names(
+    git: &crate::git_ops::GitBinary,
+    root: &Path,
+    legacy_dir: &Path,
+    new_inbox: &Path,
+) -> std::collections::BTreeSet<String> {
+    let mut closed = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(legacy_dir) else {
+        return closed;
+    };
+    for e in entries.filter_map(|e| e.ok()) {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !(name.starts_with("ANNOUNCE-") && name.ends_with(".md")) {
+            continue;
+        }
+        if new_inbox.join(&name).exists() {
+            continue; // a live body means the pair is still open
+        }
+        let rel = fwd_rel(root, &new_inbox.join(&name));
+        if matches!(crate::git_ops::path_in_history(git, root, &rel), Ok(true)) {
+            closed.insert(name);
+        }
+    }
+    closed
+}
+
+/// The transition dual-write (T-000245, `ANNOUNCE_LEGACY_DUAL_WRITE`): every
+/// ANNOUNCE body in a shared recipient's `inbox/<sender>/` also gets a
+/// byte-identical file at the legacy role-named path — written ONCE per
+/// publication. If the file is absent but git ever carried it, an old-style
+/// delete-ack already happened and it must not be revived; an existing file
+/// is the old agent's to delete and is never rewritten. Symmetrically, a
+/// legacy file whose new-layout body was delivered and then cleaned retires
+/// with it, while a file whose new body never existed is pre-migration
+/// residue and stays.
+fn deliver_announce_projections(
+    git: &crate::git_ops::GitBinary,
+    recipient_base: &Path,
+    legacy_dir: &Path,
+    new_inbox: &Path,
+    c: &mut SyncCounters,
+) {
+    if !sync::ANNOUNCE_LEGACY_DUAL_WRITE {
+        return;
+    }
+    for body in sync::announce_bodies(new_inbox) {
+        let legacy = legacy_dir.join(&body);
+        if legacy.exists() {
+            continue;
+        }
+        let rel = fwd_rel(recipient_base, &legacy);
+        match crate::git_ops::path_in_history(git, recipient_base, &rel) {
+            Ok(true) => {} // delivered and delete-acked before — never revive
+            Ok(false) => match std::fs::read(new_inbox.join(&body)) {
+                Ok(bytes) => {
+                    if let Some(p) = legacy.parent() {
+                        if let Err(e) = std::fs::create_dir_all(p) {
+                            c.push(migration_issue(&p.display().to_string(), e));
+                            continue;
+                        }
+                    }
+                    match std::fs::write(&legacy, &bytes) {
+                        Ok(()) => c.copied += 1,
+                        Err(e) => c.push(migration_issue(&legacy.display().to_string(), e)),
+                    }
+                }
+                Err(e) => c.push(migration_issue(&body, e)),
+            },
+            Err(e) => c.push(migration_issue(&rel, e)),
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(legacy_dir) else {
+        return;
+    };
+    for e in entries.filter_map(|e| e.ok()) {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !(name.starts_with("ANNOUNCE-") && name.ends_with(".md")) {
+            continue;
+        }
+        if new_inbox.join(&name).exists() {
+            continue; // live pair — the projection stays for old agents
+        }
+        let rel = fwd_rel(recipient_base, &new_inbox.join(&name));
+        match crate::git_ops::path_in_history(git, recipient_base, &rel) {
+            // The new body existed and is gone — the pair closed; retire the
+            // projection so no stale copy lingers for a fresh checkout.
+            Ok(true) => match std::fs::remove_file(legacy_dir.join(&name)) {
+                Ok(()) => c.migrated += 1,
+                Err(e) => c.push(migration_issue(&name, e)),
+            },
+            Ok(false) => {} // never delivered on the new layout — residue stays
+            Err(e) => c.push(migration_issue(&name, e)),
+        }
+    }
+}
+
+/// T-000245: migrate the recipient-side legacy announcement folder of one
+/// vertical pair (server→client `server-announcements/<server>/`, ms→parent
+/// `microservice-announcements/<ms-project>/`) onto the pairwise layout —
+/// each body lands in the recipient's `inbox/<sender>/` replica AND the
+/// sender's `outbox/<recipient>/` master — then honour the transition
+/// dual-write for a shared recipient.
+fn sync_announce_channel(
+    db: &AppDb,
+    git: Option<&crate::git_ops::GitBinary>,
+    sender_base: &Path,
+    sender: &Repository,
+    recipient_base: &Path,
+    recipient: &Repository,
+    legacy_dir: &Path,
+    c: &mut SyncCounters,
+) {
+    let sender_name = sender.canonical_folder_name();
+    let recipient_name = recipient.canonical_folder_name();
+    let new_inbox = sync::inbox_dir(recipient_base, &sender_name);
+    let new_outbox = sync::outbox_dir(sender_base, &recipient_name);
+    let shared_recipient = db
+        .get_shared_state(recipient.id)
+        .map(|s| s.shared_mode)
+        .unwrap_or(false);
+    if shared_recipient && git.is_none() {
+        // The delivery/ack fact store for a shared repo IS its git history;
+        // without it an unclear state must not bootstrap blindly.
+        c.push(
+            SyncIssue::new(
+                Code::MigrationFailed,
+                format!("announcements → {}", recipient.display_name()),
+            )
+            .detail("shared announce migration needs git history"),
+        );
+        return;
+    }
+    let closed = match (shared_recipient, git) {
+        (true, Some(g)) => closed_announce_names(g, recipient_base, legacy_dir, &new_inbox),
+        _ => Default::default(),
+    };
+    let mut warnings = Vec::new();
+    match sync::migrate_announce_dir(
+        legacy_dir,
+        &new_inbox,
+        &new_outbox,
+        shared_recipient,
+        &closed,
+        &mut warnings,
+    ) {
+        Ok(n) => c.migrated += n,
+        Err(e) => c.push(migration_issue(&legacy_dir.display().to_string(), e)),
+    }
+    c.extend(warnings);
+    if let (true, Some(g)) = (shared_recipient, git) {
+        deliver_announce_projections(g, recipient_base, legacy_dir, &new_inbox, c);
     }
 }
 
@@ -286,6 +624,7 @@ fn sync_client_to_server(
     srv: &Repository,
     srv_base: &Path,
     clients: &[&Repository],
+    git: Option<&crate::git_ops::GitBinary>,
     c: &mut SyncCounters,
 ) {
     let srv_name = srv.display_name();
@@ -303,6 +642,10 @@ fn sync_client_to_server(
             let client_name = client.canonical_folder_name();
             let client_requirements_parent = srv_base.join("docs").join("client-requirements");
             // F-033 Stage 1e: replay client renames on server side before sync.
+            // T-000190: a COLLISION leaves the old-named dir in place — its
+            // files still belong to this pair, so it joins the migration as
+            // an extra side instead of waiting for the blocking dir to retire.
+            let mut req_collided: Vec<PathBuf> = Vec::new();
             match db.list_renames_for_repo(client.id) {
                 Ok(renames) => {
                     for r in renames {
@@ -313,11 +656,15 @@ fn sync_client_to_server(
                         ) {
                             Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                             Ok(sync::RenameOutcome::NoOp) => {}
-                            Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                                &r.old_canonical,
-                                &r.new_canonical,
-                                &client_requirements_parent,
-                            )),
+                            Ok(sync::RenameOutcome::Collision) => {
+                                req_collided
+                                    .push(client_requirements_parent.join(&r.old_canonical));
+                                c.push(rename_collision(
+                                    &r.old_canonical,
+                                    &r.new_canonical,
+                                    &client_requirements_parent,
+                                ));
+                            }
                             Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                         }
                     }
@@ -326,34 +673,83 @@ fn sync_client_to_server(
             }
             let srv_client_dir = client_requirements_parent.join(&client_name);
 
-            // F-000039: auto-close pairs the client (sender) acknowledged via .impl.md.
-            match sync::auto_close_impl_pairs(&client_req_dir, &srv_client_dir) {
-                Ok(closed) => c.auto_closed.extend(closed),
-                Err(e) => c.push(auto_close_failed(&client_label, e)),
-            }
+            // T-000190: replay renames on the InOutBox lanes too — the peer-named
+            // dirs under outbox/, inbox/ and pact/ follow the counterparty's
+            // canonical name exactly like the legacy folder did.
+            replay_inoutbox_renames(db, client_base, srv, c);
+            replay_inoutbox_renames(db, srv_base, client, c);
 
-            // Copy REQ-*.md from client (source of truth) to server.
-            // Overwrite on change so sender edits propagate to the recipient.
-            for req_file in sync::scan_requirements(&client_req_dir) {
-                let src = client_req_dir.join(&req_file);
-                let dst = srv_client_dir.join(&req_file);
-                match sync::copy_file_if_changed(&src, &dst) {
-                    Ok(true) => c.copied += 1,
-                    Ok(false) => {}
-                    Err(e) => c.push(copy_failed(&req_file, &srv_name, e)),
+            // T-000190: move the pair's legacy dirs onto the InOutBox layout —
+            // sender backend-requirements -> outbox/<server>, recipient
+            // client-requirements/<client> -> inbox/<client> — then run the
+            // unified kind-aware pass for this pair in both directions. A
+            // rolled-back migration leaves the legacy pair working one more
+            // pass (channel never runs half old, half new).
+            let srv_canonical = srv.canonical_folder_name();
+            let client_out = sync::outbox_dir(client_base, &srv_canonical);
+            let srv_in = sync::inbox_dir(srv_base, &client_name);
+            let mut sides: Vec<(&Path, &Path)> = vec![
+                (client_req_dir.as_path(), client_out.as_path()),
+                (srv_client_dir.as_path(), srv_in.as_path()),
+            ];
+            for dir in &req_collided {
+                sides.push((dir.as_path(), srv_in.as_path()));
+            }
+            let mut mig_warnings = Vec::new();
+            match sync::migrate_req_pair(&sides, &mut mig_warnings) {
+                Ok(o) => {
+                    c.migrated += o.migrated;
+                    if o.channel_ready {
+                        fold_channel(sync::sync_peer_pair_ctx(Some(db), client, srv), c);
+                    } else {
+                        // Migration rolled back — the legacy dirs are intact;
+                        // keep the REQ channel alive on the old layout this pass.
+                        sync_req_pair_legacy(
+                            &client_req_dir,
+                            &srv_client_dir,
+                            &client_label,
+                            &srv_name,
+                            c,
+                        );
+                    }
+                }
+                Err(e) => c.push(migration_issue(&client_label, e)),
+            }
+            c.extend(mig_warnings);
+
+            // T-000245: the server→client announcement lane migrates onto the
+            // same pair — the folder name follows the SENDER's canonical, so
+            // server renames replay on it first.
+            let ann_parent = client_base.join("docs").join("server-announcements");
+            // T-000190: a rename COLLISION leaves the old-named folder beside
+            // the new one — its files belong to this same lane and migrate in
+            // this pass rather than on some later sync.
+            let mut ann_collided: Vec<PathBuf> = Vec::new();
+            if let Ok(renames) = db.list_renames_for_repo(srv.id) {
+                for r in renames {
+                    match sync::replay_rename_in_dir(
+                        &ann_parent,
+                        &r.old_canonical,
+                        &r.new_canonical,
+                    ) {
+                        Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
+                        Ok(sync::RenameOutcome::NoOp) => {}
+                        Ok(sync::RenameOutcome::Collision) => {
+                            ann_collided.push(ann_parent.join(&r.old_canonical));
+                            c.push(rename_collision(
+                                &r.old_canonical,
+                                &r.new_canonical,
+                                &ann_parent,
+                            ));
+                        }
+                        Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
+                    }
                 }
             }
-
-            // Copy *.response.md from server (source of truth) back to client.
-            // Overwrite on change so recipient edits propagate to the sender.
-            for resp_file in sync::scan_responses(&srv_client_dir) {
-                let src = srv_client_dir.join(&resp_file);
-                let dst = client_req_dir.join(&resp_file);
-                match sync::copy_file_if_changed(&src, &dst) {
-                    Ok(true) => c.responses += 1,
-                    Ok(false) => {}
-                    Err(e) => c.push(copy_failed(&resp_file, &client_label, e)),
-                }
+            let ann_legacy = ann_parent.join(&srv_canonical);
+            sync_announce_channel(db, git, srv_base, srv, client_base, client, &ann_legacy, c);
+            for dir in &ann_collided {
+                sync_announce_channel(db, git, srv_base, srv, client_base, client, dir, c);
             }
 
             // 0.9.0: api.md + handlers.md target moved to docs/server-api/
@@ -430,6 +826,7 @@ fn sync_server_to_microservice(
     srv_base: &Path,
     microservice_ids: &[i64],
     skip_api_contract: bool,
+    git: Option<&crate::git_ops::GitBinary>,
     c: &mut SyncCounters,
 ) {
     for ms_project_id in microservice_ids {
@@ -490,6 +887,9 @@ fn sync_server_to_microservice(
         }
 
         // F-033 Stage 1e: replay ms-server-repo renames on parent side (microservice-requirements/).
+        // T-000190: COLLISION survivors join the pair migration as extra
+        // sides — the old dir's files still belong to this lane.
+        let mut ms_req_collided: Vec<PathBuf> = Vec::new();
         match db.list_renames_for_repo(ms_server_repo.id) {
             Ok(renames) => {
                 for r in renames {
@@ -500,11 +900,14 @@ fn sync_server_to_microservice(
                     ) {
                         Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                         Ok(sync::RenameOutcome::NoOp) => {}
-                        Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                            &r.old_canonical,
-                            &r.new_canonical,
-                            &ms_req_parent,
-                        )),
+                        Ok(sync::RenameOutcome::Collision) => {
+                            ms_req_collided.push(ms_req_parent.join(&r.old_canonical));
+                            c.push(rename_collision(
+                                &r.old_canonical,
+                                &r.new_canonical,
+                                &ms_req_parent,
+                            ));
+                        }
                         Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                     }
                 }
@@ -534,6 +937,7 @@ fn sync_server_to_microservice(
         }
 
         // F-033 Stage 1e: replay server renames on ms side (server-requirements/).
+        let mut srv_req_collided: Vec<PathBuf> = Vec::new();
         match db.list_renames_for_repo(srv.id) {
             Ok(renames) => {
                 for r in renames {
@@ -544,11 +948,14 @@ fn sync_server_to_microservice(
                     ) {
                         Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                         Ok(sync::RenameOutcome::NoOp) => {}
-                        Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                            &r.old_canonical,
-                            &r.new_canonical,
-                            &ms_srv_parent,
-                        )),
+                        Ok(sync::RenameOutcome::Collision) => {
+                            srv_req_collided.push(ms_srv_parent.join(&r.old_canonical));
+                            c.push(rename_collision(
+                                &r.old_canonical,
+                                &r.new_canonical,
+                                &ms_srv_parent,
+                            ));
+                        }
                         Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                     }
                 }
@@ -595,34 +1002,76 @@ fn sync_server_to_microservice(
         // F-033: nested per parent-server so multi-parent microservices don't collide.
         let ms_srv_dir = ms_srv_parent.join(&parent_folder);
 
-        // F-000039: auto-close pairs the server (sender) acknowledged via .impl.md.
-        match sync::auto_close_impl_pairs(&srv_ms_dir, &ms_srv_dir) {
-            Ok(closed) => c.auto_closed.extend(closed),
-            Err(e) => c.push(auto_close_failed(&ms_label, e)),
-        }
+        // T-000190: renames replay on the InOutBox lanes too (peer-named dirs).
+        replay_inoutbox_renames(db, srv_base, &ms_server_repo, c);
+        replay_inoutbox_renames(db, ms_base, srv, c);
 
-        // Copy REQ-*.md from server (source of truth) to microservice server-repo.
-        // Overwrite on change so sender edits propagate to the recipient.
-        for req_file in sync::scan_requirements(&srv_ms_dir) {
-            let src = srv_ms_dir.join(&req_file);
-            let dst = ms_srv_dir.join(&req_file);
-            match sync::copy_file_if_changed(&src, &dst) {
-                Ok(true) => c.copied += 1,
-                Ok(false) => {}
-                Err(e) => c.push(copy_failed(&req_file, &ms_label, e)),
-            }
+        // T-000190: server microservice-requirements/<ms> -> outbox/<ms>,
+        // microservice server-requirements/<parent> -> inbox/<parent>; then the
+        // unified kind-aware pass for this pair in both directions.
+        let srv_out = sync::outbox_dir(srv_base, &ms_canonical);
+        let ms_in = sync::inbox_dir(ms_base, &parent_folder);
+        let mut sides: Vec<(&Path, &Path)> = vec![
+            (srv_ms_dir.as_path(), srv_out.as_path()),
+            (ms_srv_dir.as_path(), ms_in.as_path()),
+        ];
+        for dir in &ms_req_collided {
+            sides.push((dir.as_path(), srv_out.as_path()));
         }
-
-        // Copy *.response.md from microservice (source of truth) back to server.
-        // Overwrite on change so recipient edits propagate to the sender.
-        for resp_file in sync::scan_responses(&ms_srv_dir) {
-            let src = ms_srv_dir.join(&resp_file);
-            let dst = srv_ms_dir.join(&resp_file);
-            match sync::copy_file_if_changed(&src, &dst) {
-                Ok(true) => c.responses += 1,
-                Ok(false) => {}
-                Err(e) => c.push(copy_failed(&resp_file, &srv.display_name(), e)),
+        for dir in &srv_req_collided {
+            sides.push((dir.as_path(), ms_in.as_path()));
+        }
+        let mut mig_warnings = Vec::new();
+        match sync::migrate_req_pair(&sides, &mut mig_warnings) {
+            Ok(o) => {
+                c.migrated += o.migrated;
+                if o.channel_ready {
+                    fold_channel(sync::sync_peer_pair_ctx(Some(db), srv, &ms_server_repo), c);
+                } else {
+                    let srv_label = srv.display_name();
+                    sync_req_pair_legacy(&srv_ms_dir, &ms_srv_dir, &srv_label, &ms_label, c);
+                }
             }
+            Err(e) => c.push(migration_issue(&ms_label, e)),
+        }
+        c.extend(mig_warnings);
+
+        // T-000245: the ms→parent announcement lane migrates onto the same
+        // pair — folder named by the ms PROJECT (like microservice-api), so
+        // project renames replay on it before the files move.
+        let ann_parent = srv_base.join("docs").join("microservice-announcements");
+        let mut ann_collided: Vec<PathBuf> = Vec::new();
+        match db.list_renames_for_project(*ms_project_id) {
+            Ok(renames) => {
+                for r in renames {
+                    match sync::replay_rename_in_dir(&ann_parent, &r.old_name, &r.new_name) {
+                        Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
+                        Ok(sync::RenameOutcome::NoOp) => {}
+                        Ok(sync::RenameOutcome::Collision) => {
+                            ann_collided.push(ann_parent.join(&r.old_name));
+                            c.push(rename_collision(&r.old_name, &r.new_name, &ann_parent))
+                        }
+                        Err(e) => c.push(rename_failed(&r.old_name, &r.new_name, e)),
+                    }
+                }
+            }
+            Err(e) => c.push(renames_lookup(&ms_name, e)),
+        }
+        let ann_legacy = ann_parent.join(&ms_name);
+        sync_announce_channel(
+            db,
+            git,
+            ms_base,
+            &ms_server_repo,
+            srv_base,
+            srv,
+            &ann_legacy,
+            c,
+        );
+        // T-000190: a rename COLLISION leaves the old-named folder beside the
+        // new one — its files belong to this same lane and migrate this pass.
+        for dir in &ann_collided {
+            sync_announce_channel(db, git, ms_base, &ms_server_repo, srv_base, srv, dir, c);
         }
 
         // 0.9.0: Microservice → Parent server — api.md + handlers.md + my_api.
@@ -701,6 +1150,7 @@ fn sync_microservice_to_parents(
     project_id: i64,
     ms_server: &Repository,
     skip_api: bool,
+    git: Option<&crate::git_ops::GitBinary>,
     c: &mut SyncCounters,
 ) {
     if let Some(ref ms_path) = ms_server.local_path {
@@ -791,32 +1241,59 @@ fn sync_microservice_to_parents(
                     .join("server-requirements")
                     .join(&parent_canonical);
 
-                // F-000039: auto-close pairs the parent server (sender) acknowledged via .impl.md.
-                match sync::auto_close_impl_pairs(&parent_ms_dir, &ms_parent_dir) {
-                    Ok(closed) => c.auto_closed.extend(closed),
-                    Err(e) => c.push(auto_close_failed(&parent_label, e)),
-                }
-
-                for req_file in sync::scan_requirements(&parent_ms_dir) {
-                    let src = parent_ms_dir.join(&req_file);
-                    let dst = ms_parent_dir.join(&req_file);
-                    match sync::copy_file_if_changed(&src, &dst) {
-                        Ok(true) => c.copied += 1,
-                        Ok(false) => {}
-                        Err(e) => c.push(copy_failed(&req_file, &ms_server.display_name(), e)),
+                // T-000190: same pair migration + unified pass as the
+                // parent-driven side — an MS-initiated sync is no longer a
+                // lesser pass; idempotent when the parent already migrated.
+                replay_inoutbox_renames(db, parent_base, ms_server, c);
+                replay_inoutbox_renames(db, ms_base, parent_server, c);
+                let parent_out = sync::outbox_dir(parent_base, &ms_canonical);
+                let ms_in = sync::inbox_dir(ms_base, &parent_canonical);
+                let mut mig_warnings = Vec::new();
+                match sync::migrate_req_pair(
+                    &[
+                        (parent_ms_dir.as_path(), parent_out.as_path()),
+                        (ms_parent_dir.as_path(), ms_in.as_path()),
+                    ],
+                    &mut mig_warnings,
+                ) {
+                    Ok(o) => {
+                        c.migrated += o.migrated;
+                        if o.channel_ready {
+                            fold_channel(
+                                sync::sync_peer_pair_ctx(Some(db), parent_server, ms_server),
+                                c,
+                            );
+                        } else {
+                            let ms_label = ms_server.display_name();
+                            sync_req_pair_legacy(
+                                &parent_ms_dir,
+                                &ms_parent_dir,
+                                &parent_label,
+                                &ms_label,
+                                c,
+                            );
+                        }
                     }
+                    Err(e) => c.push(migration_issue(&parent_label, e)),
                 }
+                c.extend(mig_warnings);
 
-                // MS → parent: *.response.md (source of truth on MS side)
-                for resp_file in sync::scan_responses(&ms_parent_dir) {
-                    let src = ms_parent_dir.join(&resp_file);
-                    let dst = parent_ms_dir.join(&resp_file);
-                    match sync::copy_file_if_changed(&src, &dst) {
-                        Ok(true) => c.responses += 1,
-                        Ok(false) => {}
-                        Err(e) => c.push(copy_failed(&resp_file, &parent_label, e)),
-                    }
-                }
+                // T-000245: same announce migration as the parent-driven
+                // pass — idempotent, whichever side of the pair ran first.
+                let ann_legacy = parent_base
+                    .join("docs")
+                    .join("microservice-announcements")
+                    .join(&ms_project_name);
+                sync_announce_channel(
+                    db,
+                    git,
+                    ms_base,
+                    ms_server,
+                    parent_base,
+                    parent_server,
+                    &ann_legacy,
+                    c,
+                );
             }
         }
     }
@@ -878,6 +1355,8 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
     let recipient_dir = recipient_srv_parent.join(sender.canonical_folder_name());
 
     // Replay recipient (codex) repo renames on the sender's microservice-requirements/ side.
+    // T-000190: COLLISION survivors join the pair migration as extra sides.
+    let mut sender_req_collided: Vec<PathBuf> = Vec::new();
     match db.list_renames_for_repo(recipient.id) {
         Ok(renames) => {
             for r in renames {
@@ -888,11 +1367,14 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
                 ) {
                     Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                     Ok(sync::RenameOutcome::NoOp) => {}
-                    Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                        &r.old_canonical,
-                        &r.new_canonical,
-                        &sender_req_parent,
-                    )),
+                    Ok(sync::RenameOutcome::Collision) => {
+                        sender_req_collided.push(sender_req_parent.join(&r.old_canonical));
+                        c.push(rename_collision(
+                            &r.old_canonical,
+                            &r.new_canonical,
+                            &sender_req_parent,
+                        ));
+                    }
                     Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                 }
             }
@@ -901,6 +1383,7 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
     }
 
     // Replay sender (consumer) repo renames on the recipient's server-requirements/ side.
+    let mut recipient_srv_collided: Vec<PathBuf> = Vec::new();
     match db.list_renames_for_repo(sender.id) {
         Ok(renames) => {
             for r in renames {
@@ -911,11 +1394,14 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
                 ) {
                     Ok(sync::RenameOutcome::Renamed) => c.migrated += 1,
                     Ok(sync::RenameOutcome::NoOp) => {}
-                    Ok(sync::RenameOutcome::Collision) => c.push(rename_collision(
-                        &r.old_canonical,
-                        &r.new_canonical,
-                        &recipient_srv_parent,
-                    )),
+                    Ok(sync::RenameOutcome::Collision) => {
+                        recipient_srv_collided.push(recipient_srv_parent.join(&r.old_canonical));
+                        c.push(rename_collision(
+                            &r.old_canonical,
+                            &r.new_canonical,
+                            &recipient_srv_parent,
+                        ));
+                    }
                     Err(e) => c.push(rename_failed(&r.old_canonical, &r.new_canonical, e)),
                 }
             }
@@ -923,33 +1409,44 @@ fn sync_req_pair(db: &AppDb, sender: &Repository, recipient: &Repository, c: &mu
         Err(e) => c.push(renames_lookup(&sender.display_name(), e)),
     }
 
-    // F-000039: auto-close pairs the consumer (sender) acknowledged via .impl.md.
-    match sync::auto_close_impl_pairs(&sender_dir, &recipient_dir) {
-        Ok(closed) => c.auto_closed.extend(closed),
-        Err(e) => c.push(auto_close_failed(&recipient.display_name(), e)),
+    // T-000190: same pair migration + unified pass — consumer
+    // microservice-requirements/<codex> -> outbox/<codex>, codex
+    // server-requirements/<consumer> -> inbox/<consumer>.
+    replay_inoutbox_renames(db, sender_base, recipient, c);
+    replay_inoutbox_renames(db, recipient_base, sender, c);
+    let sender_out = sync::outbox_dir(sender_base, &recipient.canonical_folder_name());
+    let recipient_in = sync::inbox_dir(recipient_base, &sender.canonical_folder_name());
+    let mut sides: Vec<(&Path, &Path)> = vec![
+        (sender_dir.as_path(), sender_out.as_path()),
+        (recipient_dir.as_path(), recipient_in.as_path()),
+    ];
+    for dir in &sender_req_collided {
+        sides.push((dir.as_path(), sender_out.as_path()));
     }
-
-    // Copy REQ-*.md from consumer (source of truth) to codex.
-    for req_file in sync::scan_requirements(&sender_dir) {
-        let src = sender_dir.join(&req_file);
-        let dst = recipient_dir.join(&req_file);
-        match sync::copy_file_if_changed(&src, &dst) {
-            Ok(true) => c.copied += 1,
-            Ok(false) => {}
-            Err(e) => c.push(copy_failed(&req_file, &recipient.display_name(), e)),
+    for dir in &recipient_srv_collided {
+        sides.push((dir.as_path(), recipient_in.as_path()));
+    }
+    let mut mig_warnings = Vec::new();
+    match sync::migrate_req_pair(&sides, &mut mig_warnings) {
+        Ok(o) => {
+            c.migrated += o.migrated;
+            if o.channel_ready {
+                fold_channel(sync::sync_peer_pair_ctx(Some(db), sender, recipient), c);
+            } else {
+                let sender_label = sender.display_name();
+                let recipient_label = recipient.display_name();
+                sync_req_pair_legacy(
+                    &sender_dir,
+                    &recipient_dir,
+                    &sender_label,
+                    &recipient_label,
+                    c,
+                );
+            }
         }
+        Err(e) => c.push(migration_issue(&sender.display_name(), e)),
     }
-
-    // Copy *.response.md from codex (source of truth) back to consumer.
-    for resp_file in sync::scan_responses(&recipient_dir) {
-        let src = recipient_dir.join(&resp_file);
-        let dst = sender_dir.join(&resp_file);
-        match sync::copy_file_if_changed(&src, &dst) {
-            Ok(true) => c.responses += 1,
-            Ok(false) => {}
-            Err(e) => c.push(copy_failed(&resp_file, &sender.display_name(), e)),
-        }
-    }
+    c.extend(mig_warnings);
 }
 
 /// T-000175: codex REQ channels, per-lane. Unlike the broadcast (svod content),
@@ -1222,6 +1719,7 @@ pub(crate) fn run_project_sync_in(
             &tpl,
             &quiet_conflicts,
             &shared,
+            git.as_ref(),
             &mut c,
         );
     }
@@ -1247,6 +1745,7 @@ pub(crate) fn run_project_sync_in(
             &tpl,
             &quiet_conflicts,
             &shared,
+            git.as_ref(),
             &mut c,
         );
     }
@@ -1278,8 +1777,16 @@ pub(crate) fn run_project_sync_in(
                 return Ok(c.into_result());
             }
 
-            sync_client_to_server(db, srv, srv_base, &clients, &mut c);
-            sync_server_to_microservice(db, srv, srv_base, &microservice_ids, false, &mut c);
+            sync_client_to_server(db, srv, srv_base, &clients, git.as_ref(), &mut c);
+            sync_server_to_microservice(
+                db,
+                srv,
+                srv_base,
+                &microservice_ids,
+                false,
+                git.as_ref(),
+                &mut c,
+            );
         }
     }
 
@@ -1288,7 +1795,7 @@ pub(crate) fn run_project_sync_in(
     // separately (per-lane) by run_codex_req_channels below.
     if project_type == "microservice" {
         if let Some(ms_server) = server {
-            sync_microservice_to_parents(db, project_id, ms_server, false, &mut c);
+            sync_microservice_to_parents(db, project_id, ms_server, false, git.as_ref(), &mut c);
         }
     }
 
@@ -1312,37 +1819,7 @@ pub(crate) fn run_project_sync_in(
     let handled = shared.handled.clone();
     finish_shared(db, git.as_ref(), shared, &mut c);
     if let Some(git) = git {
-        match db.list_autocommit_repos() {
-            Ok(repos) => {
-                for (repo, branch) in repos {
-                    if handled.contains(&repo.id) {
-                        continue;
-                    }
-                    let Some(ref lp) = repo.local_path else {
-                        continue;
-                    };
-                    let path = std::path::Path::new(lp);
-                    if !crate::git_ops::is_git_repo(path) {
-                        continue;
-                    }
-                    match crate::sync::autocommit_repo(&git, path, &branch) {
-                        Ok(crate::git_ops::CommitOutcome::Committed { .. }) => {
-                            c.committed.push(repo.display_name());
-                        }
-                        // T-000198: a repo on another branch is repo state, not a
-                        // sync failure — RepoDetail shows it beside the branch
-                        // setting. Reporting it here repeated it on every sync of
-                        // every project, since this loop walks the portfolio.
-                        Ok(crate::git_ops::CommitOutcome::WrongBranch { .. }) => {}
-                        Ok(crate::git_ops::CommitOutcome::NothingToCommit) => {}
-                        Err(e) => c.push(
-                            SyncIssue::new(Code::AutocommitFailed, repo.display_name()).detail(e),
-                        ),
-                    }
-                }
-            }
-            Err(e) => c.push(SyncIssue::lookup(lookup::AUTOCOMMIT_REPOS, "").detail(e)),
-        }
+        autocommit_portfolio_repos(db, &git, &handled, &mut c);
     }
 
     // v0.20.0: record sync event. SyncResult fields per models.rs — copied + responses + migrated
@@ -1356,6 +1833,114 @@ pub(crate) fn run_project_sync_in(
     );
 
     Ok(c.into_result())
+}
+
+/// T-000137: the portfolio-wide auto-commit pass, extracted for the
+/// T-000243 review (thirteenth pass): every repo's eligibility read, fresh
+/// binding re-read and the WHOLE commit now run under the per-repo policy
+/// guard. This loop walks the whole portfolio, so a shared repo belonging
+/// to ANOTHER project is not in `handled` — the fresh `is_shared_repo`
+/// check under the same hold is what keeps phase B's commit path the only
+/// one for it. The guard also serializes the commit against a concurrent
+/// `disable_shared_mode` / repath on the same repo: `commit_paths_index_only`
+/// builds its temp index from a `read-tree HEAD` snapshot, and without the
+/// hold a disable's `.sdh/` deletion committed between that snapshot and
+/// `git commit` would be resurrected by the stale index — the deletion
+/// would look pushed while `.sdh/` stayed on origin with no retry marker.
+fn autocommit_portfolio_repos(
+    db: &AppDb,
+    git: &crate::git_ops::GitBinary,
+    handled: &std::collections::HashSet<i64>,
+    c: &mut SyncCounters,
+) {
+    match db.list_autocommit_repos() {
+        Ok(repos) => {
+            for (repo, branch) in repos {
+                if handled.contains(&repo.id) {
+                    continue;
+                }
+                let guard = sync::shared::specs_policy_guard(repo.id);
+                let _guard = guard.lock().unwrap();
+                if sync::shared::is_shared_repo(db, repo.id) {
+                    continue;
+                }
+                // Fresh binding: the list snapshot may predate a repath.
+                let Ok(fresh) = db.get_repository(repo.id) else {
+                    continue;
+                };
+                let Some(ref lp) = fresh.local_path else {
+                    continue;
+                };
+                let path = Path::new(lp);
+                if !crate::git_ops::is_git_repo(path) {
+                    continue;
+                }
+                #[cfg(test)]
+                autocommit_policy_probe(repo.id, path);
+                match crate::sync::autocommit_repo(git, path, &branch) {
+                    Ok(crate::git_ops::CommitOutcome::Committed { .. }) => {
+                        c.committed.push(repo.display_name());
+                    }
+                    // T-000198: a repo on another branch is repo state, not a
+                    // sync failure — RepoDetail shows it beside the branch
+                    // setting. Reporting it here repeated it on every sync of
+                    // every project, since this loop walks the portfolio.
+                    Ok(crate::git_ops::CommitOutcome::WrongBranch { .. }) => {}
+                    Ok(crate::git_ops::CommitOutcome::NothingToCommit) => {}
+                    Err(e) => c.push(
+                        SyncIssue::new(Code::AutocommitFailed, repo.display_name()).detail(e),
+                    ),
+                }
+            }
+        }
+        Err(e) => c.push(SyncIssue::lookup(lookup::AUTOCOMMIT_REPOS, "").detail(e)),
+    }
+}
+
+// T-000243 review (thirteenth pass): a rendezvous fired inside
+// `autocommit_portfolio_repos`'s guard hold, right before the commit —
+// the concurrency test proves the policy guard is still held across the
+// whole eligibility+commit section (a lifecycle writer on the same repo
+// cannot interleave) and that a shared repo is skipped on FRESH state.
+// Matched by (repo id, repo root); fires once.
+#[cfg(test)]
+struct AutocommitPolicyProbe {
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+}
+
+#[cfg(test)]
+static AUTOCOMMIT_POLICY_PROBES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(i64, PathBuf), AutocommitPolicyProbe>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_autocommit_policy_probe(
+    repo: i64,
+    root: &Path,
+    entered: std::sync::mpsc::Sender<i64>,
+    release: std::sync::mpsc::Receiver<i64>,
+) {
+    let cell = AUTOCOMMIT_POLICY_PROBES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    cell.lock().unwrap().insert(
+        (repo, root.to_path_buf()),
+        AutocommitPolicyProbe { entered, release },
+    );
+}
+
+#[cfg(test)]
+fn autocommit_policy_probe(repo_id: i64, root: &Path) {
+    let cell = AUTOCOMMIT_POLICY_PROBES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let probe = {
+        let mut g = cell.lock().unwrap();
+        g.remove(&(repo_id, root.to_path_buf()))
+    };
+    if let Some(p) = probe {
+        let _ = p.entered.send(repo_id);
+        let _ = p.release.recv();
+    }
 }
 
 #[cfg(test)]
@@ -1860,6 +2445,124 @@ mod tests {
         );
     }
 
+    /// T-000243 review (thirteenth pass): a git repo on `dev` with one
+    /// uncommitted cross-repo file, registered for auto-commit. Returns
+    /// the repo id.
+    fn autocommit_fixture(db: &AppDb, dir: &Path, shared: bool) -> i64 {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {:?}: {:?}", args, out);
+        };
+        git(&["init", "-q"]);
+        git(&["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        git(&[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        let api = dir.join("docs").join("server-api");
+        fs::create_dir_all(&api).unwrap();
+        fs::write(api.join("api.md"), "# api\n").unwrap();
+        let project = db.create_project("P", None, "standard").unwrap();
+        let repo = db
+            .insert_local_repository(&dir.to_string_lossy(), "ac", Some(project.id), Some("tool"))
+            .unwrap();
+        db.set_autocommit_branch(repo.id, Some("dev")).unwrap();
+        if shared {
+            db.set_shared_mode(repo.id, true).unwrap();
+        }
+        repo.id
+    }
+
+    fn autocommit_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?}: {:?}", args, out);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// T-000243 review (thirteenth pass): the portfolio autocommit loop
+    /// walks EVERY project, so `handled` cannot see a shared repo owned by
+    /// another project. The fresh `is_shared_repo` check under the guard
+    /// is what keeps phase B's commit path the only one for it — the
+    /// cross-repo file must stay uncommitted here.
+    #[test]
+    fn a_shared_repo_is_skipped_by_the_portfolio_autocommit() {
+        let db = make_db();
+        let dir = TempDir::new().unwrap();
+        autocommit_fixture(&db, dir.path(), true);
+        let git = crate::git_ops::check_git_available().expect("git available");
+        let mut c = SyncCounters::new();
+        autocommit_portfolio_repos(&db, &git, &std::collections::HashSet::new(), &mut c);
+        assert!(c.committed.is_empty(), "{:?}", c.committed);
+        assert_eq!(
+            autocommit_git(dir.path(), &["ls-files", "--", "docs/server-api/api.md"]),
+            "",
+            "a shared repo's cross-repo files belong to phase B, not autocommit"
+        );
+    }
+
+    /// T-000243 review (thirteenth pass): the eligibility read, the fresh
+    /// binding and the whole commit run under the per-repo policy guard —
+    /// the probe parks the pass inside that hold and the guard must still
+    /// be taken, so a disable / repath on the same repo cannot interleave
+    /// between the temp index's HEAD snapshot and `git commit`.
+    #[test]
+    fn the_autocommit_commit_runs_under_the_policy_guard() {
+        let db = make_db();
+        let dir = TempDir::new().unwrap();
+        let repo_id = autocommit_fixture(&db, dir.path(), false);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        install_autocommit_policy_probe(repo_id, dir.path(), entered_tx, release_rx);
+        let git = crate::git_ops::check_git_available().expect("git available");
+        let c = std::thread::scope(|s| {
+            let worker = s.spawn(|| {
+                let mut c = SyncCounters::new();
+                autocommit_portfolio_repos(&db, &git, &std::collections::HashSet::new(), &mut c);
+                c
+            });
+            // Record first, release and join, THEN assert — a panic inside
+            // the scope (a timed-out rendezvous included) would leave the
+            // worker parked on `release_rx` and `thread::scope` would never
+            // join it (T-000243 review, fifteenth pass).
+            let reached = entered_rx.recv_timeout(std::time::Duration::from_secs(30));
+            let held = reached.is_ok().then(|| {
+                sync::shared::specs_policy_guard(repo_id)
+                    .try_lock()
+                    .is_err()
+            });
+            let _ = release_tx.send(1);
+            let c = worker.join().unwrap();
+            let in_window = reached.expect("the autocommit probe never fired");
+            assert_eq!(in_window, repo_id);
+            assert!(
+                held.expect("the probe never fired"),
+                "the guard must be held across the whole commit"
+            );
+            c
+        });
+        assert_eq!(c.committed.len(), 1, "{:?}", c.committed);
+        assert_eq!(
+            autocommit_git(dir.path(), &["ls-files", "--", "docs/server-api/api.md"]),
+            "docs/server-api/api.md",
+            "the ordinary repo's cross-repo file was committed"
+        );
+    }
+
     /// A marker beside a copy that already equals the rule means the edit it
     /// stood for was lost before anyone collected it. Taking that up would
     /// report a success and mark an untouched rule as a fork.
@@ -1946,15 +2649,17 @@ mod tests {
 
         run_project_sync(&db, consumer.id).unwrap();
 
-        // REQ landed on the codex side under server-requirements/<consumer-canonical>/.
+        // T-000190: REQ landed on the codex side under InOutBox/inbox/<consumer>/ —
+        // the legacy seed above proves the pair migrates along the way.
         let codex_req = codex_base
             .join("docs")
-            .join("server-requirements")
+            .join("InOutBox")
+            .join("inbox")
             .join("consumer-backend")
             .join("REQ-001_add-retry-rule.md");
         assert!(
             codex_req.exists(),
-            "consumer's REQ must be delivered to the codex's server-requirements"
+            "consumer's REQ must be delivered to the codex's InOutBox inbox"
         );
 
         // api-contract was NOT propagated — no microservice-api inbox for the codex.
@@ -1968,11 +2673,13 @@ mod tests {
             "a codex must not push an api.md to the consumer"
         );
 
-        // The codex answers with a response; next sync brings it back to the consumer.
+        // The codex answers in its inbox; next sync brings the response back
+        // into the consumer's outbox.
         fs::write(
             codex_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-backend")
                 .join("REQ-001_add-retry-rule.response.md"),
             "Added rules/retry.md — idempotency key now required.",
@@ -1981,7 +2688,12 @@ mod tests {
 
         run_project_sync(&db, consumer.id).unwrap();
 
-        let consumer_response = consumer_req_dir.join("REQ-001_add-retry-rule.response.md");
+        let consumer_response = consumer_base
+            .join("docs")
+            .join("InOutBox")
+            .join("outbox")
+            .join("practices-server")
+            .join("REQ-001_add-retry-rule.response.md");
         assert!(
             consumer_response.exists(),
             "the codex's response must be copied back to the consumer"
@@ -2031,10 +2743,11 @@ mod tests {
 
         run_project_sync(&db, consumer.id).unwrap();
 
-        // REQ landed on the codex's admin repo under server-requirements/<consumer-admin>/.
+        // REQ landed on the codex's admin repo under InOutBox/inbox/<consumer>/.
         let codex_req = codex_base
             .join("docs")
-            .join("server-requirements")
+            .join("InOutBox")
+            .join("inbox")
             .join("consumer-admin")
             .join("REQ-001_admin-rule.md");
         assert!(
@@ -2042,11 +2755,12 @@ mod tests {
             "consumer's admin-lane REQ must be delivered to the codex's admin repo"
         );
 
-        // Codex answers; next sync brings it back.
+        // Codex answers in its inbox; next sync brings it back.
         fs::write(
             codex_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-admin")
                 .join("REQ-001_admin-rule.response.md"),
             "Added rules/admin-a11y.md.",
@@ -2055,7 +2769,12 @@ mod tests {
 
         run_project_sync(&db, consumer.id).unwrap();
 
-        let consumer_response = consumer_req_dir.join("REQ-001_admin-rule.response.md");
+        let consumer_response = consumer_base
+            .join("docs")
+            .join("InOutBox")
+            .join("outbox")
+            .join("practices-admin")
+            .join("REQ-001_admin-rule.response.md");
         assert!(
             consumer_response.exists(),
             "the codex's admin-lane response must be copied back to the consumer"
@@ -2118,7 +2837,8 @@ mod tests {
         assert!(
             codex_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-admin")
                 .join("REQ-010_admin-rule.md")
                 .exists(),
@@ -2208,11 +2928,12 @@ mod tests {
 
         run_project_sync(&db, consumer.id).unwrap();
 
-        // Each REQ landed only in its own lane's folder.
+        // Each REQ landed only in its own lane's inbox.
         assert!(
             codex_srv_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-backend")
                 .join("REQ-100_server-rule.md")
                 .exists(),
@@ -2221,7 +2942,8 @@ mod tests {
         assert!(
             codex_adm_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-admin")
                 .join("REQ-200_admin-rule.md")
                 .exists(),
@@ -2232,7 +2954,8 @@ mod tests {
         assert!(
             !codex_adm_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-backend")
                 .join("REQ-100_server-rule.md")
                 .exists(),
@@ -2241,12 +2964,65 @@ mod tests {
         assert!(
             !codex_srv_base
                 .join("docs")
-                .join("server-requirements")
+                .join("InOutBox")
+                .join("inbox")
                 .join("consumer-admin")
                 .join("REQ-200_admin-rule.md")
                 .exists(),
             "admin-lane REQ must NOT appear in the server repo"
         );
+    }
+
+    #[test]
+    fn test_req_pair_client_to_server_on_unified_layout() {
+        // T-000190 spec verification 2: REQ → response → impl-close rides the
+        // unified layout end-to-end — `outbox/` authors, `inbox/` receives,
+        // the receipt backflows, `.impl.md` tears down the triple on both.
+        let db = make_db();
+        let srv_dir = TempDir::new().unwrap();
+        let cli_dir = TempDir::new().unwrap();
+        let p = db.create_project("App", None, "standard").unwrap();
+        db.insert_local_repository(
+            srv_dir.path().to_str().unwrap(),
+            "srv",
+            Some(p.id),
+            Some("server"),
+        )
+        .unwrap();
+        db.insert_local_repository(
+            cli_dir.path().to_str().unwrap(),
+            "cli",
+            Some(p.id),
+            Some("client"),
+        )
+        .unwrap();
+
+        run_project_sync(&db, p.id).unwrap();
+        let cli_out = cli_dir.path().join("docs/InOutBox/outbox/srv");
+        let srv_in = srv_dir.path().join("docs/InOutBox/inbox/cli");
+        fs::write(cli_out.join("REQ-001_feat.md"), "please").unwrap();
+
+        run_project_sync(&db, p.id).unwrap();
+        assert_eq!(
+            fs::read_to_string(srv_in.join("REQ-001_feat.md")).unwrap(),
+            "please"
+        );
+
+        fs::write(srv_in.join("REQ-001_feat.response.md"), "implemented").unwrap();
+        run_project_sync(&db, p.id).unwrap();
+        assert_eq!(
+            fs::read_to_string(cli_out.join("REQ-001_feat.response.md")).unwrap(),
+            "implemented"
+        );
+
+        fs::write(cli_out.join("REQ-001_feat.impl.md"), "x").unwrap();
+        let r = run_project_sync(&db, p.id).unwrap();
+        assert!(r.auto_closed.contains(&"REQ-001_feat.md".to_string()));
+        for d in [&cli_out, &srv_in] {
+            assert!(!d.join("REQ-001_feat.md").exists());
+            assert!(!d.join("REQ-001_feat.response.md").exists());
+            assert!(!d.join("REQ-001_feat.impl.md").exists());
+        }
     }
 
     #[test]
@@ -2390,6 +3166,440 @@ mod tests {
         assert!(
             b_pact.join("PACT-001_shared.md").exists(),
             "unlinking must not delete history"
+        );
+    }
+
+    /// T-000243 review (second pass): the render's policy guard must outlive
+    /// the `.gitignore` WRITE, not just the policy read — binding the guard
+    /// inside the `else` branch let it drop before the write, so an old-ON
+    /// render could land after an OFF save or overwrite a newer OFF render.
+    /// The probe fires from inside `write_repo_skeletons` right after the
+    /// write, while the guard is still held: a specs save (or a phase B policy
+    /// section) cannot interleave between the read and the write any more.
+    #[test]
+    fn the_gitignore_render_holds_the_policy_guard_through_the_write() {
+        let db = make_db();
+        let project = db.create_project("P", None, "standard").unwrap();
+        let dir = TempDir::new().unwrap();
+        let repo = db
+            .insert_local_repository(
+                dir.path().to_string_lossy().as_ref(),
+                "render",
+                Some(project.id),
+                Some("tool"),
+            )
+            .unwrap();
+        let repo_id = repo.id;
+        db.set_shared_mode(repo_id, true).unwrap();
+        db.set_shared_role(repo_id, Some("main")).unwrap();
+        // The owner opts out: the render must keep the specs folder ignored.
+        db.set_repo_share_specs(repo_id, false).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<i64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<i64>();
+        sync::shared::install_render_write_probe(repo_id, dir.path(), entered_tx, release_rx);
+        let tpl = SkeletonTemplates {
+            gitignore: "docs/codex/\ndocs/superpowers/\n".to_string(),
+            gitattributes: String::new(),
+            todo: String::new(),
+            bug_reports: String::new(),
+        };
+        let base = dir.path().to_path_buf();
+        let render = std::thread::spawn(move || {
+            let mut c = SyncCounters::new();
+            let shared = sync::shared::SharedSync::empty();
+            // The repo is this install's own (shared mode on): its policy is
+            // its database row, so no git binary is needed to resolve it.
+            write_repo_skeletons(
+                &db,
+                project.id,
+                &base,
+                &repo,
+                &tpl,
+                &[],
+                &shared,
+                None,
+                &mut c,
+            );
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the render probe never fired: the render did not run");
+        assert!(
+            sync::shared::specs_policy_guard(repo_id)
+                .try_lock()
+                .is_err(),
+            "the guard must still be held AFTER the .gitignore write"
+        );
+        release_tx.send(1).unwrap();
+        render.join().unwrap();
+        let text = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(
+            text.contains("docs/superpowers/"),
+            "the OFF render keeps the specs folder ignored:\n{}",
+            text
+        );
+    }
+
+    /// T-000243 review (fourth pass): without a git binary a HELPER's specs
+    /// policy cannot be discovered — the render is refused and `.gitignore`
+    /// keeps its last written state instead of answering ON from a possibly
+    /// stale work-tree copy (the owner's policy needs no git and is covered
+    /// by the test above).
+    #[test]
+    fn the_gitignore_render_refuses_a_helper_policy_without_git() {
+        let db = make_db();
+        let project = db.create_project("P", None, "standard").unwrap();
+        let dir = TempDir::new().unwrap();
+        let repo = db
+            .upsert_repository("Owner/api", None, None, None, None, None)
+            .unwrap();
+        db.set_repo_local_path(repo.id, Some(dir.path().to_string_lossy().as_ref()))
+            .unwrap();
+        db.assign_repository(repo.id, Some(project.id), Some("tool"))
+            .unwrap();
+        db.set_shared_role(repo.id, Some("contributor")).unwrap();
+        // The last render kept the specs folder ignored.
+        fs::write(
+            dir.path().join(".gitignore"),
+            "# --- solo-dev-hub:begin ---\ndocs/superpowers/\n# --- solo-dev-hub:end ---\n",
+        )
+        .unwrap();
+        let tpl = SkeletonTemplates {
+            gitignore: "docs/codex/\ndocs/superpowers/\n".to_string(),
+            gitattributes: String::new(),
+            todo: String::new(),
+            bug_reports: String::new(),
+        };
+        let base = dir.path().to_path_buf();
+        let repo = db.get_repository(repo.id).unwrap();
+        let mut c = SyncCounters::new();
+        let shared = sync::shared::SharedSync::empty();
+        write_repo_skeletons(
+            &db,
+            project.id,
+            &base,
+            &repo,
+            &tpl,
+            &[],
+            &shared,
+            None,
+            &mut c,
+        );
+        let text = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(
+            text.contains("docs/superpowers/"),
+            "a refused render must leave .gitignore untouched:\n{}",
+            text
+        );
+    }
+
+    /// T-000245: the shared-recipient dual-write — a live new-layout body
+    /// projects onto the legacy path once, an existing projection is never
+    /// rewritten, and a closed pair retires its projection instead of
+    /// reviving it.
+    #[test]
+    fn announce_projections_dual_write_then_retire() {
+        let dir = TempDir::new().unwrap();
+        autocommit_git(dir.path(), &["init", "-q", "-b", "dev"]);
+        autocommit_git(dir.path(), &["config", "user.email", "t@e.c"]);
+        autocommit_git(dir.path(), &["config", "user.name", "T"]);
+        autocommit_git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let git = crate::git_ops::check_git_available().expect("git available");
+        let legacy = dir.path().join("docs/server-announcements/backend");
+        let inbox = dir.path().join("docs/InOutBox/inbox/backend");
+        fs::create_dir_all(&inbox).unwrap();
+
+        // A new publication — the projection appears byte-identical.
+        fs::write(inbox.join("ANNOUNCE-001_a.md"), "v1").unwrap();
+        let mut c = SyncCounters::new();
+        deliver_announce_projections(&git, dir.path(), &legacy, &inbox, &mut c);
+        assert_eq!(
+            fs::read(legacy.join("ANNOUNCE-001_a.md")).unwrap(),
+            b"v1",
+            "live body projects onto the legacy path"
+        );
+
+        // Whatever an old agent did to the projection is its business — the
+        // pass must not "repair" the file.
+        fs::write(legacy.join("ANNOUNCE-001_a.md"), "tampered").unwrap();
+        let mut c = SyncCounters::new();
+        deliver_announce_projections(&git, dir.path(), &legacy, &inbox, &mut c);
+        assert_eq!(
+            fs::read(legacy.join("ANNOUNCE-001_a.md")).unwrap(),
+            b"tampered"
+        );
+
+        // A second announcement commits, gets acknowledged on the new layout
+        // (body deleted by cleanup), and its projection must retire — while
+        // the live one stays.
+        fs::write(inbox.join("ANNOUNCE-002_b.md"), "x").unwrap();
+        let mut c = SyncCounters::new();
+        deliver_announce_projections(&git, dir.path(), &legacy, &inbox, &mut c);
+        autocommit_git(dir.path(), &["add", "-A"]);
+        autocommit_git(dir.path(), &["commit", "-q", "-m", "published"]);
+        fs::remove_file(inbox.join("ANNOUNCE-002_b.md")).unwrap();
+        let mut c = SyncCounters::new();
+        deliver_announce_projections(&git, dir.path(), &legacy, &inbox, &mut c);
+        assert!(
+            !legacy.join("ANNOUNCE-002_b.md").exists(),
+            "the projection of a closed pair retires"
+        );
+        assert!(
+            legacy.join("ANNOUNCE-001_a.md").exists(),
+            "a live pair keeps its projection"
+        );
+
+        // And a leftover projection of that closed pair is now "closed":
+        // migration must never spawn fresh copies from it.
+        fs::write(legacy.join("ANNOUNCE-002_b.md"), "x").unwrap();
+        let closed = closed_announce_names(&git, dir.path(), &legacy, &inbox);
+        assert!(closed.contains("ANNOUNCE-002_b.md"), "{:?}", closed);
+        assert!(!closed.contains("ANNOUNCE-001_a.md"));
+    }
+
+    // ----- T-000190: portfolio-copy dry-run (spec verification 6) ----------
+
+    /// The sync-relevant surface of one repo mirror: `docs/`, `.sdh/` and the
+    /// managed root files. `.git` stays out on purpose — with no `.git` the
+    /// copies cannot fetch, push or plumb anywhere, so a dry run can never
+    /// touch the originals or the remote.
+    fn mirror_portfolio_repo(src: &Path, dst: &Path) {
+        fn copy_tree(s: &Path, d: &Path) {
+            let Ok(entries) = fs::read_dir(s) else { return };
+            for e in entries.filter_map(|e| e.ok()) {
+                let sp = e.path();
+                let dp = d.join(e.file_name());
+                if sp.is_dir() {
+                    fs::create_dir_all(&dp).unwrap();
+                    copy_tree(&sp, &dp);
+                } else if sp.is_file() {
+                    fs::create_dir_all(dp.parent().unwrap()).unwrap();
+                    fs::copy(&sp, &dp).unwrap();
+                }
+            }
+        }
+        for sub in ["docs", ".sdh"] {
+            copy_tree(&src.join(sub), &dst.join(sub));
+        }
+        for f in [".gitignore", ".gitattributes", "CLAUDE.md"] {
+            if let Ok(bytes) = fs::read(src.join(f)) {
+                fs::write(dst.join(f), bytes).unwrap();
+            }
+        }
+    }
+
+    /// rel-path → (len, hash) for every file under `root`. DefaultHasher is
+    /// std-only and good enough to compare two snapshots of one tree.
+    fn inventory(root: &Path) -> std::collections::BTreeMap<String, (u64, u64)> {
+        use std::hash::{Hash, Hasher};
+        let mut map = std::collections::BTreeMap::new();
+        fn walk(dir: &Path, root: &Path, map: &mut std::collections::BTreeMap<String, (u64, u64)>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, root, map);
+                } else if p.is_file() {
+                    let rel = p
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let bytes = fs::read(&p).unwrap_or_default();
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    bytes.hash(&mut h);
+                    map.insert(rel, (bytes.len() as u64, h.finish()));
+                }
+            }
+        }
+        walk(root, root, &mut map);
+        map
+    }
+
+    /// T-000190 spec, verification 6 ("~45-repo reality"): run every project's
+    /// sync against a COPY of the live portfolio — a `VACUUM INTO` snapshot of
+    /// `data.db` plus `docs/`-only mirrors of each repo — never the originals.
+    /// Asserts the migration loses no legacy-channel bytes (every file under a
+    /// legacy REQ/announce dir either lands under `docs/InOutBox/` or stays
+    /// where it was) and that a second sync is a no-op (identical inventory).
+    ///
+    /// Run: `cargo test portfolio_dry_run -- --include-ignored --nocapture`
+    /// (optionally `SDH_DRYRUN_DB=<path to data.db>`).
+    #[ignore = "dry-run on a copy of the live portfolio; opt-in via --include-ignored"]
+    #[test]
+    fn portfolio_dry_run_migrates_channel_folders() {
+        let src_db = std::env::var("SDH_DRYRUN_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("solo-dev-hub")
+                    .join("data.db")
+            });
+        if !src_db.exists() {
+            eprintln!(
+                "portfolio dry-run: no live data.db at {:?} — skipped",
+                src_db
+            );
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        // A consistent snapshot even while the app runs (WAL-safe).
+        let copy_db = tmp.path().join("data.db");
+        let conn = rusqlite::Connection::open(&src_db).unwrap();
+        conn.execute(
+            &format!(
+                "VACUUM INTO '{}'",
+                copy_db
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+                    .replace('\'', "''")
+            ),
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = AppDb::new(copy_db).unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        // Mirror every repo's sync surface and repoint the copy's local_path.
+        let repos = db.list_repos_with_local_path(None).unwrap();
+        let mut mirrored = 0usize;
+        for r in &repos {
+            let Some(lp) = r.local_path.as_deref() else {
+                continue;
+            };
+            let src = Path::new(lp);
+            if !src.is_dir() {
+                continue;
+            }
+            let dst = tmp.path().join(format!("repo-{}", r.id));
+            mirror_portfolio_repo(src, &dst);
+            db.set_repo_local_path(r.id, dst.to_str()).unwrap();
+            mirrored += 1;
+        }
+
+        // Legacy-channel bytes present BEFORE the sync, per repo: hash → the
+        // rel path that produced it (for error messages).
+        const LEGACY: &[&str] = &[
+            "docs/backend-requirements",
+            "docs/client-requirements",
+            "docs/microservice-requirements",
+            "docs/server-requirements",
+            "docs/server-announcements",
+            "docs/microservice-announcements",
+        ];
+        let mirror_of = |rid: i64| tmp.path().join(format!("repo-{}", rid));
+        let mut legacy_before: std::collections::BTreeMap<
+            i64,
+            std::collections::BTreeMap<u64, String>,
+        > = Default::default();
+        // Q3: `docs/InOutBox/registry/` ledgers are agent-owned — the app may
+        // carry them through git but must never create or rewrite one.
+        let mut registry_before: std::collections::BTreeMap<i64, Vec<(String, u64)>> =
+            Default::default();
+        for r in &repos {
+            for (rel, (_, h)) in inventory(&mirror_of(r.id)) {
+                if LEGACY.iter().any(|d| rel.starts_with(&format!("{}/", d))) {
+                    legacy_before
+                        .entry(r.id)
+                        .or_default()
+                        .entry(h)
+                        .or_insert(rel.clone());
+                }
+                if rel.starts_with("docs/InOutBox/registry/") {
+                    registry_before.entry(r.id).or_default().push((rel, h));
+                }
+            }
+        }
+
+        // First pass: the real entry point, every project.
+        let mut issues = Vec::new();
+        for p in db.list_projects().unwrap() {
+            if let Ok(r) = run_project_sync_in(&db, p.id, Some(home.clone())) {
+                issues.extend(
+                    r.errors
+                        .iter()
+                        .map(|i| format!("{}: {:?} {}", p.name, i.code, i.subject)),
+                );
+            }
+        }
+
+        // Every legacy byte is accounted for inside the same repo: moved
+        // under docs/InOutBox/, or still at its own path (a divergent
+        // migration keeps both versions; an unmigrated file stays).
+        let mut lost = Vec::new();
+        let mut after_invs: std::collections::BTreeMap<i64, _> = Default::default();
+        for r in &repos {
+            let inv = inventory(&mirror_of(r.id));
+            let hashes: std::collections::HashSet<u64> = inv.values().map(|(_, h)| *h).collect();
+            for (h, rel) in legacy_before.get(&r.id).into_iter().flatten() {
+                if !hashes.contains(h) {
+                    lost.push(format!("{}: {}", r.display_name(), rel));
+                }
+            }
+            let registry_after: Vec<(String, u64)> = inv
+                .iter()
+                .filter(|(rel, _)| rel.starts_with("docs/InOutBox/registry/"))
+                .map(|(rel, (_, h))| (rel.clone(), *h))
+                .collect();
+            assert_eq!(
+                registry_before.get(&r.id).cloned().unwrap_or_default(),
+                registry_after,
+                "the app must never write ledger content ({})",
+                r.display_name()
+            );
+            after_invs.insert(r.id, inv);
+        }
+        assert!(
+            lost.is_empty(),
+            "the migration lost channel bytes:\n{}",
+            lost.join("\n")
+        );
+
+        // Second pass: a no-op — identical inventory on every repo.
+        for p in db.list_projects().unwrap() {
+            let _ = run_project_sync_in(&db, p.id, Some(home.clone()));
+        }
+        let mut churn = Vec::new();
+        for r in &repos {
+            let now = inventory(&mirror_of(r.id));
+            let before = after_invs.get(&r.id).unwrap();
+            if &now != before {
+                let mut detail = String::new();
+                for (rel, _) in &now {
+                    if !before.contains_key(rel.as_str()) {
+                        detail.push_str(&format!("\n  + {}", rel));
+                    }
+                }
+                for (rel, (ph, _)) in before {
+                    match now.get(rel.as_str()) {
+                        None => detail.push_str(&format!("\n  - {}", rel)),
+                        Some((nh, _)) if nh != ph => detail.push_str(&format!("\n  ~ {}", rel)),
+                        _ => {}
+                    }
+                }
+                churn.push(format!("{}{}", r.display_name(), detail));
+            }
+        }
+        assert!(
+            churn.is_empty(),
+            "second sync was not a no-op for:\n{}",
+            churn.join("\n")
+        );
+
+        eprintln!(
+            "portfolio dry-run: {} repos mirrored, {} projects synced, {} legacy-channel files accounted, {} sync issues (see below)\n{}",
+            mirrored,
+            db.list_projects().unwrap().len(),
+            legacy_before.values().map(|m| m.len()).sum::<usize>(),
+            issues.len(),
+            issues.join("\n")
         );
     }
 }
