@@ -2,7 +2,7 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Changelog.ru.md](Changelog.ru.md).
 
-## [Unreleased]
+## [1.23.0] — 2026-11-10
 
 ### Added
 - **A contributor's rule edit becomes a proposal the owner decides on (T-000241).** Until now an `.approved` hand-back in a shared repository either silently lost to the owner's canon or replaced it outright. A contributor's edit is now applied locally at once and carried to the owner as a proposal file on the shared dev branch; the owner's accept or reject travels back as an immutable receipt the contributor's app lays over its proposal. The Rules screen gains a **Proposals** tab: the owner sees the queue with diffs against the canon and decides (CAS-checked against the exact version seen — a newer version never inherits an older decision), and the contributor sees sent/unsent state, the owner's resolution and a withdraw action. A canon that moved between the decision and its application lands the acceptance in an explicit conflict the owner resolves by hand, receipts publish idempotently and confirm from origin rather than the local push, and every unfinished step resumes after a crash or an app restart. New Tauri commands: `list_rule_proposals`, `list_rule_acceptances`, `decide_rule_proposal`, `withdraw_rule_proposal`, `resolve_rule_acceptance_conflict`. Flow: `docs/flows/rule-proposals.md`.
@@ -16,6 +16,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Chang
 
 ### Fixed
 - **Hand-back markers no longer leak into git tracking (T-000244).** The `.approved` markers and `.conflict` reason files sat beside the rule copies under `docs/sdh_skills/`, so a sync could commit them into the shared tree. The shared pathspec now excludes them, and a contributor's checkout removes rule copies a previous version rendered without tracking before a fast-forward could trip on them.
+
+### Tests
+- 1188 Rust on the Linux CI run of `4891f61` (`cargo test --lib -- --include-ignored` — the 127 git-spawning tests run there); macOS runs the fast subset. 223 vitest, svelte-check clean.
 
 ## [1.22.1] — 2026-11-08
 
