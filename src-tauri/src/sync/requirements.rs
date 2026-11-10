@@ -1555,7 +1555,10 @@ mod tests {
         assert_eq!(fs::read(new.join("NOTE-001_x.md")).unwrap(), b"note");
         assert!(new.join("ANNOUNCE-001_a.md.ack/helper").is_file());
         // Divergent pair keeps both versions.
-        assert_eq!(fs::read(new.join("NOTE-003_diff.md")).unwrap(), b"new bytes");
+        assert_eq!(
+            fs::read(new.join("NOTE-003_diff.md")).unwrap(),
+            b"new bytes"
+        );
         assert_eq!(
             fs::read(old.join("NOTE-003_diff.md")).unwrap(),
             b"old bytes"

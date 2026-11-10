@@ -8171,10 +8171,7 @@ mod tests {
         let changed = g(&fx.origin, &["diff", "--name-only", &before, "dev"]);
         assert_eq!(
             changed.lines().collect::<Vec<_>>(),
-            vec![
-                ".sdh/app-versions/helper.json",
-                ".sdh/requests/helper.json"
-            ]
+            vec![".sdh/app-versions/helper.json", ".sdh/requests/helper.json"]
         );
         assert!(fx
             .remote_file("dev", ".sdh/requests/helper.json")
@@ -11016,8 +11013,7 @@ mod tests {
                 &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]
             )
             .lines()
-            .all(|f| f.starts_with("docs/sdh_skills/")
-                || f.starts_with(APP_VERSIONS_REL_DIR)),
+            .all(|f| f.starts_with("docs/sdh_skills/") || f.starts_with(APP_VERSIONS_REL_DIR)),
             "the commit touches shared paths only"
         );
         // And the next sync is a no-op that pushes nothing new.

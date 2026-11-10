@@ -546,7 +546,15 @@ pub fn last_commit_touching(
     rel_path: &str,
 ) -> Result<Option<String>, String> {
     let out = spawn_cmd(&git.0)
-        .args(["log", rev, "--no-merges", "--format=%H", "-1", "--", rel_path])
+        .args([
+            "log",
+            rev,
+            "--no-merges",
+            "--format=%H",
+            "-1",
+            "--",
+            rel_path,
+        ])
         .current_dir(local_path)
         .output()
         .map_err(|e| format!("git log failed to start: {}", e))?;
