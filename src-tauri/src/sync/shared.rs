@@ -5116,6 +5116,7 @@ fn sdh_tracked_paths() -> Vec<String> {
         REQUESTS_REL_DIR.to_string(),
         rp::RULE_PROPOSALS_REL_DIR.to_string(),
         rp::RULE_DECISIONS_REL_DIR.to_string(),
+        APP_VERSIONS_REL_DIR.to_string(),
     ]
 }
 
@@ -5999,6 +6000,7 @@ pub(crate) mod test_support {
             g(&self.main_dir, &["commit", "-q", "-m", "structure"]);
             g(&self.main_dir, &["push", "-q", "origin", "dev"]);
             self.sync_helper(); // contributor now
+            self.catch_up_main();
         }
 
         /// The same state reached through real syncs of both installs.
@@ -6009,6 +6011,16 @@ pub(crate) mod test_support {
             approve_join_request(&self.main_db, Some(&gb()), self.main_repo, "helper").unwrap();
             self.sync_main(); // approval committed + pushed
             self.sync_helper(); // contributor now
+            self.catch_up_main();
+        }
+
+        /// A contributor's first sync publishes `.sdh/app-versions/<login>.json`
+        /// on dev: the owner's clone is a commit behind until it fetches. The
+        /// fixture restores the old invariant so a raw push or a disable still
+        /// fast-forwards instead of being refused.
+        fn catch_up_main(&self) {
+            g(&self.main_dir, &["fetch", "-q", "origin", "dev"]);
+            g(&self.main_dir, &["merge", "-q", "--ff-only", "origin/dev"]);
         }
     }
 
@@ -8158,7 +8170,10 @@ mod tests {
         let changed = g(&fx.origin, &["diff", "--name-only", &before, "dev"]);
         assert_eq!(
             changed.lines().collect::<Vec<_>>(),
-            vec![".sdh/requests/helper.json"]
+            vec![
+                ".sdh/app-versions/helper.json",
+                ".sdh/requests/helper.json"
+            ]
         );
         assert!(fx
             .remote_file("dev", ".sdh/requests/helper.json")
@@ -11000,7 +11015,8 @@ mod tests {
                 &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]
             )
             .lines()
-            .all(|f| f.starts_with("docs/sdh_skills/")),
+            .all(|f| f.starts_with("docs/sdh_skills/")
+                || f.starts_with(APP_VERSIONS_REL_DIR)),
             "the commit touches shared paths only"
         );
         // And the next sync is a no-op that pushes nothing new.

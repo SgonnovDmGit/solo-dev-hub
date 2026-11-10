@@ -482,6 +482,8 @@ fn classify_net_stderr(stderr: &str) -> NetErrorKind {
         "network is unreachable",
         "does not appear to be a git repository",
         "could not read from remote repository",
+        "does not exist",
+        "no such file or directory",
         "operation timed out",
         "timed out",
     ];
