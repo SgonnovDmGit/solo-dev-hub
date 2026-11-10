@@ -532,19 +532,21 @@ pub fn path_in_history(git: &GitBinary, local_path: &Path, rel_path: &str) -> Re
     Ok(!out.stdout.trim_ascii().is_empty())
 }
 
-/// The newest commit (any ref) that touched `rel_path`, or `None` when the
-/// path is uncommitted / unknown to history. `git log --all` covers the
-/// shared dev branch and every fetched participant branch alike. Merges are
-/// skipped: a merge carries a file forward but never authors its bytes, and
-/// newer gits report it as the touching commit — the caller's ancestry
-/// judgement needs the authoring commit.
+/// The newest non-merge commit that touched `rel_path`, or `None` when the
+/// path is uncommitted / unknown to history. `rev` scopes the walk: "HEAD"
+/// pins the answer to the checked-out history — deterministic even when
+/// sibling refs share commit timestamps — while "--all" spans every fetched
+/// branch. Merges are skipped: a merge carries a file forward but never
+/// authors its bytes — the caller's ancestry judgement needs the authoring
+/// commit.
 pub fn last_commit_touching(
     git: &GitBinary,
     local_path: &Path,
+    rev: &str,
     rel_path: &str,
 ) -> Result<Option<String>, String> {
     let out = spawn_cmd(&git.0)
-        .args(["log", "--all", "--no-merges", "--format=%H", "-1", "--", rel_path])
+        .args(["log", rev, "--no-merges", "--format=%H", "-1", "--", rel_path])
         .current_dir(local_path)
         .output()
         .map_err(|e| format!("git log failed to start: {}", e))?;

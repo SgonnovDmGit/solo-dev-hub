@@ -5126,6 +5126,7 @@ fn remove_sdh_files(root: &Path) {
         REQUESTS_REL_DIR,
         rp::RULE_PROPOSALS_REL_DIR,
         rp::RULE_DECISIONS_REL_DIR,
+        APP_VERSIONS_REL_DIR,
     ] {
         if let Ok(entries) = std::fs::read_dir(root.join(dir)) {
             for e in entries.flatten() {

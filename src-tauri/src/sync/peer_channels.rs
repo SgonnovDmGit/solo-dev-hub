@@ -578,7 +578,9 @@ fn current_ack_keys(
         return keys;
     };
     let body_rel = fwd_rel(root, &b_in.join(body));
-    let body_rev = git_ops::last_commit_touching(git, root, &body_rel);
+    // The body's current revision is judged on the checked-out history: an
+    // --all walk can pick a sibling ref's older commit when timestamps tie.
+    let body_rev = git_ops::last_commit_touching(git, root, "HEAD", &body_rel);
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
@@ -596,7 +598,7 @@ fn current_ack_keys(
         let marker_rel = fwd_rel(root, &path);
         let stale = match (
             &body_rev,
-            git_ops::last_commit_touching(git, root, &marker_rel),
+            git_ops::last_commit_touching(git, root, "--all", &marker_rel),
         ) {
             (Ok(Some(b)), Ok(Some(m))) => match git_ops::is_ancestor(git, root, b, &m) {
                 Ok(anc) => !anc,
