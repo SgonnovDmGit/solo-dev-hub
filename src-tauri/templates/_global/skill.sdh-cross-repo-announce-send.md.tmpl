@@ -4,9 +4,10 @@ description: >
   Use when YOU proactively push unsolicited information that affects another
   repo — server → client, or microservice → parent server (ANNOUNCE-NNN.md
   files). Covers the announcement-vs-REQ-receipt choice, the actionable-impact
-  threshold, finding the recipient's path, picking the number, the file
-  structure, and the carve-out (writing directly into another repo is allowed).
-  To READ an announcement that arrived — skill sdh-cross-repo-announce-read.
+  threshold, finding the recipients, picking the number from the per-pair
+  registry, the file structure, and the `.ack/<key>` acknowledgement the app
+  transports back. To READ an announcement that arrived — skill
+  sdh-cross-repo-announce-read.
 ---
 
 A one-way push on your own initiative, no reply expected. Only server → client and microservice → parent server; the reverse directions go through REQ. An announcement that arrived for you → `sdh-cross-repo-announce-read`.
@@ -23,20 +24,22 @@ A one-way push on your own initiative, no reply expected. Only server → client
 
 Threshold: write one only if the recipient must change code, config or behaviour, or acknowledge a deprecation. A new endpoint they may adopt later reaches them through the contract sync.
 
-## 1. Recipient path — from your `docs/project.md`
+## 1. Recipients — from your `docs/project.md`
 
-| Direction | Path column | Where you write |
+| Direction | Rows | You write |
 |---|---|---|
-| Server → client | `## Repositories`, rows with role `client` / `admin_client` / `test_client` | `<client-path>/docs/server-announcements/<your-repo>/ANNOUNCE-NNN_<slug>.md` |
-| Microservice → parent | `## Parent projects`, row of the target server | `<parent-path>/docs/microservice-announcements/<your-ms-project>/ANNOUNCE-NNN_<slug>.md` |
+| Server → client | `## Repositories`, role `client` / `admin_client` / `test_client` | `docs/InOutBox/outbox/<client-repo>/ANNOUNCE-NNN_<slug>.md` — one file per recipient |
+| Microservice → parent | `## Parent projects`, row of the target server | `docs/InOutBox/outbox/<parent-repo>/ANNOUNCE-NNN_<slug>.md` |
 
-No path (`_no local path configured_`) or `⚠ server repo not resolvable` → do not write; tell the user or file a `T-` task. Folder names use the last segment (`web-app-backend`); take yours from the `## Repositories` row whose path is the current directory.
+No path (`_no local path configured_`) or `⚠ server repo not resolvable` → do not write; tell the user or file a `T-` task. Folder names use the last segment of the repo name; take yours from the `## Repositories` row whose path is the current directory.
 
-## 2. Number
+## 2. Number — from `docs/InOutBox/registry/<peer>.md`
 
-Per sender × recipient pair, monotonic, never reused. Folder absent → create it, `001`. Otherwise `max + 1` — but acknowledged announcements are deleted, so also check the recipient's records (`docs/done.md`, commits, specs) for higher numbers.
+- `max` over every `registry/*.md` line plus the frozen legacy ledgers + 1 — the same global counter every other kind uses, incoming included. Write the `out` line into `registry/<recipient>.md` in the same pass; the app never writes the registry.
+- Ledger missing → seed it from the pair's `ANNOUNCE-*.md` (and any frozen `docs/*-announcements/`) first; never restart at `001` while history exists.
+- In a shared repo: sync first, then write the ledger line and the body — `max+1` without a current `dev` collides.
 
-## 3. File
+## 3. File — in your own `outbox/`
 
 ```markdown
 # ANNOUNCE-NNN: <headline>
@@ -54,6 +57,6 @@ Per sender × recipient pair, monotonic, never reused. Folder absent → create 
 - <commit / endpoint>
 ```
 
-You write it directly into the recipient's repo and keep no copy; its git history is the record. No registry in this channel.
+Your copy in `outbox/` is the master: the next sync mirrors the body into each recipient's `docs/InOutBox/inbox/<you>/` (and onto the shared `dev` branch for a shared repo). Recipients ack with an empty `.ack/<key>` marker; the app transports the markers back and deletes body and markers on both sides once every expected key has arrived. Your later edits to the body reset that ack group — ship the final text.
 
-This direct write is the one exception to "never write across a repo boundary", and it holds only for these two vertical directions. Between equals you write only in your own repo (`sdh-peer-channel-send`). The app does not track announcements; the recipient deletes the file once applied.
+The old carve-out is gone: you never write into another repo — `outbox/` is the only place you touch, same as REQ and peer exchanges.

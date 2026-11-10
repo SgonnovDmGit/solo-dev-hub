@@ -94,7 +94,7 @@ Legacy-папки живут как проекция и источник миг�
 
 1. **Server-LLM канонизирует имена.** `docs/project.md` `## Repositories`: свою row (sender canonical) и row каждого client (`role` ∈ {`client`, `admin_client`, `test_client`}).
 
-2. **Picks `NNN`** — `max(existing ANNOUNCE-NNN*.md) + 1` в `docs/InOutBox/outbox/<client-canonical>/` (per sender×recipient pair, monotonic; ранее закрытые номера не переиспользуются — это сохраняет читаемость истории).
+2. **Picks `NNN`** — из глобального счётчика репо ([peer-channels.md](peer-channels.md) §реестр): `1 + max` по всем `docs/InOutBox/registry/*.md` и замороженным legacy-реестрам, сквозной по родам, направлениям и контрагентам. Строку `out` в `registry/<client-canonical>.md` пишет в том же проходе, что и body; ранее закрытые номера не переиспользуются — это сохраняет читаемость истории.
 
 3. **Пишет файл** в СВОЙ outbox: `<server-repo>/docs/InOutBox/outbox/<client-canonical>/ANNOUNCE-NNN_<slug>.md` — один файл на каждого client. 4-section структура:
 

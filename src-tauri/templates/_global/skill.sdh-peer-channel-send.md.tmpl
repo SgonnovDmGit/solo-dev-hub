@@ -24,7 +24,7 @@ You want something from, or tell something to, a repo at your own level: client 
 | `docs/InOutBox/inbox/<peer>/` | what the peer sent | the app only |
 | `docs/InOutBox/pact/<peer>/` | agreements | both, one file per writer |
 
-`<peer>` is the last segment of the peer's repo name. You write only in your own repo — never in `inbox/`, never in another repo (the announcement carve-out does not apply here). The app mirrors your `outbox/<peer>/` into their `inbox/<you>/` and merges the `pact/` folders.
+`<peer>` is the last segment of the peer's repo name. You write only in your own repo — never in `inbox/`, never in another repo. The app mirrors your `outbox/<peer>/` into their `inbox/<you>/` and merges the `pact/` folders.
 
 ## Kind
 
@@ -36,11 +36,24 @@ You want something from, or tell something to, a repo at your own level: client 
 
 Does the peer have to commit to something? Yes → PACT, no → NOTE. There is no "request" form.
 
-## Number — from `docs/InOutBox/registry.md`
+## Number — from `docs/InOutBox/registry/<peer>.md`
 
-- `max` over every line of the registry + 1 — shared across kinds and across directions (incoming numbers included). One registry per repo, not per peer. Never from the folder, never reused.
-- Line: `- PACT-003 | out | LenSa_Assist1C | shared code: console is the donor | 2026-08-24 | | |` — `id | direction | counterpart | subject | opened | closed | final status | where the result went`. Empty `closed` = in flight.
-- Write the line in the same pass as the file. Missing registry → create it; the app never writes or deletes it.
+- `max` over every line of every `docs/InOutBox/registry/*.md` plus the
+  frozen legacy ledgers + 1 — one counter per repo, shared across kinds and
+  directions, incoming numbers included, across all counterparties. Never
+  from the folder, never reused.
+- Line into `registry/<peer>.md`:
+  `- PACT-003 | out | LenSa_Assist1C | shared code: console is the donor | 2026-08-24 | | |`
+  — `id | direction | counterpart | subject | opened | closed | final status |
+  where the result went`. Empty `closed` = in flight.
+- Write the line in the same pass as the file; the app never writes or
+  deletes the registry. First touch: split a flat `docs/InOutBox/registry.md`
+  and frozen `docs/*-requirements/**/registry.md` ledgers into per-pair files
+  by counterpart; originals stay byte-identical. A row whose counterpart does
+  not resolve stays archived — raise it; the number still counts.
+- In a shared repo the number is issued on a current `dev`: sync, write the
+  ledger line, then publish the body — parallel `max+1` without checking is
+  a collision.
 
 ## PACT body
 

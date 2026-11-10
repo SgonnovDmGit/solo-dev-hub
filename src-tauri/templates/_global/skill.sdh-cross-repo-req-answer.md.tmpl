@@ -14,7 +14,7 @@ A requirement arrived (`REQ-*.md` without a `.response.md`) and you answer it wi
 
 - Asking yourself → `sdh-cross-repo-req-send`; pushing → `sdh-cross-repo-announce-send`.
 - The app moves files between repos; you write only in your own incoming folder.
-- The `NNN` belongs to the sender's registry — never pick or change it. If a pair closes from your side or by ✓ while you work there, tell the sender in the receipt that their registry line is open.
+- The `NNN` belongs to the sender's registry — never pick or change it. If a pair closes via your app's ✓ while you work there, tell the sender in the receipt that their registry line is open.
 
 ## Files
 
@@ -23,8 +23,13 @@ A requirement arrived (`REQ-*.md` without a `.response.md`) and you answer it wi
 
 | You | Incoming folder |
 |---|---|
-| Server answering a client | `docs/client-requirements/<client-repo-name>/` |
-| Microservice answering a server | `docs/server-requirements/` (flat: one parent server per microservice for now) |
+| Server answering a client | `docs/InOutBox/inbox/<client-repo>/` |
+| Microservice answering a server | `docs/InOutBox/inbox/<server-repo>/` — one per parent |
+
+Your `.response.md` sits next to the REQ replica **inside your own `inbox/`**
+— it is the one file you write there; everything else in `inbox/` is the
+app's mirror. Frozen `docs/client-requirements/` and
+`docs/server-requirements/` stay archives: read, never write.
 
 ## Receipt
 
@@ -56,7 +61,7 @@ The sync returns the receipt to the sender. **The sender closes the pair** (✓ 
 1. **Classify** using `docs/project.md` and the handler surface: server-only (ordinary pair), MS-only, or mixed. "Not my responsibility" is never a receipt.
 2. **MS-only / mixed:** one downstream REQ per microservice (`sdh-cross-repo-req-send`, "Downstream REQ", with `Forwarded-from:`).
 3. **Write the client receipt exactly once**, after every downstream REQ has a receipt and your own part is done; consolidate the outcome. No interim receipts.
-4. **Resuming:** for each client REQ without your receipt, grep `docs/microservice-requirements/*/REQ-*.md` for `Forwarded-from: <client-repo>/REQ-NNN`. Downstream answered → write the client receipt now; not answered → wait; no match → classify and act.
+4. **Resuming:** for each client REQ without your receipt, grep `docs/InOutBox/outbox/*/REQ-*.md` for `Forwarded-from: <client-repo>/REQ-NNN`. Downstream answered → write the client receipt now; not answered → wait; no match → classify and act.
 
 The client receipt says nothing about microservices — no names, no forwarding.
 
@@ -64,10 +69,10 @@ The client receipt says nothing about microservices — no names, no forwarding.
 
 - Ignore client identity: a client name leaking in via `Forwarded-from:` or the body goes into no DB, code or comment. The body alone sets your scope.
 - The only client-related distinction is admin vs user when it affects access — the server states it in the body; if it matters and is missing, ask via `clarification-needed`.
-- Receipts only in your `docs/server-requirements/`. Never write to a client repo; there is no ms↔client channel.
+- Receipts only in your `docs/InOutBox/inbox/<server>/`. Never write to a client repo; there is no ms↔client channel.
 
 ## Never
 
-- Edit the received REQ; write a `REQ-*.md` in your incoming folder; write a receipt for a REQ you did not receive.
+- Edit the received REQ; write a `REQ-*.md` into `inbox/` (only your `.response.md` belongs there); write a receipt for a REQ you did not receive.
 - Author `.impl.md` on the receiving side (undeliverable — closing is the sender's).
 - Delete your receipt or the received REQ to clean up — the sender's REQ re-syncs as open. Rename sync folders.

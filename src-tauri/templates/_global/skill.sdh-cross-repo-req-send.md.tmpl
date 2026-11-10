@@ -18,29 +18,41 @@ You are asking another repo for something. REQ is the reactive channel along the
 ## Files
 
 - `REQ-NNN_<slug>.md` — yours, the source of truth; the recipient holds a replica.
-- `REQ-NNN_<slug>.response.md` — the recipient's receipt; your copy is a replica, never edit it.
+- `REQ-NNN_<slug>.response.md` — the recipient's receipt; the sync copies it back into your `outbox/<peer>/` — your copy is a replica, never edit it.
 - `NNN` is never renamed or reused. The slug is optional (the app matches `REQ-*.md`).
 - Revising your REQ before a receipt: edit the same file in place, never a second file under the same number.
 
-## 1. Number — from the registry
+## 1. Number — from `docs/InOutBox/registry/<peer>.md`
 
-| You | Registry |
-|---|---|
-| Client → server | `docs/backend-requirements/registry.md` |
-| Server → microservice | `docs/microservice-requirements/registry.md` |
-
-- New number = `max` over the registry + 1, three digits. One counter per channel, across all counterparties.
-- Registry missing or empty → seed it first from every `REQ-*.md` in the channel, all subfolders; nothing anywhere → `001`. Never take the number from the folder listing: closed pairs are deleted.
-- Write the opening line in the same pass as the REQ: `- REQ-014 | out | swan_code_server | pagination on /orders | 2026-08-24 | | |` — fields `id | direction | counterpart | subject | opened | closed | final status | where the result went`. Direction is `out` here. The app never writes or deletes the registry.
+- `max` over every line of every `docs/InOutBox/registry/*.md` plus the
+  frozen legacy ledgers + 1 — one counter per repo, shared across kinds
+  (REQ / PACT / NOTE / HANDOFF / ANNOUNCE), directions and counterparties,
+  incoming numbers included. Never take the number from the folder listing:
+  closed pairs are deleted.
+- Line into `registry/<recipient>.md`, same pass as the REQ:
+  `- REQ-014 | out | swan_code_server | pagination on /orders | 2026-08-24 | | |`
+  — `id | direction | counterpart | subject | opened | closed | final status |
+  where the result went`, direction `out` here. The app never writes or
+  deletes the registry.
+- First touch: split a flat `docs/InOutBox/registry.md` and the frozen
+  `docs/*-requirements/**/registry.md` ledgers into per-pair
+  `registry/<peer>.md` files by the counterpart column; the originals stay
+  byte-identical archives. A row whose counterpart does not resolve stays in
+  the archive — raise it; its number still counts.
+- Ledger absent: seed `registry/<peer>.md` from the pair's existing
+  `REQ-*.md`; nothing anywhere → `001`.
+- In a shared repo the number is issued on a current `dev`: sync first, then
+  write the ledger line and the body — `max+1` without checking is a
+  collision waiting.
 
 ## 2. Folder
 
-| You | Outgoing folder |
-|---|---|
-| Client → server | `docs/backend-requirements/` |
-| Server → microservice | `docs/microservice-requirements/<microservice-project-name>/` |
+`docs/InOutBox/outbox/<peer>/` — every direction (client → server,
+server → microservice). `<peer>` is the last segment of the recipient's repo
+name. Never rename channel folders — the app handles renames.
 
-Never rename sync folders — the app handles renames.
+Legacy `docs/backend-requirements/` and `docs/microservice-requirements/<ms>/`
+are frozen archives: read for history and the registry split, never write.
 
 ## 3. Body
 
@@ -69,7 +81,7 @@ Links, constraints, related endpoints or tables.
 
 ## 5. Closing
 
-- **✓ in the app**, or **drop an empty `REQ-NNN_<slug>.impl.md`** beside your REQ when you are done integrating. The next sync deletes `.md`, `.response.md` and `.impl.md` on both sides.
+- **✓ in the app**, or **drop an empty `REQ-NNN_<slug>.impl.md` in your own `outbox/<peer>/`** — never in `inbox/`, a marker there is not a close signal. The next sync deletes `.md`, `.response.md` and `.impl.md` on both sides.
 - Fill the registry line (closed date, final status, where the result went) in the same pass. Closed by ✓ → fill it the next time you touch the channel.
 - **After dropping `.impl.md`, touch nothing.** Deleting any of the files yourself before a sync processes the close makes the next sync re-send your REQ as open, with no receipt.
 - Unsatisfied with a final receipt (`implemented` / `partially` / `declined`): write `REQ-N+1` with the clarified ask.
@@ -86,5 +98,5 @@ When to forward and the client receipt: `sdh-cross-repo-req-answer`, "Forwarding
 
 ## Never
 
-- Write a `REQ-*.md` into an incoming folder (a server writing in `docs/client-requirements/` — server-to-client goes through announcements).
+- Write a `REQ-*.md` into `inbox/` or a frozen `docs/*-requirements/` folder (a server-to-client ask goes through announcements).
 - Edit a `.response.md`, delete pair files by hand, renumber, rename sync folders.
