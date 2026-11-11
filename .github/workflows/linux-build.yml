@@ -24,16 +24,21 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Linux system dependencies
-        # azure.archive.ubuntu.com (the apt-mirrors.txt target on hosted
-        # runners) had a multi-hour DNS outage during the v1.24.0 release and
-        # burned ~75 min per job on per-package resolver timeouts. If the
-        # mirror does not resolve, swap the sources to the public mirror up
-        # front instead of paying a DNS timeout on every package fetch.
+        # The *.ubuntu.com DNS zone itself went dark on hosted runners during
+        # the v1.24.0 release (azure/archive/security all NXDOMAIN while
+        # github.com and packages.microsoft.com resolved), and apt burned
+        # ~75 min per job on per-package resolver timeouts. If the runner's
+        # mirror does not resolve, swap all ubuntu sources to the OSUOSL
+        # mirror — a non-ubuntu.com host whose DNS still resolves. apt
+        # verifies the archive's GPG signatures, so the mirror's trust level
+        # does not matter for package integrity.
         run: |
           if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
             sudo sed -i \
-              -e 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu|g' \
-              -e 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' \
+              -e 's|mirror+file:/etc/apt/apt-mirrors.txt|http://ubuntu.osuosl.org/ubuntu|g' \
+              -e 's|azure\.archive\.ubuntu\.com|ubuntu.osuosl.org|g' \
+              -e 's|security\.ubuntu\.com|ubuntu.osuosl.org|g' \
+              -e 's|archive\.ubuntu\.com|ubuntu.osuosl.org|g' \
               /etc/apt/sources.list
           fi
           sudo apt-get update
