@@ -79,6 +79,7 @@ One file, one writer: the initiator writes `PACT-NNN.md` and later `.impl.md`, t
 
 - PACT → the initiator drops `PACT-NNN_<slug>.impl.md`; HANDOFF / NOTE → the sender drops `<name>.done.md` beside the body. The app removes the files on both sides.
 - Drop the marker only after the peer has had a sync to read the body. Signs it was read: their `.done.md` on the exchange that prompted yours, a reply NOTE, or a task in their plan; none → close at your next release's inbox scan and say so in the registry.
+- At session start, sweep your own `outbox/<peer>/` against `registry/<peer>.md`: every `out` exchange the peer has confirmed (reply NOTE, their registry line you saw, a task in their plan, a release that shipped the thing) gets its close marker in the same pass. An outbox that only grows is a sender who never closes.
 - Fill `closed`, final status and where the result went in the same pass.
 
 ## Never
