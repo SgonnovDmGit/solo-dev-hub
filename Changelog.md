@@ -2,6 +2,11 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Changelog.ru.md](Changelog.ru.md).
 
+## [1.24.0] — TBD
+
+### Added
+- **The codex mirror reaches the contributor (T-000247).** `docs/codex/` stayed gitignored even in a shared repository, so a participant install — which knows no codex connections and can never mirror a svod locally — never received it (the billing report). The folder now rides the same `share_specs` flag as `docs/superpowers/`: on, the managed `.gitignore` drops the codex line and the owner publishes the mirror on the shared dev branch (main-role pathspec only — a contributor receives but never commits it); off, the line is restored and nothing new travels, while already published content keeps its history. Before every publish the inbox root is prepared: entries outside the full set of connected codex names are swept, and any preparation failure excludes the codex from the commit with a diagnostic instead of letting stray files into the shared tree. A contributor install never sweeps — with no connections of its own the set cannot resolve, and the delivered mirror is left alone. Flow: `docs/flows/codex-broadcast.md`.
+
 ## [1.23.0] — 2026-11-10
 
 ### Added

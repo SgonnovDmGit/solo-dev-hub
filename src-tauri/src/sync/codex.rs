@@ -1,6 +1,8 @@
 // Codex broadcast: mirror a codex project's per-lane svod folders into each
 // connected consumer's same-role repo, read-only. Role-matched, best-effort.
 
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::Path;
 
 use crate::db::AppDb;
@@ -128,6 +130,217 @@ pub fn broadcast_codex_to_consumer(
     }
 
     outcome
+}
+
+/// T-000247: the consumer's codex inbox root — the folder the mirrors live in.
+pub fn codex_inbox_root(consumer_root: &Path) -> std::path::PathBuf {
+    consumer_root.join("docs").join("codex")
+}
+
+/// T-000247: the FULL expected-name set of one consumer's `docs/codex/` root —
+/// the names of every codex connected to `consumer_project_id`, whether or not
+/// its source/lane is currently available. Any lookup failure is fatal to the
+/// whole set: a partial answer is exactly what a sweep must never trust.
+pub fn connected_codex_names(
+    db: &AppDb,
+    consumer_project_id: i64,
+) -> Result<BTreeSet<String>, String> {
+    let ids = db
+        .list_connected_codices(consumer_project_id)
+        .map_err(|e| e.to_string())?;
+    let mut names = BTreeSet::new();
+    for id in ids {
+        names.insert(db.get_project(id).map_err(|e| e.to_string())?.name);
+    }
+    Ok(names)
+}
+
+/// A codex name is used as a single path component — anything else (empty,
+/// `.`/`..`, a path separator) is a DB anomaly the sweep refuses to act on.
+fn valid_inbox_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\'])
+        && Path::new(name).components().count() == 1
+}
+
+/// T-000247: delete top-level entries of `<consumer_root>/docs/codex/` that are
+/// not in `expected` — the root belongs to the app's mirrors alone, so stray
+/// files (a script run from the wrong cwd, a dropped snapshot) must not ride
+/// the shared pathspec to a contributor. Returns the number of removed entries.
+///
+/// Safety contract: the root (and its `docs` parent) must not be a
+/// symlink/junction — a misdirected inbox is refused, never followed. Expected
+/// names are matched case-insensitively (a case-only rename on Windows must
+/// not delete a fresh mirror). An empty or invalid set refuses: "unknown"
+/// never reads as "empty inbox". A missing root is a no-op — the sweep never
+/// creates the folder just to clean it.
+pub fn sweep_codex_inbox(
+    consumer_root: &Path,
+    expected: &BTreeSet<String>,
+) -> Result<usize, String> {
+    let inbox = codex_inbox_root(consumer_root);
+    if !inbox.exists() {
+        return Ok(0);
+    }
+    if expected.is_empty() {
+        return Err("refusing to sweep docs/codex/ with an empty expected-name set".to_string());
+    }
+    for name in expected {
+        if !valid_inbox_name(name) {
+            return Err(format!(
+                "codex name {:?} is not a valid path component — refusing to sweep",
+                name
+            ));
+        }
+    }
+    // The root and its `docs` parent must be real directories — a link here
+    // would point the mirror elsewhere, and deleting through it is a write
+    // outside the contract.
+    for dir in [inbox.as_path(), inbox.parent().unwrap_or(inbox.as_path())] {
+        let meta = fs::symlink_metadata(dir)
+            .map_err(|e| format!("could not inspect {}: {}", dir.display(), e))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "{} is a symlink/junction — refusing to sweep",
+                dir.display()
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(format!(
+                "{} is not a directory — refusing to sweep",
+                dir.display()
+            ));
+        }
+    }
+    // Windows is the primary platform and its FS is case-insensitive: a
+    // name that differs only by case IS the expected mirror.
+    let expected_lower: BTreeSet<String> = expected.iter().map(|n| n.to_lowercase()).collect();
+    let mut pruned = 0usize;
+    let entries =
+        fs::read_dir(&inbox).map_err(|e| format!("could not list {}: {}", inbox.display(), e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("could not read {}: {}", inbox.display(), e))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if expected_lower.contains(&name.to_lowercase()) {
+            continue;
+        }
+        let path = entry.path();
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("could not stat {}: {}", path.display(), e))?;
+        let res = if ft.is_symlink() {
+            // A link entry is removed itself, never followed: file links go
+            // via remove_file, directory links/junctions need remove_dir.
+            fs::remove_file(&path).or_else(|_| fs::remove_dir(&path))
+        } else if ft.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        res.map_err(|e| format!("could not remove {}: {}", path.display(), e))?;
+        pruned += 1;
+    }
+    Ok(pruned)
+}
+
+/// T-000247 D4b: the outcome of preparing a consumer's `docs/codex/` root for
+/// publishing — `safe` says the folder may ride the shared pathspec this pass;
+/// `reason` carries why not (the caller excludes `docs/codex` from the commit
+/// paths and reports it, the rest of the shared set is unaffected).
+#[derive(Debug, Default)]
+pub struct CodexRootPrep {
+    pub safe: bool,
+    pub pruned: usize,
+    pub reason: Option<String>,
+}
+
+impl CodexRootPrep {
+    fn unsafe_(reason: impl Into<String>) -> Self {
+        CodexRootPrep {
+            safe: false,
+            pruned: 0,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// Prepend caller-held context (e.g. the name-set resolution error) to the
+    /// refusal reason — a `safe` verdict has no reason to prefix.
+    pub fn with_reason_prefix(mut self, prefix: impl Into<String>) -> Self {
+        if let Some(r) = &mut self.reason {
+            *r = format!("{}{}", prefix.into(), r);
+        }
+        self
+    }
+}
+
+/// Prepare `consumer_root`'s codex inbox for publishing. `expected` is the
+/// consumer's resolved connection set (`None` = the project has no resolvable
+/// connection set — an unassigned repo, or the DB refused it upstream). With
+/// an empty/unknown set the function is only a verdict: an existing non-empty
+/// inbox cannot be proven safe and is refused; an absent or empty one is a
+/// no-op. With a non-empty set the root is swept and every expected name is
+/// checked to be a mirror directory, not a file.
+pub fn prepare_codex_root(
+    consumer_root: &Path,
+    expected: Option<&BTreeSet<String>>,
+) -> CodexRootPrep {
+    let inbox = codex_inbox_root(consumer_root);
+    let inbox_has_entries = fs::read_dir(&inbox)
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false);
+    match expected {
+        None => {
+            if inbox_has_entries {
+                CodexRootPrep::unsafe_(
+                    "docs/codex/ holds files but the project's connected codices are unknown; \
+                     not publishing unverified content",
+                )
+            } else {
+                CodexRootPrep {
+                    safe: true,
+                    ..Default::default()
+                }
+            }
+        }
+        Some(set) if set.is_empty() => {
+            if inbox_has_entries {
+                CodexRootPrep::unsafe_(
+                    "docs/codex/ holds files but no connected codex is known locally; \
+                     not publishing unverified content",
+                )
+            } else {
+                CodexRootPrep {
+                    safe: true,
+                    ..Default::default()
+                }
+            }
+        }
+        Some(set) => match sweep_codex_inbox(consumer_root, set) {
+            Err(e) => CodexRootPrep::unsafe_(e),
+            Ok(pruned) => {
+                for name in set {
+                    let p = inbox.join(name);
+                    match fs::symlink_metadata(&p) {
+                        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+                        Ok(_) => {
+                            return CodexRootPrep::unsafe_(format!(
+                                "docs/codex/{} exists but is not a mirror directory",
+                                name
+                            ))
+                        }
+                        Err(_) => {} // absent mirror is fine — a lane may not deliver it
+                    }
+                }
+                CodexRootPrep {
+                    safe: true,
+                    pruned,
+                    reason: None,
+                }
+            }
+        },
+    }
 }
 
 #[cfg(test)]
@@ -409,5 +622,178 @@ mod tests {
         assert_eq!(second.pruned, 1);
         assert!(!inbox.join("intro.md").exists(), "deleted file pruned");
         assert!(inbox.join("guide/style.md").exists(), "survivor remains");
+    }
+
+    // ----- T-000247: inbox root sweep + publish preparation -------------------
+
+    fn names(list: &[&str]) -> std::collections::BTreeSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sweep_removes_strays_and_keeps_expected_mirrors() {
+        let tmp = TempDir::new().unwrap();
+        let inbox = tmp.path().join("docs/codex");
+        fs::create_dir_all(inbox.join("Swan Practise")).unwrap();
+        fs::write(inbox.join("Swan Practise/rule.md"), "r").unwrap();
+        fs::create_dir_all(inbox.join("Other Codex")).unwrap();
+        fs::write(inbox.join("release.ps1"), "junk").unwrap();
+        fs::create_dir_all(inbox.join("stray-dir")).unwrap();
+
+        let pruned =
+            sweep_codex_inbox(tmp.path(), &names(&["Swan Practise", "Other Codex"])).unwrap();
+        assert_eq!(pruned, 2);
+        assert!(inbox.join("Swan Practise/rule.md").exists());
+        assert!(inbox.join("Other Codex").is_dir());
+        assert!(!inbox.join("release.ps1").exists());
+        assert!(!inbox.join("stray-dir").exists());
+    }
+
+    #[test]
+    fn sweep_keeps_a_case_only_renamed_mirror() {
+        // The mirror on disk carries a different case than the project name —
+        // on Windows that is the same entry, deleting it would be data loss.
+        let tmp = TempDir::new().unwrap();
+        let inbox = tmp.path().join("docs/codex");
+        fs::create_dir_all(inbox.join("Swan Practise")).unwrap();
+        fs::write(inbox.join("Swan Practise/rule.md"), "r").unwrap();
+
+        let pruned = sweep_codex_inbox(tmp.path(), &names(&["swan practise"])).unwrap();
+        assert_eq!(pruned, 0);
+        assert!(inbox.join("Swan Practise/rule.md").exists());
+    }
+
+    #[test]
+    fn sweep_refuses_an_empty_or_invalid_name_set() {
+        let tmp = TempDir::new().unwrap();
+        let inbox = tmp.path().join("docs/codex");
+        fs::create_dir_all(inbox.join("stray")).unwrap();
+
+        let empty = std::collections::BTreeSet::new();
+        assert!(sweep_codex_inbox(tmp.path(), &empty).is_err());
+        assert!(
+            inbox.join("stray").exists(),
+            "refused sweep must not delete"
+        );
+
+        for bad in ["", ".", "..", "a/b", "a\\b"] {
+            assert!(
+                sweep_codex_inbox(tmp.path(), &names(&[bad])).is_err(),
+                "name {:?} must be refused",
+                bad
+            );
+        }
+        assert!(inbox.join("stray").exists());
+    }
+
+    #[test]
+    fn sweep_is_a_noop_without_an_inbox() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(
+            sweep_codex_inbox(tmp.path(), &names(&["Swan Practise"])).unwrap(),
+            0
+        );
+        // The root is never created just to clean it.
+        assert!(!tmp.path().join("docs/codex").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_refuses_a_symlink_root() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("docs/codex")).unwrap();
+
+        let err = sweep_codex_inbox(tmp.path(), &names(&["Swan Practise"])).unwrap_err();
+        assert!(err.contains("symlink"), "{}", err);
+        assert!(real.is_dir(), "the link target must not be touched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_a_stray_link_without_following_it() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.md"), "k").unwrap();
+        let inbox = tmp.path().join("docs/codex");
+        fs::create_dir_all(&inbox).unwrap();
+        std::os::unix::fs::symlink(&outside, inbox.join("bad-link")).unwrap();
+
+        let pruned = sweep_codex_inbox(tmp.path(), &names(&["Swan Practise"])).unwrap();
+        assert_eq!(pruned, 1);
+        assert!(!inbox.join("bad-link").exists());
+        assert!(outside.join("keep.md").exists(), "the target must survive");
+    }
+
+    #[test]
+    fn prep_without_a_connection_set_is_safe_only_when_empty() {
+        let tmp = TempDir::new().unwrap();
+        // No inbox at all: nothing to publish, nothing to fear.
+        let prep = prepare_codex_root(tmp.path(), None);
+        assert!(prep.safe);
+
+        // An inbox with files but no resolvable connection set is unverifiable.
+        fs::create_dir_all(tmp.path().join("docs/codex/stray")).unwrap();
+        let prep = prepare_codex_root(tmp.path(), None);
+        assert!(!prep.safe);
+        assert!(prep.reason.is_some());
+
+        // Same verdict for an empty resolved set.
+        let empty = std::collections::BTreeSet::new();
+        let prep = prepare_codex_root(tmp.path(), Some(&empty));
+        assert!(!prep.safe);
+    }
+
+    #[test]
+    fn prep_refuses_an_expected_name_that_is_a_file() {
+        let tmp = TempDir::new().unwrap();
+        let inbox = tmp.path().join("docs/codex");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(inbox.join("Swan Practise"), "not a dir").unwrap();
+
+        let set = names(&["Swan Practise"]);
+        let prep = prepare_codex_root(tmp.path(), Some(&set));
+        assert!(!prep.safe);
+        assert!(prep
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("not a mirror directory"));
+    }
+
+    #[test]
+    fn prep_sweeps_and_reports_pruned() {
+        let tmp = TempDir::new().unwrap();
+        let inbox = tmp.path().join("docs/codex");
+        fs::create_dir_all(inbox.join("Swan Practise")).unwrap();
+        fs::write(inbox.join("junk.txt"), "j").unwrap();
+
+        let set = names(&["Swan Practise"]);
+        let prep = prepare_codex_root(tmp.path(), Some(&set));
+        assert!(prep.safe);
+        assert_eq!(prep.pruned, 1);
+        assert!(inbox.join("Swan Practise").is_dir());
+        assert!(!inbox.join("junk.txt").exists());
+    }
+
+    #[test]
+    fn connected_codex_names_resolves_the_full_set() {
+        let db = make_db();
+        let consumer = db.create_project("Consumer", None, "standard").unwrap();
+        let cx_a = db.create_project("Swan Practise", None, "codex").unwrap();
+        let cx_b = db.create_project("Other Codex", None, "codex").unwrap();
+        db.connect_codex(consumer.id, cx_a.id).unwrap();
+        db.connect_codex(consumer.id, cx_b.id).unwrap();
+
+        let set = connected_codex_names(&db, consumer.id).unwrap();
+        assert_eq!(set, names(&["Other Codex", "Swan Practise"]));
+
+        // A project with no connections resolves to an EMPTY set — not an
+        // error, and never a sweep trigger.
+        let lonely = db.create_project("Lonely", None, "standard").unwrap();
+        assert!(connected_codex_names(&db, lonely.id).unwrap().is_empty());
     }
 }

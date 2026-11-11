@@ -9,9 +9,9 @@ export const ru = {
   'shared.myBandsHint': 'Номера задач и багов, которые выдаются этой установке.',
   'shared.readOnlyHint': 'Задаёт главный общего проекта — здесь только для чтения.',
   'shared.contributorInfo': 'Общий репо главного {0} · отправляю в {1} и {2}',
-  // T-000243: the owner's docs/superpowers/ switch.
-  'shared.specs.label': 'Делиться спеками и планами (docs/superpowers/)',
-  'shared.specs.hint': 'Настройка общего режима (доступна и до его включения). Выкл: новые файлы docs/superpowers/ не коммитятся и не передаются; уже закоммиченные остаются в репо с историей — флаг не снимает их с трекинга и не переписывает историю. Вкл возобновляет передачу. Задачи, сделанное и баги передаются при любом значении.',
+  // T-000243: the owner's docs/superpowers/ switch. T-000247: docs/codex/ rides the same flag.
+  'shared.specs.label': 'Делиться спеками, планами и кодексом (docs/superpowers/, docs/codex/)',
+  'shared.specs.hint': 'Настройка общего режима (доступна и до его включения). Выкл: новые файлы docs/superpowers/ и docs/codex/ не коммитятся и не передаются; уже закоммиченные остаются в репо с историей — флаг не снимает их с трекинга и не переписывает историю. Вкл возобновляет передачу. Задачи, сделанное и баги передаются при любом значении.',
   'shared.specs.saveFailed': 'Не удалось сохранить настройку спеков: {0}',
   'shared.specs.loadFailed': 'Не удалось прочитать настройку спеков этого репо.',
 
@@ -115,9 +115,9 @@ export const en: Record<keyof typeof ru, string> = {
   'shared.myBandsHint': 'The task and bug numbers issued to this install.',
   'shared.readOnlyHint': 'Set by the owner of the shared project — read-only here.',
   'shared.contributorInfo': 'Shared repo of the owner {0} · sending to {1} and {2}',
-  // T-000243: the owner's docs/superpowers/ switch.
-  'shared.specs.label': 'Share specs and plans (docs/superpowers/)',
-  'shared.specs.hint': 'A shared-mode setting (available before enabling it too). Off: new docs/superpowers/ files are not committed and not sent; the already committed ones stay in the repo with their history — the flag neither untracks them nor rewrites history. On resumes sharing. Tasks, done items and bugs travel whatever the value.',
+  // T-000243: the owner's docs/superpowers/ switch. T-000247: docs/codex/ rides the same flag.
+  'shared.specs.label': 'Share specs, plans and the codex (docs/superpowers/, docs/codex/)',
+  'shared.specs.hint': 'A shared-mode setting (available before enabling it too). Off: new docs/superpowers/ and docs/codex/ files are not committed and not sent; the already committed ones stay in the repo with their history — the flag neither untracks them nor rewrites history. On resumes sharing. Tasks, done items and bugs travel whatever the value.',
   'shared.specs.saveFailed': 'Could not save the specs setting: {0}',
   'shared.specs.loadFailed': 'Could not read this repo\'s specs setting.',
 

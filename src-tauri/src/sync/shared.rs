@@ -185,6 +185,35 @@ pub fn is_shared_repo(db: &AppDb, repo_id: i64) -> bool {
         .unwrap_or(false)
 }
 
+/// T-000247 D4a: may THIS install's codex machinery delete stray top-level
+/// entries of `root`'s `docs/codex/`? Deletion needs certainty, not a default:
+/// `is_shared_repo` folds a DB error into `false`, which here would wrongly
+/// read as "not shared — sweep away". A repo this install KNOWS to share only
+/// lets its main sweep (a helper must never delete the owner's delivered
+/// mirror); a checkout that merely LOOKS unshared — a fresh clone whose role
+/// is not cached yet but that carries a published structure or a saved shared
+/// pin — is not proof of non-shared either, so the sweep is refused until
+/// discovery settles the state. `Err` propagates: callers treat a failed
+/// verdict like a `false`, never a delete.
+pub fn codex_sweep_allowed(db: &AppDb, repo: &Repository, root: &Path) -> Result<bool, String> {
+    let state = db.get_shared_state(repo.id).map_err(|e| e.to_string())?;
+    if is_shared_state(&state) {
+        // The owner — `shared_mode` on, or the cached "main" role — may sweep;
+        // contributor / pending helpers and any unrecognised role may not.
+        return Ok(state.shared_mode || state.shared_role.as_deref() == Some("main"));
+    }
+    if root.join(STRUCTURE_REL_PATH).exists() {
+        return Ok(false);
+    }
+    if ss::read_shared_import(db, repo.id)
+        .pinned_dev_branch
+        .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// T-000243 review (sixth pass): per-repo shared-lifecycle GENERATION.
 /// In-memory on purpose: a pass never outlives its sync call, so the
 /// counter needs no persistence (and no schema change). Keyed by
@@ -534,11 +563,18 @@ pub const SHARED_UNIGNORED_LINES: &[&str] = &[
     "docs/InOutBox/",
     "docs/sdh_skills/",
     "docs/superpowers/",
+    // T-000247: the owner's codex mirror travels to helpers under the same
+    // `share_specs` gate as the specs folder.
+    "docs/codex/",
 ];
 
 /// T-000243: the specs folder of the shared set, as the `.gitignore` line
 /// spells it.
 const SPECS_IGNORE_LINE: &str = "docs/superpowers/";
+
+/// T-000247: the codex mirror root, as the `.gitignore` line spells it —
+/// gated on `share_specs` exactly like the specs folder.
+const CODEX_IGNORE_LINE: &str = "docs/codex/";
 
 /// `.gitattributes` lines added for a shared repo.
 pub const SHARED_ATTRIBUTE_LINES: &[&str] = &[
@@ -565,8 +601,15 @@ pub fn gitignore_template_for(template: &str, shared: bool, share_specs: bool) -
     while out.last().is_some_and(|l| l.trim().is_empty()) {
         out.pop();
     }
-    if !share_specs && !out.iter().any(|l| l.trim() == SPECS_IGNORE_LINE) {
-        out.push(SPECS_IGNORE_LINE);
+    // T-000247: opted out, BOTH gated folders stay ignored even when the
+    // custom (or empty) template lacks their lines — off is "never
+    // committed", whatever the template says.
+    if !share_specs {
+        for line in [SPECS_IGNORE_LINE, CODEX_IGNORE_LINE] {
+            if !out.iter().any(|l| l.trim() == line) {
+                out.push(line);
+            }
+        }
     }
     out.join("\n")
 }
@@ -590,6 +633,8 @@ pub fn gitattributes_template_for(template: &str, shared: bool) -> String {
 pub(super) const SKILLS_DIR: &str = "docs/sdh_skills";
 /// T-000243: the specs folder of the shared set, as a pathspec spells it.
 const SPECS_DIR: &str = "docs/superpowers";
+/// T-000247: the codex mirror root, as a pathspec spells it.
+const CODEX_DIR: &str = "docs/codex";
 const SKILLS_EXCLUDES: [&str; 2] = [
     ":(exclude)docs/sdh_skills/*.approved",
     ":(exclude)docs/sdh_skills/*.conflict",
@@ -646,6 +691,11 @@ pub fn shared_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String
     }
     if share_specs {
         v.push(SPECS_DIR.to_string());
+        // T-000247: only the owner publishes its codex mirror — a helper
+        // receives it through merge/ff and never commits it.
+        if role == Role::Main {
+            v.push(CODEX_DIR.to_string());
+        }
     }
     if let Some(p) = own_version {
         v.push(p);
@@ -4524,8 +4574,38 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
         }
     };
     diagnose_specs_blocking(git, pass, role, share_specs);
-    let pathspec = shared_pathspec(role, &login, share_specs);
-    let plumb_spec = plumb_pathspec(role, &login, share_specs);
+    let mut pathspec = shared_pathspec(role, &login, share_specs);
+    let mut plumb_spec = plumb_pathspec(role, &login, share_specs);
+    // T-000247 D4b: the codex folder publishes only from a prepared root —
+    // stray entries are swept now, and a root whose safety cannot be proven
+    // (unresolvable connection set, unsafe path, failed sweep) keeps codex
+    // OUT of this pass's commit and plumb paths without blocking anything
+    // else. An already-prepared commit from an earlier pass is not touched.
+    if share_specs && role == Role::Main {
+        let expected = pass
+            .repo
+            .project_id
+            .map(|pid| crate::sync::codex::connected_codex_names(db, pid));
+        let prep = match &expected {
+            Some(Ok(set)) => crate::sync::codex::prepare_codex_root(&root, Some(set)),
+            Some(Err(e)) => crate::sync::codex::prepare_codex_root(&root, None)
+                .with_reason_prefix(format!("could not resolve connected codices: {}; ", e)),
+            None => crate::sync::codex::prepare_codex_root(&root, None),
+        };
+        if !prep.safe {
+            pathspec.retain(|p| p != CODEX_DIR);
+            plumb_spec.retain(|p| p != CODEX_DIR);
+            pass.issue(
+                repo_issue(Code::ManagedFileFailed, &pass.repo)
+                    .target(CODEX_IGNORE_LINE)
+                    .detail(format!(
+                        "docs/codex/ is excluded from this sync's commits: {}",
+                        prep.reason
+                            .unwrap_or_else(|| "root not prepared".to_string())
+                    )),
+            );
+        }
+    }
     let approved: Vec<String> = match (role, &pass.structure) {
         (Role::Main, Some(s)) => s.participants.iter().map(|p| p.login.clone()).collect(),
         _ => Vec::new(),
@@ -4744,7 +4824,7 @@ fn mark_receipts_blocked(db: &AppDb, pass: &RepoPass, branch: &str) {
 fn probe_paths(share_specs: bool) -> Vec<String> {
     let mut v: Vec<String> = SHARED_UNIGNORED_LINES
         .iter()
-        .filter(|l| share_specs || **l != SPECS_IGNORE_LINE)
+        .filter(|l| share_specs || (**l != SPECS_IGNORE_LINE && **l != CODEX_IGNORE_LINE))
         .map(|l| {
             if l.ends_with('/') {
                 format!("{}sdh-probe.md", l)
@@ -4854,43 +4934,55 @@ pub fn blocking_ignore_lines(
 /// flow of the shared switch. Covers a repo that was enabled with the flag off
 /// and switched on later, and one that upgraded to this feature already shared.
 fn specs_blocking_lines(git: &GitBinary, root: &Path) -> Result<Vec<IgnoreLine>, String> {
-    ignoring_lines(git, root, &[format!("{}sdh-probe.md", SPECS_IGNORE_LINE)])
+    // T-000247: the flag gates both agent-material folders.
+    ignoring_lines(
+        git,
+        root,
+        &[
+            format!("{}sdh-probe.md", SPECS_IGNORE_LINE),
+            format!("{}sdh-probe.md", CODEX_IGNORE_LINE),
+        ],
+    )
 }
 
-/// The recurring diagnosis of the ON policy: user rules that keep the specs
-/// folder ignored are reported once per change (`fresh_issues`), never removed.
+/// The recurring diagnosis of the ON policy: user rules that keep a gated
+/// folder ignored are reported once per change (`fresh_issues`), per folder,
+/// never removed.
 fn diagnose_specs_blocking(git: &GitBinary, pass: &mut RepoPass, role: Role, share_specs: bool) {
     if !share_specs || role == Role::Pending {
         return;
     }
-    let blocking = match specs_blocking_lines(git, &pass.root) {
-        Ok(b) => b,
-        Err(e) => {
-            pass.issue(
-                repo_issue(Code::ManagedFileFailed, &pass.repo)
-                    .target(".gitignore")
-                    .detail(format!(
-                        "could not check whether docs/superpowers/ is ignored: {}",
-                        e
-                    )),
-            );
-            return;
+    for folder in [SPECS_IGNORE_LINE, CODEX_IGNORE_LINE] {
+        let blocking = match ignoring_lines(git, &pass.root, &[format!("{}sdh-probe.md", folder)]) {
+            Ok(b) => b,
+            Err(e) => {
+                pass.issue(
+                    repo_issue(Code::ManagedFileFailed, &pass.repo)
+                        .target(".gitignore")
+                        .detail(format!(
+                            "could not check whether {} is ignored: {}",
+                            folder, e
+                        )),
+                );
+                continue;
+            }
+        };
+        if blocking.is_empty() {
+            continue;
         }
-    };
-    if blocking.is_empty() {
-        return;
+        let rules: Vec<&str> = blocking.iter().map(|l| l.text.as_str()).collect();
+        pass.issue(
+            repo_issue(Code::ManagedFileFailed, &pass.repo)
+                .target(".gitignore")
+                .detail(format!(
+                    "user rule(s) [{}] still ignore {}: the specs policy is on but the \
+                 folder is ignored, so it never travels. Remove the rule(s) in the preflight of \
+                 the shared switch (or switch the specs off); they are never removed automatically",
+                    rules.join(", "),
+                    folder
+                )),
+        );
     }
-    let rules: Vec<&str> = blocking.iter().map(|l| l.text.as_str()).collect();
-    pass.issue(
-        repo_issue(Code::ManagedFileFailed, &pass.repo)
-            .target(".gitignore")
-            .detail(format!(
-                "user rule(s) [{}] still ignore docs/superpowers/: the specs policy is on but the \
-             folder is ignored, so specs never travel. Remove the rule(s) in the preflight of \
-             the shared switch (or switch the specs off); they are never removed automatically",
-                rules.join(", ")
-            )),
-    );
 }
 
 fn repo_root(repo: &Repository) -> Result<PathBuf, String> {
@@ -5080,9 +5172,9 @@ pub fn set_repo_share_specs(db: &AppDb, repo_id: i64, on: bool) -> Result<Option
             .map(|lines| {
                 let rules: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
                 format!(
-                    "docs/superpowers/ is still ignored by user .gitignore rule(s) [{}]: the \
-                     specs will not travel until they are removed in the preflight of the \
-                     shared switch",
+                    "shared folder(s) (docs/superpowers/, docs/codex/) are still ignored by \
+                     user .gitignore rule(s) [{}]: they will not travel until the rules are \
+                     removed in the preflight of the shared switch",
                     rules.join(", ")
                 )
             })
@@ -6356,13 +6448,7 @@ mod tests {
                 line
             );
         }
-        for kept in [
-            ".env",
-            "/CLAUDE.*",
-            ".claude/",
-            "docs/project.md",
-            "docs/codex/",
-        ] {
+        for kept in [".env", "/CLAUDE.*", ".claude/", "docs/project.md"] {
             assert!(
                 shared.lines().any(|l| l.trim() == kept),
                 "{} must stay",
@@ -6370,9 +6456,11 @@ mod tests {
             );
         }
         // T-000243: opted out of specs, the shared render keeps ignoring the
-        // folder (the template line survives the shared drop).
+        // folder (the template line survives the shared drop). T-000247: the
+        // same gate covers the codex mirror root.
         let off = gitignore_template_for(GITIGNORE_TMPL, true, false);
         assert!(off.lines().any(|l| l.trim() == "docs/superpowers/"));
+        assert!(off.lines().any(|l| l.trim() == "docs/codex/"));
         assert!(!off.lines().any(|l| l.trim() == "docs/sdh_skills/"));
     }
 
@@ -6396,7 +6484,8 @@ mod tests {
         assert!(crate::sync::sync_gitignore_section(&tpl, tmp.path()).unwrap());
         let first = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         assert!(!first.contains("docs/todo.md"));
-        assert!(first.contains("docs/codex/"));
+        // T-000247: the codex line left the shared render too (flag on).
+        assert!(!first.contains("docs/codex/"));
         // The other install renders the same text: nothing is rewritten.
         assert!(!crate::sync::sync_gitignore_section(&tpl, tmp.path()).unwrap());
         assert_eq!(
@@ -6412,11 +6501,16 @@ mod tests {
     /// ignore rule behind. The user's own block is preserved throughout.
     #[test]
     fn off_render_ensures_the_specs_ignore_with_custom_and_empty_templates() {
-        // A custom template without the line: the off render carries it anyway.
+        // A custom template without the lines: the off render carries both
+        // gated folders anyway (T-000247).
         let custom = gitignore_template_for("target\nnode_modules\n", true, false);
         assert!(custom.lines().any(|l| l.trim() == "docs/superpowers/"));
-        // An empty template: the managed render is exactly the ensured rule.
-        assert_eq!(gitignore_template_for("", true, false), "docs/superpowers/");
+        assert!(custom.lines().any(|l| l.trim() == "docs/codex/"));
+        // An empty template: the managed render is exactly the ensured rules.
+        assert_eq!(
+            gitignore_template_for("", true, false),
+            "docs/superpowers/\ndocs/codex/"
+        );
         // On with an empty template renders nothing at all.
         assert_eq!(gitignore_template_for("", true, true), "");
         // A non-shared repo is untouched, whatever the policy.
@@ -6465,7 +6559,7 @@ mod tests {
         .unwrap());
         assert_eq!(
             fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
-            "# --- solo-dev-hub:begin ---\ndocs/superpowers/\n# --- solo-dev-hub:end ---\n"
+            "# --- solo-dev-hub:begin ---\ndocs/superpowers/\ndocs/codex/\n# --- solo-dev-hub:end ---\n"
         );
         // on with the same empty template: the block is gone, not kept
         assert!(crate::sync::sync_gitignore_section(
@@ -7878,6 +7972,7 @@ mod tests {
             ".sdh/requests",
             "docs/sdh_skills",
             "docs/superpowers",
+            "docs/codex",
         ] {
             assert!(main.iter().any(|x| x == p), "main lacks {}", p);
         }
@@ -7885,8 +7980,10 @@ mod tests {
 
         // T-000243: the specs folder leaves the pathspec of BOTH roles when the
         // policy is off; `docs/sdh_skills/` stays main-only either way.
+        // T-000247: `docs/codex/` is main-only under the same flag.
         let main_off = shared_pathspec(Role::Main, "Owner", false);
         assert!(!main_off.iter().any(|x| x == "docs/superpowers"));
+        assert!(!main_off.iter().any(|x| x == "docs/codex"));
         assert!(main_off.iter().any(|x| x == "docs/sdh_skills"));
 
         let contributor = shared_pathspec(Role::Contributor, "helper", true);
@@ -7898,10 +7995,14 @@ mod tests {
             .iter()
             .all(|x| !x.starts_with(".sdh") || x == ".sdh/app-versions/helper.json"));
         assert!(!contributor.iter().any(|x| x == "docs/sdh_skills"));
+        // T-000247: a helper never publishes the codex mirror — it arrives
+        // through merge/ff, not through the helper's commits.
+        assert!(!contributor.iter().any(|x| x == "docs/codex"));
         assert!(exclude_specs(&contributor).is_empty());
 
         let contributor_off = shared_pathspec(Role::Contributor, "helper", false);
         assert!(!contributor_off.iter().any(|x| x == "docs/superpowers"));
+        assert!(!contributor_off.iter().any(|x| x == "docs/codex"));
 
         // A pending helper sends only its request and its own version file —
         // specs never travel for it, whatever the flag says.
