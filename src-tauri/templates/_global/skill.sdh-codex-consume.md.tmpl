@@ -2,17 +2,17 @@
 name: sdh-codex-consume
 description: >
   Use when a practices svod has landed in docs/codex/<name>/ and you're applying
-  its rules/lessons to your work. The inbox is a read-only, gitignored mirror —
-  apply what's relevant, never edit it (edits are overwritten on next sync), and
-  propose additions/changes back via a REQ. To CURATE a svod (you're the
-  publisher) — skill sdh-codex-maintain.
+  its rules/lessons to your work. The inbox is a read-only mirror — apply what's
+  relevant, never edit it (edits are overwritten on next sync), and propose
+  additions/changes back via a REQ. To CURATE a svod (you're the publisher) —
+  skill sdh-codex-maintain.
 ---
 
 A Codex broadcast its svod of practices into your repo and you are about to build something it speaks to (retries, auth, error handling, deploy). A contract is a surface you call; a svod is practice you apply. Curating one → `sdh-codex-maintain`.
 
-`docs/codex/<codex-name>/` is a read-only, gitignored full mirror (`rules/`, `lessons/`, `cases/`), matched to your repo's lane, refreshed and pruned on every sync.
+`docs/codex/<codex-name>/` is a read-only full mirror (`rules/`, `lessons/`, `cases/`), matched to your repo's lane, refreshed and pruned on every sync. In a shared repo it may be tracked on the branch (the owner publishes it under its share flag) — tracked or not, it stays read-only for you.
 
 1. Before relying on your own instinct, grep it for the topic: `grep -rn "backoff" docs/codex/`.
 2. Apply matching rules as canon, like a `CLAUDE.md` rule.
-3. Never edit the inbox — the next sync overwrites it, and there is nothing to commit.
+3. Never edit the inbox — the next sync overwrites it, and the mirror is published only by the owner's install.
 4. To add or change a practice, send a REQ to the Codex (`sdh-cross-repo-req-send`) into `docs/InOutBox/outbox/<codex-repo>/` — you consume the Codex like a microservice. The accepted change mirrors back to everyone.

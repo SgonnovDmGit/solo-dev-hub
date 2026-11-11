@@ -1114,12 +1114,12 @@ fn v6_a_local_ai_edit_of_a_bug_is_undone_and_a_committed_task_edit_is_taken() {
 // ---------------------------------------------------------------------------
 
 /// Verification 7: the owner commits code on `dev` and does not push; the
-/// helper pushes a task. The owner's sync reports `needs_manual_merge`, master
-/// is untouched and nothing is forced (every remote ref only moved forward: the
-/// old `origin/dev` is an ancestor of the new one); the Merge button merges
-/// without a conflict in `todo.md` -- both sides appended to the end of the
-/// file, which only the registered driver (merging by id) can resolve -- and the
-/// next sync pushes the merge.
+/// helper pushes a task. Both sides appended to the end of `todo.md`, which
+/// only the registered driver (merging by id) can resolve. T-000248: the
+/// owner's sync now runs that very merge itself -- the driver resolves
+/// `todo.md` by id, the merge commit lands on `dev` and is pushed in the
+/// same pass, master is untouched and every remote ref only moved forward.
+/// The Merge button is left with nothing to do.
 ///
 /// The driver in the clones is the app executable in production. A unit test
 /// runs inside the test harness, which is not the app; see `arm_driver` for how
@@ -1127,7 +1127,7 @@ fn v6_a_local_ai_edit_of_a_bug_is_undone_and_a_committed_task_edit_is_taken() {
 /// binary in a real `git merge` is covered by `tests/merge_driver_git.rs`.
 #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
-fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
+fn v7_unpushed_code_and_a_helpers_push_auto_merge_by_id() {
     let w = World::new();
     let fx = &w.fx;
     w.participants();
@@ -1141,7 +1141,6 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
     write(&fx.main_dir, "src.rs", "fn main() {}\n");
     g(&fx.main_dir, &["add", "src.rs", "docs/todo.md"]);
     g(&fx.main_dir, &["commit", "-q", "-m", "code and a task"]);
-    let local_commit = g(&fx.main_dir, &["rev-parse", "HEAD"]);
 
     // The helper pushes a task, also at the end of the file.
     append(
@@ -1156,31 +1155,16 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
         .unwrap()
         .contains("T-500000"));
 
+    // The registered driver is the shim for this clone (see `arm_driver`).
+    assert!(g(&fx.main_dir, &["config", "--get", "merge.sdh.driver"]).contains("sdh-shim"));
+
     let out = w.sync_owner();
-    assert_eq!(fx.main_status().as_deref(), Some("needs_manual_merge"));
+    // No manual gate: the sync merged the divergence through the driver.
+    assert_eq!(fx.main_status(), None);
     assert!(out
         .errors
         .iter()
-        .any(|i| i.code == crate::models::SyncIssueCode::SharedNeedsManualMerge));
-    // Nothing was forced, pushed over or merged behind the owner's back.
-    assert_eq!(fx.remote_rev("dev").unwrap(), old_dev);
-    assert_eq!(
-        fx.remote_file("dev", "src.rs"),
-        None,
-        "code must not travel unasked"
-    );
-    assert_eq!(g(&fx.main_dir, &["rev-parse", "HEAD"]), local_commit);
-    assert!(!w.owner_file("docs/todo.md").contains("T-500000"));
-    assert_eq!(
-        fx.remote_rev("master").unwrap(),
-        w.master0,
-        "master is untouched"
-    );
-
-    // The registered driver is the shim for this clone (see `arm_driver`).
-    assert!(g(&fx.main_dir, &["config", "--get", "merge.sdh.driver"]).contains("sdh-shim"));
-    let res = merge_shared_upstream(&fx.main_db, &gb(), fx.main_repo).unwrap();
-    assert_eq!(res.outcome, "merged", "{:?}", res);
+        .all(|i| i.code != crate::models::SyncIssueCode::SharedNeedsManualMerge));
     let todo = w.owner_file("docs/todo.md");
     no_markers(&todo);
     assert!(
@@ -1188,7 +1172,6 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
         "{}",
         todo
     );
-    assert_eq!(fx.main_status(), None);
     assert_eq!(
         g(&fx.main_dir, &["rev-list", "--parents", "-n", "1", "HEAD"])
             .split(' ')
@@ -1197,8 +1180,8 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
         "a merge commit"
     );
 
-    // The next sync pushes the merge: a fast-forward of the remote's dev.
-    w.sync_owner();
+    // The merge was pushed in the same pass: a fast-forward of the remote's
+    // dev, master untouched.
     let new_dev = fx.remote_rev("dev").unwrap();
     assert_ne!(new_dev, old_dev);
     g(
@@ -1207,11 +1190,27 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
     );
     assert!(
         fx.remote_file("dev", "src.rs").is_some(),
-        "the owner's commit is pushed now"
+        "the owner's commit rides into origin/dev with the merge"
     );
     let remote_todo = fx.remote_file("dev", "docs/todo.md").unwrap();
     assert!(remote_todo.contains("T-000010") && remote_todo.contains("T-500000"));
-    assert_eq!(fx.main_status(), None);
+    assert_eq!(
+        fx.remote_rev("master").unwrap(),
+        w.master0,
+        "master is untouched"
+    );
+
+    // The button finds nothing left, and a repeated sync merges nothing new.
+    let res = merge_shared_upstream(&fx.main_db, &gb(), fx.main_repo).unwrap();
+    assert_eq!(res.outcome, "up_to_date", "{:?}", res);
+    let merges = g(&fx.main_dir, &["rev-list", "--merges", "--count", "HEAD"]);
+    w.sync_owner();
+    assert_eq!(
+        g(&fx.main_dir, &["rev-list", "--merges", "--count", "HEAD"]),
+        merges,
+        "a repeated sync must not create another merge"
+    );
+
     // The helper receives the merged file.
     w.settle();
     let helper_todo = w.helper_file("docs/todo.md");
@@ -1672,19 +1671,17 @@ fn t000243_specs_are_shared_end_to_end_while_the_flag_is_on() {
     w.join();
     w.settle();
 
-    // The managed .gitignore of both installs stopped ignoring the folder,
-    // while the local-only docs stay ignored.
+    // The managed .gitignore of both installs stopped ignoring the shared
+    // agent-material folders (T-000247: codex travels under the same flag).
     for text in [w.owner_file(".gitignore"), w.helper_file(".gitignore")] {
-        assert!(
-            !text.lines().any(|l| l.trim() == "docs/superpowers/"),
-            "the shared render must drop the specs ignore:\n{}",
-            text
-        );
-        assert!(
-            text.lines().any(|l| l.trim() == "docs/codex/"),
-            "the local-only docs stay ignored:\n{}",
-            text
-        );
+        for gated in ["docs/superpowers/", "docs/codex/"] {
+            assert!(
+                !text.lines().any(|l| l.trim() == gated),
+                "the shared render must drop the {} ignore:\n{}",
+                gated,
+                text
+            );
+        }
     }
     // The folder really is visible to git, and the files arrived.
     for dir in [&fx.main_dir, &fx.helper_dir] {
@@ -2268,4 +2265,162 @@ fn a_body_revision_resets_markers_across_the_shared_branch() {
             .is_empty(),
         "both readers acked v2 — the pair closes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// T-000247: the codex mirror rides the shared transport
+// ---------------------------------------------------------------------------
+
+/// Registers a codex in the owner's portfolio and connects it to the shared
+/// repo's project — the fixture equivalent of live Swan Practise → billing.
+fn connect_svod(fx: &TwoInstalls) -> String {
+    let codex = fx
+        .main_db
+        .create_project("Swan Practise", None, "codex")
+        .unwrap();
+    let svod = fx._tmp.path().join("svod");
+    write(&svod, "practices/rules/no-unwrap.md", "do not unwrap\n");
+    fx.main_db
+        .insert_local_repository(
+            svod.to_str().unwrap(),
+            "swan_practices",
+            Some(codex.id),
+            Some("server"),
+        )
+        .unwrap();
+    fx.main_db.connect_codex(fx.project_id, codex.id).unwrap();
+    "docs/codex/Swan Practise/rules/no-unwrap.md".to_string()
+}
+
+/// T-000247, the reporter's case end to end: a shared repo whose project is
+/// connected to a codex publishes its `docs/codex/<name>/` mirror on dev while
+/// `share_specs` is on — the helper receives it through the branch (it cannot
+/// be mirrored locally: the helper's database knows no codex). A stray file
+/// the owner left at the inbox root is swept before the publish and never
+/// reaches the remote, and the helper's own syncs never delete the delivered
+/// mirror — with no codex connection of its own, the sweep resolves no set
+/// and refuses to act.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn t000247_the_codex_mirror_reaches_the_helper_under_share_specs() {
+    let w = World::new();
+    let fx = &w.fx;
+    let mirror = connect_svod(fx);
+    // What d_lemma_admin looked like: junk next to the mirror at the root.
+    write(&fx.main_dir, "docs/codex/release-log.txt", "junk\n");
+
+    w.join();
+
+    // The mirror landed and the stray is gone from the owner's tree...
+    assert!(fx.main_dir.join(&mirror).is_file());
+    assert!(!fx.main_dir.join("docs/codex/release-log.txt").exists());
+    // ...it is on dev and on the helper's checkout, the stray nowhere.
+    assert_eq!(
+        fx.remote_file("dev", &mirror).as_deref(),
+        Some("do not unwrap\n")
+    );
+    assert!(fx
+        .remote_file("dev", "docs/codex/release-log.txt")
+        .is_none());
+    assert!(fx.remote_file("helper-dev", &mirror).is_some());
+    assert_eq!(w.helper_file(&mirror), "do not unwrap\n");
+    // The managed .gitignore of both installs dropped the codex line.
+    for text in [w.owner_file(".gitignore"), w.helper_file(".gitignore")] {
+        assert!(
+            !text.lines().any(|l| l.trim() == "docs/codex/"),
+            "the shared render must drop the codex ignore:\n{}",
+            text
+        );
+    }
+    // The helper never sweeps what it received: another sync of its own leaves
+    // the mirror alone and its commits never carry codex deletions.
+    w.sync_helper();
+    assert!(fx.helper_dir.join(&mirror).is_file());
+    assert!(g(
+        &fx.helper_dir,
+        &["status", "--porcelain", "--", "docs/codex/"]
+    )
+    .trim()
+    .is_empty());
+}
+
+/// T-000247 with the flag off: `share_specs` stored OFF before sharing is
+/// enabled keeps `docs/codex/` ignored on both installs — the owner still
+/// mirrors the svod locally (the broadcast does not consult the flag) but
+/// nothing under the folder is ever committed or reaches the helper.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn t000247_with_specs_off_the_mirror_stays_local() {
+    let w = World::new();
+    let fx = &w.fx;
+    let mirror = connect_svod(fx);
+    // The owner's choice before the first sync that could commit the mirror.
+    set_repo_share_specs(&fx.main_db, fx.main_repo, false).unwrap();
+
+    w.join();
+
+    // The local mirror exists (the broadcast ran) but stayed ignored.
+    assert!(fx.main_dir.join(&mirror).is_file());
+    let v = ignored(&fx.main_dir, &mirror).expect("docs/codex/ must stay ignored");
+    assert!(v.contains("docs/codex/"), "{}", v);
+    // Nothing under the folder on any transport branch or the helper's tree.
+    for rev in ["dev", "helper-dev"] {
+        assert!(
+            fx.remote_file(rev, &mirror).is_none(),
+            "codex reached {}",
+            rev
+        );
+    }
+    assert!(!fx.helper_dir.join("docs/codex").exists());
+    // Never tracked on the owner's clone either.
+    assert!(g(&fx.main_dir, &["ls-files", "--", "docs/codex/"])
+        .trim()
+        .is_empty());
+}
+
+/// T-000247, the on→off transition: after the mirror already travelled, opting
+/// out restores the managed ignore line and stops new codex content — the
+/// published commit and its blobs stay on dev (off never untracks history),
+/// while the next svod revision stays local.
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn t000247_turning_specs_off_afterwards_stops_new_codex_content() {
+    let w = World::new();
+    let fx = &w.fx;
+    let mirror = connect_svod(fx);
+
+    w.join();
+    assert_eq!(
+        fx.remote_file("dev", &mirror).as_deref(),
+        Some("do not unwrap\n")
+    );
+
+    // The owner flips the flag; the next svod revision must not travel.
+    set_repo_share_specs(&fx.main_db, fx.main_repo, false).unwrap();
+    write(
+        &fx._tmp.path().join("svod"),
+        "practices/rules/r2.md",
+        "rule two\n",
+    );
+    w.sync_owner();
+    w.sync_helper();
+    w.sync_owner();
+
+    // The ignore is back on both installs, the published mirror still on dev.
+    for text in [w.owner_file(".gitignore"), w.helper_file(".gitignore")] {
+        assert!(
+            text.lines().any(|l| l.trim() == "docs/codex/"),
+            "off must restore the codex ignore:\n{}",
+            text
+        );
+    }
+    assert_eq!(
+        fx.remote_file("dev", &mirror).as_deref(),
+        Some("do not unwrap\n")
+    );
+    // The new rule stayed local: not on dev, not on the helper's checkout.
+    let r2 = "docs/codex/Swan Practise/rules/r2.md";
+    assert!(fx.main_dir.join(r2).is_file());
+    assert!(fx.remote_file("dev", r2).is_none());
+    assert!(!fx.helper_dir.join(r2).exists());
 }

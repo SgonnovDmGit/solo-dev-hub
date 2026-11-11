@@ -9,9 +9,9 @@ export const ru = {
   'shared.myBandsHint': 'Номера задач и багов, которые выдаются этой установке.',
   'shared.readOnlyHint': 'Задаёт главный общего проекта — здесь только для чтения.',
   'shared.contributorInfo': 'Общий репо главного {0} · отправляю в {1} и {2}',
-  // T-000243: the owner's docs/superpowers/ switch.
-  'shared.specs.label': 'Делиться спеками и планами (docs/superpowers/)',
-  'shared.specs.hint': 'Настройка общего режима (доступна и до его включения). Выкл: новые файлы docs/superpowers/ не коммитятся и не передаются; уже закоммиченные остаются в репо с историей — флаг не снимает их с трекинга и не переписывает историю. Вкл возобновляет передачу. Задачи, сделанное и баги передаются при любом значении.',
+  // T-000243: the owner's docs/superpowers/ switch. T-000247: docs/codex/ rides the same flag.
+  'shared.specs.label': 'Делиться спеками, планами и кодексом (docs/superpowers/, docs/codex/)',
+  'shared.specs.hint': 'Настройка общего режима (доступна и до его включения). Выкл: новые файлы docs/superpowers/ и docs/codex/ не коммитятся и не передаются; уже закоммиченные остаются в репо с историей — флаг не снимает их с трекинга и не переписывает историю. Вкл возобновляет передачу. Задачи, сделанное и баги передаются при любом значении.',
   'shared.specs.saveFailed': 'Не удалось сохранить настройку спеков: {0}',
   'shared.specs.loadFailed': 'Не удалось прочитать настройку спеков этого репо.',
 
@@ -69,9 +69,9 @@ export const ru = {
   'shared.requestsWaitingHint': 'Откройте вкладку «Участники», чтобы подтвердить.',
 
   // ── Status lines ───────────────────────────────────────────────────────────
-  'shared.status.needsMergeCurrent': '{0} разошлась с origin/{0} — нужен ручной merge. Задачи и баги сольются по id.',
+  'shared.status.needsMergeCurrent': '{0} разошлась с origin/{0} — слейте кнопкой «Слить» или вручную. Задачи и баги сольются по id.',
   'shared.status.needsMergeOther': 'Ветка {0} разошлась с origin/{0} и не выбрана в репо: выполните git fetch и слейте её вручную (git merge origin/{0}).',
-  'shared.status.needsMergeUnknown': 'Ветка разошлась с origin — нужен ручной merge. Задачи и баги сольются по id.',
+  'shared.status.needsMergeUnknown': 'Ветка разошлась с origin — слейте кнопкой «Слить» или вручную. Задачи и баги сольются по id.',
   'shared.status.pushRejected': 'Push в {0} отклонён: ветка защищена (GH006). Разрешите push участнику или снимите защиту.',
   'shared.status.pushRejectedUnknown': 'Push отклонён: ветка защищена (GH006). Разрешите push участнику или снимите защиту.',
   'shared.status.fetchFailed': 'Не удалось получить изменения с GitHub: проверьте сеть и вход git на этой машине.',
@@ -83,10 +83,10 @@ export const ru = {
   'shared.status.noLogin': 'Логин GitHub этой установки неизвестен — сохраните токен ещё раз в Настройках.',
   'shared.status.unknown': 'Состояние общего репо: {0}',
   'shared.merge.button': 'Слить',
-  'shared.merge.hint': 'git merge origin/<ветка>: общие файлы сольются по id, конфликт в коде остановит слияние.',
+  'shared.merge.hint': 'git merge origin/<ветка>: общие файлы сольются по id, текстовый конфликт остановит слияние.',
   'shared.merge.done': 'Ветка слита с origin.',
   'shared.merge.upToDate': 'Сливать нечего — ветка уже актуальна.',
-  'shared.merge.conflict': '«Слить» остановлен: конфликт в коде ({0}). Слейте вручную: git merge origin/{1}.',
+  'shared.merge.conflict': '«Слить» остановлен: конфликт ({0}). Слейте вручную: git merge origin/{1}.',
   'shared.merge.failed': 'Не удалось слить: {0}',
   'shared.acceptBranch.button': 'Принять новую ветку главного',
   'shared.acceptBranch.hint': 'Доверять новой ветке главного, указанной в структуре проекта.',
@@ -115,9 +115,9 @@ export const en: Record<keyof typeof ru, string> = {
   'shared.myBandsHint': 'The task and bug numbers issued to this install.',
   'shared.readOnlyHint': 'Set by the owner of the shared project — read-only here.',
   'shared.contributorInfo': 'Shared repo of the owner {0} · sending to {1} and {2}',
-  // T-000243: the owner's docs/superpowers/ switch.
-  'shared.specs.label': 'Share specs and plans (docs/superpowers/)',
-  'shared.specs.hint': 'A shared-mode setting (available before enabling it too). Off: new docs/superpowers/ files are not committed and not sent; the already committed ones stay in the repo with their history — the flag neither untracks them nor rewrites history. On resumes sharing. Tasks, done items and bugs travel whatever the value.',
+  // T-000243: the owner's docs/superpowers/ switch. T-000247: docs/codex/ rides the same flag.
+  'shared.specs.label': 'Share specs, plans and the codex (docs/superpowers/, docs/codex/)',
+  'shared.specs.hint': 'A shared-mode setting (available before enabling it too). Off: new docs/superpowers/ and docs/codex/ files are not committed and not sent; the already committed ones stay in the repo with their history — the flag neither untracks them nor rewrites history. On resumes sharing. Tasks, done items and bugs travel whatever the value.',
   'shared.specs.saveFailed': 'Could not save the specs setting: {0}',
   'shared.specs.loadFailed': 'Could not read this repo\'s specs setting.',
 
@@ -171,9 +171,9 @@ export const en: Record<keyof typeof ru, string> = {
   'shared.requestsWaitingMany': '● {0} requests wait for approval',
   'shared.requestsWaitingHint': 'Open the "Participants" tab to approve.',
 
-  'shared.status.needsMergeCurrent': '{0} diverged from origin/{0} — a manual merge is needed. Tasks and bugs merge by id.',
+  'shared.status.needsMergeCurrent': '{0} diverged from origin/{0} — merge with the "Merge" button or by hand. Tasks and bugs merge by id.',
   'shared.status.needsMergeOther': 'Branch {0} diverged from origin/{0} and is not checked out: run git fetch and merge it by hand (git merge origin/{0}).',
-  'shared.status.needsMergeUnknown': 'The branch diverged from origin — a manual merge is needed. Tasks and bugs merge by id.',
+  'shared.status.needsMergeUnknown': 'The branch diverged from origin — merge with the "Merge" button or by hand. Tasks and bugs merge by id.',
   'shared.status.pushRejected': 'Push to {0} rejected: the branch is protected (GH006). Allow the participant to push or lift the protection.',
   'shared.status.pushRejectedUnknown': 'Push rejected: the branch is protected (GH006). Allow the participant to push or lift the protection.',
   'shared.status.fetchFailed': 'Could not fetch changes from GitHub: check the network and the git login on this machine.',
@@ -185,10 +185,10 @@ export const en: Record<keyof typeof ru, string> = {
   'shared.status.noLogin': 'The GitHub login of this install is unknown — save the token again in Settings.',
   'shared.status.unknown': 'Shared repo state: {0}',
   'shared.merge.button': 'Merge',
-  'shared.merge.hint': 'git merge origin/<branch>: shared files merge by id, a code conflict stops the merge.',
+  'shared.merge.hint': 'git merge origin/<branch>: shared files merge by id, a textual conflict stops the merge.',
   'shared.merge.done': 'The branch is merged with origin.',
   'shared.merge.upToDate': 'Nothing to merge — the branch is up to date.',
-  'shared.merge.conflict': '"Merge" stopped: conflict in code ({0}). Merge by hand: git merge origin/{1}.',
+  'shared.merge.conflict': '"Merge" stopped: conflict ({0}). Merge by hand: git merge origin/{1}.',
   'shared.merge.failed': 'Could not merge: {0}',
   'shared.acceptBranch.button': 'Accept the owner\'s new branch',
   'shared.acceptBranch.hint': 'Trust the new owner\'s branch named in the project structure.',

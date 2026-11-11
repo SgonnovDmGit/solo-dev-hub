@@ -2,6 +2,15 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Changelog.ru.md](Changelog.ru.md).
 
+## [1.24.0] — 2026-11-11
+
+### Added
+- **A diverged shared branch merges itself when the merge is clean (T-000248).** Two installs writing to the same dev branch legitimately diverge, and every divergence used to stop at `needs_manual_merge` — one manual Merge click per repository, every time. The sync now merges a truly diverged **current** branch itself: `git merge` runs through the registered id-driver with an explicit flag contract (`--ff --no-squash --commit --no-autostash`) that user git config cannot rewrite, lands the merge commit on the branch and pushes it in the same pass. A contributor's auto-merge carries the `SDH-Participant:` trailer so the owner's "Last send" sees it. The manual gate stays exactly where it belongs: a real textual conflict aborts the attempt, verifies the checkout restored (HEAD, index, bytes) and reports the conflicting files; a git refusal reports its reason; an unrestorable attempt halts the whole repo pass rather than mutating a tree it cannot trust. Dirty shared files still defer the attempt to the next sync, non-current branches are never auto-merged, and a two-parent merge is never mistaken for the app's own linear commit. Flow: `docs/flows/contributor-mode.md`.
+- **The codex mirror reaches the contributor (T-000247).** `docs/codex/` stayed gitignored even in a shared repository, so a participant install — which knows no codex connections and can never mirror a svod locally — never received it (the billing report). The folder now rides the same `share_specs` flag as `docs/superpowers/`: on, the managed `.gitignore` drops the codex line and the owner publishes the mirror on the shared dev branch (main-role pathspec only — a contributor receives but never commits it); off, the line is restored and nothing new travels, while already published content keeps its history. Before every publish the inbox root is prepared: entries outside the full set of connected codex names are swept, and any preparation failure excludes the codex from the commit with a diagnostic instead of letting stray files into the shared tree. A contributor install never sweeps — with no connections of its own the set cannot resolve, and the delivered mirror is left alone. Flow: `docs/flows/codex-broadcast.md`.
+
+### Tests
+- 950 Rust (`cargo test --lib`) plus this change's git-spawning tests run locally on Windows — 6 shared-mode e2e (auto-merge, real-conflict gate, non-current merge protection, dirty-defer, driver merge-by-id, codex transport) and 9 `merge_or_abort` unit tests; the rest of the ignored suite runs on the Linux CI. 223 vitest, svelte-check clean.
+
 ## [1.23.0] — 2026-11-10
 
 ### Added

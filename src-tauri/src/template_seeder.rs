@@ -289,7 +289,8 @@ mod tests {
     fn test_bundled_global_gitignore_ignores_codex_inbox() {
         // T-000167: the codex svod inbox is a synced read-only mirror — it must
         // be gitignored so auto-commit skips it and it never clutters the
-        // consumer's history.
+        // consumer's history. T-000247: a shared repo with share_specs on
+        // drops this line in its managed render and the mirror travels.
         let content = bundled_file_content("_global", ".gitignore.tmpl")
             .expect(".gitignore.tmpl must be bundled");
         assert!(

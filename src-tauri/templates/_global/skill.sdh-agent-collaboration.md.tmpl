@@ -58,6 +58,7 @@ Large scope → 3–4 reviewers in parallel, one per domain. Verify a critical f
 
 - Out-of-scope finding → a `T-` task, never a silent fold.
 - A fix that widens or narrows a predicate names every reader of the same meaning (found by meaning, not by symbol).
+- The review loop has a budget, not a floor. When a pass finds only test-hygiene or stylistic notes, or the loop exceeds its designed passes, stop and report the open findings to the owner with the pattern behind them — further rounds on the same axes burn tokens without new signal.
 
 ## Retro
 

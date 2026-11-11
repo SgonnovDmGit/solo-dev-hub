@@ -1308,27 +1308,121 @@ fn sync_microservice_to_parents(
 /// Folds each per-(codex,consumer) outcome into the shared counters — mirror
 /// writes into `copied`, prunes into `migrated` (a structural change to the
 /// consumer's mirror), errors appended.
+/// Fold one per-(codex,consumer) outcome into the shared counters — mirror
+/// writes into `copied`, prunes into `migrated`, errors appended.
+fn fold_codex(o: sync::CodexBroadcastOutcome, c: &mut SyncCounters) {
+    c.copied += o.copied;
+    c.migrated += o.pruned;
+    c.extend(o.errors);
+}
+
 fn run_codex_broadcast(db: &AppDb, project_id: i64, project_type: &str, c: &mut SyncCounters) {
-    let mut fold = |o: sync::CodexBroadcastOutcome| {
-        c.copied += o.copied;
-        c.migrated += o.pruned;
-        c.extend(o.errors);
-    };
+    // T-000247: repos already swept this pass — a repo reachable from both
+    // directions (or through two consumers) is prepared once.
+    let mut swept: std::collections::HashSet<i64> = std::collections::HashSet::new();
     // Consumer-driven: pull each connected codex into this project.
     for codex_id in db.list_connected_codices(project_id).unwrap_or_default() {
-        fold(sync::broadcast_codex_to_consumer(db, codex_id, project_id));
+        fold_codex(
+            sync::broadcast_codex_to_consumer(db, codex_id, project_id),
+            c,
+        );
     }
+    // ...then sweep this project's consumer repos against its FULL set.
+    sweep_codex_roots(db, project_id, &mut swept, c);
     // Codex-driven: push this codex's svod into each connected consumer.
     if project_type == "codex" {
         for consumer in db
             .list_parents_of_microservice(project_id)
             .unwrap_or_default()
         {
-            fold(sync::broadcast_codex_to_consumer(
-                db,
-                project_id,
-                consumer.id,
-            ));
+            fold_codex(
+                sync::broadcast_codex_to_consumer(db, project_id, consumer.id),
+                c,
+            );
+            // ...and sweep that consumer with ITS full set — deleting the
+            // other codices' mirrors because only ours is in scope would be
+            // exactly the bug the set exists to prevent.
+            sweep_codex_roots(db, consumer.id, &mut swept, c);
+        }
+    }
+}
+
+/// T-000247 D4/D4a: after a consumer project's mirrors are refreshed, delete
+/// stray top-level entries of each of its lane repos' `docs/codex/` — entries
+/// that are not a connected codex's mirror must not ride the shared pathspec
+/// to a contributor. Sweep requires: ≥1 connected codex known LOCALLY (an
+/// unresolved/empty set is "unknown", never proof of an empty inbox), the
+/// repo's `local_path` fresh from the database, and `codex_sweep_allowed`
+/// (fail-closed: shared repos only their main, role-less checkouts with a
+/// structure/pin never). The per-repo `specs_policy_guard` serializes the
+/// check+delete against lifecycle writers, same as the render sites.
+fn sweep_codex_roots(
+    db: &AppDb,
+    consumer_project_id: i64,
+    swept: &mut std::collections::HashSet<i64>,
+    c: &mut SyncCounters,
+) {
+    let expected = match sync::codex::connected_codex_names(db, consumer_project_id) {
+        Ok(n) if !n.is_empty() => n,
+        Ok(_) => return,
+        Err(e) => {
+            c.push(
+                SyncIssue::new(
+                    Code::ManagedFileFailed,
+                    format!("project #{}", consumer_project_id),
+                )
+                .target("docs/codex/")
+                .detail(format!("could not resolve connected codices: {}", e)),
+            );
+            return;
+        }
+    };
+    for lane in ["server", "admin_client"] {
+        let Ok(repo) = db.repo_of_project_with_role(consumer_project_id, lane) else {
+            continue;
+        };
+        if !swept.insert(repo.id) {
+            continue;
+        }
+        let Some(local) = repo.local_path.as_deref().filter(|p| !p.trim().is_empty()) else {
+            continue;
+        };
+        let root = Path::new(local);
+        if !sync::codex::codex_inbox_root(root).exists() {
+            // Never create the root just to clean it.
+            continue;
+        }
+        let guard = sync::shared::specs_policy_guard(repo.id);
+        let _g = guard.lock().unwrap();
+        match sync::shared::codex_sweep_allowed(db, &repo, root) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                c.push(
+                    SyncIssue::new(Code::ManagedFileFailed, repo.display_name())
+                        .target("docs/codex/")
+                        .detail(format!(
+                            "could not verify the repo state — sweep refused: {}",
+                            e
+                        )),
+                );
+                continue;
+            }
+        }
+        match sync::codex::prepare_codex_root(root, Some(&expected)) {
+            prep if prep.safe => {
+                c.migrated += prep.pruned;
+            }
+            prep => {
+                c.push(
+                    SyncIssue::new(Code::ManagedFileFailed, repo.display_name())
+                        .target("docs/codex/")
+                        .detail(
+                            prep.reason
+                                .unwrap_or_else(|| "root not prepared".to_string()),
+                        ),
+                );
+            }
         }
     }
 }
