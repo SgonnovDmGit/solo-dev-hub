@@ -27,7 +27,9 @@ use crate::git_ops::{
     commit_paths, commit_paths_index_only, current_branch, is_git_repo, list_markers_in_rev,
     spawn_cmd, CommitOutcome, GitBinary,
 };
-use crate::git_sync::{self, BranchCommit, FfOutcome, FileChange, MergeOutcome, PushOutcome};
+use crate::git_sync::{
+    self, BranchCommit, FfOutcome, FileChange, MergeAttempt, PushOutcome, RestoreState,
+};
 use crate::merge_driver::register_merge_driver;
 use crate::models::{
     AdminCheck, IgnoreLine, ParticipantActivity, RepoSharedState, Repository, SharedDisableResult,
@@ -452,13 +454,12 @@ pub fn effective_share_specs(
     repo: &Repository,
     structure: Option<&ProjectStructure>,
 ) -> Result<bool, String> {
-    let state = db.get_shared_state(repo.id).ok();
-    if state
-        .as_ref()
-        .is_some_and(|s| s.shared_mode || s.shared_role.as_deref() == Some("main"))
-    {
+    // T-000248 review: fail-closed — a DB error must not silently fall
+    // through to the structure path and let a guess decide the policy.
+    let state = db.get_shared_state(repo.id).map_err(|e| e.to_string())?;
+    if state.shared_mode || state.shared_role.as_deref() == Some("main") {
         // This install is the repo's owner: its own setting is the policy.
-        return Ok(state.is_some_and(|s| s.share_specs));
+        return Ok(state.share_specs);
     }
     let structure = match structure {
         Some(s) => Some(s.to_owned()),
@@ -1860,6 +1861,16 @@ struct RepoPass {
     /// subtracts them: only a FOREIGN bump between the capture and the seal
     /// makes the pass stale.
     own_bumps: u32,
+    /// T-000248: the merge driver registered successfully in this pass — a
+    /// current-branch auto-merge is attempted only then: without the driver
+    /// a shared file that changed on both sides conflicts textually.
+    driver_ready: bool,
+    /// T-000248: a merge attempt left the repo unverified — the rest of this
+    /// pass must not mutate it: no import, no proposals, no canon, no phase
+    /// B (like `cancelled`, but for a filesystem-trust failure, not a
+    /// lifecycle one; the status stays untouched as well — the issue carries
+    /// the reason).
+    halt: bool,
 }
 
 impl RepoPass {
@@ -1936,6 +1947,23 @@ impl RepoPass {
             status: SharedStatus::NeedsManualMerge,
             detail: diverged_detail(branch, current),
             diverged: Some((branch.to_string(), current)),
+            rejected_branch: None,
+            ui: None,
+        });
+    }
+
+    /// `NeedsManualMerge` after the sync's own merge attempt hit real
+    /// conflicts — the settled issue's detail names the files so the user
+    /// sees WHAT conflicts, not only that it diverged (T-000248).
+    fn note_conflict(&mut self, branch: &str, files: &[String]) {
+        self.notes.push(StatusNote {
+            status: SharedStatus::NeedsManualMerge,
+            detail: format!(
+                "{} — conflict in: {}",
+                diverged_detail(branch, true),
+                files.join(", ")
+            ),
+            diverged: Some((branch.to_string(), true)),
             rejected_branch: None,
             ui: None,
         });
@@ -2497,6 +2525,8 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         cancelled: false,
         lifecycle_gen: None,
         own_bumps: 0,
+        driver_ready: false,
+        halt: false,
     }
 }
 
@@ -3109,11 +3139,14 @@ fn register_driver(git: &GitBinary, pass: &mut RepoPass, expected: u64) {
     if !lifecycle_is_current(pass.repo.id, &pass.root, expected) {
         return;
     }
-    if let Err(e) = register_merge_driver(git, &pass.root) {
-        let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
-            .target(".git/config")
-            .detail(e);
-        pass.issue(issue);
+    match register_merge_driver(git, &pass.root) {
+        Ok(_) => pass.driver_ready = true,
+        Err(e) => {
+            let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
+                .target(".git/config")
+                .detail(e);
+            pass.issue(issue);
+        }
     }
 }
 
@@ -3238,11 +3271,6 @@ fn reset_to_origin(
 /// pass write the old checkout's rows into the new checkout's files.
 fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
     let Some(role) = pass.role else { return };
-    if !repo_ready(git, &pass.root) {
-        return;
-    }
-    let cur = current_branch(git, &pass.root).ok().flatten();
-    let pathspec = shared_pathspec(role, &pass.login, pass.share_specs);
     let recipients = pass.recipients.clone();
     #[cfg(test)]
     after_fetch_probe(pass.repo.id, &pass.root);
@@ -3254,7 +3282,19 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
         // branch resets AND the import/canon tail. The pass seals stale at
         // `finish` regardless (T-000243 review, fourteenth pass).
         if lifecycle_is_current(pass.repo.id, &pass.root, gen0 + u64::from(pass.own_bumps)) {
+            // T-000248: the current branch, the tree readiness and the policy
+            // pathspec are read under the same hold that mutates — a repath
+            // or a foreign checkout between the fetch and the merge must not
+            // drive an action on a stale observation.
+            if !repo_ready(git, &pass.root) {
+                return;
+            }
+            let cur = current_branch(git, &pass.root).ok().flatten();
+            let pathspec = shared_pathspec(role, &pass.login, pass.share_specs);
             for b in &recipients {
+                if pass.halt {
+                    break;
+                }
                 let remote = remote_ref(b);
                 let has_remote =
                     matches!(git_sync::rev_parse(git, &pass.root, &remote), Ok(Some(_)));
@@ -3263,9 +3303,37 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
                     if !has_remote {
                         continue;
                     }
-                    match ff_current(git, &pass.root, &remote, &pathspec) {
-                        Ok(true) => {}
-                        Ok(false) => pass.note_diverged(b, true),
+                    match ff_current(
+                        git,
+                        &pass.root,
+                        &remote,
+                        &pathspec,
+                        role,
+                        &pass.login,
+                        b,
+                        pass.driver_ready,
+                    ) {
+                        Ok(FfResult::Clean) => {}
+                        Ok(FfResult::Merged) => pass.committed = true,
+                        Ok(FfResult::Conflict { files }) => {
+                            pass.note_conflict(b, &files);
+                        }
+                        Ok(FfResult::Refused { reason }) => {
+                            pass.note_diverged(b, true);
+                            pass.issue(
+                                repo_issue(Code::AutocommitFailed, &pass.repo)
+                                    .target(b)
+                                    .detail(reason),
+                            );
+                        }
+                        Ok(FfResult::Unrestored { reason }) => {
+                            pass.issue(
+                                repo_issue(Code::AutocommitFailed, &pass.repo)
+                                    .target(b)
+                                    .detail(reason),
+                            );
+                            pass.halt = true;
+                        }
                         Err(e) => {
                             let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
                             pass.issue(issue)
@@ -3319,6 +3387,12 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
                         }
                     }
                 }
+            }
+            // T-000248: an unrestored merge ends the mutating tail — no
+            // import, no proposals, no canon on a tree that cannot be
+            // trusted (phase B is skipped in `finish` via `pass.halt`).
+            if pass.halt {
+                return;
             }
             // T-000243 review (fourteenth pass): the import and the canon
             // adoption are side effects of the same observation — they run
@@ -3995,27 +4069,126 @@ fn rule_copy_label_repo(repo: &Repository) -> String {
     crate::sync::skills::rule_copy_label(repo)
 }
 
-/// Bring the CURRENT branch up to `remote`. `Ok(false)` = diverged (needs a
-/// manual merge). A branch that is only behind is fast-forwarded when none of
-/// the shared files is modified in the work tree; otherwise it waits.
+/// The outcome of settling the CURRENT branch against `remote` — richer
+/// than the old bool since a true divergence now attempts a merge itself
+/// (T-000248).
+enum FfResult {
+    /// Up-to-date, fast-forwarded, or deferred on dirty shared paths — the
+    /// pass continues without a merge.
+    Clean,
+    /// A merge commit landed on the current branch — the pass counts it as
+    /// its commit (phase B pushes it like any sync commit).
+    Merged,
+    /// The merge hit real conflicts; it was aborted and the restore verified.
+    Conflict { files: Vec<String> },
+    /// The merge attempt was refused or failed before completing — the repo
+    /// was either never touched or verified restored.
+    Refused { reason: String },
+    /// The attempt left the repo unverified — the rest of the pass must not
+    /// mutate it (`RepoPass::halt`).
+    Unrestored { reason: String },
+}
+
+/// The commit message of a sync-created merge: `SDH-Participant:` marks a
+/// participant install's commit (`participants_activity` reads the trailer —
+/// a pending helper is a participant too). The owner's merges need no
+/// trailer — its commits are not looked up by login. An empty login never
+/// writes a trailer at all. The "Merge" button uses the same builder.
+fn sync_merge_msg(role: Role, login: &str, upstream: &str) -> String {
+    let base = format!("merge {}", upstream);
+    match role {
+        Role::Contributor | Role::Pending if !login.is_empty() => {
+            format!("{}\n\nSDH-Participant: {}", base, login)
+        }
+        _ => base,
+    }
+}
+
+/// Staged (index) paths outside `pathspec` — a merge commit is built from
+/// the index, so foreign staged changes would silently ride into it.
+fn foreign_staged_paths(
+    git: &GitBinary,
+    root: &Path,
+    pathspec: &[String],
+) -> Result<Vec<String>, String> {
+    let out = git_bytes(git, root, &["diff", "--cached", "--name-only", "-z"], &[])?;
+    let mut foreign = Vec::new();
+    for raw in out.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let p = String::from_utf8_lossy(raw).into_owned();
+        let covered = pathspec
+            .iter()
+            .any(|s| p == *s || p.starts_with(&format!("{}/", s.trim_end_matches('/'))));
+        if !covered {
+            foreign.push(p);
+        }
+    }
+    Ok(foreign)
+}
+
+/// Bring the CURRENT branch up to `remote`: fast-forward when it is only
+/// behind, attempt `git merge` when it truly diverged (T-000248 — the manual
+/// "Merge" button remains for real conflicts). `expected` is the branch the
+/// caller believes is checked out — the merge helper re-checks it right
+/// before merging so a checkout changed between the probe and this call
+/// refuses instead of merging the wrong upstream. `driver_ready` gates the
+/// attempt: without the merge driver a both-sides-changed shared file
+/// conflicts textually. A dirty shared path waits for phase B either way
+/// (`shared_paths_dirty`), and a staged path outside the shared set refuses —
+/// it must not ride into the merge commit.
 fn ff_current(
     git: &GitBinary,
     root: &Path,
     remote: &str,
     pathspec: &[String],
-) -> Result<bool, String> {
+    role: Role,
+    login: &str,
+    expected: &str,
+    driver_ready: bool,
+) -> Result<FfResult, String> {
     if git_sync::is_ancestor(git, root, remote, "HEAD")? {
-        return Ok(true);
+        return Ok(FfResult::Clean);
     }
     if !git_sync::is_ancestor(git, root, "HEAD", remote)? {
-        return Ok(false);
+        // True divergence: both sides moved.
+        if shared_paths_dirty(git, root, pathspec)? {
+            return Ok(FfResult::Clean);
+        }
+        if !driver_ready {
+            return Ok(FfResult::Refused {
+                reason: "the merge driver is not registered".to_string(),
+            });
+        }
+        let foreign = foreign_staged_paths(git, root, pathspec)?;
+        if !foreign.is_empty() {
+            return Ok(FfResult::Refused {
+                reason: format!(
+                    "staged changes outside the shared paths would join the merge: {}",
+                    foreign.join(", ")
+                ),
+            });
+        }
+        let msg = sync_merge_msg(role, login, remote);
+        return Ok(
+            match git_sync::merge_or_abort_msg(git, root, remote, Some(&msg), Some(expected))? {
+                MergeAttempt::UpToDate => FfResult::Clean,
+                MergeAttempt::Merged => FfResult::Merged,
+                MergeAttempt::Conflict { files } => FfResult::Conflict { files },
+                MergeAttempt::Failed {
+                    reason,
+                    restore: RestoreState::Unconfirmed,
+                } => FfResult::Unrestored { reason },
+                MergeAttempt::Failed { reason, .. } => FfResult::Refused { reason },
+            },
+        );
     }
     if shared_paths_dirty(git, root, pathspec)? {
-        return Ok(true);
+        return Ok(FfResult::Clean);
     }
     match git_sync::merge_ff_only(git, root, remote)? {
-        FfOutcome::Diverged => Ok(false),
-        _ => Ok(true),
+        FfOutcome::Diverged => Ok(FfResult::Refused {
+            reason: "diverged after the ancestry checks".to_string(),
+        }),
+        _ => Ok(FfResult::Clean),
     }
 }
 
@@ -4075,7 +4248,7 @@ impl SharedSync {
                     }
                 }
             }
-            if !stale {
+            if !stale && !pass.halt {
                 if let (Some(git), Some(_)) = (git, pass.role) {
                     phase_b_repo(db, git, &mut pass);
                 }
@@ -4092,7 +4265,9 @@ impl SharedSync {
             // T-000243 review (third pass): a pass cancelled by phase B's
             // revalidation settles no status — the writer that changed the
             // repo's state under the guard owns it (see `RepoPass::cancelled`).
-            if !pass.cancelled && !stale {
+            // T-000248: a halted pass (unrestored merge) settles none either —
+            // its issue already carries the reason.
+            if !pass.cancelled && !pass.halt && !stale {
                 settle_status(db, &pass, &mut out);
             }
         }
@@ -5692,13 +5867,34 @@ pub fn merge_shared_upstream(
         .ok_or_else(|| "HEAD is detached: check out a branch first".to_string())?;
     register_merge_driver(git, &root)?;
     let upstream = remote_ref(&cur);
-    let outcome = git_sync::merge_or_abort(git, &root, &upstream)?;
+    // T-000248: the button's merge carries the same participant trailer as
+    // the sync's auto-merge — role/login read under this hold, never guessed.
+    let role = db
+        .get_shared_state(repo_id)
+        .map_err(|e| e.to_string())?
+        .shared_role
+        .as_deref()
+        .and_then(|r| match r {
+            "contributor" => Some(Role::Contributor),
+            "pending" => Some(Role::Pending),
+            "main" => Some(Role::Main),
+            _ => None,
+        })
+        .unwrap_or(Role::Main);
+    let login = db.github_login().unwrap_or_default();
+    // A contributor's merge MUST carry its login in the trailer — an empty
+    // one is worse than none (it reads as an unidentified participant).
+    if matches!(role, Role::Contributor | Role::Pending) && login.is_empty() {
+        return Err("no GitHub login on this install — cannot sign the merge".to_string());
+    }
+    let msg = sync_merge_msg(role, &login, &upstream);
+    let outcome = git_sync::merge_or_abort_msg(git, &root, &upstream, Some(&msg), Some(&cur))?;
     Ok(match outcome {
-        MergeOutcome::UpToDate => SharedMergeResult {
+        MergeAttempt::UpToDate => SharedMergeResult {
             outcome: "up_to_date".into(),
             files: vec![],
         },
-        MergeOutcome::Merged => {
+        MergeAttempt::Merged => {
             // T-000243 review (seventh pass): a successful merge invalidates
             // every pre-merge observation — bump unconditionally, whether or
             // not `needs_manual_merge` was persisted. `root` IS the guarded
@@ -5714,10 +5910,13 @@ pub fn merge_shared_upstream(
                 files: vec![],
             }
         }
-        MergeOutcome::Conflict { files } => SharedMergeResult {
+        MergeAttempt::Conflict { files } => SharedMergeResult {
             outcome: "conflict".into(),
             files,
         },
+        MergeAttempt::Failed { reason, .. } => {
+            return Err(reason);
+        }
     })
 }
 
@@ -5969,6 +6168,16 @@ pub(crate) mod test_support {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `g` for commands expected to exit nonzero (a manual merge that
+    /// conflicts).
+    pub fn g_may_fail(dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git invocation failed")
     }
 
     pub fn configure(dir: &Path) {
@@ -8178,7 +8387,9 @@ mod tests {
                 helper_todo
             );
         }
-        // Main's own dev diverged from the helper's push to it: manual merge.
+        // Main's own dev diverged from the helper's push to it: this pass
+        // still reports it — the dirty todo deferred any merge attempt to
+        // after phase B's commit (T-000248, D3).
         assert_eq!(fx.main_status().as_deref(), Some("needs_manual_merge"));
         assert!(codes(&out).contains(&Code::SharedNeedsManualMerge));
         // Neither checkout was touched by the plumbing.
@@ -8186,6 +8397,29 @@ mod tests {
             g(&fx.helper_dir, &["branch", "--show-current"]),
             "helper-dev"
         );
+        assert_eq!(g(&fx.main_dir, &["branch", "--show-current"]), "dev");
+
+        // T-000248: the NEXT sync finds clean shared paths (the todo was
+        // committed by the pass above) and merges the divergence itself —
+        // no Merge button click.
+        let out = fx.sync_main();
+        assert_eq!(fx.main_status(), None);
+        assert_eq!(fx.main_status_detail(), None);
+        assert!(out.committed.contains(&"api".to_string()));
+        let parents = g(&fx.main_dir, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert_eq!(
+            parents.split_whitespace().count(),
+            3,
+            "expected a merge commit on dev: {}",
+            parents
+        );
+        for id in ["T-000001", "T-500000", "T-500001"] {
+            assert!(
+                fx.remote_file("dev", "docs/todo.md").unwrap().contains(id),
+                "origin/dev lacks {} after the auto-merge",
+                id
+            );
+        }
         assert_eq!(g(&fx.main_dir, &["branch", "--show-current"]), "dev");
     }
 
@@ -8370,7 +8604,10 @@ mod tests {
 
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
-    fn diverged_current_branch_needs_a_manual_merge_and_the_button_merges() {
+    /// T-000248: a clean divergence of the CURRENT branch merges itself in
+    /// the same pass — no `needs_manual_merge`, no Merge button. Both files
+    /// land on origin/dev in one sync, and a repeated pass stays a no-op.
+    fn diverged_current_branch_auto_merges_without_the_button() {
         let fx = two_installs();
         fx.enable_main();
         fx.sync_helper(); // pending: pushes its request to origin/dev
@@ -8379,38 +8616,127 @@ mod tests {
         g(&fx.main_dir, &["add", "src.rs"]);
         g(&fx.main_dir, &["commit", "-q", "-m", "code"]);
         let out = fx.sync_main();
+        assert_eq!(fx.main_status(), None);
+        assert_eq!(fx.main_status_detail(), None);
+        assert!(out
+            .issues
+            .iter()
+            .all(|i| i.code != Code::SharedNeedsManualMerge));
+        // The merge counts as this pass's commit even with no sync commit.
+        assert!(out.committed.contains(&"api".to_string()));
+        // The merge commit on the checked-out dev has two parents and both
+        // sides' files; phase B pushed it in the same pass.
+        let parents = g(&fx.main_dir, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert_eq!(
+            parents.split_whitespace().count(),
+            3,
+            "expected a merge commit: {}",
+            parents
+        );
+        assert!(fx.main_dir.join(".sdh/requests/helper.json").exists());
+        assert!(fx.remote_file("dev", "src.rs").is_some());
+        assert!(fx.remote_file("dev", ".sdh/requests/helper.json").is_some());
+
+        // The button agrees nothing is left, and the next pass merges again.
+        let res = merge_shared_upstream(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert_eq!(res.outcome, "up_to_date");
+        let merges_before = g(&fx.main_dir, &["rev-list", "--merges", "--count", "HEAD"]);
+        fx.sync_main();
+        assert_eq!(fx.main_status(), None);
+        assert_eq!(
+            g(&fx.main_dir, &["rev-list", "--merges", "--count", "HEAD"]),
+            merges_before,
+            "a repeated sync must not create a second merge"
+        );
+    }
+
+    /// T-000248: a REAL conflict on the current branch keeps the manual
+    /// gate — the sync's merge attempt is aborted and verified restored
+    /// (HEAD, index, bytes), the status names the conflicting file, and the
+    /// Merge button reports the same conflict. A hand-resolved merge then
+    /// converges on the next sync.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn conflicting_edit_on_current_branch_keeps_the_manual_gate() {
+        let fx = two_installs();
+        fx.enable_main();
+        write(&fx.main_dir, "src.rs", "fn main() { /* base */ }\n");
+        g(&fx.main_dir, &["add", "src.rs"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "base code"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        // The remote side edits the same line (stands in for the helper).
+        g(&fx.helper_dir, &["fetch", "-q", "origin", "dev"]);
+        g(
+            &fx.helper_dir,
+            &["checkout", "-q", "-B", "dev", "FETCH_HEAD"],
+        );
+        write(&fx.helper_dir, "src.rs", "fn main() { /* helper */ }\n");
+        g(&fx.helper_dir, &["add", "src.rs"]);
+        g(&fx.helper_dir, &["commit", "-q", "-m", "helper code"]);
+        g(&fx.helper_dir, &["push", "-q", "origin", "dev"]);
+        // Main edits the same line without pushing.
+        write(&fx.main_dir, "src.rs", "fn main() { /* owner */ }\n");
+        g(&fx.main_dir, &["add", "src.rs"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "owner code"]);
+        let head_before = g(&fx.main_dir, &["rev-parse", "HEAD"]);
+        let src_before = fs::read_to_string(fx.main_dir.join("src.rs")).unwrap();
+
+        let out = fx.sync_main();
         assert_eq!(fx.main_status().as_deref(), Some("needs_manual_merge"));
-        assert!(codes(&out).contains(&Code::SharedNeedsManualMerge));
         let detail = out
             .issues
             .iter()
             .find(|i| i.code == Code::SharedNeedsManualMerge)
             .and_then(|i| i.detail.clone())
-            .unwrap();
+            .unwrap_or_default();
         assert!(
-            detail.contains("dev") && detail.contains("Merge button"),
-            "{}",
+            detail.contains("src.rs"),
+            "the issue names the conflicting file: {}",
             detail
         );
-        // The UI gets the branch and whether it is checked out (T-000223).
+        // Verified restored: same HEAD, no MERGE_HEAD, clean index, original
+        // bytes.
+        assert_eq!(g(&fx.main_dir, &["rev-parse", "HEAD"]), head_before);
+        assert!(!fx.main_dir.join(".git/MERGE_HEAD").exists());
+        g(&fx.main_dir, &["diff", "--cached", "--quiet"]);
         assert_eq!(
-            fx.main_status_detail().as_deref(),
-            Some(r#"{"branch":"dev","current":true}"#)
+            fs::read_to_string(fx.main_dir.join("src.rs")).unwrap(),
+            src_before
         );
-        assert!(!fx.main_dir.join(".sdh/requests/helper.json").exists());
-        // Nothing was forced.
-        assert!(fx.remote_file("dev", "src.rs").is_none());
 
+        // The button reports the same conflict and restores the same way.
         let res = merge_shared_upstream(&fx.main_db, &gb(), fx.main_repo).unwrap();
-        assert_eq!(res.outcome, "merged");
-        assert!(fx.main_dir.join(".sdh/requests/helper.json").exists());
-        assert_eq!(fx.main_status(), None);
-        // The detail goes with the code.
-        assert_eq!(fx.main_status_detail(), None);
-        // The next sync pushes the merge.
+        assert_eq!(res.outcome, "conflict");
+        assert!(res.files.iter().any(|f| f == "src.rs"), "{:?}", res.files);
+        assert_eq!(g(&fx.main_dir, &["rev-parse", "HEAD"]), head_before);
+        assert!(!fx.main_dir.join(".git/MERGE_HEAD").exists());
+        assert_eq!(
+            fs::read_to_string(fx.main_dir.join("src.rs")).unwrap(),
+            src_before
+        );
+
+        // The user resolves it by hand; the next sync clears everything.
+        let m = g_may_fail(&fx.main_dir, &["merge", "origin/dev"]);
+        assert!(
+            !m.status.success(),
+            "expected the manual merge to conflict too"
+        );
+        write(&fx.main_dir, "src.rs", "fn main() { /* union */ }\n");
+        g(&fx.main_dir, &["add", "src.rs"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "resolve src.rs"]);
         fx.sync_main();
-        assert!(fx.remote_file("dev", "src.rs").is_some());
-        assert!(fx.remote_file("dev", ".sdh/requests/helper.json").is_some());
+        assert_eq!(fx.main_status(), None);
+        assert_eq!(fx.main_status_detail(), None);
+        assert_eq!(
+            fx.remote_file("dev", "src.rs").as_deref(),
+            Some("fn main() { /* union */ }\n")
+        );
+        // Both histories reached origin/dev.
+        let new_dev = fx.remote_rev("dev").unwrap();
+        g(
+            &fx.origin,
+            &["merge-base", "--is-ancestor", &head_before, &new_dev],
+        );
     }
 
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
@@ -8884,24 +9210,14 @@ mod tests {
             .join("docs/superpowers/specs/theirs.md")
             .is_file());
         // The helper committed `theirs.md` while origin/helper-dev had already
-        // taken main's plumbed `mine.md` commit, so its own branch diverged —
-        // the transport's designed state, identical for every shared path in
-        // this interleaving (see `main_plumbs_a_merged_todo_into_a_participant_
-        // branch`): the files travelled (both remotes, and main's checkout got
-        // theirs.md), the helper's checkout waits for the Merge button.
-        assert_eq!(
-            fx.helper_status().as_deref(),
-            Some("needs_manual_merge"),
-            "the diverged own branch is reported, not silently merged"
-        );
-        assert_eq!(
-            fx.helper_status_detail().as_deref(),
-            Some(r#"{"branch":"helper-dev","current":true}"#)
-        );
+        // taken main's plumbed `mine.md` commit, so its own branch diverged.
+        // T-000248: the last `sync_helper` above merged that clean divergence
+        // itself (the earlier pass deferred while theirs.md was uncommitted) —
+        // no status, no Merge button.
+        assert_eq!(fx.helper_status(), None);
+        assert_eq!(fx.helper_status_detail(), None);
         // Two sides adding DIFFERENT spec files: the merge keeps both (specs
         // carry no merge driver; different files never collide).
-        let res = merge_shared_upstream(&fx.helper_db, &gb(), fx.helper_repo).unwrap();
-        assert_eq!(res.outcome, "merged");
         assert!(fx
             .helper_dir
             .join("docs/superpowers/specs/mine.md")
@@ -8910,9 +9226,23 @@ mod tests {
             .helper_dir
             .join("docs/superpowers/specs/theirs.md")
             .is_file());
+        // The button agrees there is nothing left to merge.
+        let res = merge_shared_upstream(&fx.helper_db, &gb(), fx.helper_repo).unwrap();
+        assert_eq!(res.outcome, "up_to_date");
+        // The helper's auto-merge commit is signed as a participant (D4) —
+        // `participants_activity` reads that trailer.
+        let body = g(
+            &fx.helper_dir,
+            &["log", "--merges", "-1", "--format=%B", "helper-dev"],
+        );
+        assert!(
+            body.contains("SDH-Participant: helper"),
+            "the auto-merge carries the participant trailer: {}",
+            body
+        );
         fx.sync_helper();
         assert_eq!(fx.helper_status(), None);
-        // After the merge both files live on every branch.
+        // After the auto-merge both files live on every branch.
         for branch in ["dev", "helper-dev"] {
             for path in [
                 "docs/superpowers/specs/mine.md",
@@ -9343,6 +9673,84 @@ mod tests {
             .remote_file("helper-dev", "docs/todo.md")
             .unwrap()
             .contains("T-500001"));
+    }
+
+    /// T-000248 (D5): a two-parent merge on a NON-current branch is never
+    /// "our linear commit" — not reset, not plumbed, not pushed — even when
+    /// it carries the `SDH-Participant:` trailer a sync merge writes. Back on
+    /// the branch, the next sync converges it normally (local ahead → push).
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_merge_commit_on_a_non_current_branch_is_never_reset() {
+        let fx = two_installs();
+        fx.make_participant();
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        fx.sync_helper();
+        // A user merge on the non-current `dev`, trailer and all.
+        g(&fx.helper_dir, &["checkout", "-q", "dev"]);
+        write(&fx.helper_dir, "src.rs", "fn main() {}\n");
+        g(&fx.helper_dir, &["add", "src.rs"]);
+        g(&fx.helper_dir, &["commit", "-q", "-m", "my code"]);
+        // A foreign commit lands on origin/dev — by hand, since the helper's
+        // plumb above made main's own dev non-fast-forwardable.
+        write(&fx.main_dir, "docs/server-api/api.md", "# API\n");
+        g(&fx.main_dir, &["add", "docs/server-api/api.md"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "api doc"]);
+        g(&fx.main_dir, &["fetch", "-q", "origin"]);
+        g(&fx.main_dir, &["merge", "-q", "--no-edit", "origin/dev"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        g(&fx.helper_dir, &["fetch", "-q", "origin"]);
+        g(
+            &fx.helper_dir,
+            &[
+                "merge",
+                "-q",
+                "-m",
+                "merge origin/dev\n\nSDH-Participant: helper",
+                "origin/dev",
+            ],
+        );
+        g(&fx.helper_dir, &["checkout", "-q", "helper-dev"]);
+        let merged = g(&fx.helper_dir, &["rev-parse", "dev"]);
+        assert_eq!(
+            g(&fx.helper_dir, &["rev-list", "--parents", "-n1", "dev"])
+                .split_whitespace()
+                .count(),
+            3,
+            "a real merge commit on dev"
+        );
+        let remote_dev = fx.remote_rev("dev").unwrap();
+        // The judgement refuses the two-parent tip, trailer or not.
+        assert_eq!(
+            local_tip_if_ours(&gb(), &fx.helper_dir, "dev").unwrap(),
+            None
+        );
+
+        write(
+            &fx.helper_dir,
+            "docs/todo.md",
+            &todo(&["T-500000", "T-500001"]),
+        );
+        fx.sync_helper();
+        assert_eq!(
+            g(&fx.helper_dir, &["rev-parse", "dev"]),
+            merged,
+            "never reset"
+        );
+        assert_eq!(fx.remote_rev("dev").unwrap(), remote_dev, "never pushed");
+        assert_eq!(fx.remote_file("dev", "src.rs"), None);
+        assert_eq!(fx.helper_status().as_deref(), Some("needs_manual_merge"));
+        assert!(fx
+            .remote_file("helper-dev", "docs/todo.md")
+            .unwrap()
+            .contains("T-500001"));
+
+        // Back on the branch the sync sees local-ahead and pushes — the
+        // merge rides to origin like any user merge would.
+        g(&fx.helper_dir, &["checkout", "-q", "dev"]);
+        fx.sync_helper();
+        assert_eq!(fx.helper_status(), None);
+        assert!(fx.remote_file("dev", "src.rs").is_some());
     }
 
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]

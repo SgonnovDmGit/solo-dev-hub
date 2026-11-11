@@ -900,72 +900,270 @@ pub fn merge_ff_only(git: &GitBinary, repo: &Path, upstream: &str) -> Result<FfO
 
 /// Merge `upstream` into the CURRENT branch. On conflict the merge is aborted
 /// (the files that conflicted are reported) and HEAD is verified restored.
+///
+/// Thin compatibility wrapper over `merge_or_abort_msg` (T-000248): the typed
+/// `Failed` collapses into the old `String` error, the restoration state is
+/// folded into its text since the old signature cannot carry it.
 pub fn merge_or_abort(
     git: &GitBinary,
     repo: &Path,
     upstream: &str,
 ) -> Result<MergeOutcome, String> {
+    match merge_or_abort_msg(git, repo, upstream, None, None)? {
+        MergeAttempt::UpToDate => Ok(MergeOutcome::UpToDate),
+        MergeAttempt::Merged => Ok(MergeOutcome::Merged),
+        MergeAttempt::Conflict { files } => Ok(MergeOutcome::Conflict { files }),
+        MergeAttempt::Failed { reason, restore } => Err(match restore {
+            RestoreState::Untouched => reason,
+            RestoreState::Restored => format!("{} (restored)", reason),
+            RestoreState::Unconfirmed => {
+                format!("{} (the repo could not be verified restored)", reason)
+            }
+        }),
+    }
+}
+
+/// T-000248: how the work tree fared when a merge attempt failed — the
+/// caller needs to know whether the repo is still trustworthy, not just
+/// that the merge did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreState {
+    /// Git never touched the repo (refused before starting).
+    Untouched,
+    /// The mid-merge state was aborted and HEAD/state verified restored.
+    Restored,
+    /// Restoration could not be confirmed — the caller must stop mutating
+    /// this repo (no import, no commit, no push).
+    Unconfirmed,
+}
+
+/// T-000248: the richer outcome of `merge_or_abort_msg` — the failure paths
+/// carry the restoration state instead of a bare error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeAttempt {
+    UpToDate,
+    Merged,
+    Conflict {
+        files: Vec<String>,
+    },
+    Failed {
+        reason: String,
+        restore: RestoreState,
+    },
+}
+
+/// Merge `upstream` into the CURRENT branch, T-000248 style: the merge gets
+/// an explicit "make a merge commit" flag set so user git config
+/// (`merge.ff=only`, `branch.mergeOptions=--no-commit`, `merge.autoStash`)
+/// cannot change the contract; `msg` supplies the commit message (trailer
+/// included) instead of the default "Merge branch …" text; `expected_branch`
+/// refuses to merge when the checked-out branch moved between the caller's
+/// probe and this call (a stale pass must not merge origin of the OLD branch
+/// into the NEW one). On conflict the merge is aborted and HEAD is verified
+/// restored; on any failure the `RestoreState` says how much of the repo is
+/// still trustworthy. A pre-existing mid-merge state is refused, never
+/// aborted — "You have not concluded your merge" in the output marks OUR
+/// `git merge` refused on a foreign merge, which we must not `merge --abort`.
+pub fn merge_or_abort_msg(
+    git: &GitBinary,
+    repo: &Path,
+    upstream: &str,
+    msg: Option<&str>,
+    expected_branch: Option<&str>,
+) -> Result<MergeAttempt, String> {
     validate_rev(upstream)?;
-    checked_out_branch_for_merge(git, repo)?;
+    let cur = checked_out_branch_for_merge(git, repo)?;
+    if let Some(expected) = expected_branch {
+        if cur != expected {
+            return Ok(MergeAttempt::Failed {
+                reason: format!(
+                    "the checked-out branch changed {} -> {} since the sync looked",
+                    expected, cur
+                ),
+                restore: RestoreState::Untouched,
+            });
+        }
+    }
     let head_before =
         rev_parse(git, repo, "HEAD")?.ok_or_else(|| "HEAD has no commit".to_string())?;
+    // Resolve the upstream to a SHA once — a moving ref must not surprise
+    // the merge between our ancestry check and the invocation.
     let up = rev_parse(git, repo, upstream)?
         .ok_or_else(|| format!("upstream '{}' does not exist", upstream))?;
     if is_ancestor(git, repo, &up, &head_before)? {
-        return Ok(MergeOutcome::UpToDate);
+        return Ok(MergeAttempt::UpToDate);
     }
     let env: [(&str, &OsStr); 1] = [("GIT_MERGE_AUTOEDIT", OsStr::new("no"))];
+    let mut args: Vec<String> = vec![
+        "merge".into(),
+        // Pin the contract against user config: allow ff when possible (the
+        // callers only reach here on true divergence, so this is a safety
+        // net), never squash, always commit, never autostash.
+        "--ff".into(),
+        "--no-squash".into(),
+        "--commit".into(),
+        "--no-autostash".into(),
+    ];
+    match msg {
+        Some(m) => {
+            args.push("-m".into());
+            args.push(m.to_string());
+        }
+        None => args.push("--no-edit".into()),
+    }
+    args.push(up);
     let opts = RunOpts {
         env: &env,
         stdin: None,
         timeout: LOCAL_TIMEOUT,
     };
-    let out = run_git(git, repo, &["merge", "--no-edit", up.as_str()], &opts)
-        .map_err(|e| e.to_string())?;
+    let out = match run_git(git, repo, &args, &opts) {
+        Ok(o) => o,
+        Err(e) => {
+            // The merge may have left MERGE_HEAD behind before being killed
+            // (timeout) — the plain `?` of the old wrapper would leak it.
+            return Ok(tidy_failed_merge(git, repo, &head_before, e.to_string()));
+        }
+    };
     if out.status.success() {
-        return Ok(MergeOutcome::Merged);
+        // A merge process that exits 0 without producing a new HEAD is not
+        // "merged" — the ancestry check ruled out already-contained, so a
+        // moved HEAD is the only success proof we accept.
+        return match rev_parse(git, repo, "HEAD") {
+            Ok(Some(h)) if h != head_before => Ok(MergeAttempt::Merged),
+            Ok(Some(_)) => Ok(MergeAttempt::Failed {
+                reason: "git merge succeeded but HEAD did not move".to_string(),
+                restore: RestoreState::Untouched,
+            }),
+            _ => Ok(MergeAttempt::Failed {
+                reason: "could not verify HEAD after a successful merge".to_string(),
+                restore: RestoreState::Unconfirmed,
+            }),
+        };
     }
-    if repo_state(git, repo)? != RepoState::MidMerge {
-        // Refused before touching anything (dirty tree overlap, no identity, ...).
-        return Err(failure("merge", &out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("You have not concluded your merge") || stderr.contains("MERGE_HEAD exists")
+    {
+        // A foreign merge arrived between our Clean check and the command —
+        // aborting it would destroy someone else's operation.
+        return Ok(MergeAttempt::Failed {
+            reason: "a merge started elsewhere while the sync was running".to_string(),
+            restore: RestoreState::Unconfirmed,
+        });
     }
-    // The abort is attempted whatever happens while listing the conflicts, so a
-    // failed listing can never leave the repo stuck mid-merge.
-    let listing = run_ok(git, repo, &["diff", "--name-only", "--diff-filter=U", "-z"]);
+    match repo_state(git, repo)? {
+        RepoState::Clean => Ok(MergeAttempt::Failed {
+            // Refused before touching anything (dirty overlap, no identity).
+            reason: failure("merge", &out),
+            restore: RestoreState::Untouched,
+        }),
+        RepoState::MidRebase => Ok(MergeAttempt::Failed {
+            reason: "the repo ended mid-rebase after a failed merge".to_string(),
+            restore: RestoreState::Unconfirmed,
+        }),
+        RepoState::MidMerge => {
+            // OUR merge is mid-flight: list conflicts first, then abort — a
+            // failed listing can never leave the repo stuck, and it is
+            // reported instead of silently becoming "no conflicts".
+            let (files, listing_err) =
+                match run_ok(git, repo, &["diff", "--name-only", "--diff-filter=U", "-z"]) {
+                    Ok(d) => (
+                        d.stdout
+                            .split(|b| *b == 0)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| String::from_utf8_lossy(s).into_owned())
+                            .collect::<Vec<String>>(),
+                        None,
+                    ),
+                    Err(e) => (Vec::new(), Some(e.to_string())),
+                };
+            match abort_and_verify(git, repo, &head_before) {
+                Ok(()) if !files.is_empty() => Ok(MergeAttempt::Conflict { files }),
+                Ok(()) => Ok(MergeAttempt::Failed {
+                    // Mid-merge with no unmerged files — e.g. a commit hook
+                    // refused, or the listing itself failed. Either is a
+                    // refusal, not a textual conflict.
+                    reason: match listing_err {
+                        Some(e) => format!(
+                            "{}; listing conflicted files: {}",
+                            failure("merge", &out),
+                            e
+                        ),
+                        None => failure("merge", &out),
+                    },
+                    restore: RestoreState::Restored,
+                }),
+                Err(e) => Ok(MergeAttempt::Failed {
+                    reason: e,
+                    restore: RestoreState::Unconfirmed,
+                }),
+            }
+        }
+    }
+}
+
+/// After a merge invocation that never returned its Output (spawn error or
+/// timeout kill): find out whether it left a mid-merge state and clean it
+/// up the same way the nonzero path does.
+fn tidy_failed_merge(
+    git: &GitBinary,
+    repo: &Path,
+    head_before: &str,
+    cause: String,
+) -> MergeAttempt {
+    let state = match repo_state(git, repo) {
+        Ok(s) => s,
+        Err(e) => {
+            return MergeAttempt::Failed {
+                reason: format!("{}; could not read the repo state: {}", cause, e),
+                restore: RestoreState::Unconfirmed,
+            }
+        }
+    };
+    match state {
+        RepoState::Clean => match rev_parse(git, repo, "HEAD") {
+            Ok(Some(h)) if h == head_before => MergeAttempt::Failed {
+                reason: cause,
+                restore: RestoreState::Untouched,
+            },
+            _ => MergeAttempt::Failed {
+                reason: format!("{}; HEAD moved but the repo reads clean", cause),
+                restore: RestoreState::Unconfirmed,
+            },
+        },
+        RepoState::MidMerge => match abort_and_verify(git, repo, head_before) {
+            Ok(()) => MergeAttempt::Failed {
+                reason: cause,
+                restore: RestoreState::Restored,
+            },
+            Err(e) => MergeAttempt::Failed {
+                reason: format!("{}; {}", cause, e),
+                restore: RestoreState::Unconfirmed,
+            },
+        },
+        RepoState::MidRebase => MergeAttempt::Failed {
+            reason: format!("{}; the repo is mid-rebase", cause),
+            restore: RestoreState::Unconfirmed,
+        },
+    }
+}
+
+/// `git merge --abort` and proof that HEAD and the repo state are back to
+/// the pre-merge commit. An Err means the tree cannot be trusted.
+fn abort_and_verify(git: &GitBinary, repo: &Path, head_before: &str) -> Result<(), String> {
     let abort = run_ok(git, repo, &["merge", "--abort"]);
-    let restored = match (rev_parse(git, repo, "HEAD"), repo_state(git, repo)) {
+    if let Err(e) = abort {
+        return Err(format!("aborting the merge: {}", e));
+    }
+    match (rev_parse(git, repo, "HEAD"), repo_state(git, repo)) {
         (Ok(head), Ok(state)) => {
-            if head.as_deref() == Some(head_before.as_str()) && state == RepoState::Clean {
+            if head.as_deref() == Some(head_before) && state == RepoState::Clean {
                 Ok(())
             } else {
                 Err("merge --abort did not restore the pre-merge state".to_string())
             }
         }
         (Err(e), _) | (_, Err(e)) => Err(format!("could not verify the repo after abort: {}", e)),
-    };
-    let mut errors: Vec<String> = Vec::new();
-    let files = match listing {
-        Ok(diff) => diff
-            .stdout
-            .split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect(),
-        Err(e) => {
-            errors.push(format!("listing conflicted files: {}", e));
-            Vec::new()
-        }
-    };
-    if let Err(e) = abort {
-        errors.push(format!("aborting the merge: {}", e));
-    }
-    if let Err(e) = restored {
-        errors.push(e);
-    }
-    if errors.is_empty() {
-        Ok(MergeOutcome::Conflict { files })
-    } else {
-        Err(errors.join("; "))
     }
 }
 
@@ -3630,6 +3828,138 @@ mod tests {
         assert!(e.contains("middle of a merge"), "{e}");
         let e = merge_ff_only(&gb(), &fx.a, "shared").unwrap_err();
         assert!(e.contains("middle of a merge"), "{e}");
+    }
+
+    // ----- merge_or_abort_msg (T-000248) -----------------------------------
+
+    /// Two clones diverging on different files: the merge gets the caller's
+    /// message and participant trailer verbatim.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn merge_or_abort_msg_lands_the_custom_message_and_trailer() {
+        let fx = fixture();
+        let b = clone_b(&fx);
+        commit_file(&fx.a, "from-a.txt", "a", "a side");
+        g(&fx.a, &["push", "-q", "origin", "dev"]);
+        commit_file(&b, "from-b.txt", "b", "b side");
+        fetch(&gb(), &b, "origin").unwrap();
+        let r = merge_or_abort_msg(
+            &gb(),
+            &b,
+            "origin/dev",
+            Some("merge origin/dev\n\nSDH-Participant: helper"),
+            Some("dev"),
+        )
+        .unwrap();
+        assert_eq!(r, MergeAttempt::Merged);
+        let body = g(&b, &["log", "-1", "--format=%B"]);
+        assert!(
+            body.contains("merge origin/dev") && body.contains("SDH-Participant: helper"),
+            "{body}"
+        );
+    }
+
+    /// `expected_branch` is the race guard: the checkout moved since the
+    /// caller looked -> refuse, never merge the wrong upstream in.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn merge_or_abort_msg_refuses_a_moved_checkout() {
+        let fx = fixture();
+        // `a` is on `dev`; the caller last saw `shared`.
+        let r = merge_or_abort_msg(&gb(), &fx.a, "shared", None, Some("shared")).unwrap();
+        match r {
+            MergeAttempt::Failed { reason, restore } => {
+                assert!(reason.contains("changed"), "{reason}");
+                assert_eq!(restore, RestoreState::Untouched);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// Hostile user config must not rewrite the contract: `merge.ff=only`
+    /// would fail a diverged merge outright, `autoStash` would stash the
+    /// tree, `mergeOptions=--no-commit` would leave it uncommitted. The
+    /// explicit flags override all three.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn merge_or_abort_msg_ignores_hostile_merge_config() {
+        let fx = fixture();
+        let b = clone_b(&fx);
+        commit_file(&fx.a, "from-a.txt", "a", "a side");
+        g(&fx.a, &["push", "-q", "origin", "dev"]);
+        commit_file(&b, "from-b.txt", "b", "b side");
+        fs::write(b.join("untracked.txt"), "keep me\n").unwrap();
+        fetch(&gb(), &b, "origin").unwrap();
+        g(&b, &["config", "merge.ff", "only"]);
+        g(&b, &["config", "merge.autoStash", "true"]);
+        g(&b, &["config", "branch.dev.mergeOptions", "--no-commit"]);
+        let r = merge_or_abort_msg(&gb(), &b, "origin/dev", Some("m"), Some("dev")).unwrap();
+        assert_eq!(r, MergeAttempt::Merged);
+        assert_eq!(
+            g(&b, &["rev-list", "--parents", "-n1", "HEAD"])
+                .split(' ')
+                .count(),
+            3,
+            "a real merge commit despite merge.ff=only"
+        );
+        // The merge committed (mergeOptions --no-commit lost) and the
+        // untracked file survived un-stashed (autoStash lost).
+        assert_eq!(repo_state(&gb(), &b).unwrap(), RepoState::Clean);
+        assert_eq!(
+            fs::read_to_string(b.join("untracked.txt")).unwrap(),
+            "keep me\n"
+        );
+    }
+
+    /// A commit hook refusing the merge commit is a FAILED attempt with a
+    /// verified restore — never an empty Conflict and never a false Merged.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn merge_or_abort_msg_reports_a_hook_refusal_as_failed_not_conflict() {
+        let fx = fixture();
+        let b = clone_b(&fx);
+        commit_file(&fx.a, "from-a.txt", "a", "a side");
+        g(&fx.a, &["push", "-q", "origin", "dev"]);
+        commit_file(&b, "from-b.txt", "b", "b side");
+        fetch(&gb(), &b, "origin").unwrap();
+        let hook = b.join(".git/hooks/commit-msg");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let head = g(&b, &["rev-parse", "HEAD"]);
+        let r = merge_or_abort_msg(&gb(), &b, "origin/dev", Some("m"), Some("dev")).unwrap();
+        match r {
+            MergeAttempt::Failed { reason, restore } => {
+                assert!(!reason.is_empty());
+                assert_eq!(restore, RestoreState::Restored);
+            }
+            MergeAttempt::Conflict { files } => {
+                panic!("a hook refusal is not a textual conflict: {files:?}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(g(&b, &["rev-parse", "HEAD"]), head);
+        assert!(!b.join(".git/MERGE_HEAD").exists());
+        assert_eq!(repo_state(&gb(), &b).unwrap(), RepoState::Clean);
+    }
+
+    /// Detached HEAD and a planted mid-rebase marker are refused before any
+    /// merge runs — never aborted-as-ours.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn merge_or_abort_msg_refuses_detached_head_and_mid_rebase() {
+        let fx = fixture();
+        g(&fx.a, &["checkout", "-q", "--detach", "HEAD"]);
+        let e = merge_or_abort_msg(&gb(), &fx.a, "shared", None, None).unwrap_err();
+        assert!(e.contains("detached"), "{e}");
+        g(&fx.a, &["checkout", "-q", "dev"]);
+        fs::create_dir_all(fx.a.join(".git/rebase-merge")).unwrap();
+        assert_eq!(repo_state(&gb(), &fx.a).unwrap(), RepoState::MidRebase);
+        let e = merge_or_abort_msg(&gb(), &fx.a, "shared", None, Some("dev")).unwrap_err();
+        assert!(e.contains("rebase"), "{e}");
     }
 
     // ----- review follow-ups (T-000217) -----------------------------------

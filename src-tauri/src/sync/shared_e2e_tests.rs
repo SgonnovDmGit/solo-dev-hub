@@ -1114,12 +1114,12 @@ fn v6_a_local_ai_edit_of_a_bug_is_undone_and_a_committed_task_edit_is_taken() {
 // ---------------------------------------------------------------------------
 
 /// Verification 7: the owner commits code on `dev` and does not push; the
-/// helper pushes a task. The owner's sync reports `needs_manual_merge`, master
-/// is untouched and nothing is forced (every remote ref only moved forward: the
-/// old `origin/dev` is an ancestor of the new one); the Merge button merges
-/// without a conflict in `todo.md` -- both sides appended to the end of the
-/// file, which only the registered driver (merging by id) can resolve -- and the
-/// next sync pushes the merge.
+/// helper pushes a task. Both sides appended to the end of `todo.md`, which
+/// only the registered driver (merging by id) can resolve. T-000248: the
+/// owner's sync now runs that very merge itself -- the driver resolves
+/// `todo.md` by id, the merge commit lands on `dev` and is pushed in the
+/// same pass, master is untouched and every remote ref only moved forward.
+/// The Merge button is left with nothing to do.
 ///
 /// The driver in the clones is the app executable in production. A unit test
 /// runs inside the test harness, which is not the app; see `arm_driver` for how
@@ -1127,7 +1127,7 @@ fn v6_a_local_ai_edit_of_a_bug_is_undone_and_a_committed_task_edit_is_taken() {
 /// binary in a real `git merge` is covered by `tests/merge_driver_git.rs`.
 #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
 #[test]
-fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
+fn v7_unpushed_code_and_a_helpers_push_auto_merge_by_id() {
     let w = World::new();
     let fx = &w.fx;
     w.participants();
@@ -1141,7 +1141,6 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
     write(&fx.main_dir, "src.rs", "fn main() {}\n");
     g(&fx.main_dir, &["add", "src.rs", "docs/todo.md"]);
     g(&fx.main_dir, &["commit", "-q", "-m", "code and a task"]);
-    let local_commit = g(&fx.main_dir, &["rev-parse", "HEAD"]);
 
     // The helper pushes a task, also at the end of the file.
     append(
@@ -1156,31 +1155,16 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
         .unwrap()
         .contains("T-500000"));
 
+    // The registered driver is the shim for this clone (see `arm_driver`).
+    assert!(g(&fx.main_dir, &["config", "--get", "merge.sdh.driver"]).contains("sdh-shim"));
+
     let out = w.sync_owner();
-    assert_eq!(fx.main_status().as_deref(), Some("needs_manual_merge"));
+    // No manual gate: the sync merged the divergence through the driver.
+    assert_eq!(fx.main_status(), None);
     assert!(out
         .errors
         .iter()
-        .any(|i| i.code == crate::models::SyncIssueCode::SharedNeedsManualMerge));
-    // Nothing was forced, pushed over or merged behind the owner's back.
-    assert_eq!(fx.remote_rev("dev").unwrap(), old_dev);
-    assert_eq!(
-        fx.remote_file("dev", "src.rs"),
-        None,
-        "code must not travel unasked"
-    );
-    assert_eq!(g(&fx.main_dir, &["rev-parse", "HEAD"]), local_commit);
-    assert!(!w.owner_file("docs/todo.md").contains("T-500000"));
-    assert_eq!(
-        fx.remote_rev("master").unwrap(),
-        w.master0,
-        "master is untouched"
-    );
-
-    // The registered driver is the shim for this clone (see `arm_driver`).
-    assert!(g(&fx.main_dir, &["config", "--get", "merge.sdh.driver"]).contains("sdh-shim"));
-    let res = merge_shared_upstream(&fx.main_db, &gb(), fx.main_repo).unwrap();
-    assert_eq!(res.outcome, "merged", "{:?}", res);
+        .all(|i| i.code != crate::models::SyncIssueCode::SharedNeedsManualMerge));
     let todo = w.owner_file("docs/todo.md");
     no_markers(&todo);
     assert!(
@@ -1188,7 +1172,6 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
         "{}",
         todo
     );
-    assert_eq!(fx.main_status(), None);
     assert_eq!(
         g(&fx.main_dir, &["rev-list", "--parents", "-n", "1", "HEAD"])
             .split(' ')
@@ -1197,8 +1180,8 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
         "a merge commit"
     );
 
-    // The next sync pushes the merge: a fast-forward of the remote's dev.
-    w.sync_owner();
+    // The merge was pushed in the same pass: a fast-forward of the remote's
+    // dev, master untouched.
     let new_dev = fx.remote_rev("dev").unwrap();
     assert_ne!(new_dev, old_dev);
     g(
@@ -1207,11 +1190,27 @@ fn v7_unpushed_code_and_a_helpers_push_need_a_manual_merge_that_merges_by_id() {
     );
     assert!(
         fx.remote_file("dev", "src.rs").is_some(),
-        "the owner's commit is pushed now"
+        "the owner's commit rides into origin/dev with the merge"
     );
     let remote_todo = fx.remote_file("dev", "docs/todo.md").unwrap();
     assert!(remote_todo.contains("T-000010") && remote_todo.contains("T-500000"));
-    assert_eq!(fx.main_status(), None);
+    assert_eq!(
+        fx.remote_rev("master").unwrap(),
+        w.master0,
+        "master is untouched"
+    );
+
+    // The button finds nothing left, and a repeated sync merges nothing new.
+    let res = merge_shared_upstream(&fx.main_db, &gb(), fx.main_repo).unwrap();
+    assert_eq!(res.outcome, "up_to_date", "{:?}", res);
+    let merges = g(&fx.main_dir, &["rev-list", "--merges", "--count", "HEAD"]);
+    w.sync_owner();
+    assert_eq!(
+        g(&fx.main_dir, &["rev-list", "--merges", "--count", "HEAD"]),
+        merges,
+        "a repeated sync must not create another merge"
+    );
+
     // The helper receives the merged file.
     w.settle();
     let helper_todo = w.helper_file("docs/todo.md");
