@@ -24,7 +24,18 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Linux system dependencies
+        # azure.archive.ubuntu.com (the apt-mirrors.txt target on hosted
+        # runners) had a multi-hour DNS outage during the v1.24.0 release and
+        # burned ~75 min per job on per-package resolver timeouts. If the
+        # mirror does not resolve, swap the sources to the public mirror up
+        # front instead of paying a DNS timeout on every package fetch.
         run: |
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            sudo sed -i \
+              -e 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu|g' \
+              -e 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' \
+              /etc/apt/sources.list
+          fi
           sudo apt-get update
           sudo apt-get install -y build-essential curl wget file libssl-dev libxdo-dev \
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
@@ -65,6 +76,7 @@ jobs:
           name: solo-dev-hub-linux-${{ github.sha }}
           path: |
             src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
             src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: error
           retention-days: 14
