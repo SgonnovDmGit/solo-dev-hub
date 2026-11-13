@@ -2,12 +2,15 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Changelog.ru.md](Changelog.ru.md).
 
-## [Unreleased]
+## [1.24.1] — 2026-11-13
 
 ### Fixed
 - **Linux memory footprint is roughly halved (T-000249).** The WebKitGTK DMABUF renderer idled at ~600 MB RSS on its own — the whole app ~1 GB against ~160 MB on Windows — worst on virtualized GL. On Linux the app now sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` before the webview starts, measured ~963 → ~497 MB on the helper's VM. A user-provided value wins; setting `=0` restores the renderer (the variable is removed entirely, since WebKit checks presence, not value).
 - **A `.deb` install now says how it updates (T-000252).** The in-app updater only replaces AppImage launches, so a package-installed app silently never found updates — and offered no hint why. The About card detects a non-AppImage install and honestly reports "installed as a system package — update via apt/dpkg" with a link to the releases page.
 - **The release pipeline can no longer ship a half-empty updater manifest (T-000251).** v1.24.0's `latest.json` went out without the Linux key after the ubuntu leg died — valid JSON, a silent "no update" for every Linux install. A final `verify-updater-manifest` job now asserts every platform key (signature + URL) once the whole matrix lands; a missing leg fails the run loudly, and `docs/RELEASING.md` documents the catch-up path through `linux-build.yml`.
+
+### Tests
+- 950 Rust (`cargo test --lib`) locally on Windows — the linux-gated env-var test joins the suite on the Linux CI run. 223 vitest, svelte-check clean, `cargo fmt --check` clean.
 
 ## [1.24.0] — 2026-11-11
 
