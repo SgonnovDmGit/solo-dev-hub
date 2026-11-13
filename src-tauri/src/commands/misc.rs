@@ -21,6 +21,19 @@ pub fn delete_pat() -> Result<(), String> {
     keyring_store::delete_pat()
 }
 
+/// v1.24.1: can this install apply in-app updates at all? On Linux the
+/// updater only replaces AppImage launches — a `.deb`-installed binary (no
+/// `APPIMAGE` env var) can never self-update. The About card uses this to
+/// direct package installs to apt instead of a check that finds nothing.
+#[tauri::command]
+pub fn self_update_supported() -> bool {
+    if cfg!(target_os = "linux") {
+        std::env::var_os("APPIMAGE").is_some()
+    } else {
+        true
+    }
+}
+
 // ── Settings commands ─────────────────────────────────────────────────────────
 
 #[tauri::command]

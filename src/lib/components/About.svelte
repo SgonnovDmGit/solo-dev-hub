@@ -30,6 +30,10 @@
     try { await openUrl(githubUrl); } catch (err) { addToast(String(err), 'error'); }
   }
 
+  async function openReleases() {
+    try { await openUrl(githubUrl + '/releases'); } catch (err) { addToast(String(err), 'error'); }
+  }
+
   async function openBoosty() {
     try { await openUrl(boostyUrl); } catch (err) { addToast(String(err), 'error'); }
   }
@@ -177,6 +181,13 @@
       <div class="update-body">
         <span class="spinner" aria-hidden="true"></span>
         {$tStore('about.update.installing' as any)}
+      </div>
+    {:else if $updaterStatus.kind === 'packageManaged'}
+      <div class="update-body muted">
+        {$tStore('about.update.packageManaged' as any)}
+        <button type="button" class="link-btn" onclick={openReleases}>
+          {$tStore('about.update.releasesLink' as any)}
+        </button>
       </div>
     {:else if $updaterStatus.kind === 'error'}
       <div class="update-body error-block">

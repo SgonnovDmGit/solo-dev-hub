@@ -55,8 +55,32 @@ pub fn merge_driver_entry(args: Vec<String>) -> Option<i32> {
     merge_driver::run_from_args(&args)
 }
 
+/// T-000249: the Linux WebKitGTK webview idles near ~600 MB RSS — most of it
+/// DMABUF renderer buffers, worst on virtualized GL (the MESA ZINK fallbacks
+/// seen on the helper's VM). Disabling the renderer roughly halved the whole
+/// app's RSS there (~963 → ~497 MB measured). Must be set before the webview
+/// spawns, so `run()` calls this first. A user-provided value wins; `=0` is
+/// the documented opt-out.
+fn apply_linux_webkit_env() {
+    #[cfg(target_os = "linux")]
+    {
+        const KEY: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+        match std::env::var(KEY) {
+            // Explicit opt-out — WEBKIT_DISABLE_* is a presence check, not a
+            // value check, so `=0` still disables it. Removing the variable
+            // entirely is the only way a user gets the renderer back.
+            Ok(ref v) if v == "0" => std::env::remove_var(KEY),
+            // Absent (or unreadable) → disable the renderer ourselves.
+            Err(_) => std::env::set_var(KEY, "1"),
+            // Any other user-set value is left alone.
+            Ok(_) => {}
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    apply_linux_webkit_env();
     let db = AppDb::new(get_db_path()).expect("Failed to initialize database");
 
     // T-000063: copy legacy PAT from old keyring service to new one. Idempotent;
@@ -292,6 +316,7 @@ pub fn run() {
             commands::deploy::get_deploy_secret_values,
             commands::deploy::read_repo_file,
             commands::misc::read_repo_files,
+            commands::misc::self_update_supported,
             commands::misc::read_repo_todo,
             commands::misc::read_repo_done,
             commands::misc::parse_done_entries_in_period_cmd,
@@ -312,4 +337,31 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    /// T-000249: all three branches of `apply_linux_webkit_env` in a single
+    /// test — the env is process-global, so parallel tests touching the same
+    /// variable would race.
+    #[test]
+    fn linux_dmabuf_env_semantics() {
+        const KEY: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+        std::env::remove_var(KEY);
+
+        // Absent → we disable the renderer.
+        super::apply_linux_webkit_env();
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("1"));
+
+        // A user-set value is left alone.
+        std::env::set_var(KEY, "yes");
+        super::apply_linux_webkit_env();
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("yes"));
+
+        // `=0` opts back into the renderer: the var must disappear entirely
+        // (WebKit checks presence, not value).
+        std::env::set_var(KEY, "0");
+        super::apply_linux_webkit_env();
+        assert!(std::env::var_os(KEY).is_none());
+    }
 }
