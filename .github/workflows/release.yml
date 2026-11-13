@@ -43,7 +43,23 @@ jobs:
 
       - name: Install Linux system dependencies
         if: matrix.platform == 'ubuntu-22.04'
+        # The *.ubuntu.com DNS zone itself went dark on hosted runners during
+        # the v1.24.0 release (azure/archive/security all NXDOMAIN while
+        # github.com and packages.microsoft.com resolved), and apt burned
+        # ~75 min per job on per-package resolver timeouts. If the runner's
+        # mirror does not resolve, swap all ubuntu sources to the OSUOSL
+        # mirror — a non-ubuntu.com host whose DNS still resolves. apt
+        # verifies the archive's GPG signatures, so the mirror's trust level
+        # does not matter for package integrity.
         run: |
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            sudo sed -i \
+              -e 's|mirror+file:/etc/apt/apt-mirrors.txt|http://ubuntu.osuosl.org/ubuntu|g' \
+              -e 's|azure\.archive\.ubuntu\.com|ubuntu.osuosl.org|g' \
+              -e 's|security\.ubuntu\.com|ubuntu.osuosl.org|g' \
+              -e 's|archive\.ubuntu\.com|ubuntu.osuosl.org|g' \
+              /etc/apt/sources.list
+          fi
           sudo apt-get update
           sudo apt-get install -y build-essential curl wget file libssl-dev libxdo-dev             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
 
@@ -88,3 +104,39 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+  # T-000251: during v1.24.0 the ubuntu leg died on an apt DNS outage and the
+  # run still published a syntactically valid latest.json missing linux-* —
+  # the updater then honestly answered "no update" to every Linux install.
+  # A missing platform is a release failure, not a footnote: after ALL matrix
+  # legs finish, assert the full key set (each leg merges only its own entries
+  # into the manifest, so no leg can verify the others).
+  verify-updater-manifest:
+    name: Verify updater manifest
+    needs: publish-tauri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert all platform keys in latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" --pattern latest.json --clobber
+          required=(
+            windows-x86_64 windows-x86_64-nsis
+            linux-x86_64 linux-x86_64-appimage
+            darwin-aarch64 darwin-aarch64-app
+            darwin-x86_64 darwin-x86_64-app
+          )
+          missing=()
+          for key in "${required[@]}"; do
+            if ! jq -e --arg key "$key" \
+              '.platforms[$key].signature and .platforms[$key].url' latest.json >/dev/null; then
+              missing+=("$key")
+            fi
+          done
+          if ((${#missing[@]})); then
+            echo "::error::latest.json is missing platform entries: ${missing[*]}"
+            echo "Catch-up path: build the platform via linux-build.yml on the tag's commit, upload the signed artifacts, then add the entries to latest.json — docs/RELEASING.md."
+            exit 1
+          fi
+          echo "latest.json covers all ${#required[@]} platform keys"

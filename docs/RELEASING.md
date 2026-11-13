@@ -75,7 +75,8 @@ git checkout dev && git rebase master   # подтягиваем хотфикс 
 1. Checkout, setup Node 20, install deps, setup Rust, cache.
 2. Извлечение release notes из `Changelog.md` скриптом `scripts/extract-changelog.mjs <version>`.
 3. `tauri-apps/tauri-action@v0` — компиляция, подпись (`TAURI_SIGNING_PRIVATE_KEY`, опционально + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` если ключ зашифрован — текущий ключ solo-dev-hub без пароля), сборка NSIS installer'а, генерация `latest.json`, публикация Release с артефактами.
-4. Endpoint у installed apps настроен на `https://github.com/SgonnovDmGit/solo-dev-hub/releases/latest/download/latest.json` — GitHub редиректит на актуальный релиз автоматически. Репозиторий приватный до v1.0.0 public-flip'а — `latest.json` без auth не отдаётся, autoupdate фактически приостановлен на v0.25.x.
+4. `verify-updater-manifest` — финальная джоба после всей матрицы: скачивает свежеопубликованный `latest.json` и проверяет, что в `platforms` есть все ключи (`windows-x86_64(-nsis)`, `linux-x86_64(-appimage)`, `darwin-aarch64(-app)`, `darwin-x86_64(-app)`) с подписью и URL. Каждая нога матрицы дописывает в манифест только свои записи, поэтому проверить полноту может только отдельная джоба в конце. **Отсутствие платформы = упавший ран = релиз не считается выкаченным** — частичный, но валидный манифест это маскировка, а не успех (урок v1.24.0: ubuntu-нога умерла на apt DNS-аутедже, манифест вышел без Linux и апдейтер честно отвечал «обновлений нет»). Догон — см. ниже «Догон платформы».
+5. Endpoint у installed apps настроен на `https://github.com/SgonnovDmGit/solo-dev-hub/releases/latest/download/latest.json` — GitHub редиректит на актуальный релиз автоматически. Репозиторий приватный до v1.0.0 public-flip'а — `latest.json` без auth не отдаётся, autoupdate фактически приостановлен на v0.25.x.
 
 ### Linux
 
@@ -83,7 +84,23 @@ git checkout dev && git rebase master   # подтягиваем хотфикс 
 - Linux-цели задаются аргументом `--bundles appimage,deb` у `tauri-action` (не в `tauri.conf.json`, чтобы локальная Windows-сборка не менялась). Подписанный AppImage даёт запись `linux-x86_64` в `latest.json`.
 - Автообновление работает только у AppImage. `.deb` ставится вручную и сам не обновляется.
 - Хранилище секретов на Linux — Secret Service по D-Bus (GNOME Keyring / KWallet), фича `sync-secret-service` в `Cargo.toml` (target-specific). Без запущенного демона PAT и ключ шифрования секретов сохранить нельзя: UI получит строку ошибки от keyring.
-- `.github/workflows/linux-build.yml` (push в `dev` и ручной запуск): `cargo test --lib -- --include-ignored --skip db::migrations::tests::export_fresh_schema_db` (полный набор, включая тесты с git, проигнорированные локально) и сборка AppImage + deb **без публикации**; артефакты `solo-dev-hub-linux-<sha>` хранятся 14 дней. Используется для проверки Linux-сборки до тега.
+- `.github/workflows/linux-build.yml` (push в `dev` и ручной запуск): `cargo test --lib -- --include-ignored --skip db::migrations::tests::export_fresh_schema_db` (полный набор, включая тесты с git, проигнорированные локально) и сборка AppImage + deb **без публикации**; артефакты `solo-dev-hub-linux-<sha>` хранятся 14 дней. Используется для проверки Linux-сборки до тега — и как штатный догоняющий источник, см. ниже.
+
+### Догон платформы (если нога сборки упала)
+
+Джоба `verify-updater-manifest` падает, когда в `latest.json` нет ключа платформы — значит, соответствующая нога матрицы не опубликовала артефакты. Порядок догона (проверен вживую на v1.24.0):
+
+1. Сначала попробовать штатное: Actions → failed run → **Re-run failed jobs**. Нога пересоберёт и сама вольёт свои записи в `latest.json`.
+2. Если нога не поднимается из-за внешней причины (как DNS-аутедж `*.ubuntu.com` у v1.24.0 — легла вся зона, а не одно зеркало; с bb947e1/c3b7f13 воркфлоу сами уходят на OSUOSL-фолбэк и пробуют зону через `getent`) — догон через `linux-build.yml`:
+   - Actions → **Linux build → Run workflow**, выбрать ветку/ref **коммита тега** (`vX.Y.Z`).
+   - Скачать артефакт `solo-dev-hub-linux-<sha>` (AppImage + `.sig` + deb, подписанные тем же `TAURI_SIGNING_PRIVATE_KEY`).
+   - `gh release upload vX.Y.Z <файлы>` — залить AppImage, AppImage.sig и deb в релиз.
+   - Дописать в `latest.json` ключи `linux-x86_64` и `linux-x86_64-appimage`: `url` → `.../releases/download/vX.Y.Z/Solo.Dev.Hub_X.Y.Z_amd64.AppImage`, `signature` → содержимое `.sig` base64-строкой (как у других платформ).
+   - Перезалить: `gh release upload vX.Y.Z latest.json --clobber`.
+   - Перезапустить `verify-updater-manifest` (Re-run failed jobs) — должен позеленеть.
+3. До зелёного гейта релиз — открытый инцидент, не «выкачен с оговоркой».
+
+Аналогично для других платформ: собрать артефакты на соответствующем раннере тем же деревом тега, подписать, залить, дописать ключи, перевыложить манифест, прогнать гейт.
 
 ### macOS
 

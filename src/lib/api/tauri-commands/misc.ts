@@ -69,3 +69,10 @@ export async function readRepoTodo(repoId: number): Promise<ReadTodoResult> {
 export async function readRepoDone(repoId: number): Promise<ReadDoneResult> {
   return invoke<ReadDoneResult>('read_repo_done', { repoId });
 }
+
+// ── Updater / install info ────────────────────────────────────────────────────
+
+/** False on a Linux non-AppImage install (e.g. .deb) — it can never self-update. */
+export async function selfUpdateSupported(): Promise<boolean> {
+  return invoke<boolean>('self_update_supported');
+}

@@ -1,6 +1,7 @@
 import { writable, get } from 'svelte/store';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
+import { selfUpdateSupported } from '$lib/api/tauri-commands';
 
 export type UpdaterErrorCategory = 'network' | 'notFound' | 'signature' | 'unknown';
 
@@ -11,7 +12,8 @@ export type UpdaterStatus =
   | { kind: 'available'; update: Update; version: string; notes: string }
   | { kind: 'downloading'; percent: number; downloaded: number; total: number | null }
   | { kind: 'installing' }
-  | { kind: 'error'; category: UpdaterErrorCategory; message: string };
+  | { kind: 'error'; category: UpdaterErrorCategory; message: string }
+  | { kind: 'packageManaged' };
 
 function categorizeError(err: unknown): UpdaterErrorCategory {
   const s = String(err).toLowerCase();
@@ -62,7 +64,21 @@ function saveLastCheckedAt(ts: number): void {
   lastCheckedAt.set(ts);
 }
 
+// v1.24.1: a .deb-installed Linux build can never self-update — the updater
+// plugin only replaces AppImage launches. Detected once and cached; on any
+// doubt the honest answer is "yes" (a failed check surfaces an error either
+// way, but a false packageManaged would hide real updates).
+let selfUpdateCache: Promise<boolean> | null = null;
+function detectSelfUpdate(): Promise<boolean> {
+  selfUpdateCache ??= selfUpdateSupported().catch(() => true);
+  return selfUpdateCache;
+}
+
 export async function checkForUpdate(silent = false): Promise<void> {
+  if (!(await detectSelfUpdate())) {
+    updaterStatus.set({ kind: 'packageManaged' });
+    return;
+  }
   updaterStatus.set({ kind: 'checking' });
   try {
     const update = await check();
