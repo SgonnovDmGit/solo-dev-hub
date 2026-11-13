@@ -104,3 +104,39 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+  # T-000251: during v1.24.0 the ubuntu leg died on an apt DNS outage and the
+  # run still published a syntactically valid latest.json missing linux-* —
+  # the updater then honestly answered "no update" to every Linux install.
+  # A missing platform is a release failure, not a footnote: after ALL matrix
+  # legs finish, assert the full key set (each leg merges only its own entries
+  # into the manifest, so no leg can verify the others).
+  verify-updater-manifest:
+    name: Verify updater manifest
+    needs: publish-tauri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert all platform keys in latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" --pattern latest.json --clobber
+          required=(
+            windows-x86_64 windows-x86_64-nsis
+            linux-x86_64 linux-x86_64-appimage
+            darwin-aarch64 darwin-aarch64-app
+            darwin-x86_64 darwin-x86_64-app
+          )
+          missing=()
+          for key in "${required[@]}"; do
+            if ! jq -e --arg key "$key" \
+              '.platforms[$key].signature and .platforms[$key].url' latest.json >/dev/null; then
+              missing+=("$key")
+            fi
+          done
+          if ((${#missing[@]})); then
+            echo "::error::latest.json is missing platform entries: ${missing[*]}"
+            echo "Catch-up path: build the platform via linux-build.yml on the tag's commit, upload the signed artifacts, then add the entries to latest.json — docs/RELEASING.md."
+            exit 1
+          fi
+          echo "latest.json covers all ${#required[@]} platform keys"
