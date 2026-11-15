@@ -613,7 +613,7 @@ fn v2_helper_joins_the_owner_approves_and_the_helper_becomes_a_contributor() {
     assert_eq!(reqs[0].branch, "helper-dev");
 
     let approved = approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper").unwrap();
-    assert_eq!(approved.participants.len(), 1);
+    assert_eq!(approved.structure.participants.len(), 1);
     w.sync_owner(); // approval committed and pushed
     w.sync_helper(); // contributor now, publishes its own branch
     w.sync_owner(); // the structure is plumbed into the helper's branch

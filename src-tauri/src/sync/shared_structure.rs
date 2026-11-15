@@ -132,6 +132,21 @@ pub struct JoinRequest {
     pub branch: String,
 }
 
+/// T-000254: result of approving a helper's join request — the new structure,
+/// and whether it already reached the remote dev branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveJoinResult {
+    /// The approved structure (with the participant and its number band).
+    pub structure: ProjectStructure,
+    /// The approval commit is on `origin/<dev>`: the helper's next sync turns
+    /// it into a contributor. `false` = the local write stands and the next
+    /// sync publishes it (the pre-T-000254 path).
+    pub published: bool,
+    /// Why the approval is only local (diverged dev, a moved ref, a refused
+    /// push, no git binary...).
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Main,
