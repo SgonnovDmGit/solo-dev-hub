@@ -204,8 +204,16 @@
     const repoId = sharedDataRepoId;
     approving = login;
     try {
-      await approveJoinRequest(repoId, login);
-      addToast($tStore('shared.approved' as any).replace('{0}', login), 'success');
+      const res = await approveJoinRequest(repoId, login);
+      // T-000254: the approval publishes itself; `published=false` means it
+      // only rides the next sync — the toast must say which happened.
+      const key = res.published ? 'shared.approved' : 'shared.approvedPending';
+      addToast(
+        $tStore(key as any)
+          .replace('{0}', login)
+          .replace('{1}', res.note ?? ''),
+        'success',
+      );
       await handleSharedChanged();
     } catch (err) {
       addToast($tStore('shared.approveFailed' as any).replace('{0}', String(err)), 'error');

@@ -40,8 +40,8 @@ use crate::sync::autocommit::{
 };
 use crate::sync::merge_by_id::{kind_for_path, merge_shared_bytes, merge_shared_file_per_entity};
 use crate::sync::shared_structure::{
-    self as ss, DiscoverOutcome, JoinRequest, ProjectStructure, Role, REQUESTS_REL_DIR,
-    STRUCTURE_REL_PATH,
+    self as ss, ApproveJoinResult, DiscoverOutcome, JoinRequest, ProjectStructure, Role,
+    REQUESTS_REL_DIR, STRUCTURE_REL_PATH,
 };
 
 const REMOTE: &str = "origin";
@@ -5729,14 +5729,17 @@ fn all_join_requests(
 /// Main: approve the join request of `login` (from the work tree or, when the
 /// owner is on another branch, from `origin/<dev>`). The structure file gains
 /// the participant (with a number band) and a work-tree request file is
-/// deleted; the next sync commits the structure and prunes the request from
-/// the dev branch.
+/// deleted; the approval then commits and pushes itself to the dev branch —
+/// the request rode there the moment it was filed, the answer must not wait
+/// for a sync that may never run (T-000254). A refusal (diverged dev, a moved
+/// ref, a failed push, no git) leaves the local write standing: the next sync
+/// publishes it, and `published`/`note` in the result say so.
 pub fn approve_join_request(
     db: &AppDb,
     git: Option<&GitBinary>,
     repo_id: i64,
     login: &str,
-) -> Result<ProjectStructure, String> {
+) -> Result<ApproveJoinResult, String> {
     let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
     let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
     if !state.shared_mode {
@@ -5790,7 +5793,152 @@ pub fn approve_join_request(
             }
         }
     }
-    Ok(next)
+    let (published, note) =
+        publish_approval(git, &root, &base.main.dev_branch, &next, &req.login, &me);
+    if !published {
+        let _ = db.set_shared_status(repo_id, Some(SharedStatus::PushFailed.as_str()));
+    }
+    Ok(ApproveJoinResult {
+        structure: next,
+        published,
+        note,
+    })
+}
+
+/// T-000254: commit the approval onto the shared dev branch and push it, the
+/// way `disable_shared_mode` commits the `.sdh/` deletion. The dev branch is
+/// brought up to `origin/<dev>` first (a real divergence defers publishing to
+/// the next sync's own merge pass). When dev is checked out here the commit
+/// is a pathspec work-tree commit of the files the approval just touched;
+/// when it is not, the same change lands by plumbing — the structure's
+/// canonical bytes plus a deletion per request file the approved login has
+/// tracked on dev. Returns `(published, note)` — every refusal keeps the
+/// work-tree state, so the next sync finishes the job exactly as before.
+fn publish_approval(
+    git: Option<&GitBinary>,
+    root: &Path,
+    dev: &str,
+    next: &ProjectStructure,
+    approved_login: &str,
+    me: &str,
+) -> (bool, Option<String>) {
+    let Some(git) = git else {
+        return (
+            false,
+            Some("no git binary: the next sync publishes the approval".into()),
+        );
+    };
+    let remote = remote_ref(dev);
+    // A failed fetch only means we compare against the last seen remote tip;
+    // the push below is the real verdict.
+    let _ = git_sync::fetch(git, root, REMOTE);
+    let remote_tip = git_sync::rev_parse(git, root, &remote).ok().flatten();
+    let dev_checked_out = current_branch(git, root)
+        .ok()
+        .flatten()
+        .is_some_and(|c| same_branch(&c, dev));
+    if remote_tip.is_some() {
+        let ff = if dev_checked_out {
+            git_sync::merge_ff_only(git, root, &remote)
+        } else {
+            git_sync::fast_forward_ref(git, root, dev, &remote)
+        };
+        match ff {
+            Ok(FfOutcome::UpToDate) | Ok(FfOutcome::FastForwarded) | Ok(FfOutcome::LocalAhead) => {}
+            Ok(FfOutcome::Diverged) => {
+                return (
+                    false,
+                    Some(format!(
+                        "{} has diverged from {}: the next sync merges it and publishes",
+                        dev, remote
+                    )),
+                );
+            }
+            Err(e) => return (false, Some(e)),
+        }
+    }
+    let (subject, body) = commit_message(me);
+    if dev_checked_out {
+        let paths = [
+            PathBuf::from(STRUCTURE_REL_PATH),
+            PathBuf::from(REQUESTS_REL_DIR),
+        ];
+        match commit_paths(
+            git,
+            root,
+            dev,
+            &paths,
+            &subject,
+            Some(&body),
+            SDH_COMMIT_NAME,
+            SDH_COMMIT_EMAIL,
+        ) {
+            Ok(CommitOutcome::Committed { .. }) | Ok(CommitOutcome::NothingToCommit) => {}
+            other => return (false, Some(format!("commit to {}: {:?}", dev, other))),
+        }
+    } else {
+        if !matches!(git_sync::rev_parse(git, root, &local_ref(dev)), Ok(Some(_))) {
+            return (
+                false,
+                Some(format!(
+                    "no local {} branch: the next sync publishes the approval",
+                    dev
+                )),
+            );
+        }
+        let mut changes = vec![FileChange {
+            rel_path: PathBuf::from(STRUCTURE_REL_PATH),
+            content: Some(ss::serialize_structure(next).into_bytes()),
+        }];
+        if let Ok(tree) = ls_tree(git, root, &local_ref(dev), &[REQUESTS_REL_DIR.to_string()]) {
+            for path in tree.keys() {
+                let stem = path
+                    .strip_prefix(&format!("{}/", REQUESTS_REL_DIR))
+                    .and_then(|n| n.strip_suffix(".json"));
+                if stem.is_some_and(|s| ss::logins_equal(s, approved_login)) {
+                    changes.push(FileChange {
+                        rel_path: PathBuf::from(path),
+                        content: None,
+                    });
+                }
+            }
+        }
+        match git_sync::commit_files_to_branch(
+            git,
+            root,
+            dev,
+            &changes,
+            &format!("{}\n\n{}", subject, body),
+            SDH_COMMIT_NAME,
+            SDH_COMMIT_EMAIL,
+        ) {
+            Ok(BranchCommit::Committed { .. }) | Ok(BranchCommit::NothingToCommit) => {}
+            Ok(BranchCommit::RefMoved) => {
+                return (
+                    false,
+                    Some(format!(
+                        "{} moved meanwhile; the next sync publishes the approval",
+                        dev
+                    )),
+                );
+            }
+            Err(e) => return (false, Some(e)),
+        }
+    }
+    match git_sync::push_branches(git, root, REMOTE, &[dev]) {
+        Ok(results)
+            if results
+                .iter()
+                .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)) =>
+        {
+            (true, None)
+        }
+        Ok(results) => (
+            false,
+            Some(format!("push of {} was refused: {:?}", dev, results)),
+        ),
+        Err(e) => (false, Some(format!("push failed: {}", e))),
+    }
 }
 
 /// Contributor: trust the owner's current dev branch again (after the pin
@@ -6287,8 +6435,9 @@ pub(crate) mod test_support {
 
         /// Owner enabled sharing, the helper joined and the owner approved:
         /// the helper is a contributor with the band 500000, on `helper-dev`.
-        /// Fast path: the request and the approval are made by hand, with one
-        /// sync (the helper's) instead of the six of the full flow.
+        /// Fast path: the request is made by hand, the approval publishes
+        /// itself (T-000254), with one sync (the helper's) instead of the six
+        /// of the full flow.
         pub fn make_participant(&self) {
             enable_shared_mode(&self.main_db, &gb(), self.main_repo, false).unwrap();
             write(
@@ -6298,9 +6447,6 @@ pub(crate) mod test_support {
 ",
             );
             approve_join_request(&self.main_db, Some(&gb()), self.main_repo, "helper").unwrap();
-            g(&self.main_dir, &["add", ".sdh"]);
-            g(&self.main_dir, &["commit", "-q", "-m", "structure"]);
-            g(&self.main_dir, &["push", "-q", "origin", "dev"]);
             self.sync_helper(); // contributor now
             self.catch_up_main();
         }
@@ -6320,7 +6466,7 @@ pub(crate) mod test_support {
         /// on dev: the owner's clone is a commit behind until it fetches. The
         /// fixture restores the old invariant so a raw push or a disable still
         /// fast-forwards instead of being refused.
-        fn catch_up_main(&self) {
+        pub fn catch_up_main(&self) {
             g(&self.main_dir, &["fetch", "-q", "origin", "dev"]);
             g(&self.main_dir, &["merge", "-q", "--ff-only", "origin/dev"]);
         }
@@ -7231,6 +7377,141 @@ mod tests {
         );
         // and the request file of the approved participant stays gone
         assert!(!fx.main_dir.join(".sdh/requests/helper2.json").exists());
+    }
+
+    /// T-000254: the approval publishes itself — the participant lands on
+    /// `origin/<dev>` and its request file is pruned WITHOUT a follow-up sync.
+    /// The pre-T-000254 contract ("the next sync commits it") let an approval
+    /// sit local indefinitely once auto-sync was off — DmLab2026's live case.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_approval_publishes_without_waiting_for_a_sync() {
+        let fx = two_installs();
+        fx.enable_main();
+        fx.sync_helper(); // pending: the request lands in origin/dev
+        fx.sync_main(); // the request arrives locally
+
+        let res = approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper").unwrap();
+        assert!(res.published, "{:?}", res.note);
+        let published = fx.remote_file("dev", ".sdh/project.json").unwrap();
+        assert!(
+            published.contains("helper"),
+            "the approval must be on origin/dev already:\n{}",
+            published
+        );
+        assert_eq!(fx.remote_file("dev", ".sdh/requests/helper.json"), None);
+        // The work tree holds no uncommitted `.sdh/` residue either.
+        assert_eq!(
+            g(
+                &fx.main_dir,
+                &[
+                    "status",
+                    "--porcelain",
+                    "--",
+                    ".sdh/project.json",
+                    ".sdh/requests"
+                ]
+            ),
+            ""
+        );
+        // …and the helper's next sync still completes the join, unchanged.
+        fx.sync_helper();
+        fx.catch_up_main();
+        assert_eq!(fx.helper_status(), None, "{:?}", fx.helper_status());
+    }
+
+    /// T-000254: a dev branch behind `origin/<dev>` is fast-forwarded before
+    /// the approval commits on top — the exact live case (the owner's dev was
+    /// three sync commits behind and a naive push would have been refused).
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_approval_fast_forwards_a_dev_behind_origin() {
+        let fx = two_installs();
+        fx.enable_main();
+        fx.sync_helper();
+        fx.sync_main();
+        // A foreign commit lands on origin/dev that the owner's install lacks —
+        // plumbed straight onto the remote (checking dev out in the helper
+        // clone would trip over its untracked .sdh files).
+        foreign_commit_on(&fx.main_dir, "refs/heads/foreign-tip", "origin/dev");
+        g(&fx.main_dir, &["push", "-q", "origin", "foreign-tip:dev"]);
+        g(&fx.main_dir, &["branch", "-q", "-D", "foreign-tip"]);
+        assert!(
+            g(&fx.main_dir, &["rev-parse", "dev"]) != fx.remote_rev("dev").unwrap(),
+            "main's dev must be behind"
+        );
+
+        let res = approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper").unwrap();
+        assert!(res.published, "{:?}", res.note);
+        let published = fx.remote_file("dev", ".sdh/project.json").unwrap();
+        assert!(published.contains("helper"), "{}", published);
+        assert_eq!(fx.remote_file("dev", ".sdh/requests/helper.json"), None);
+        // The local tip carried the foreign commit up, then the approval.
+        assert_eq!(
+            g(&fx.main_dir, &["rev-parse", "dev"]),
+            fx.remote_rev("dev").unwrap()
+        );
+    }
+
+    /// T-000254: a truly diverged dev defers publishing to the next sync —
+    /// `published=false` + a `push_failed` status — and the sync's own merge
+    /// pass (T-000248) then carries the approval to origin.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_approval_on_a_diverged_dev_defers_to_the_next_sync() {
+        let fx = two_installs();
+        fx.enable_main();
+        fx.sync_helper();
+        fx.sync_main();
+        // A foreign commit on origin/dev + a local commit on dev = diverged.
+        foreign_commit_on(&fx.main_dir, "refs/heads/foreign-tip", "origin/dev");
+        g(&fx.main_dir, &["push", "-q", "origin", "foreign-tip:dev"]);
+        g(&fx.main_dir, &["branch", "-q", "-D", "foreign-tip"]);
+        write(&fx.main_dir, "docs/scratch2.txt", "local\n");
+        g(&fx.main_dir, &["add", "docs/scratch2.txt"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "local"]);
+
+        let res = approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper").unwrap();
+        assert!(!res.published, "a diverged dev must not publish");
+        assert!(
+            res.note.as_deref().is_some_and(|n| n.contains("diverged")),
+            "{:?}",
+            res.note
+        );
+        assert_eq!(fx.main_status().as_deref(), Some("push_failed"));
+        // The approval itself stands locally; origin still holds the request.
+        let local = fs::read_to_string(fx.main_dir.join(".sdh/project.json")).unwrap();
+        assert!(local.contains("helper"), "{}", local);
+        assert!(fx.remote_file("dev", ".sdh/requests/helper.json").is_some());
+
+        // The next syncs merge the divergence and carry the approval out —
+        // the first pass commits the dirty `.sdh/` the approval left, a later
+        // one merges and pushes.
+        for _ in 0..3 {
+            fx.sync_main();
+        }
+        let published = fx.remote_file("dev", ".sdh/project.json").unwrap();
+        assert!(published.contains("helper"), "{}", published);
+        assert_eq!(fx.remote_file("dev", ".sdh/requests/helper.json"), None);
+    }
+
+    /// T-000254: dev checked out nowhere here — the approval commits by
+    /// plumbing (`commit_files_to_branch`, the `disable_shared_mode` path)
+    /// and pushes all the same.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_approval_publishes_when_dev_is_checked_out_elsewhere() {
+        let fx = two_installs();
+        fx.enable_main();
+        fx.sync_helper();
+        fx.sync_main();
+        g(&fx.main_dir, &["checkout", "-q", "-b", "side"]);
+
+        let res = approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper").unwrap();
+        assert!(res.published, "{:?}", res.note);
+        let published = fx.remote_file("dev", ".sdh/project.json").unwrap();
+        assert!(published.contains("helper"), "{}", published);
+        assert_eq!(fx.remote_file("dev", ".sdh/requests/helper.json"), None);
     }
 
     /// T-000243 review (third pass), ordering (b): `disable_shared_mode`
@@ -9831,7 +10112,7 @@ mod tests {
         assert_eq!(reqs[0].login, "helper");
 
         let s = approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper").unwrap();
-        assert_eq!(s.participants[0].band_start, 500_000);
+        assert_eq!(s.structure.participants[0].band_start, 500_000);
         fx.sync_main();
         assert!(fx
             .remote_file("dev", ".sdh/project.json")

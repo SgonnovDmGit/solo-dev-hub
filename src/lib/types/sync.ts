@@ -224,6 +224,16 @@ export interface SharedDisableResult {
   note: string | null;
 }
 
+/** Result of approving a join request (`ApproveJoinResult`, T-000254). */
+export interface ApproveJoinResult {
+  /** The approved structure (participant + number band). */
+  structure: ProjectStructure;
+  /** The approval commit is on `origin/<dev>` already; `false` = it rides the next sync. */
+  published: boolean;
+  /** Why the approval is only local (diverged dev, refused push, no git…). */
+  note: string | null;
+}
+
 /** A helper's request to join a shared project (`.sdh/requests/<login>.json`). */
 export interface JoinRequest {
   login: string;

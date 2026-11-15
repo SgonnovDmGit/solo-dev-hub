@@ -5,7 +5,7 @@ use crate::db::AppDb;
 use crate::git_ops::cached_git;
 use crate::models::{ParticipantActivity, SharedDisableResult, SharedMergeResult, SharedPreflight};
 use crate::sync::shared;
-use crate::sync::shared_structure::{JoinRequest, ProjectStructure};
+use crate::sync::shared_structure::{ApproveJoinResult, JoinRequest, ProjectStructure};
 use tauri::State;
 
 fn need_git() -> Result<crate::git_ops::GitBinary, String> {
@@ -75,13 +75,15 @@ pub fn disable_shared_mode(db: State<AppDb>, repo_id: i64) -> Result<SharedDisab
     shared::disable_shared_mode(&db, &need_git()?, repo_id)
 }
 
-/// Owner only: approve the join request of `login`; the next sync commits it.
+/// Owner only: approve the join request of `login`; the approval commits and
+/// pushes itself now (`published` in the result), the next sync is the
+/// fallback when it cannot.
 #[tauri::command(async)]
 pub fn approve_join_request(
     db: State<AppDb>,
     repo_id: i64,
     login: String,
-) -> Result<ProjectStructure, String> {
+) -> Result<ApproveJoinResult, String> {
     shared::approve_join_request(&db, cached_git().as_ref(), repo_id, &login)
 }
 

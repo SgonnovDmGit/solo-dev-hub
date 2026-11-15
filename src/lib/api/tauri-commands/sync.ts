@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult, SharedPreflight, SharedMergeResult, SharedDisableResult, JoinRequest, ProjectStructure, ParticipantActivity } from '$lib/types';
+import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult, SharedPreflight, SharedMergeResult, SharedDisableResult, ApproveJoinResult, JoinRequest, ProjectStructure, ParticipantActivity } from '$lib/types';
 
 
 // ── Requirements sync commands ──────────────────────────────────────────────
@@ -105,9 +105,12 @@ export async function disableSharedMode(repoId: number): Promise<SharedDisableRe
   return invoke<SharedDisableResult>('disable_shared_mode', { repoId });
 }
 
-/** Owner: approve a helper's join request. The next sync commits it. */
-export async function approveJoinRequest(repoId: number, login: string): Promise<ProjectStructure> {
-  return invoke<ProjectStructure>('approve_join_request', { repoId, login });
+/**
+ * Owner: approve a helper's join request. The approval commits and pushes
+ * itself now (`published`); the next sync is the fallback when it cannot.
+ */
+export async function approveJoinRequest(repoId: number, login: string): Promise<ApproveJoinResult> {
+  return invoke<ApproveJoinResult>('approve_join_request', { repoId, login });
 }
 
 /** Contributor: trust the owner's changed dev branch again. */
