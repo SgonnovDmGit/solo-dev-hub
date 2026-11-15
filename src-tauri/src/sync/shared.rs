@@ -5858,11 +5858,26 @@ fn publish_approval(
         }
     }
     let (subject, body) = commit_message(me);
+    // The request files dev tracks for the approved login — exact paths,
+    // never the `.sdh/requests` dir: a request file that only existed
+    // untracked (the fixture path of `make_participant`) leaves the dir
+    // empty after its deletion and `git add` fails the pathspec
+    // ("did not match"), while a dir pathspec would also sweep a DIFFERENT
+    // login's untracked request into this commit.
+    let mut request_paths: Vec<String> = Vec::new();
+    if let Ok(tree) = ls_tree(git, root, &local_ref(dev), &[REQUESTS_REL_DIR.to_string()]) {
+        for path in tree.keys() {
+            let stem = path
+                .strip_prefix(&format!("{}/", REQUESTS_REL_DIR))
+                .and_then(|n| n.strip_suffix(".json"));
+            if stem.is_some_and(|s| ss::logins_equal(s, approved_login)) {
+                request_paths.push(path.clone());
+            }
+        }
+    }
     if dev_checked_out {
-        let paths = [
-            PathBuf::from(STRUCTURE_REL_PATH),
-            PathBuf::from(REQUESTS_REL_DIR),
-        ];
+        let mut paths = vec![PathBuf::from(STRUCTURE_REL_PATH)];
+        paths.extend(request_paths.iter().map(PathBuf::from));
         match commit_paths(
             git,
             root,
@@ -5890,19 +5905,10 @@ fn publish_approval(
             rel_path: PathBuf::from(STRUCTURE_REL_PATH),
             content: Some(ss::serialize_structure(next).into_bytes()),
         }];
-        if let Ok(tree) = ls_tree(git, root, &local_ref(dev), &[REQUESTS_REL_DIR.to_string()]) {
-            for path in tree.keys() {
-                let stem = path
-                    .strip_prefix(&format!("{}/", REQUESTS_REL_DIR))
-                    .and_then(|n| n.strip_suffix(".json"));
-                if stem.is_some_and(|s| ss::logins_equal(s, approved_login)) {
-                    changes.push(FileChange {
-                        rel_path: PathBuf::from(path),
-                        content: None,
-                    });
-                }
-            }
-        }
+        changes.extend(request_paths.iter().map(|p| FileChange {
+            rel_path: PathBuf::from(p),
+            content: None,
+        }));
         match git_sync::commit_files_to_branch(
             git,
             root,
