@@ -2,6 +2,11 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Changelog.ru.md](Changelog.ru.md).
 
+## [1.24.3] — 2026-11-16
+
+### Fixed
+- **An approved join request publishes itself (T-000254).** Approving a helper's request wrote `.sdh/project.json` and deleted the request file, then waited for the owner's next sync to commit and push it — while the request itself had travelled to the dev branch the moment it was filed. With auto-sync off (the default), an approval could sit local indefinitely: DmLab2026's did, until a manual pull+commit+push. The approval now commits the structure and the request deletion to the dev branch and pushes right away, through the same fast-forward/plumbing path the share switch-off uses; a diverged branch, a moved ref or a refused push is reported as "approved, it rides the next sync" and flagged `push_failed` instead of pretending. Flow: `docs/flows/contributor-mode.md`.
+
 ## [1.24.2] — 2026-11-15
 
 ### Changed
