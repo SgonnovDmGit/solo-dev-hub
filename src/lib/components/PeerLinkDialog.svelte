@@ -30,11 +30,18 @@
   // T-000201: are these two actually equals? Mirrors
   // `AppDb::check_peers_are_equal` in src-tauri/src/db/peers.rs — that one
   // enforces and explains, this one filters. Change both together.
+  // T-000250: `tool` is horizontal (pairs with anything but `other`), and
+  // `landing` compares at the `client` level.
+  function equalityLevel(role: string): string {
+    return role === 'landing' ? 'client' : role;
+  }
+
   function arePeers(a: Repository | undefined, b: Repository): boolean {
     if (!a) return false;
     if (!a.role || !b.role) return false;
     if (a.role === 'other' || b.role === 'other') return false;
-    if (a.role !== b.role) return false;
+    if (a.role === 'tool' || b.role === 'tool') return true;
+    if (equalityLevel(a.role) !== equalityLevel(b.role)) return false;
     const ta = a.project_id === null ? undefined : projectTypeById.get(a.project_id);
     const tb = b.project_id === null ? undefined : projectTypeById.get(b.project_id);
     if (ta === undefined || tb === undefined) return false;

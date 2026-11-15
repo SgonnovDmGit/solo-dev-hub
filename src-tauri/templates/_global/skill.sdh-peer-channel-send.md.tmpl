@@ -12,7 +12,7 @@ description: >
 You want something from, or tell something to, a repo at your own level: client ↔ client, server ↔ server, microservice ↔ microservice, in your project or another product.
 
 - Answering a peer → `sdh-peer-channel-answer`. Asking the level above or below → `sdh-cross-repo-req-send`. Pushing down or up → `sdh-cross-repo-announce-send`.
-- Equals only. A client never opens an exchange with a server — not even another product's: it asks its own server through REQ.
+- Equals only. A client never opens an exchange with a server — not even another product's: it asks its own server through REQ. A `landing` counts as a client; a `tool` repo is horizontal — it pairs with any role in any project kind except `other`.
 - **A channel exists only where the owner declared it.** Your counterparts are listed in `docs/project.md`, `## Peer channels`. Not listed → no channel: ask the owner to link the pair; never create folders by hand.
 - Equals owe each other nothing: unlike REQ, `declined` is a normal answer.
 
