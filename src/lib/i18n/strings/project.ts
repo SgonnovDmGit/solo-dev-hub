@@ -59,7 +59,7 @@ export const ru = {
   'project.peerLinkTitle': 'Связать репозитории как равные',
   'project.peerLinkSearch': 'Поиск по имени или роли…',
   'project.peerAlreadyLinked': 'уже связан',
-  'project.peerLinkEqualityHint': 'Равные — это одинаковая роль в проекте одного типа. Остальные в список не попадают: сервер микросервиса не равен обычному серверу, админ-клиент — обычному клиенту.',
+  'project.peerLinkEqualityHint': 'Равные — это одинаковая роль в проекте одного типа (лендинг считается клиентом). Утилита горизонтальна: вяжется с кем угодно, кроме «other». Остальные в список не попадают: сервер микросервиса не равен обычному серверу, админ-клиент — обычному клиенту.',
   'project.peerNoCandidates': 'Подходящих репозиториев нет',
 } as const;
 
@@ -123,6 +123,6 @@ export const en: Record<keyof typeof ru, string> = {
   'project.peerLinkTitle': 'Link two repositories as peers',
   'project.peerLinkSearch': 'Search by name or role…',
   'project.peerAlreadyLinked': 'already linked',
-  'project.peerLinkEqualityHint': 'Peers share a role and sit in the same kind of project. The rest are not listed: a microservice server is not the equal of an ordinary one, nor an admin client of a plain client.',
+  'project.peerLinkEqualityHint': 'Peers share a role and sit in the same kind of project (a landing counts as a client). A tool is horizontal: it pairs with anything but `other`. The rest are not listed: a microservice server is not the equal of an ordinary one, nor an admin client of a plain client.',
   'project.peerNoCandidates': 'No matching repositories',
 };

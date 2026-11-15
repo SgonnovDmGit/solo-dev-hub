@@ -11631,6 +11631,58 @@ mod tests {
         assert!(p.on_origin, "{:?}", p);
     }
 
+    /// T-000253: the whole pipeline for real — the contributor's agent marks
+    /// its edited copy in the shared checkout, the install's collection turns
+    /// the marker into a stored proposal, and the transport carries it to the
+    /// owner's queue. No direct row insert: the marker is the entry point.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_contributors_marker_becomes_a_proposal_that_reaches_the_owner() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        let skills = fx.helper_dir.join("docs/sdh_skills");
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(skills.join("sdh-alpha.md"), "PROPOSED").unwrap();
+        fs::write(skills.join("sdh-alpha.md.approved"), "").unwrap();
+
+        let report = crate::sync::skills::refresh_rules(
+            &fx.helper_db,
+            None,
+            crate::sync::skills::RenderScope::UptakeOnly,
+            None,
+        );
+        assert_eq!(report.proposed, vec!["sdh-alpha".to_string()]);
+        assert!(!skills.join("sdh-alpha.md.approved").exists());
+        let rows = fx.helper_db.list_rule_proposals(fx.helper_repo).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_name, "sdh-alpha.helper.json");
+        assert_eq!(rows[0].text, "PROPOSED");
+
+        fx.sync_helper();
+        let remote = fx
+            .remote_file("dev", ".sdh/rule-proposals/sdh-alpha.helper.json")
+            .expect("the proposal reached origin/dev");
+        let wire: crate::models::RuleProposalFile = serde_json::from_str(&remote).unwrap();
+        assert_eq!(wire.status, "open");
+        assert_eq!(wire.text, "PROPOSED");
+        fx.sync_main();
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        let list =
+            crate::commands::rule_proposals::list_owner_proposals(&fx.main_db, Some(&gb()), &repo)
+                .unwrap();
+        let p = list
+            .iter()
+            .find(|v| v.file_name == "sdh-alpha.helper.json")
+            .expect("listed");
+        assert_eq!(p.status, "open");
+        assert_eq!(
+            p.rev.as_deref(),
+            Some(proposal_dev_sha(&fx.main_dir).as_str())
+        );
+    }
+
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn an_accepted_proposal_applies_the_canon_and_the_receipt_reaches_the_contributor() {

@@ -2,6 +2,17 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Changelog.ru.md](Changelog.ru.md).
 
+## [1.24.2] — 2026-11-15
+
+### Changed
+- **The `tool` role pairs horizontally; `landing` counts as `client` (T-000250).** Peer-channel equality used to demand the same role AND the same project kind, so a utility repository — horizontal by nature — could only ever link to another tool in the same kind of project. A `tool` on either side of the pair now skips both comparisons, a `landing` is normalized to `client` (landing↔client and landing↔landing pair, still within one project kind), and `other` keeps refusing everything — including a tool. Peer links stay explicit owner-declared connections; the guard only decides which candidates the dialog offers. Flow: `docs/flows/peer-channels.md`.
+
+### Fixed
+- **A contributor's `.approved` marker actually becomes a proposal (T-000253).** Since v1.23.0 the marker collection ran over the render list, which excludes contributor- and pending-role checkouts — so on the one install where the whole feature matters, `.approved` never reached `propose_up` and no proposal ever rode the transport. The collection now scans every repository with a local checkout, a contributor's or pending helper's marker opens a `rule_proposals` row (a pending helper's waits for the approval before it travels), proposal sides count when a conflict decides whether all sides were read and whether it is still live, and the conflict-resolution screen finds contributor sides again. Live case: DmLab2026's two-day-old markers on `sdh-release-closure` and `sdh-debugging`.
+
+### Tests
+- 956 Rust (`cargo test --lib`) locally on Windows, plus the change's git-spawning tests run by hand (new e2e marker→proposal→owner list, contributor-checkout sweep); the rest of the ignored suite runs on the Linux CI. 223 vitest, svelte-check clean, `cargo fmt` applied.
+
 ## [1.24.1] — 2026-11-13
 
 ### Fixed

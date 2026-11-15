@@ -33,6 +33,23 @@ fn normalize_pair(a: i64, b: i64) -> (i64, i64) {
 /// never establish equality with anything, including another `other`.
 const UNPAIRABLE_ROLE: &str = "other";
 
+/// T-000250: the horizontal role. A tool stands beside every declared level —
+/// it pairs with any role in any kind of project (though never with `other`,
+/// which declares no level to stand beside).
+const HORIZONTAL_ROLE: &str = "tool";
+
+/// T-000250: the level a role actually pairs at. A landing is a client-level
+/// repository (owner's call, 2026-11-15): `landing` counts as `client` for the
+/// role comparison — landing↔client and landing↔landing are equals in the
+/// same kind of project.
+fn equality_level(role: &str) -> &str {
+    if role == "landing" {
+        "client"
+    } else {
+        role
+    }
+}
+
 impl AppDb {
     /// T-000201: are these two repositories actually equals?
     ///
@@ -42,6 +59,10 @@ impl AppDb {
     /// product, even though both are spelled `server`. Role families are not
     /// collapsed either — an admin client and an ordinary client solve different
     /// problems, and an exchange between them is vertical in nature.
+    ///
+    /// T-000250: two exceptions ride on top. A `tool` is horizontal — it pairs
+    /// with any role in any kind of project. And a `landing` compares at the
+    /// `client` level, not at its own spelling (`equality_level`).
     ///
     /// Returns the reason as an `Err` so both the guard and the dialog can show
     /// the same explanation instead of silently hiding a choice.
@@ -59,7 +80,12 @@ impl AppDb {
                     .to_string(),
             );
         }
-        if ra != rb {
+        if ra == HORIZONTAL_ROLE || rb == HORIZONTAL_ROLE {
+            return Ok(());
+        }
+        let ea = equality_level(ra);
+        let eb = equality_level(rb);
+        if ea != eb {
             return Err(format!(
                 "Peers must share a role, and these do not: `{}` and `{}`",
                 ra, rb
@@ -374,5 +400,71 @@ mod tests {
         }
         assert_eq!(db.peers_of_repo(a).unwrap().len(), 1);
         assert_eq!(db.list_peer_links().unwrap().len(), 1);
+    }
+
+    // ── T-000250: `tool` is horizontal, `landing` is client-level ────────────
+
+    #[test]
+    fn a_tool_pairs_with_any_role_in_any_project_kind() {
+        let db = make_db();
+        let std_p = db.create_project("Product", None, "standard").unwrap();
+        let ms_p = db.create_project("MS", None, "microservice").unwrap();
+        let tool = repo(&db, "/tmp/tool", "tool", Some(std_p.id), Some("tool"));
+        for role in ["server", "client", "test_client", "admin_client", "landing"] {
+            let r = repo(
+                &db,
+                &format!("/tmp/{role}"),
+                role,
+                Some(std_p.id),
+                Some(role),
+            );
+            db.add_peer_link(tool, r).unwrap();
+        }
+        // …and across project kinds: a tool beside a microservice's server.
+        let ms = repo(&db, "/tmp/ms-srv", "ms-srv", Some(ms_p.id), Some("server"));
+        db.add_peer_link(tool, ms).unwrap();
+        assert_eq!(db.peers_of_repo(tool).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn a_tool_still_cannot_pair_with_other_or_the_roleless() {
+        // `other` declares no level — a horizontal role stands beside declared
+        // levels, it does not invent one for its peer.
+        let db = make_db();
+        let p = db.create_project("P", None, "standard").unwrap();
+        let tool = repo(&db, "/tmp/tool", "tool", Some(p.id), Some("tool"));
+        let other = repo(&db, "/tmp/o", "o", Some(p.id), Some("other"));
+        assert!(db.add_peer_link(tool, other).is_err());
+        let roleless = repo(&db, "/tmp/n", "n", Some(p.id), None);
+        assert!(db.add_peer_link(tool, roleless).is_err());
+    }
+
+    #[test]
+    fn a_landing_is_the_equal_of_a_client() {
+        // Owner's call, 2026-11-15: `landing` counts at the `client` level.
+        let db = make_db();
+        let p = db.create_project("P", None, "standard").unwrap();
+        let landing = repo(&db, "/tmp/l", "l", Some(p.id), Some("landing"));
+        let client = repo(&db, "/tmp/c", "c", Some(p.id), Some("client"));
+        db.add_peer_link(landing, client).unwrap();
+        let l2 = repo(&db, "/tmp/l2", "l2", Some(p.id), Some("landing"));
+        db.add_peer_link(landing, l2).unwrap(); // landing↔landing too
+        assert_eq!(db.peers_of_repo(landing).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_landing_is_not_the_equal_of_other_client_family_or_kinds() {
+        // Client-level means exactly `client`: not admin_client, not a server,
+        // and not a client in another kind of project.
+        let db = make_db();
+        let p = db.create_project("P", None, "standard").unwrap();
+        let ms_p = db.create_project("MS", None, "microservice").unwrap();
+        let landing = repo(&db, "/tmp/l", "l", Some(p.id), Some("landing"));
+        let admin = repo(&db, "/tmp/ac", "ac", Some(p.id), Some("admin_client"));
+        assert!(db.add_peer_link(landing, admin).is_err());
+        let server = repo(&db, "/tmp/s", "s", Some(p.id), Some("server"));
+        assert!(db.add_peer_link(landing, server).is_err());
+        let ms_client = repo(&db, "/tmp/mc", "mc", Some(ms_p.id), Some("client"));
+        assert!(db.add_peer_link(landing, ms_client).is_err());
     }
 }

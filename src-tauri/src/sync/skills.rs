@@ -632,7 +632,10 @@ fn classify(
         // T-000241: a contributor-role repo's markers are proposals to its
         // owner, never hand-backs and never superseded-by-followed — the
         // followed rule is exactly what the contributor proposes to change.
-        let contributor = is_contributor_repo(db, scan.repo_id);
+        // T-000253: a pending helper's markers are proposals too — the row
+        // waits until the role becomes contributor, and nothing is lost if
+        // the join never completes.
+        let proposer = is_proposer_repo(db, scan.repo_id);
         for marker in &scan.markers {
             let name = marker.name.as_str();
             let Some(current) = known.get(name) else {
@@ -654,7 +657,7 @@ fn classify(
             if stale {
                 out.owner_superseded.insert(name.to_string());
             }
-            if settings_edit == Some(name) || (!contributor && (followed.contains(name) || stale)) {
+            if settings_edit == Some(name) || (!proposer && (followed.contains(name) || stale)) {
                 match remove_if_present(&marker.path) {
                     Ok(()) => {
                         out.superseded.push(format!("{} ({})", name, label));
@@ -694,7 +697,7 @@ fn classify(
                         marker: marker.path.clone(),
                         note,
                     };
-                    if contributor {
+                    if proposer {
                         proposals.entry(name.to_string()).or_default().push(copy);
                     } else {
                         handed.entry(name.to_string()).or_default().push(copy);
@@ -722,11 +725,17 @@ fn classify(
     found
 }
 
-/// T-000241: `repo_id` is a contributor-role shared repo — its markers are
-/// proposals to its owner, not hand-backs.
-fn is_contributor_repo(db: &AppDb, repo_id: i64) -> bool {
+/// T-000241: `repo_id` is a shared repo where this install is not the owner —
+/// its markers are proposals to the owner, not hand-backs. T-000253: a
+/// `pending` helper proposes too; the row waits for approval to transport it.
+fn is_proposer_repo(db: &AppDb, repo_id: i64) -> bool {
     db.get_shared_state(repo_id)
-        .map(|s| s.shared_role.as_deref() == Some("contributor"))
+        .map(|s| {
+            matches!(
+                s.shared_role.as_deref(),
+                Some("contributor") | Some("pending")
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -772,9 +781,13 @@ fn settle_open_conflicts(
     out: &mut Collected,
 ) -> HashSet<String> {
     let superseded_rules = out.owner_superseded.clone();
+    // T-000253: a proposal disagreement is just as live a conflict as a
+    // hand-back one — without it an open proposal conflict would flap
+    // open/close on every pass.
     let live: HashSet<&str> = found
         .handed
         .iter()
+        .chain(found.proposals.iter())
         .filter(|(_, copies)| in_conflict(copies))
         .map(|(name, _)| name.as_str())
         .collect();
@@ -816,7 +829,10 @@ fn settle_open_conflicts(
 /// back was read this pass. Sides are repo ids, stable across a rename. A side
 /// gone from the portfolio, or whose local path was cleared, can hand nothing
 /// back any more and does not block; a side with a local path that was not
-/// read — or whose copy of `rule` was unreadable — does.
+/// read — or whose copy of `rule` was unreadable — does. T-000253: a
+/// contributor / pending checkout DOES hand back (as a proposal), so it is a
+/// side that must be read like any other — the pre-T-000241 `skips_rule_copies`
+/// skip let a live proposal conflict close with a side unseen.
 fn all_sides_read(
     db: &AppDb,
     rule: &str,
@@ -829,9 +845,9 @@ fn all_sides_read(
             Err(rusqlite::Error::QueryReturnedNoRows) => continue,
             Err(e) => return Err(e),
         };
-        if repo.local_path.is_none() || skips_rule_copies(db, id) {
-            // Р16: a contributor's checkout hands nothing back, so its side
-            // cannot hold a conflict open.
+        if repo.local_path.is_none() {
+            // A checkout gone from this machine hands nothing back, so its
+            // side cannot hold a conflict open.
             continue;
         }
         if !found.read.contains(&id) || found.unread.contains(&(rule.to_string(), id)) {
@@ -1346,7 +1362,11 @@ fn live_conflict(repos: &[Repository], rule: &str) -> LiveConflict {
 /// collection cannot clear a marker halfway through the read.
 pub fn conflict_sides(db: &AppDb, rule: &str) -> Result<Vec<RuleConflictSide>, String> {
     let _guard = rules_guard();
-    let repos = rules_repos(db).map_err(|e| e.to_string())?;
+    // T-000253: the full list, like the collection — a contributor's own
+    // proposal conflict shows its sides on this install's Rules screen too.
+    let repos = db
+        .list_repos_with_local_path(None)
+        .map_err(|e| e.to_string())?;
     Ok(live_conflict(&repos, rule).sides)
 }
 
@@ -1384,8 +1404,11 @@ pub fn resolve_conflict(
     }
     // A failed listing is refused outright: with no repos nothing is read, so
     // an accept would claim its side is gone and a reject would close the
-    // conflict without clearing a single marker.
-    let repos = rules_repos(db).map_err(|e| e.to_string())?;
+    // conflict without clearing a single marker. T-000253: the full list —
+    // contributor sides are resolvable here like any other.
+    let repos = db
+        .list_repos_with_local_path(None)
+        .map_err(|e| e.to_string())?;
     let live = live_conflict(&repos, rule);
     let accepted = match accept {
         Some(label) => Some(
@@ -1403,7 +1426,7 @@ pub fn resolve_conflict(
         // text and writes the row atomically.
         let contributor_side = repos
             .iter()
-            .find(|r| rule_copy_label(r) == side.repo && is_contributor_repo(db, r.id));
+            .find(|r| rule_copy_label(r) == side.repo && is_proposer_repo(db, r.id));
         if let Some(repo) = contributor_side {
             let login = db.github_login().unwrap_or_default();
             let file_name = crate::sync::rule_proposals::proposal_file_name(rule, &login);
@@ -1583,10 +1606,14 @@ pub fn count_render_targets(db: &AppDb) -> Result<usize, String> {
         .count())
 }
 
-/// Every repo with a local path — what a collection covers. A failed listing
-/// is reported and yields none: nothing is read, so nothing is decided.
+/// Every repo with a local path — what a collection covers. T-000253: this is
+/// the FULL list, not `rules_repos` — a contributor's or pending helper's own
+/// checkout hands its markers back as proposals (`is_proposer_repo`), and
+/// filtering it out here left the whole T-000241 proposal input unreachable.
+/// A failed listing is reported and yields none: nothing is read, so nothing
+/// is decided.
 fn portfolio_repos(db: &AppDb, report: &mut RulesRefresh) -> Vec<Repository> {
-    match rules_repos(db) {
+    match db.list_repos_with_local_path(None) {
         Ok(v) => v,
         Err(e) => {
             report
@@ -3395,9 +3422,13 @@ mod tests {
         );
     }
 
+    /// T-000253: on a contributor's install the marker is a proposal to the
+    /// owner — the collection reads the contributor checkout, stores the
+    /// proposal and applies its text to the local canon atomically.
     #[test]
-    fn test_a_contributors_hand_back_marker_is_not_collected() {
+    fn test_a_contributors_marker_becomes_a_proposal() {
         let db = db_with_skill();
+        db.set_setting("github_login", "helper").unwrap();
         let tmp = TempDir::new().unwrap();
         let (repo, skills) = rendered_repo(&db, &tmp, "a");
         hand_back(&skills, "sdh-alpha", "ALPHA REVISED", "approved");
@@ -3407,16 +3438,68 @@ mod tests {
 
         assert!(report.taken.is_empty() && report.lost.is_empty());
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert_eq!(rule_text(&db), "ALPHA BODY");
-        assert!(skills.join("sdh-alpha.md.approved").exists(), "left alone");
-        assert_eq!(
-            fs::read_to_string(skills.join("sdh-alpha.md")).unwrap(),
-            "ALPHA REVISED"
+        assert_eq!(report.proposed, vec!["sdh-alpha".to_string()]);
+        let rows = db.list_rule_proposals(repo.id).unwrap();
+        assert_eq!(rows.len(), 1, "the proposal waits for the decision");
+        assert_eq!(rows[0].rule, "sdh-alpha");
+        assert_eq!(rows[0].text, "ALPHA REVISED");
+        assert_eq!(rows[0].status, "open");
+        assert_eq!(rule_text(&db), "ALPHA REVISED");
+        assert!(!skills.join("sdh-alpha.md.approved").exists());
+    }
+
+    /// T-000253: a pending helper proposes the same way — the row is stored
+    /// now and waits for the approval to start riding the transport.
+    #[test]
+    fn test_a_pending_helpers_marker_becomes_a_proposal() {
+        let db = db_with_skill();
+        db.set_setting("github_login", "helper").unwrap();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        hand_back(&skills, "sdh-alpha", "ALPHA REVISED", "approved");
+        db.set_shared_role(repo.id, Some("pending")).unwrap();
+
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.proposed, vec!["sdh-alpha".to_string()]);
+        let rows = db.list_rule_proposals(repo.id).unwrap();
+        assert_eq!(rows.len(), 1, "the proposal is stored while pending");
+        assert_eq!(rows[0].status, "open");
+    }
+
+    /// T-000253: two contributor checkouts proposing different texts for one
+    /// rule open a conflict — and it must stay quietly open while its sides
+    /// stay live, not flap open/closed every pass.
+    #[test]
+    fn test_two_contributor_proposals_for_one_rule_conflict_and_stay() {
+        let db = db_with_skill();
+        db.set_setting("github_login", "helper").unwrap();
+        let (one, two) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (r1, s1) = rendered_repo(&db, &one, "a");
+        let (r2, s2) = rendered_repo(&db, &two, "b");
+        hand_back(&s1, "sdh-alpha", "ALPHA ONE", "");
+        hand_back(&s2, "sdh-alpha", "ALPHA TWO", "");
+        db.set_shared_role(r1.id, Some("contributor")).unwrap();
+        db.set_shared_role(r2.id, Some("contributor")).unwrap();
+
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+        assert!(!report.errors.is_empty(), "the conflict is reported");
+        assert!(db.open_rule_conflicts().unwrap().contains("sdh-alpha"));
+        assert!(db.list_rule_proposals(r1.id).unwrap().is_empty());
+        assert!(s1.join("sdh-alpha.md.approved").exists());
+        assert!(s2.join("sdh-alpha.md.approved").exists());
+
+        let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            db.open_rule_conflicts().unwrap().contains("sdh-alpha"),
+            "live proposal sides hold the conflict open"
         );
     }
 
     #[test]
-    fn test_a_contributor_side_does_not_hold_a_conflict_open() {
+    fn test_a_contributor_side_of_a_conflict_is_read_and_proposes() {
         let db = db_with_skill();
         let (one, two) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let (_, s1) = rendered_repo(&db, &one, "a");
@@ -3427,14 +3510,21 @@ mod tests {
         assert!(!report.errors.is_empty(), "the conflict is reported");
         assert!(db.open_rule_conflicts().unwrap().contains("sdh-alpha"));
 
-        // The second repo becomes a contributor's: its marker is no longer read
-        // and cannot keep the conflict open; the first one's text is taken.
+        // The second repo becomes a contributor's: its marker is still read —
+        // as a proposal side. The conflict sees both sides and settles; the
+        // private hand-back is taken and the contributor's text goes up as a
+        // proposal (which applies its text to this install's canon).
         db.set_shared_role(r2.id, Some("contributor")).unwrap();
         let report = refresh_rules(&db, None, RenderScope::UptakeOnly, None);
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(db.open_rule_conflicts().unwrap().is_empty());
-        assert_eq!(rule_text(&db), "ALPHA ONE");
+        assert_eq!(report.taken, vec!["sdh-alpha".to_string()]);
+        assert_eq!(report.proposed, vec!["sdh-alpha".to_string()]);
+        let rows = db.list_rule_proposals(r2.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "ALPHA TWO");
+        assert_eq!(rule_text(&db), "ALPHA TWO");
     }
 
     #[test]
@@ -4094,8 +4184,9 @@ mod tests {
 
     #[test]
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
-    fn test_sweep_covers_a_shared_contributor_checkout_but_collects_nothing_there() {
+    fn test_sweep_covers_a_shared_contributor_checkout_and_its_marker_proposes() {
         let db = db_with_skill();
+        db.set_setting("github_login", "helper").unwrap();
         let tmp = TempDir::new().unwrap();
         let repo = git_repo_with_tracked_marker(
             &db,
@@ -4120,15 +4211,14 @@ mod tests {
         );
 
         let report = marker_sweep(&db);
-        // The collection of a real refresh runs over `rules_repos`, which
-        // leaves a contributor's checkout out — its uptake filter is unchanged.
-        let repos: Vec<Repository> = db
-            .list_repos_with_local_path(None)
-            .unwrap()
-            .into_iter()
-            .filter(|r| !skips_rule_copies(&db, r.id))
-            .collect();
-        let collected = collect_approved_skill_edits(&db, &repos, None);
+        // T-000253: the collection of a real refresh runs over the full
+        // portfolio list now — a contributor's marker is read as a proposal,
+        // not skipped and not taken as a private hand-back.
+        let collected = collect_approved_skill_edits(
+            &db,
+            &portfolio_repos(&db, &mut RulesRefresh::default()),
+            None,
+        );
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(ls_files(tmp.path(), "docs/sdh_skills/*.approved").is_empty());
@@ -4139,6 +4229,11 @@ mod tests {
         assert!(
             collected.taken.is_empty(),
             "a contributor hands nothing back"
+        );
+        assert_eq!(
+            collected.proposed,
+            vec!["sdh-alpha".to_string()],
+            "its marker is a proposal instead"
         );
     }
 

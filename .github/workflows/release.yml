@@ -119,8 +119,10 @@ jobs:
       - name: Assert all platform keys in latest.json
         env:
           GH_TOKEN: ${{ github.token }}
+        # No checkout here — gh resolves the repo from --repo, not from git
+        # context (a bare runner has no .git; the v1.24.1 gate fell over that).
         run: |
-          gh release download "$GITHUB_REF_NAME" --pattern latest.json --clobber
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern latest.json --clobber
           required=(
             windows-x86_64 windows-x86_64-nsis
             linux-x86_64 linux-x86_64-appimage
