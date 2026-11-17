@@ -1265,8 +1265,52 @@ fn commit_files_to_branch_inner(
     let refname = format!("refs/heads/{}", branch);
     let old = rev_parse(git, repo, &refname)?
         .ok_or_else(|| format!("branch '{}' does not exist", branch))?;
-    if changes.is_empty() {
+    let Some(new) = commit_tree_onto(git, repo, &old, changes, message, author_name, author_email)?
+    else {
         return Ok(BranchCommit::NothingToCommit);
+    };
+    before_cas();
+    if update_ref_cas(git, repo, &refname, &new, Some(&old))? {
+        Ok(BranchCommit::Committed { sha: new })
+    } else {
+        Ok(BranchCommit::RefMoved)
+    }
+}
+
+/// Commit `changes` onto `base` (any rev) with the throw-away-index plumbing
+/// of `commit_files_to_branch` but WITHOUT moving any ref — the caller decides
+/// what the commit is for (T-000256 pushes it as `<sha>:refs/heads/<branch>`:
+/// a current branch that also holds unpushed user commits still publishes its
+/// shared files, and only them). `Ok(None)` when the tree ends up equal to
+/// `base`'s — nothing to commit.
+pub fn commit_files_onto_rev(
+    git: &GitBinary,
+    repo: &Path,
+    base: &str,
+    changes: &[FileChange],
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+) -> Result<Option<String>, String> {
+    validate_rev(base)?;
+    commit_tree_onto(git, repo, base, changes, message, author_name, author_email)
+}
+
+/// Build a commit of `changes` on `base` through plumbing and a throw-away
+/// index; the working tree, the real index, HEAD and every ref stay
+/// untouched. Returns the commit sha, or `None` when the resulting tree is
+/// `base`'s own.
+fn commit_tree_onto(
+    git: &GitBinary,
+    repo: &Path,
+    base: &str,
+    changes: &[FileChange],
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+) -> Result<Option<String>, String> {
+    if changes.is_empty() {
+        return Ok(None);
     }
     // Validate every path before creating anything.
     let paths: Vec<String> = changes
@@ -1285,7 +1329,7 @@ fn commit_files_to_branch_inner(
     // A stale file at this path (crashed run, recycled pid) must never act as a
     // starting index or block the lock; start clean.
     let _ = std::fs::remove_file(&index.0);
-    run_ok_with(git, repo, &["read-tree", old.as_str()], &idx_opts)?;
+    run_ok_with(git, repo, &["read-tree", base], &idx_opts)?;
     for (change, path) in changes.iter().zip(&paths) {
         match &change.content {
             Some(bytes) => {
@@ -1309,14 +1353,14 @@ fn commit_files_to_branch_inner(
         }
     }
     let tree = stdout_text(&run_ok_with(git, repo, &["write-tree"], &idx_opts)?);
-    let old_tree_spec = format!("{}^{{tree}}", old);
+    let old_tree_spec = format!("{}^{{tree}}", base);
     let old_tree = stdout_text(&run_ok(
         git,
         repo,
         &["rev-parse", "--verify", old_tree_spec.as_str()],
     )?);
     if tree == old_tree {
-        return Ok(BranchCommit::NothingToCommit);
+        return Ok(None);
     }
 
     let mut msg = message.to_string();
@@ -1343,17 +1387,11 @@ fn commit_files_to_branch_inner(
             "commit-tree",
             tree.as_str(),
             "-p",
-            old.as_str(),
+            base,
         ],
         &commit_opts,
     )?);
-
-    before_cas();
-    if update_ref_cas(git, repo, &refname, &new, Some(&old))? {
-        Ok(BranchCommit::Committed { sha: new })
-    } else {
-        Ok(BranchCommit::RefMoved)
-    }
+    Ok(Some(new))
 }
 
 // ---------------------------------------------------------------------------
@@ -1400,6 +1438,46 @@ pub fn push_branches_with_timeout(
     let out = run_git(git, repo, &args, &net_opts(&env, timeout)).map_err(net_error_from_run)?;
     parse_push_output(
         branches,
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+        &out,
+    )
+}
+
+/// Push `src:refs/heads/<branch>` pairs in one `git push --porcelain` (never
+/// forced, never a protected branch). `src` may be any rev — e.g. a detached
+/// commit publishing to a branch whose local tip must NOT travel (T-000256).
+/// Outcomes come back keyed by `branch`, exactly like `push_branches`.
+pub fn push_refs(
+    git: &GitBinary,
+    repo: &Path,
+    remote: &str,
+    refs: &[(&str, &str)],
+) -> Result<Vec<(String, PushOutcome)>, NetError> {
+    let refuse = |m: String| NetError {
+        kind: NetErrorKind::Other,
+        message: m,
+    };
+    for (src, b) in refs {
+        refuse_protected(b).map_err(&refuse)?;
+        validate_branch(b).map_err(&refuse)?;
+        validate_rev(src).map_err(&refuse)?;
+    }
+    validate_rev(remote).map_err(&refuse)?;
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<String> = LOW_SPEED_ARGS.iter().map(|a| a.to_string()).collect();
+    args.extend(["push".into(), "--porcelain".into(), remote.into()]);
+    for (src, b) in refs {
+        args.push(format!("{}:refs/heads/{}", src, b));
+    }
+    let env = net_env();
+    let out =
+        run_git(git, repo, &args, &net_opts(&env, NET_TIMEOUT)).map_err(net_error_from_run)?;
+    let branches: Vec<&str> = refs.iter().map(|(_, b)| *b).collect();
+    parse_push_output(
+        &branches,
         &String::from_utf8_lossy(&out.stdout),
         &String::from_utf8_lossy(&out.stderr),
         &out,

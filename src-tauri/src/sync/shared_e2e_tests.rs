@@ -2424,3 +2424,67 @@ fn t000247_turning_specs_off_afterwards_stops_new_codex_content() {
     assert!(fx.remote_file("dev", r2).is_none());
     assert!(!fx.helper_dir.join(r2).exists());
 }
+
+/// T-000256: a current branch that also holds the user's own unpushed
+/// commits is never pushed — the shared state still goes out, as a sync
+/// commit built on the remote tip (LenSA's `2d6ac92`: the helper worked on
+/// `dev`, a sync commit landed on top of their code, and the push carried
+/// it to origin before the local test run ended).
+#[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+#[test]
+fn a_current_branch_with_foreign_commits_publishes_shared_only() {
+    let w = World::new();
+    let fx = &w.fx;
+    w.participants();
+
+    // The helper works on `dev` directly: a code commit, then a task row.
+    g(&fx.helper_dir, &["checkout", "-q", "dev"]);
+    write(&fx.helper_dir, "src.rs", "fn main() {}\n");
+    g(&fx.helper_dir, &["add", "src.rs"]);
+    g(&fx.helper_dir, &["commit", "-q", "-m", "code"]);
+    let foreign = g(&fx.helper_dir, &["rev-parse", "HEAD"]);
+    append(
+        &fx.helper_dir,
+        "docs/todo.md",
+        &task_line("T-500001", "later task", "open"),
+    );
+    let old_dev = fx.remote_rev("dev").unwrap();
+
+    w.sync_helper();
+
+    let new_dev = fx.remote_rev("dev").unwrap();
+    assert_ne!(new_dev, old_dev, "the shared change went out");
+    assert_eq!(
+        g(&fx.origin, &["rev-parse", "dev^"]),
+        old_dev,
+        "the published commit was built on the remote tip"
+    );
+    assert_eq!(
+        g(&fx.origin, &["log", "-1", "--format=%s", "dev"]),
+        "chore(sdh-sync): sync shared files"
+    );
+    let todo = fx.remote_file("dev", "docs/todo.md").unwrap();
+    assert!(todo.contains("T-500001"), "{}", todo);
+    assert_eq!(fx.remote_file("dev", "src.rs"), None);
+    // The foreign commit object never even reached origin.
+    assert!(!Command::new("git")
+        .args(["cat-file", "-e", &foreign])
+        .current_dir(&fx.origin)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success());
+    // The local branch keeps everything: clean tree, user's work unpushed.
+    assert!(g(&fx.helper_dir, &["status", "--porcelain"])
+        .trim()
+        .is_empty());
+    assert_eq!(fx.helper_status(), None);
+
+    // The next sync merges the remote commit back in; the shared paths are
+    // already equal, so nothing new is published.
+    w.sync_helper();
+    assert_eq!(fx.remote_rev("dev").unwrap(), new_dev);
+    assert!(g(&fx.helper_dir, &["status", "--porcelain"])
+        .trim()
+        .is_empty());
+}
