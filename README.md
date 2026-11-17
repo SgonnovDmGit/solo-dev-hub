@@ -155,7 +155,8 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Shipped**
 
-- **v1.24.3** *(current — 2026-11-16)* — an approved join request commits and pushes itself to the dev branch instead of waiting for the owner's next sync.
+- **v1.24.4** *(current — 2026-11-16)* — a task row deleted on one side stays deleted on oscillating histories (the merge-base decides), and a current branch holding your own unpushed commits no longer carries them to origin: the sync commit rides the remote tip instead.
+- **v1.24.3** — an approved join request commits and pushes itself to the dev branch instead of waiting for the owner's next sync.
 - **v1.24.2** — the `tool` role pairs horizontally and `landing` counts as `client` for peer links; a contributor's `.approved` marker actually becomes a rule proposal the owner sees.
 - **v1.24.0** — a diverged shared branch merges itself when the merge is clean (the manual Merge button remains for real conflicts); the codex mirror reaches contributor installs under the same `share_specs` flag.
 - **v1.23.0** — clone a repository with no local folder straight from the app; `docs/superpowers/` specs travel to contributors; a contributor's rule edit becomes a proposal the owner decides on; all cross-repo channels share the `docs/InOutBox/` layout; announcements get per-participant acknowledgements; `.approved`/`.conflict` markers stay out of git.
