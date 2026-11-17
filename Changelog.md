@@ -2,6 +2,12 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Changelog.ru.md](Changelog.ru.md).
 
+## [1.24.4]
+
+### Fixed
+- **A deleted task row no longer resurrects on oscillating histories (T-000255).** The per-entity merge base picks the last state both file histories shared — the tail of their longest common subsequence, where absence counts as a state. Absence is fungible, so when a row had already been deleted and re-added (three times in LenSA's T-500053), the LCS aligned absences that were unrelated to each other and ended on one — the merge then saw the deleted row as a one-sided addition and kept it. An absent LCS tail is ambiguous (a stale copy vs a deletion vs a genuine re-add after a shared deletion — indistinguishable in row history), so the row's base now comes from the file at the real merge-base: present there makes the deletion newer knowledge and it stands; absent — or no merge-base — makes the addition newer and the row survives. Reported via handoff from the LenSA client.
+- **A current-branch sync no longer publishes the user's own unpushed commits (T-000256).** The "only our sync commits get pushed" guard covered every non-current recipient branch, but the checked-out branch was pushed as a whole — a helper working straight on `dev` watched their unfinished code ride `origin/dev` on the sync commit's tail (LenSA's `2d6ac92`, before the local test run ended). A current branch holding foreign local-only commits is now never pushed: the shared state goes out as a sync commit built plumbing-side on the `origin/<branch>` tip — parented on it, carrying only the shared-path diffs of the local tip — and pushed by sha (`<sha>:refs/heads/<b>`). The local branch keeps everything and converges through the next sync's merge pass; a moved remote defers the whole attempt, and nothing is committed when the shared paths already match. Flow: `docs/flows/contributor-mode.md`.
+
 ## [1.24.3] — 2026-11-16
 
 ### Fixed

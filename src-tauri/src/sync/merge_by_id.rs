@@ -593,17 +593,23 @@ pub fn merge_shared_file(
 /// Judging a whole file by when its bytes first appeared goes wrong when the
 /// same file content comes back three or more times; aligned as sequences, the
 /// branch that is a prefix of the other ends exactly at the shared state. An
-/// entity the histories never both held keeps the whole-file base.
+/// entity the histories never both held keeps the whole-file base. A row
+/// whose LCS ends in absence is ambiguous — its state in `ancestry` (the
+/// file at the real merge-base, `None` when there is none) becomes the base
+/// instead (T-000255): presence there makes a deletion newer knowledge.
 pub fn merge_shared_file_per_entity(
     kind: SharedFileKind,
     base: &str,
+    ancestry: Option<&str>,
     versions: &[String],
     ours_seq: &[usize],
     theirs_seq: &[usize],
     ours: &str,
     theirs: &str,
 ) -> Result<String, MergeError> {
-    let overrides = entity_bases(kind, base, versions, ours_seq, theirs_seq, ours, theirs);
+    let overrides = entity_bases(
+        kind, base, ancestry, versions, ours_seq, theirs_seq, ours, theirs,
+    );
     merge_with_bases(kind, base, ours, theirs, &overrides)
 }
 
@@ -663,6 +669,7 @@ fn lcs_last<'a>(a: &[Option<&'a Ent>], b: &[Option<&'a Ent>]) -> Option<Option<&
 fn entity_bases(
     kind: SharedFileKind,
     base: &str,
+    ancestry: Option<&str>,
     versions: &[String],
     ours_seq: &[usize],
     theirs_seq: &[usize],
@@ -671,6 +678,7 @@ fn entity_bases(
 ) -> HashMap<String, Option<Ent>> {
     let mut overrides = HashMap::new();
     let (b, o, t) = (parse(kind, base), parse(kind, ours), parse(kind, theirs));
+    let anc = ancestry.map(|s| parse(kind, s));
     // Only a row that differs between the sides needs a base.
     let mut diff: HashSet<String> = HashSet::new();
     for e in o.ents.iter().chain(t.ents.iter()) {
@@ -702,15 +710,20 @@ fn entity_bases(
         let a = state_seq(ours_seq, &states, key);
         let bb = state_seq(theirs_seq, &states, key);
         if let Some(found) = lcs_last(&a, &bb) {
-            // Absence as the only shared state, while both histories held the
-            // row in versions of their own, says nothing about the row: the
-            // texts diverged with no shared version. Keep the whole-file base.
-            let shared_text = a
-                .iter()
-                .flatten()
-                .any(|x| bb.iter().flatten().any(|y| same(x, y)));
-            let both_held = a.iter().any(|s| s.is_some()) && bb.iter().any(|s| s.is_some());
-            if found.is_none() && both_held && !shared_text {
+            // An absent tail of the LCS is never a usable base (T-000255):
+            // absence is fungible, so the LCS may have aligned unrelated
+            // gaps — a stale copy on our side vs a fresh deletion on
+            // theirs, or a re-add ours made after a deletion both sides
+            // shared. Row-only history cannot tell those apart; the
+            // merge-base's file can — a base file holding the row makes
+            // the deletion newer knowledge (it wins), a base file without
+            // the row (or no merge-base at all) makes ours' row newer
+            // (a re-add survives).
+            if found.is_none() {
+                let st = anc
+                    .as_ref()
+                    .and_then(|p| p.by_key.get(key).map(|&i| &p.ents[i]));
+                overrides.insert(key.clone(), st.cloned());
                 continue;
             }
             let whole = b.by_key.get(key).map(|&i| &b.ents[i]);
@@ -1528,9 +1541,17 @@ mod tests {
         // ours: absent, then the row; theirs: absent, an edited row, deleted
         // again. The row never had a shared text, so absence is no base: the
         // whole-file base (the row present) makes theirs' deletion stand.
-        let merged =
-            merge_shared_file_per_entity(Todo, &with, &v, &[0, 1], &[0, 2, 0], &with, &without)
-                .unwrap();
+        let merged = merge_shared_file_per_entity(
+            Todo,
+            &with,
+            Some(&with),
+            &v,
+            &[0, 1],
+            &[0, 2, 0],
+            &with,
+            &without,
+        )
+        .unwrap();
         assert!(!merged.contains("T-000002"), "resurrected:\n{}", merged);
     }
 
@@ -1546,6 +1567,7 @@ mod tests {
         let deleted = merge_shared_file_per_entity(
             Todo,
             &with,
+            Some(&with),
             &v,
             &[0, 1, 0, 1],
             &[0, 1, 0],
@@ -1554,10 +1576,13 @@ mod tests {
         )
         .unwrap();
         assert!(!deleted.contains("T-000002"));
-        // ours: without, with, without, with; theirs is its prefix.
+        // ours: without, with, without, with; theirs is its prefix. The
+        // merge-base is theirs' tip — the shared deletion — so ours'
+        // identical re-add is newer knowledge and survives (T-000255).
         let readded = merge_shared_file_per_entity(
             Todo,
             &with,
+            Some(&without),
             &v,
             &[1, 0, 1, 0],
             &[1, 0, 1],
@@ -1566,5 +1591,61 @@ mod tests {
         )
         .unwrap();
         assert!(readded.contains("T-000002"));
+        // The same shape with the row still present at the merge-base reads
+        // as a stale copy kept past a deletion — the deletion stands.
+        let stale = merge_shared_file_per_entity(
+            Todo,
+            &with,
+            Some(&with),
+            &v,
+            &[1, 0, 1, 0],
+            &[1, 0, 1],
+            &with,
+            &without,
+        )
+        .unwrap();
+        assert!(!stale.contains("T-000002"));
+        // A re-add with different text is unmistakable — it survives either
+        // way.
+        let edited = with.replace("second task", "second task redone");
+        let v2 = vec![without.clone(), with.clone(), edited.clone()];
+        let redone = merge_shared_file_per_entity(
+            Todo,
+            &with,
+            Some(&without),
+            &v2,
+            &[0, 1, 0, 2],
+            &[0, 1, 0],
+            &edited,
+            &without,
+        )
+        .unwrap();
+        assert!(redone.contains("second task redone"));
+    }
+
+    #[test]
+    fn oscillating_histories_do_not_resurrect_a_moved_row() {
+        let with = TODO_BASE.to_string();
+        let without = with.replace(
+            "- [ ] T-000002 | second task | 1 | low | open | 2026-10-02\n",
+            "",
+        );
+        let v = vec![without.clone(), with.clone()];
+        // LenSA T-500053 (T-000255): ours' worktree kept the stale row while
+        // theirs moved it to done.md; both histories had already flickered
+        // under the plumbing, so the LCS lands on "absent". The real
+        // merge-base (`d24a60f`) still held the row — the deletion wins.
+        let merged = merge_shared_file_per_entity(
+            Todo,
+            &with,
+            Some(&with),
+            &v,
+            &[0, 1, 0, 1, 0, 1],
+            &[0, 1, 0, 1, 0],
+            &with,
+            &without,
+        )
+        .unwrap();
+        assert!(!merged.contains("T-000002"), "resurrected:\n{}", merged);
     }
 }

@@ -1295,6 +1295,19 @@ fn plumb_into_branch(
                         Some(s) => normalize(cat_blob(git, root, s)?),
                         None => Vec::new(),
                     };
+                    // T-000255: a row whose histories only share absences is
+                    // ambiguous; the real merge-base's copy is its base — the
+                    // fork holding the row makes the deletion newer, the fork
+                    // without it (or no merge-base) makes a re-add newer.
+                    let ancestry = match merge_base_blob {
+                        Some(m) if bs == Some(m) => {
+                            std::str::from_utf8(&base).ok().map(str::to_owned)
+                        }
+                        Some(m) => cat_blob(git, root, m)
+                            .ok()
+                            .and_then(|v| String::from_utf8(normalize(v)).ok()),
+                        None => None,
+                    };
                     // Each row gets its own base from the two histories.
                     let per_entity = hist
                         .as_ref()
@@ -1307,7 +1320,14 @@ fn plumb_into_branch(
                                 std::str::from_utf8(&theirs).ok()?,
                             );
                             Some(merge_shared_file_per_entity(
-                                kind, b, &versions, &os, &ts, o, t,
+                                kind,
+                                b,
+                                ancestry.as_deref(),
+                                &versions,
+                                &os,
+                                &ts,
+                                o,
+                                t,
                             ))
                         });
                     let merged = match per_entity {
@@ -4917,10 +4937,15 @@ fn prune_approved_requests(root: &Path, s: &ProjectStructure) {
 }
 
 /// Push the recipient branches whose tip origin does not have. A non-current
-/// branch that holds anything but our own sync commits is never pushed.
+/// branch that holds anything but our own sync commits is never pushed. The
+/// same guard now binds the CURRENT branch too (T-000256): with unpushed user
+/// commits on it, the shared state still goes out — as a sync commit built on
+/// the remote tip and pushed without the local ref, so the user's work stays
+/// local until the user's own push.
 fn push_recipients(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, cur: Option<&str>) {
     let root = pass.root.clone();
     let mut to_push: Vec<String> = Vec::new();
+    let mut onto_remote: Vec<(String, String)> = Vec::new();
     for b in pass.recipients.clone() {
         let is_current = cur.is_some_and(|c| same_branch(c, &b));
         if !is_current && pass.is_blocked(&b) {
@@ -4935,42 +4960,137 @@ fn push_recipients(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, cur: Option
         if remote.as_deref() == Some(local.as_str()) {
             continue;
         }
-        if !is_current && !local_only_commits_are_ours(git, &root, &b).unwrap_or(false) {
-            pass.blocked.insert(b.to_ascii_lowercase());
-            pass.note_diverged(&b, false);
+        if !local_only_commits_are_ours(git, &root, &b).unwrap_or(false) {
+            if !is_current {
+                pass.blocked.insert(b.to_ascii_lowercase());
+                pass.note_diverged(&b, false);
+            } else if let Some(remote) = remote.as_deref() {
+                // T-000256: republish the shared paths on the remote tip.
+                // `remote` absent (a never-pushed branch) defers silently —
+                // an orphan remote branch would only fork the history.
+                match shared_commit_on_tip(git, &root, &local, remote, pass) {
+                    Ok(Some(sha)) => onto_remote.push((b.clone(), sha)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                        pass.issue(issue)
+                    }
+                }
+            }
             continue;
         }
         to_push.push(b);
     }
-    if to_push.is_empty() {
+    if to_push.is_empty() && onto_remote.is_empty() {
         return;
     }
     if !net_slot(NetKind::Push, pass.repo.id, &root, min_net_interval()) {
         return;
     }
-    let refs: Vec<&str> = to_push.iter().map(String::as_str).collect();
-    match git_sync::push_branches(git, &root, REMOTE, &refs) {
-        Err(e) => pass.note(SharedStatus::PushFailed, e.to_string()),
-        Ok(results) => {
-            for (branch, outcome) in results {
-                match outcome {
-                    PushOutcome::Pushed | PushOutcome::UpToDate => {}
-                    PushOutcome::RejectedNonFastForward => {
-                        let current = cur.is_some_and(|c| same_branch(c, &branch));
-                        pass.note_diverged(&branch, current)
-                    }
-                    PushOutcome::RejectedProtected(m) => {
-                        pass.note_push_rejected(&branch, m);
-                        mark_receipts_blocked(db, pass, &branch);
-                    }
-                    PushOutcome::RejectedOther(m) => {
-                        pass.note(SharedStatus::PushFailed, m);
-                        mark_receipts_blocked(db, pass, &branch);
+    if !to_push.is_empty() {
+        let refs: Vec<&str> = to_push.iter().map(String::as_str).collect();
+        match git_sync::push_branches(git, &root, REMOTE, &refs) {
+            Err(e) => pass.note(SharedStatus::PushFailed, e.to_string()),
+            Ok(results) => {
+                for (branch, outcome) in results {
+                    match outcome {
+                        PushOutcome::Pushed | PushOutcome::UpToDate => {}
+                        PushOutcome::RejectedNonFastForward => {
+                            let current = cur.is_some_and(|c| same_branch(c, &branch));
+                            pass.note_diverged(&branch, current)
+                        }
+                        PushOutcome::RejectedProtected(m) => {
+                            pass.note_push_rejected(&branch, m);
+                            mark_receipts_blocked(db, pass, &branch);
+                        }
+                        PushOutcome::RejectedOther(m) => {
+                            pass.note(SharedStatus::PushFailed, m);
+                            mark_receipts_blocked(db, pass, &branch);
+                        }
                     }
                 }
             }
         }
     }
+    if !onto_remote.is_empty() {
+        let refs: Vec<(&str, &str)> = onto_remote
+            .iter()
+            .map(|(b, s)| (s.as_str(), b.as_str()))
+            .collect();
+        match git_sync::push_refs(git, &root, REMOTE, &refs) {
+            Err(e) => pass.note(SharedStatus::PushFailed, e.to_string()),
+            Ok(results) => {
+                for (branch, outcome) in results {
+                    match outcome {
+                        PushOutcome::Pushed | PushOutcome::UpToDate => {}
+                        // The remote tip moved since the fetch: nothing was
+                        // published, the next sync rebuilds the commit.
+                        PushOutcome::RejectedNonFastForward => pass.note_diverged(&branch, true),
+                        PushOutcome::RejectedProtected(m) => {
+                            pass.note_push_rejected(&branch, m);
+                            mark_receipts_blocked(db, pass, &branch);
+                        }
+                        PushOutcome::RejectedOther(m) => {
+                            pass.note(SharedStatus::PushFailed, m);
+                            mark_receipts_blocked(db, pass, &branch);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// T-000256: the shared paths of `local` republished as a sync commit on
+/// `remote`'s tip — the publishable half of a current branch that also carries
+/// the user's own unpushed commits. `Ok(None)` when no shared path differs:
+/// the local sync commit then simply waits for the user's own push. Markers
+/// never travel, whatever a commit put on the branch.
+fn shared_commit_on_tip(
+    git: &GitBinary,
+    root: &Path,
+    local: &str,
+    remote: &str,
+    pass: &RepoPass,
+) -> Result<Option<String>, String> {
+    let specs = sdh_commit_paths(
+        pass.role.unwrap_or(Role::Main),
+        &pass.login,
+        pass.share_specs,
+    );
+    let l = ls_tree(git, root, local, &specs)?;
+    let r = ls_tree(git, root, remote, &specs)?;
+    let mut changes: Vec<FileChange> = Vec::new();
+    for (path, sha) in &l {
+        if r.get(path) == Some(sha) || is_excluded_file(path) {
+            continue;
+        }
+        changes.push(FileChange {
+            rel_path: PathBuf::from(path),
+            content: Some(cat_blob(git, root, sha)?),
+        });
+    }
+    for path in r.keys() {
+        if !l.contains_key(path) && !is_excluded_file(path) {
+            changes.push(FileChange {
+                rel_path: PathBuf::from(path),
+                content: None,
+            });
+        }
+    }
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    let (subject, body) = commit_message(&pass.login);
+    git_sync::commit_files_onto_rev(
+        git,
+        root,
+        remote,
+        &changes,
+        &format!("{}\n\n{}", subject, body),
+        SDH_COMMIT_NAME,
+        SDH_COMMIT_EMAIL,
+    )
 }
 
 /// T-000241: a permanent refusal of the shared dev branch keeps this repo's
