@@ -35,6 +35,30 @@ impl AppDb {
         }
     }
 
+    /// Test-only: rewrite a freshly created repository row onto a
+    /// process-unique id and return it. Sync fixtures build their own
+    /// `:memory:` store, so every repo would otherwise land on `id = 1` —
+    /// and every id-keyed process registry (`specs_policy_guard`, the
+    /// probe/net slots) would serialize the whole parallel test binary on
+    /// one mutex, with probe tests additionally parked *inside* the guard.
+    /// Call right after the insert, before any dependent rows exist; the
+    /// 1000-id stride leaves room for the fixture's later auto-assigned ids.
+    #[cfg(test)]
+    pub fn bump_repo_id(&self, old_id: i64) -> i64 {
+        static NEXT: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(1_000_000_000);
+        let new_id = NEXT.fetch_add(1_000, std::sync::atomic::Ordering::Relaxed);
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE repositories SET id = ?1 WHERE id = ?2",
+                rusqlite::params![new_id, old_id],
+            )
+            .unwrap();
+        new_id
+    }
+
     pub fn upsert_repository_with_outcome(
         &self,
         github_name: &str,

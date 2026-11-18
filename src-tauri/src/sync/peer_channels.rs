@@ -294,12 +294,84 @@ fn close_marked_if(
     }
 }
 
+/// T-000257: the delivery ledger a mirror pass carries — the `dst` inbox
+/// files THIS install copied from `src`'s outbox are the only files its
+/// prune may ever remove. Without it, "absent from my local outbox" reads as
+/// "the author retracted it" even when the inbox copy is ANOTHER machine's
+/// delivery that arrived through git — that was the REQ-body ping-pong.
+/// The key is (src repo, dst repo, lane-relative path): immune to a
+/// peer-folder rename and to nested-name collisions.
+#[derive(Clone, Copy)]
+struct LaneLedger<'a> {
+    db: &'a AppDb,
+    src: i64,
+    dst: i64,
+}
+
+impl LaneLedger<'_> {
+    /// Record that this install delivered `rel` (lane-relative) — hashed on
+    /// the bytes that actually landed.
+    fn record(&self, rel: &str, dst_path: &Path) {
+        if let Ok(bytes) = std::fs::read(dst_path) {
+            let _ = self.db.record_peer_delivery(
+                self.src,
+                self.dst,
+                rel,
+                &sync::rule_proposals::sha256_hex(&bytes),
+            );
+        }
+    }
+
+    /// Is `rel` this install's to retract? Only a delivered file whose bytes
+    /// still match the row. A drifted or foreign file stays, and a stale
+    /// claim is dropped rather than trusted.
+    fn may_prune(&self, rel: &str, dst_path: &Path) -> bool {
+        let Ok(Some(sha)) = self.db.peer_delivery_sha(self.src, self.dst, rel) else {
+            return false;
+        };
+        let ours = std::fs::read(dst_path)
+            .map(|b| sync::rule_proposals::sha256_hex(&b) == sha)
+            .unwrap_or(false);
+        if ours {
+            true
+        } else {
+            let _ = self.db.drop_peer_delivery(self.src, self.dst, rel);
+            false
+        }
+    }
+
+    fn forget(&self, rel: &str) {
+        let _ = self.db.drop_peer_delivery(self.src, self.dst, rel);
+    }
+}
+
+/// Lane-relative paths of every regular file under `dir`, recursively —
+/// the "still present" set a ledger sweep keeps rows for.
+fn collect_rel_files(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rel_files(&path, &format!("{prefix}{name}/"), out);
+        } else if path.is_file() {
+            out.push(format!("{prefix}{name}"));
+        }
+    }
+}
+
 /// Mirror an author's outbox onto the peer's inbox, kind-aware (T-000190):
 /// copy changed files, prune whatever the author removed — but skip the files
 /// and dirs the RECIPIENT authors in its own inbox (`*.response.md`, `*.ack/`).
 /// Mirroring over them would overwrite the recipient's receipt with the
 /// sender's stale replica; pruning them would delete the recipient's own work.
-fn mirror_outbox(src: &Path, dst: &Path, out: &mut PeerChannelOutcome) {
+///
+/// With a `ledger` the prune removes only files THIS install delivered
+/// (T-000257); without it (tests, roster-less entry points) the historical
+/// unconditional prune stays.
+fn mirror_outbox(src: &Path, dst: &Path, ledger: Option<LaneLedger>, out: &mut PeerChannelOutcome) {
     if !src.exists() {
         return; // no authored outbox — nothing to deliver, nothing to prune
     }
@@ -308,50 +380,101 @@ fn mirror_outbox(src: &Path, dst: &Path, out: &mut PeerChannelOutcome) {
         return;
     }
     // Copy pass: every source entry except recipient-authored names.
-    if let Err(e) = copy_channel_tree(src, dst, &mut out.copied) {
+    if let Err(e) = copy_channel_tree(src, dst, "", ledger, &mut out.copied) {
         out.errors.push(peer_issue(dst.display().to_string(), e));
     }
     // Prune pass: dst entries absent from src, except recipient-authored names.
-    if let Err(e) = prune_channel_tree(src, dst, &mut out.pruned) {
+    if let Err(e) = prune_channel_tree(src, dst, "", ledger, &mut out.pruned) {
         out.errors.push(peer_issue(dst.display().to_string(), e));
+    }
+    // Sweep rows whose file is gone — marker closes and teardowns remove
+    // files outside the prune pass as well.
+    if let Some(l) = ledger {
+        let mut present = Vec::new();
+        collect_rel_files(dst, "", &mut present);
+        let _ = l.db.sweep_peer_deliveries(l.src, l.dst, &present);
     }
 }
 
-fn copy_channel_tree(src: &Path, dst: &Path, copied: &mut usize) -> Result<(), String> {
+fn copy_channel_tree(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    ledger: Option<LaneLedger>,
+    copied: &mut usize,
+) -> Result<(), String> {
     let entries = std::fs::read_dir(src).map_err(|e| e.to_string())?;
     for entry in entries.filter_map(|e| e.ok()) {
         if is_recipient_authored(&entry.file_name()) {
             continue;
         }
+        let name = entry.file_name().to_string_lossy().to_string();
         let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
+        let dst_path = dst.join(&name);
         if src_path.is_dir() {
-            copy_channel_tree(&src_path, &dst_path, copied)?;
-        } else if src_path.is_file() && sync::copy_file_if_changed(&src_path, &dst_path)? {
-            *copied += 1;
+            copy_channel_tree(
+                &src_path,
+                &dst_path,
+                &format!("{prefix}{name}/"),
+                ledger,
+                copied,
+            )?;
+        } else if src_path.is_file() {
+            if sync::copy_file_if_changed(&src_path, &dst_path)? {
+                *copied += 1;
+            }
+            // The row rides on byte equality too, not only on a write: a
+            // delivery that predates the ledger (or one another install made
+            // with identical bytes) still belongs to this lane — without the
+            // claim a later source removal can never retract it (T-000257).
+            if let Some(l) = ledger {
+                l.record(&format!("{prefix}{name}"), &dst_path);
+            }
         }
     }
     Ok(())
 }
 
-fn prune_channel_tree(src: &Path, dst: &Path, pruned: &mut usize) -> Result<(), String> {
+fn prune_channel_tree(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    ledger: Option<LaneLedger>,
+    pruned: &mut usize,
+) -> Result<(), String> {
     let entries = std::fs::read_dir(dst).map_err(|e| e.to_string())?;
     for entry in entries.filter_map(|e| e.ok()) {
         if is_recipient_authored(&entry.file_name()) {
             continue;
         }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let rel = format!("{prefix}{name}");
         let dst_path = entry.path();
-        let src_path = src.join(entry.file_name());
+        let src_path = src.join(&name);
         if dst_path.is_dir() {
             if src_path.is_dir() {
-                prune_channel_tree(&src_path, &dst_path, pruned)?;
+                prune_channel_tree(&src_path, &dst_path, &format!("{rel}/"), ledger, pruned)?;
+            } else if ledger.is_some() {
+                // Ledger mode: a dir absent from src prunes file by file, and
+                // the dir itself goes only once empty — a foreign delivery
+                // inside keeps it alive.
+                prune_channel_tree(&src_path, &dst_path, &format!("{rel}/"), ledger, pruned)?;
+                if std::fs::remove_dir(&dst_path).is_ok() {
+                    *pruned += 1;
+                }
             } else {
                 std::fs::remove_dir_all(&dst_path).map_err(|e| e.to_string())?;
                 *pruned += 1;
             }
         } else if !src_path.exists() {
-            std::fs::remove_file(&dst_path).map_err(|e| e.to_string())?;
-            *pruned += 1;
+            let ours = ledger.map(|l| l.may_prune(&rel, &dst_path)).unwrap_or(true);
+            if ours {
+                std::fs::remove_file(&dst_path).map_err(|e| e.to_string())?;
+                if let Some(l) = ledger {
+                    l.forget(&rel);
+                }
+                *pruned += 1;
+            }
         }
     }
     Ok(())
@@ -737,6 +860,7 @@ fn sync_one_direction(
     b_in: &Path,
     expected: Option<&BTreeSet<String>>,
     shared: Option<(&GitBinary, &Path)>,
+    ledger: Option<LaneLedger>,
     out: &mut PeerChannelOutcome,
 ) {
     // A `.done.md` closes only NOTE-*/HANDOFF-* bodies — never a REQ or an
@@ -763,7 +887,7 @@ fn sync_one_direction(
     cleanup_fully_acked(a_out, b_in, expected, shared, out);
     copy_acks_back(b_in, a_out, expected, out);
     copy_responses_back(b_in, a_out, out);
-    mirror_outbox(a_out, b_in, out);
+    mirror_outbox(a_out, b_in, ledger, out);
     drop_orphan_acks(a_out, b_in, out);
 }
 
@@ -914,8 +1038,34 @@ pub fn sync_peer_pair_ctx(
     let a_shared = (is_shared_repo(db, a))
         .then(|| git.as_ref().map(|g| (g, a_base)))
         .flatten();
-    sync_one_direction(&a_out, &b_in, b_readers.as_ref(), b_shared, &mut out);
-    sync_one_direction(&b_out, &a_in, a_readers.as_ref(), a_shared, &mut out);
+    // T-000257: each direction gets its own delivery ledger — a's outbox into
+    // b's inbox is a different lane than b's outbox into a's inbox.
+    let a_to_b = db.map(|d| LaneLedger {
+        db: d,
+        src: a.id,
+        dst: b.id,
+    });
+    let b_to_a = db.map(|d| LaneLedger {
+        db: d,
+        src: b.id,
+        dst: a.id,
+    });
+    sync_one_direction(
+        &a_out,
+        &b_in,
+        b_readers.as_ref(),
+        b_shared,
+        a_to_b,
+        &mut out,
+    );
+    sync_one_direction(
+        &b_out,
+        &a_in,
+        a_readers.as_ref(),
+        a_shared,
+        b_to_a,
+        &mut out,
+    );
     let sides = format!("{}, {}", a.display_name(), b.display_name());
     union_pacts(&a_pact, &b_pact, &sides, &mut out);
 
@@ -1676,5 +1826,224 @@ mod tests {
         let mut out = PeerChannelOutcome::default();
         let keys = current_ack_keys(&git, root, &b_in, "ANNOUNCE-001.md", None, &mut out);
         assert!(keys.contains("dave"), "uncommitted marker is current");
+    }
+
+    // ----- T-000257: the delivery ledger ------------------------------------
+
+    fn test_db() -> AppDb {
+        AppDb::new(PathBuf::from(":memory:")).unwrap()
+    }
+
+    fn insert_repo_row(db: &AppDb, id: i64, name: &str) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO repositories (id, github_name, local_path) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, format!("o/{name}"), format!("/{name}")],
+            )
+            .unwrap();
+    }
+
+    /// A db-backed pair: `a` and `b` are both rows and `Repository`s.
+    fn db_pair() -> (TempDir, AppDb, Repository, Repository) {
+        let (td, mut a, mut b) = pair();
+        let db = test_db();
+        insert_repo_row(&db, a.id, "alpha");
+        insert_repo_row(&db, b.id, "beta");
+        a.local_path = Some(base(&a).to_string_lossy().to_string());
+        b.local_path = Some(base(&b).to_string_lossy().to_string());
+        (td, db, a, b)
+    }
+
+    /// The incident: machine B mirrors with an outbox that lacks a body
+    /// machine A delivered and git carried over. With no ledger row for it,
+    /// B's prune must leave the file alone — not publish a retraction of
+    /// somebody else's delivery.
+    #[test]
+    fn a_delivery_this_install_never_made_is_not_pruned() {
+        let (_td, db, a, b) = db_pair();
+        let out = sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let b_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+        // A file that arrived in b's inbox through git — written by ANOTHER
+        // install's mirror, not this one's.
+        fs::write(b_in.join("REQ-007_x.md"), "delivered elsewhere").unwrap();
+        let out = sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.pruned, 0, "no ledger row -> no deletion");
+        assert_eq!(
+            fs::read_to_string(b_in.join("REQ-007_x.md")).unwrap(),
+            "delivered elsewhere"
+        );
+    }
+
+    #[test]
+    fn a_delivery_this_install_made_is_pruned_on_retraction() {
+        let (_td, db, a, b) = db_pair();
+        let a_out = outbox_dir(&base(&a), &b.canonical_folder_name());
+        let b_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+        fs::create_dir_all(&a_out).unwrap();
+        fs::write(a_out.join("REQ-007_x.md"), "body").unwrap();
+        let out = sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert_eq!(out.copied, 1);
+        assert!(b_in.join("REQ-007_x.md").is_file());
+        assert_eq!(
+            db.peer_delivery_sha(a.id, b.id, "REQ-007_x.md").unwrap(),
+            Some(sync::rule_proposals::sha256_hex(b"body"))
+        );
+        // The author retracts: our delivery follows it out.
+        fs::remove_file(a_out.join("REQ-007_x.md")).unwrap();
+        let out = sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert_eq!(out.pruned, 1);
+        assert!(!b_in.join("REQ-007_x.md").exists());
+        assert_eq!(
+            db.peer_delivery_sha(a.id, b.id, "REQ-007_x.md").unwrap(),
+            None,
+            "the row dies with the file"
+        );
+    }
+
+    #[test]
+    fn a_pre_ledger_delivery_earns_its_row_on_byte_equality() {
+        // The bytes were mirrored by a version that knew no ledger: the copy
+        // is already identical, `copied` stays 0, yet the delivery claims
+        // its row — a later retraction of the source must still retract it
+        // (T-000257).
+        let (_td, db, a, b) = db_pair();
+        let a_out = outbox_dir(&base(&a), &b.canonical_folder_name());
+        let b_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+        fs::create_dir_all(&a_out).unwrap();
+        fs::create_dir_all(&b_in).unwrap();
+        fs::write(a_out.join("REQ-007_x.md"), "body").unwrap();
+        fs::write(b_in.join("REQ-007_x.md"), "body").unwrap();
+        let out = sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert_eq!(out.copied, 0, "identical bytes — nothing to copy");
+        assert_eq!(
+            db.peer_delivery_sha(a.id, b.id, "REQ-007_x.md").unwrap(),
+            Some(sync::rule_proposals::sha256_hex(b"body")),
+            "equality claims the row back"
+        );
+        fs::remove_file(a_out.join("REQ-007_x.md")).unwrap();
+        let out = sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert_eq!(out.pruned, 1);
+        assert!(!b_in.join("REQ-007_x.md").exists());
+    }
+
+    #[test]
+    fn a_drifted_inbox_file_is_not_ours_to_prune() {
+        let (_td, db, a, b) = db_pair();
+        let a_out = outbox_dir(&base(&a), &b.canonical_folder_name());
+        let b_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+        fs::create_dir_all(&a_out).unwrap();
+        fs::write(a_out.join("REQ-007_x.md"), "body").unwrap();
+        sync_peer_pair_ctx(Some(&db), &a, &b);
+        // The recipient edited the delivered copy — our claim no longer
+        // matches the bytes and must be dropped, not acted on.
+        fs::write(b_in.join("REQ-007_x.md"), "edited locally").unwrap();
+        fs::remove_file(a_out.join("REQ-007_x.md")).unwrap();
+        let out = sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert_eq!(out.pruned, 0);
+        assert_eq!(
+            fs::read_to_string(b_in.join("REQ-007_x.md")).unwrap(),
+            "edited locally"
+        );
+        assert_eq!(
+            db.peer_delivery_sha(a.id, b.id, "REQ-007_x.md").unwrap(),
+            None,
+            "the stale claim is dropped"
+        );
+    }
+
+    #[test]
+    fn ledger_keys_keep_nested_path_components() {
+        // `sub/REQ-1.md` and `REQ-1.md` never collide: rel is lane-relative.
+        let (_td, db, a, b) = db_pair();
+        let a_out = outbox_dir(&base(&a), &b.canonical_folder_name());
+        let b_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+        fs::create_dir_all(a_out.join("sub")).unwrap();
+        fs::write(a_out.join("REQ-1.md"), "top").unwrap();
+        fs::write(a_out.join("sub/REQ-1.md"), "nested").unwrap();
+        sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert!(b_in.join("REQ-1.md").is_file() && b_in.join("sub/REQ-1.md").is_file());
+        assert!(db
+            .peer_delivery_sha(a.id, b.id, "REQ-1.md")
+            .unwrap()
+            .is_some());
+        assert!(db
+            .peer_delivery_sha(a.id, b.id, "sub/REQ-1.md")
+            .unwrap()
+            .is_some());
+        // Retract the nested subtree: the file goes, the emptied dir goes
+        // with it, the top-level delivery stays.
+        fs::remove_dir_all(a_out.join("sub")).unwrap();
+        sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert!(!b_in.join("sub").exists());
+        assert!(b_in.join("REQ-1.md").is_file());
+    }
+
+    #[test]
+    fn a_peer_rename_does_not_lose_the_delivery_ledger() {
+        // The key carries repo ids and a lane-relative path — following a
+        // rename of the peer's folder keeps every delivery attributable.
+        let (_td, db, mut a, b) = db_pair();
+        let a_out = outbox_dir(&base(&a), &b.canonical_folder_name());
+        fs::create_dir_all(&a_out).unwrap();
+        fs::write(a_out.join("REQ-007_x.md"), "body").unwrap();
+        sync_peer_pair_ctx(Some(&db), &a, &b);
+        let old_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+        assert!(old_in.join("REQ-007_x.md").is_file());
+        // The peer is renamed: the inbox folder follows, the rows stand.
+        fs::rename(&old_in, inbox_dir(&base(&b), "alpha2")).unwrap();
+        a.github_name = Some("o/alpha2".into());
+        let b_in_new = inbox_dir(&base(&b), "alpha2");
+        // The author's retraction still reaches the delivered file.
+        fs::remove_file(a_out.join("REQ-007_x.md")).unwrap();
+        let out = sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(!b_in_new.join("REQ-007_x.md").exists());
+    }
+
+    #[test]
+    fn sweeping_drops_rows_for_teardown_removed_files() {
+        let (_td, db, a, b) = db_pair();
+        let a_out = outbox_dir(&base(&a), &b.canonical_folder_name());
+        let b_in = inbox_dir(&base(&b), &a.canonical_folder_name());
+        fs::create_dir_all(&a_out).unwrap();
+        fs::write(a_out.join("NOTE-001_x.md"), "n").unwrap();
+        sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert!(db
+            .peer_delivery_sha(a.id, b.id, "NOTE-001_x.md")
+            .unwrap()
+            .is_some());
+        // A marker-driven close removes the file outside the mirror prune —
+        // the sweep clears the row instead of leaving it forever.
+        fs::write(a_out.join("NOTE-001_x.done.md"), "done").unwrap();
+        sync_peer_pair_ctx(Some(&db), &a, &b);
+        assert!(!b_in.join("NOTE-001_x.md").exists());
+        assert_eq!(
+            db.peer_delivery_sha(a.id, b.id, "NOTE-001_x.md").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn deleting_a_repo_cascades_its_delivery_rows() {
+        let (_td, db, a, b) = db_pair();
+        db.record_peer_delivery(a.id, b.id, "REQ-1.md", "sha")
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM repositories WHERE id = ?1",
+                rusqlite::params![a.id],
+            )
+            .unwrap();
+        assert_eq!(
+            db.peer_delivery_sha(a.id, b.id, "REQ-1.md").unwrap(),
+            None,
+            "the row dies with the repository"
+        );
     }
 }

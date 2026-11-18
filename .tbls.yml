@@ -106,6 +106,21 @@ comments:
       CHECK enforces it; without that one logical pair could be stored twice and
       the channel would sync twice per pass.
 
+  - table: peer_channel_deliveries
+    tableComment: >-
+      v37 (T-000257) — delivery provenance of the outbox→inbox mirror, one row
+      per file this install copied. The mirror's prune may only remove a file
+      it delivered: "absent from my local outbox" is not a retraction when the
+      inbox copy can be another machine's delivery that arrived through git
+      (the REQ-body ping-pong). Keyed (src repo, dst repo, lane-relative path)
+      — installation-local, never synced, immune to a peer-folder rename.
+    columnComments:
+      src_repo_id: The repo whose outbox the file was mirrored FROM.
+      dst_repo_id: The repo whose inbox received the copy.
+      rel_path: Path under the lane root (outbox|inbox/<peer>/), nested parts kept.
+      blob_sha: sha256 of the delivered bytes — a drifted file no longer matches and is left alone.
+      delivered_at: RFC 3339 UTC of the last delivery.
+
   - table: rule_events
     tableComment: >-
       v33 (T-000174) — append-only history of the workflow rules: the sdh-*
