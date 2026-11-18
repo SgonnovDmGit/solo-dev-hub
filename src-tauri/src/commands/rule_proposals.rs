@@ -13,7 +13,7 @@ use tauri::State;
 
 use crate::db::AppDb;
 use crate::git_ops::{commit_paths, current_branch, GitBinary};
-use crate::git_sync::{self, FileChange};
+use crate::git_sync::{self, FileChange, FileContent};
 use crate::models::{
     acceptance_pub_state, acceptance_status, decision_action, proposal_status, RuleAcceptance,
     RuleDecisionFile, RuleProposalFile, RuleProposalView,
@@ -675,7 +675,7 @@ pub(crate) fn publish_receipt(
     // Commit the receipt to dev.
     let change = FileChange {
         rel_path: PathBuf::from(&rpath),
-        content: Some(a.receipt_json.clone().into_bytes()),
+        content: Some(FileContent::Bytes(a.receipt_json.clone().into_bytes())),
     };
     let subject = "chore(sdh-sync): rule decisions";
     let body = format!(

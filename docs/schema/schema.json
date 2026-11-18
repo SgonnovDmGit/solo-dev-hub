@@ -2532,6 +2532,131 @@
         }
       ],
       "def": "CREATE TABLE \"rule_events\" (\n             id INTEGER PRIMARY KEY AUTOINCREMENT,\n             rule TEXT NOT NULL,\n             kind TEXT NOT NULL CHECK (kind IN ('taken','saved','reset','superseded','lost','conflict','conflict_resolved','proposed','proposal_accepted','proposal_rejected','proposal_withdrawn')),\n             repo TEXT,\n             note TEXT,\n             created_at TEXT NOT NULL\n         )"
+    },
+    {
+      "name": "peer_channel_deliveries",
+      "type": "table",
+      "comment": "v37 (T-000257) — delivery provenance of the outbox→inbox mirror, one row per file this install copied. The mirror's prune may only remove a file it delivered: \"absent from my local outbox\" is not a retraction when the inbox copy can be another machine's delivery that arrived through git (the REQ-body ping-pong). Keyed (src repo, dst repo, lane-relative path) — installation-local, never synced, immune to a peer-folder rename.",
+      "columns": [
+        {
+          "name": "src_repo_id",
+          "type": "INTEGER",
+          "nullable": false,
+          "comment": "The repo whose outbox the file was mirrored FROM."
+        },
+        {
+          "name": "dst_repo_id",
+          "type": "INTEGER",
+          "nullable": false,
+          "comment": "The repo whose inbox received the copy."
+        },
+        {
+          "name": "rel_path",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "Path under the lane root (outbox|inbox/\u003cpeer\u003e/), nested parts kept."
+        },
+        {
+          "name": "blob_sha",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "sha256 of the delivered bytes — a drifted file no longer matches and is left alone."
+        },
+        {
+          "name": "delivered_at",
+          "type": "TEXT",
+          "nullable": false,
+          "comment": "RFC 3339 UTC of the last delivery."
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_peer_channel_deliveries_pair",
+          "def": "CREATE INDEX idx_peer_channel_deliveries_pair\n             ON peer_channel_deliveries(src_repo_id, dst_repo_id)",
+          "table": "peer_channel_deliveries",
+          "columns": [
+            "src_repo_id",
+            "dst_repo_id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_peer_channel_deliveries_1",
+          "def": "PRIMARY KEY (src_repo_id, dst_repo_id, rel_path)",
+          "table": "peer_channel_deliveries",
+          "columns": [
+            "src_repo_id",
+            "dst_repo_id",
+            "rel_path"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "src_repo_id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (src_repo_id)",
+          "table": "peer_channel_deliveries",
+          "columns": [
+            "src_repo_id"
+          ]
+        },
+        {
+          "name": "dst_repo_id",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (dst_repo_id)",
+          "table": "peer_channel_deliveries",
+          "columns": [
+            "dst_repo_id"
+          ]
+        },
+        {
+          "name": "rel_path",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (rel_path)",
+          "table": "peer_channel_deliveries",
+          "columns": [
+            "rel_path"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 0)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (dst_repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "peer_channel_deliveries",
+          "referenced_table": "repositories",
+          "columns": [
+            "dst_repo_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "- (Foreign key ID: 1)",
+          "type": "FOREIGN KEY",
+          "def": "FOREIGN KEY (src_repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE",
+          "table": "peer_channel_deliveries",
+          "referenced_table": "repositories",
+          "columns": [
+            "src_repo_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_peer_channel_deliveries_1",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (src_repo_id, dst_repo_id, rel_path)",
+          "table": "peer_channel_deliveries",
+          "columns": [
+            "src_repo_id",
+            "dst_repo_id",
+            "rel_path"
+          ]
+        }
+      ],
+      "def": "CREATE TABLE peer_channel_deliveries (\n             src_repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             dst_repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             rel_path TEXT NOT NULL,\n             blob_sha TEXT NOT NULL,\n             delivered_at TEXT NOT NULL,\n             PRIMARY KEY (src_repo_id, dst_repo_id, rel_path)\n         )"
     }
   ],
   "relations": [
@@ -2807,6 +2932,32 @@
       ],
       "parent_cardinality": "exactly_one",
       "def": "FOREIGN KEY (repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "peer_channel_deliveries",
+      "columns": [
+        "dst_repo_id"
+      ],
+      "cardinality": "zero_or_one",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (dst_repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
+    },
+    {
+      "table": "peer_channel_deliveries",
+      "columns": [
+        "src_repo_id"
+      ],
+      "cardinality": "zero_or_one",
+      "parent_table": "repositories",
+      "parent_columns": [
+        "id"
+      ],
+      "parent_cardinality": "exactly_one",
+      "def": "FOREIGN KEY (src_repo_id) REFERENCES repositories (id) ON UPDATE NO ACTION ON DELETE CASCADE MATCH NONE"
     }
   ],
   "driver": {

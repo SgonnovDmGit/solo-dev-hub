@@ -150,8 +150,38 @@ impl SyncIssue {
     }
 
     pub fn detail(mut self, detail: impl std::fmt::Display) -> Self {
-        self.detail = Some(detail.to_string());
+        let text = detail.to_string();
+        self.detail = Some(match git_failure_hint(&text) {
+            // The raw stderr stays (logs, forensics); the hint tells the
+            // owner what it means and how to repair it.
+            Some(hint) => format!("{}\nПодсказка: {}", text.trim_end(), hint),
+            None => text,
+        });
         self
+    }
+}
+
+/// T-000259: a known git-failure signature → one-line repair guidance for
+/// the owner. The detail of a sync issue is raw OS/git text; a corrupt
+/// `.git/index` otherwise shows up as `bad signature 0x00000000 / fatal:
+/// index file corrupt` with no hint that the checkout is read-only until
+/// the index is rebuilt. Any write to that repo's index fails the same way,
+/// so the hint matters on every issue code, not only the sweep that caught
+/// it first.
+fn git_failure_hint(raw: &str) -> Option<&'static str> {
+    let low = raw.to_lowercase();
+    if low.contains("index file corrupt") || low.contains("bad index file sha1 signature") {
+        Some(
+            "индекс git повреждён — почините вручную: найдите файл индекса \
+             (`git rev-parse --git-path index`; в linked worktree он НЕ в \
+             `.git/index`), переименуйте его в резервную копию и выполните \
+             `git reset` — индекс перестроится из HEAD. Коммиты и файлы на \
+             диске сохранятся, но staged-состояние теряется — содержимое \
+             застейдженных правок может потребовать восстановления. Если \
+             повторится — искать виновника снаружи: антивирус, синк-папка, диск",
+        )
+    } else {
+        None
     }
 }
 
@@ -603,5 +633,31 @@ mod tests {
                 token
             );
         }
+    }
+
+    /// T-000259: a corrupt `.git/index` reaches the owner as raw stderr in
+    /// every issue code that runs git — the detail keeps the stderr and adds
+    /// the repair hint; anything else is passed through untouched.
+    #[test]
+    fn a_corrupt_index_detail_gets_the_repair_hint() {
+        let stderr = "error: bad signature 0x00000000\nfatal: index file corrupt";
+        let issue = SyncIssue::new(SyncIssueCode::RuleFailed, "o/r")
+            .target("docs/sdh_skills/")
+            .detail(stderr);
+        let d = issue.detail.unwrap();
+        assert!(d.contains("index file corrupt"), "{d}");
+        assert!(d.contains("Подсказка:"), "{d}");
+        assert!(d.contains(".git/index"), "{d}");
+        assert!(d.contains("git reset"), "{d}");
+
+        // The older git wording matches too.
+        let issue = SyncIssue::new(SyncIssueCode::AutocommitFailed, "o/r")
+            .detail("fatal: bad index file sha1 signature");
+        assert!(issue.detail.unwrap().contains("Подсказка:"));
+
+        // Unrelated errors are verbatim — the hint is not a decoration.
+        let issue =
+            SyncIssue::new(SyncIssueCode::CopyFailed, "f").detail("Access is denied. (os error 5)");
+        assert_eq!(issue.detail.unwrap(), "Access is denied. (os error 5)");
     }
 }

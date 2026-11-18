@@ -74,11 +74,27 @@ pub enum MergeOutcome {
     Conflict { files: Vec<String> },
 }
 
+/// The payload of a [`FileChange`].
+///
+/// `Bytes` is stored through `hash-object -w --stdin --path=<rel>`, i.e. the
+/// path's clean/EOL filters apply exactly like `git add` — correct for
+/// worktree-sourced bytes. `Blob` reuses an existing object id verbatim: the
+/// right shape when the published content IS a blob already (a detached
+/// commit republishing tree content would otherwise run the clean filters a
+/// second time — T-000257). `mode` is the source tree entry's mode, carried
+/// through verbatim so executables and symlinks keep `100755`/`120000`
+/// instead of collapsing to `100644`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileContent {
+    Bytes(Vec<u8>),
+    Blob { sha: String, mode: String },
+}
+
 /// One file to write into a branch. `content: None` deletes the file.
 #[derive(Debug, Clone)]
 pub struct FileChange {
     pub rel_path: PathBuf,
-    pub content: Option<Vec<u8>>,
+    pub content: Option<FileContent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1332,9 +1348,21 @@ fn commit_tree_onto(
     run_ok_with(git, repo, &["read-tree", base], &idx_opts)?;
     for (change, path) in changes.iter().zip(&paths) {
         match &change.content {
-            Some(bytes) => {
+            Some(FileContent::Bytes(bytes)) => {
                 let sha = hash_object_write(git, repo, &change.rel_path, bytes)?;
                 let cacheinfo = format!("100644,{},{}", sha, path);
+                run_ok_with(
+                    git,
+                    repo,
+                    &["update-index", "--add", "--cacheinfo", cacheinfo.as_str()],
+                    &idx_opts,
+                )?;
+            }
+            // An existing blob rides through untouched — no clean filters on
+            // bytes that are already clean, and the source mode rides with
+            // it: `100755`/`120000` entries stay executable/symlink (T-000257).
+            Some(FileContent::Blob { sha, mode }) => {
+                let cacheinfo = format!("{},{},{}", mode, sha, path);
                 run_ok_with(
                     git,
                     repo,
@@ -2151,7 +2179,7 @@ mod tests {
     fn change(path: &str, content: Option<&str>) -> FileChange {
         FileChange {
             rel_path: PathBuf::from(path),
-            content: content.map(|c| c.as_bytes().to_vec()),
+            content: content.map(|c| FileContent::Bytes(c.as_bytes().to_vec())),
         }
     }
 

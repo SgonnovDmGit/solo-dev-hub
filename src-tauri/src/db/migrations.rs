@@ -87,6 +87,11 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
     (34, "contributor_mode", mig_v34_contributor_mode),
     (35, "share_specs", mig_v35_share_specs),
     (36, "rule_proposals", mig_v36_rule_proposals),
+    (
+        37,
+        "peer_channel_deliveries",
+        mig_v37_peer_channel_deliveries,
+    ),
 ];
 
 impl AppDb {
@@ -1201,6 +1206,33 @@ fn mig_v36_rule_proposals(conn: &Connection) -> SqlResult<()> {
     )
 }
 
+fn mig_v37_peer_channel_deliveries(conn: &Connection) -> SqlResult<()> {
+    // T-000257 (v1.24.5): the outbox→inbox mirror's prune may only remove a
+    // file THIS install delivered. "Absent from my local outbox" is not proof
+    // the author retracted it: on a machine holding both checkouts the inbox
+    // copy can equally be another install's delivery that arrived through
+    // git, and pruning it published a phantom retraction (the REQ-body
+    // ping-pong of November). One row per delivered file, keyed by
+    // (src repo, dst repo, lane-relative path): installation-local
+    // provenance — never synced — immune to a peer-folder rename because the
+    // key carries repo ids and a path under the lane root, never the peer's
+    // name. `blob_sha` is the sha256 of the delivered bytes; a drifted inbox
+    // file no longer matches its row and is left for its real owner.
+    conn.execute_batch(
+        "CREATE TABLE peer_channel_deliveries (
+             src_repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             dst_repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+             rel_path TEXT NOT NULL,
+             blob_sha TEXT NOT NULL,
+             delivered_at TEXT NOT NULL,
+             PRIMARY KEY (src_repo_id, dst_repo_id, rel_path)
+         );
+         CREATE INDEX idx_peer_channel_deliveries_pair
+             ON peer_channel_deliveries(src_repo_id, dst_repo_id);
+         PRAGMA user_version = 37;",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1550,7 +1582,7 @@ mod tests {
             let version: i32 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 36);
+            assert_eq!(version, 37);
         }
 
         // Upgrade path: a v34-shaped DB keeps its rows and they default to 1.
@@ -1965,11 +1997,11 @@ mod tests {
             .unwrap_or(false);
         assert!(!manifest_exists, "deploy_manifests must be dropped in v20");
 
-        // user_version bumped (v20 migration ran; v21..v35 also applied on fresh DB)
+        // user_version bumped (v20 migration ran; v21..v37 also applied on fresh DB)
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 36);
+        assert_eq!(version, 37);
 
         drop(conn);
         let _ = repo;
@@ -2036,7 +2068,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 36);
+        assert_eq!(version, 37);
     }
 
     #[test]
