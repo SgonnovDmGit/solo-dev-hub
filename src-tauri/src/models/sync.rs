@@ -81,12 +81,20 @@ pub enum SyncIssueCode {
     /// F-000044: the remote refused the push (protected branch). subject = repo,
     /// detail = the remote's message.
     SharedPushRejected,
+    /// T-000260: the remote tip restores shared-file content the shared
+    /// timeline already superseded; merging is refused, not offered.
+    /// subject = repo, target = branch, detail = the refused paths.
+    SharedRemoteFileStale,
     /// F-000044: a shared branch diverged from its remote; merge by hand. subject = repo.
     SharedNeedsManualMerge,
     /// F-000044: this install has no usable branch of its own in a shared repo. subject = repo.
     SharedNoOwnBranch,
     /// F-000044: the join request waits for the owner's approval. subject = repo.
     SharedPendingApproval,
+    /// T-000262: a merge into the checked-out branch waits on dirty shared
+    /// paths an install that publishes nothing cannot resolve. subject = repo,
+    /// target = branch.
+    SharedMergeDeferred,
     /// F-000044: the GitHub login of this install is unknown. subject = repo.
     SharedNoLogin,
     /// F-000045: the picked clone target cannot be used (a file, an unreadable
@@ -555,9 +563,11 @@ mod tests {
             SharedFetchFailed,
             SharedPushFailed,
             SharedPushRejected,
+            SharedRemoteFileStale,
             SharedNeedsManualMerge,
             SharedNoOwnBranch,
             SharedPendingApproval,
+            SharedMergeDeferred,
             SharedNoLogin,
             CloneTargetInvalid,
             CloneFailed,
@@ -588,9 +598,11 @@ mod tests {
                 | SharedFetchFailed
                 | SharedPushFailed
                 | SharedPushRejected
+                | SharedRemoteFileStale
                 | SharedNeedsManualMerge
                 | SharedNoOwnBranch
                 | SharedPendingApproval
+                | SharedMergeDeferred
                 | SharedNoLogin
                 | CloneTargetInvalid
                 | CloneFailed

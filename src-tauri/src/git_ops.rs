@@ -539,60 +539,6 @@ pub fn path_in_history(git: &GitBinary, local_path: &Path, rel_path: &str) -> Re
 /// branch. Merges are skipped: a merge carries a file forward but never
 /// authors its bytes — the caller's ancestry judgement needs the authoring
 /// commit.
-pub fn last_commit_touching(
-    git: &GitBinary,
-    local_path: &Path,
-    rev: &str,
-    rel_path: &str,
-) -> Result<Option<String>, String> {
-    let out = spawn_cmd(&git.0)
-        .args([
-            "log",
-            rev,
-            "--no-merges",
-            "--format=%H",
-            "-1",
-            "--",
-            rel_path,
-        ])
-        .current_dir(local_path)
-        .output()
-        .map_err(|e| format!("git log failed to start: {}", e))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git log exit {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(if h.is_empty() { None } else { Some(h) })
-}
-
-/// `git merge-base --is-ancestor A B` — is `ancestor` reachable from
-/// `descendant`? Exit 1 is a plain false; anything else is an error.
-pub fn is_ancestor(
-    git: &GitBinary,
-    local_path: &Path,
-    ancestor: &str,
-    descendant: &str,
-) -> Result<bool, String> {
-    let out = spawn_cmd(&git.0)
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .current_dir(local_path)
-        .output()
-        .map_err(|e| format!("git merge-base failed to start: {}", e))?;
-    match out.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(format!(
-            "git merge-base exit {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        )),
-    }
-}
-
 /// Is `path` (a file or a dir prefix) still present in the git INDEX? An entry
 /// surviving in the index while its worktree file is gone is a pending
 /// deletion a scoped `git add -A` can stage — and the pathspec is then

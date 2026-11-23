@@ -104,6 +104,14 @@ export function parseRejectedDetail(detail: string | null | undefined): { branch
   return { branch: v.branch, message: typeof v.message === 'string' ? v.message : '' };
 }
 
+/** `shared_status_detail` of `remote_file_stale` (T-000260): `{"branch":"dev","paths":["docs/todo.md"]}`. */
+export function parseStaleDetail(detail: string | null | undefined): { branch: string; paths: string[] } | null {
+  const v = parseObject(detail);
+  if (!v || typeof v.branch !== 'string' || v.branch === '') return null;
+  const paths = Array.isArray(v.paths) ? v.paths.filter((p): p is string => typeof p === 'string') : [];
+  return { branch: v.branch, paths };
+}
+
 function parseObject(detail: string | null | undefined): Record<string, unknown> | null {
   if (!detail) return null;
   try {
@@ -169,6 +177,16 @@ export function describeSharedStatus(
       return r
         ? line(code, 'error', '✕', 'shared.status.pushRejected', [r.branch], null)
         : line(code, 'error', '✕', 'shared.status.pushRejectedUnknown', [], null);
+    }
+    case 'remote_file_stale': {
+      // T-000260: the remote tip restores content the shared timeline
+      // superseded — refused, and deliberately NO Merge action: merging is
+      // exactly what would install the stale bytes. A publishing install's
+      // sync repairs the remote tip; a merge-only install waits for it.
+      const s = parseStaleDetail(detail);
+      return s
+        ? line(code, 'error', '✕', 'shared.status.remoteFileStale', [s.branch, s.paths.join(', ')], null)
+        : line(code, 'error', '✕', 'shared.status.remoteFileStaleUnknown', [], null);
     }
     case 'fetch_failed':
       return line(code, 'warn', '⚠', 'shared.status.fetchFailed', [], null);

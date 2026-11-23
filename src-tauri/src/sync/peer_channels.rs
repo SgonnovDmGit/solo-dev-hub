@@ -41,7 +41,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::db::AppDb;
-use crate::git_ops::{self, GitBinary};
+use crate::git_ops::{self, spawn_cmd, GitBinary};
 use crate::models::{lookup, Repository, SyncIssue, SyncIssueCode as Code};
 use crate::sync;
 use crate::sync::shared_structure as ss;
@@ -681,12 +681,16 @@ fn copy_acks_back(
 }
 
 /// The valid marker keys inside `b_in`'s `<body>.ack/` for a SHARED repo,
-/// filtered by git ancestry: a marker counts only when the commit that
-/// introduced it descends from the commit that set the body's current bytes.
-/// A late merge can carry a marker authored against an older revision next to
-/// the new body — the spec rules that ambiguity is a conflict, not an ack, so
-/// such a marker is reported and never counted. An uncommitted marker is the
-/// one case proven fresh: it was authored against this very worktree body.
+/// filtered by git provenance: a marker counts only when the commit that
+/// AUTHORED it saw the body's current bytes. Commit ancestry cannot answer
+/// that — a marker travels between branches through sibling plumbing
+/// commits that never descend from the body's own commit — so the
+/// authoring add is identified by its `SDH-Participant:` trailer (the key
+/// is the reader's login) and judged by the body in that commit's own
+/// tree. A marker authored against an older revision is a conflict, not
+/// an ack: reported, never counted. An uncommitted marker is the one case
+/// proven fresh by construction: it was authored against this very
+/// worktree body.
 fn current_ack_keys(
     git: &GitBinary,
     root: &Path,
@@ -703,7 +707,7 @@ fn current_ack_keys(
     let body_rel = fwd_rel(root, &b_in.join(body));
     // The body's current revision is judged on the checked-out history: an
     // --all walk can pick a sibling ref's older commit when timestamps tie.
-    let body_rev = git_ops::last_commit_touching(git, root, "HEAD", &body_rel);
+    let body_rev = crate::git_sync::blob_sha_at(git, root, "HEAD", &body_rel);
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
@@ -719,22 +723,23 @@ fn current_ack_keys(
             continue;
         }
         let marker_rel = fwd_rel(root, &path);
-        let stale = match (
-            &body_rev,
-            git_ops::last_commit_touching(git, root, "--all", &marker_rel),
-        ) {
-            (Ok(Some(b)), Ok(Some(m))) => match git_ops::is_ancestor(git, root, b, &m) {
-                Ok(anc) => !anc,
+        // An uncommitted marker was written against the body in this very
+        // worktree — proven fresh by construction, nothing to judge.
+        let committed = matches!(
+            crate::git_sync::blob_sha_at(git, root, "HEAD", &marker_rel),
+            Ok(Some(_))
+        );
+        let stale = committed
+            && match marker_author_saw(git, root, &marker_rel, &body_rel, &body_rev, &name) {
+                // One of the marker key's own add-commits saw today's body —
+                // it was authored against this revision.
+                Ok(true) => false,
+                Ok(false) => true,
                 Err(e) => {
                     out.errors.push(peer_issue(&marker_rel, e));
                     true
                 }
-            },
-            // Either side has no commit yet — the marker cannot be proven
-            // stale against this body, and an uncommitted marker was written
-            // against the body sitting in this worktree right now.
-            _ => false,
-        };
+            };
         if stale {
             out.errors.push(
                 SyncIssue::new(Code::VersionConflict, marker_rel).detail(
@@ -746,6 +751,63 @@ fn current_ack_keys(
         keys.insert(name.to_ascii_lowercase());
     }
     keys
+}
+
+/// Did a commit signed by the marker's own participant add the marker
+/// beside the body's CURRENT bytes? `git log --all --diff-filter=A`
+/// enumerates every add of the path; transport adds made by other installs
+/// are filtered out by the `SDH-Participant:` trailer (the key is the
+/// reader's login), and each authoring add is judged by the body blob in
+/// ITS tree — the revision the reader actually saw. This survives every
+/// delivery shape: a plumbing sibling carries no ancestry relation to the
+/// body's commit, but its author's own commit records what the reader
+/// read. A commit without the trailer cannot be attributed and never
+/// proves freshness.
+fn marker_author_saw(
+    git: &GitBinary,
+    root: &Path,
+    marker_rel: &str,
+    body_rel: &str,
+    body_rev: &Result<Option<String>, String>,
+    key: &str,
+) -> Result<bool, String> {
+    let out = spawn_cmd(&git.0)
+        .args([
+            "log",
+            "--all",
+            "--diff-filter=A",
+            "--format=%H%x1f%(trailers:key=SDH-Participant,valueonly)",
+            "--",
+            marker_rel,
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("git log failed to start: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git log exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let body = match body_rev {
+        Ok(Some(b)) => b.clone(),
+        Ok(None) => return Ok(false),
+        Err(e) => return Err(e.clone()),
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((sha, participant)) = line.split_once('\x1f') else {
+            continue;
+        };
+        if !participant.trim().eq_ignore_ascii_case(key) {
+            continue;
+        }
+        if crate::git_sync::blob_sha_at(git, root, sha, body_rel)?.as_deref() == Some(body.as_str())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Forward-slash repo-relative path for git calls (`git log -- <path>`).
@@ -763,7 +825,7 @@ fn fwd_rel(root: &Path, path: &Path) -> String {
 /// reader set of the RECIPIENT repo (logins lowercased); `None`/empty means
 /// the roster is unknown and cleanup must not fire. `shared` carries the
 /// recipient repo's git when it is shared — markers there are validated by
-/// commit ancestry, not just filename.
+/// the authoring commit's provenance, not just filename.
 fn cleanup_fully_acked(
     a_out: &Path,
     b_in: &Path,
@@ -1028,9 +1090,10 @@ pub fn sync_peer_pair_ctx(
     //    inbox without touching the receipts.
     let b_readers = expected_ack_keys(db, b, b_base);
     let a_readers = expected_ack_keys(db, a, a_base);
-    // A shared repo's markers are judged by commit ancestry: only the install
-    // holding both checkouts evaluates them, so the recipient's git is read
-    // on this machine.
+    // A shared repo's markers are judged by git provenance (authoring
+    // commit's tree vs the body's current blob): only the install holding
+    // both checkouts evaluates them, so the recipient's git is read on this
+    // machine.
     let git = git_ops::cached_git();
     let b_shared = (is_shared_repo(db, b))
         .then(|| git.as_ref().map(|g| (g, b_base)))
@@ -1789,11 +1852,22 @@ mod tests {
         run_git(root, &["commit", "-q", "-m", "v1"]);
 
         // A marker authored against v1 on a side branch — the late-merge case.
+        // The participant trailer is how a real sync commit signs its author.
         run_git(root, &["switch", "-q", "-c", "stale"]);
         fs::create_dir_all(b_in.join("ANNOUNCE-001.md.ack")).unwrap();
         fs::write(b_in.join("ANNOUNCE-001.md.ack/bob"), "").unwrap();
         run_git(root, &["add", "-A"]);
-        run_git(root, &["commit", "-q", "-m", "bob acked v1"]);
+        run_git(
+            root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "bob acked v1",
+                "-m",
+                "SDH-Participant: bob",
+            ],
+        );
 
         // v2 lands on dev; the stale marker merges in afterwards.
         run_git(root, &["switch", "-q", "dev"]);
@@ -1805,7 +1879,17 @@ mod tests {
         // A fresh marker committed on top of v2 — must count.
         fs::write(b_in.join("ANNOUNCE-001.md.ack/carol"), "").unwrap();
         run_git(root, &["add", "-A"]);
-        run_git(root, &["commit", "-q", "-m", "carol acked v2"]);
+        run_git(
+            root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "carol acked v2",
+                "-m",
+                "SDH-Participant: carol",
+            ],
+        );
 
         let mut out = PeerChannelOutcome::default();
         let keys = current_ack_keys(&git, root, &b_in, "ANNOUNCE-001.md", None, &mut out);
@@ -1826,6 +1910,62 @@ mod tests {
         let mut out = PeerChannelOutcome::default();
         let keys = current_ack_keys(&git, root, &b_in, "ANNOUNCE-001.md", None, &mut out);
         assert!(keys.contains("dave"), "uncommitted marker is current");
+    }
+
+    /// T-000260: the same guard through the shared transport — a marker rides
+    /// a sibling commit (plumbing) whose tree carries the current body but
+    /// which can never descend from the body's own commit. Ancestry calls it
+    /// stale; the tree says the author saw today's bytes — that wins.
+    #[test]
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    fn a_marker_delivered_by_a_sibling_commit_counts() {
+        use crate::git_ops::check_git_available;
+        let git = check_git_available().expect("git available");
+
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        run_git(root, &["init", "-q", "-b", "dev"]);
+        run_git(root, &["config", "user.email", "t@e.c"]);
+        run_git(root, &["config", "user.name", "T"]);
+
+        let b_in = root.join("docs/InOutBox/inbox/alpha");
+        fs::create_dir_all(&b_in).unwrap();
+        fs::write(b_in.join("ANNOUNCE-001.md"), "v1").unwrap();
+        run_git(root, &["add", "-A"]);
+        run_git(root, &["commit", "-q", "-m", "v1"]);
+
+        // A side branch authored against v1's BYTES — as a plumbed delivery
+        // would be: the tree holds the current body while the commit can
+        // never descend from the body's own revision.
+        run_git(root, &["switch", "-q", "-c", "side"]);
+        fs::write(b_in.join("ANNOUNCE-001.md"), "v2").unwrap();
+        fs::create_dir_all(b_in.join("ANNOUNCE-001.md.ack")).unwrap();
+        fs::write(b_in.join("ANNOUNCE-001.md.ack/erin"), "").unwrap();
+        run_git(root, &["add", "-A"]);
+        run_git(
+            root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "erin acked v2 bytes",
+                "-m",
+                "SDH-Participant: erin",
+            ],
+        );
+        run_git(root, &["switch", "-q", "dev"]);
+        fs::write(b_in.join("ANNOUNCE-001.md"), "v2").unwrap();
+        run_git(root, &["add", "-A"]);
+        run_git(root, &["commit", "-q", "-m", "v2"]);
+        run_git(root, &["merge", "-q", "--no-edit", "side"]);
+
+        let mut out = PeerChannelOutcome::default();
+        let keys = current_ack_keys(&git, root, &b_in, "ANNOUNCE-001.md", None, &mut out);
+        assert!(
+            keys.contains("erin"),
+            "a marker whose delivering tree carried the current body counts: {:?}",
+            keys
+        );
     }
 
     // ----- T-000257: the delivery ledger ------------------------------------

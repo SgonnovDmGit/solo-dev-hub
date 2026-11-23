@@ -194,6 +194,25 @@ describe('describeSharedStatus', () => {
     );
   });
 
+  it('refuses the remote file without offering Merge (T-000260)', () => {
+    const l = describeSharedStatus(
+      state({
+        shared_status: 'remote_file_stale',
+        shared_status_detail: '{"branch":"dev","paths":["docs/todo.md","docs/done.md"]}',
+      }),
+    )!;
+    expect(l.textKey).toBe('shared.status.remoteFileStale');
+    expect(l.params).toEqual(['dev', 'docs/todo.md, docs/done.md']);
+    // The Merge button is exactly the bypass this status exists to close.
+    expect(l.action).toBeNull();
+    expect(l.severity).toBe('error');
+    // A missing/foreign detail shape falls back to the generic line — still
+    // with no action.
+    const u = describeSharedStatus(state({ shared_status: 'remote_file_stale' }))!;
+    expect(u.textKey).toBe('shared.status.remoteFileStaleUnknown');
+    expect(u.action).toBeNull();
+  });
+
   it('maps network, branch, approval and login statuses', () => {
     expect(describeSharedStatus(state({ shared_status: 'fetch_failed' }))!.textKey).toBe('shared.status.fetchFailed');
     expect(describeSharedStatus(state({ shared_status: 'push_failed' }))!.textKey).toBe('shared.status.pushFailed');
@@ -255,7 +274,7 @@ describe('sidebarBadge', () => {
   });
 
   it('shows ⚠ for a problem status', () => {
-    for (const status of ['needs_manual_merge', 'push_rejected', 'fetch_failed', 'push_failed', 'no_own_branch', 'shared_untrusted', 'shared_no_login']) {
+    for (const status of ['needs_manual_merge', 'push_rejected', 'remote_file_stale', 'fetch_failed', 'push_failed', 'no_own_branch', 'shared_untrusted', 'shared_no_login']) {
       expect(sidebarBadge(state({ shared_mode: true, shared_status: status }))).toEqual({ glyph: '⚠', problem: true });
     }
   });
