@@ -125,10 +125,10 @@ npm run tauri dev          # local dev with hot reload
 ### Tests
 
 ```bash
-cd src-tauri && cargo test --lib   # fast default: ~825 Rust tests, ~45 s
+cd src-tauri && cargo test --lib   # fast default: ~982 Rust tests, ~6 min
 cd src-tauri && cargo test --lib -- --include-ignored --skip db::migrations::tests::export_fresh_schema_db
-                                    # full set (~952 tests), what CI runs (~1 min on Linux, ~40 min on Windows: git spawns)
-npm test                            # vitest frontend (~205 tests)
+                                    # full set (~1271 tests), what CI runs (~1 min on Linux, ~40 min on Windows: git spawns)
+npm test                            # vitest frontend (~224 tests)
 npm run check                       # svelte-check
 ```
 
@@ -155,7 +155,8 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layer map, the l
 
 **Shipped**
 
-- **v1.24.5** *(current — 2026-11-19)* — a diverged shared branch no longer deletes work its tip never held: the detached republish is three-way now (merge-base decides), a skill under an open proposal is held until the owner's decision, and the peer mirror only retracts deliveries this install actually made. A corrupt `.git/index` names its own repair.
+- **v1.24.6** *(current — 2026-11-23)* — remote truth reaches a pending or contributor install's checked-out branch, so a join approval arrives by sync with no manual pull; the owner's skill-approval receipts reach contributors; a stale remote can no longer roll back a versioned task header (`remote_file_stale`); a re-dropped `.ack` marker survives the trip to the owner and is judged by what its author saw, not commit ancestry.
+- **v1.24.5** — a diverged shared branch no longer deletes work its tip never held: the detached republish is three-way now (merge-base decides), a skill under an open proposal is held until the owner's decision, and the peer mirror only retracts deliveries this install actually made. A corrupt `.git/index` names its own repair.
 - **v1.24.4** — a task row deleted on one side stays deleted on oscillating histories (the merge-base decides), and a current branch holding your own unpushed commits no longer carries them to origin: the sync commit rides the remote tip instead.
 - **v1.24.3** — an approved join request commits and pushes itself to the dev branch instead of waiting for the owner's next sync.
 - **v1.24.2** — the `tool` role pairs horizontally and `landing` counts as `client` for peer links; a contributor's `.approved` marker actually becomes a rule proposal the owner sees.
