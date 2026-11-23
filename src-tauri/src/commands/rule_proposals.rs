@@ -60,22 +60,6 @@ fn dev_branch_for(db: &AppDb, repo_id: i64, root: &Path) -> Option<String> {
     ss::read_shared_import(db, repo_id).pinned_dev_branch
 }
 
-/// The proposal file's `(path, blob sha)` at `rev`, if present.
-fn proposal_at(
-    git: &GitBinary,
-    root: &Path,
-    rev: &str,
-    rule: &str,
-    login: &str,
-) -> Result<Option<(String, String)>, String> {
-    let path = format!(
-        "{}/{}",
-        rp::RULE_PROPOSALS_REL_DIR,
-        rp::proposal_file_name(rule, login)
-    );
-    git_sync::blob_sha_at(git, root, rev, &path).map(|s| s.map(|sha| (path, sha)))
-}
-
 // ---------------------------------------------------------------------------
 // The sweeps (startup + list): resume unfinished local work, retry
 // publications, GC terminal proposal rows.
@@ -285,46 +269,26 @@ pub(crate) fn local_rev(git: &GitBinary, root: &Path, p: &RuleProposalFile) -> O
     .ok()
 }
 
-/// Both catalogs at the local dev tip and the last-seen origin snapshot —
-/// best-effort (a missing dev branch reads as two empty catalogs).
+/// Both dev refs' catalogs plus their union — best-effort (a missing dev
+/// branch reads as empty maps). T-000261/D9: the union view is what every
+/// reader and the decision machine resolve against; the per-ref maps stay
+/// for the `on_dev`/`on_origin` markers and origin-only confirmations.
 pub(crate) fn catalogs(
     git: Option<&GitBinary>,
     root: &Path,
     dev_branch: &str,
     db: &AppDb,
-) -> (
-    std::collections::BTreeMap<String, (String, RuleProposalFile)>,
-    std::collections::BTreeMap<String, (String, RuleDecisionFile)>,
-    std::collections::BTreeMap<String, (String, RuleProposalFile)>,
-) {
-    let empty = (
-        std::collections::BTreeMap::new(),
-        std::collections::BTreeMap::new(),
-        std::collections::BTreeMap::new(),
-    );
-    let Some(git) = git else { return empty };
-    let local_ref = format!("refs/heads/{}", dev_branch);
-    let Some(tip) = git_sync::rev_parse(git, root, &local_ref).ok().flatten() else {
-        return empty;
+) -> crate::sync::shared::ProposalCatalogs {
+    let Some(git) = git else {
+        return crate::sync::shared::ProposalCatalogs::default();
     };
     let known: std::collections::HashSet<String> = crate::sync::skills::list_skill_templates(db)
         .map(|v| v.into_iter().map(|(name, _)| name).collect())
         .unwrap_or_default();
     let known_fn = |r: &str| known.contains(r);
     let mut issues = Vec::new();
-    let (dev_p, dev_d) =
-        crate::sync::shared::read_proposal_catalogs(git, root, &tip, &known_fn, &mut issues);
-    let origin_ref = format!("refs/remotes/origin/{}", dev_branch);
-    let (origin_p, _) = if matches!(git_sync::rev_parse(git, root, &origin_ref), Ok(Some(_))) {
-        let mut skip = Vec::new();
-        crate::sync::shared::read_proposal_catalogs(git, root, &origin_ref, &known_fn, &mut skip)
-    } else {
-        (
-            std::collections::BTreeMap::new(),
-            std::collections::BTreeMap::new(),
-        )
-    };
-    (dev_p, dev_d, origin_p)
+    // The last-seen origin ref is read as-is — commands do not fetch.
+    crate::sync::shared::proposal_catalogs(git, root, dev_branch, &known_fn, &mut issues, true)
 }
 
 /// Contributor: own proposal rows joined with what the dev tip and the
@@ -337,7 +301,7 @@ pub(crate) fn list_contributor_proposals(
 ) -> Result<Vec<RuleProposalView>, String> {
     let root = repo_root(repo).ok();
     let dev_branch = root.as_deref().and_then(|r| dev_branch_for(db, repo.id, r));
-    let (dev_p, _dev_d, origin_p) = match (root.as_deref(), dev_branch.as_deref()) {
+    let cats = match (root.as_deref(), dev_branch.as_deref()) {
         (Some(r), Some(b)) => catalogs(git, r, b, db),
         _ => Default::default(),
     };
@@ -356,12 +320,18 @@ pub(crate) fn list_contributor_proposals(
             (Some(g), Some(r)) => local_rev(g, r, &wire),
             _ => None,
         };
-        let on_dev = rev
-            .as_deref()
-            .is_some_and(|sha| dev_p.get(&p.file_name).is_some_and(|(s, _)| s == sha));
-        let on_origin = rev
-            .as_deref()
-            .is_some_and(|sha| origin_p.get(&p.file_name).is_some_and(|(s, _)| s == sha));
+        let on_dev = rev.as_deref().is_some_and(|sha| {
+            cats.local
+                .0
+                .get(&p.file_name)
+                .is_some_and(|(s, _)| s == sha)
+        });
+        let on_origin = rev.as_deref().is_some_and(|sha| {
+            cats.origin
+                .0
+                .get(&p.file_name)
+                .is_some_and(|(s, _)| s == sha)
+        });
         out.push(RuleProposalView {
             file_name: p.file_name.clone(),
             rule: p.rule.clone(),
@@ -385,9 +355,11 @@ pub(crate) fn list_contributor_proposals(
     Ok(out)
 }
 
-/// Owner: the proposals the local dev tip carries — unpushed ones
-/// included — each resolved against the dev receipts by exact blob sha and
-/// joined with this install's acceptance row (the `queued` marker).
+/// Owner: the proposals the dev union carries (T-000261) — an origin-only
+/// proposal is listed too, each resolved against the union receipts via
+/// the effective version's alias set and joined with this install's
+/// acceptance row (the `queued` marker). `rev` is the deterministic CAS
+/// alias the decision command accepts.
 pub(crate) fn list_owner_proposals(
     db: &AppDb,
     git: Option<&GitBinary>,
@@ -396,17 +368,18 @@ pub(crate) fn list_owner_proposals(
     let root = repo_root(repo)?;
     let dev_branch = dev_branch_for(db, repo.id, &root)
         .ok_or_else(|| "the shared dev branch is not known".to_string())?;
-    let (dev_p, dev_d, _origin_p) = catalogs(git, &root, &dev_branch, db);
+    let cats = catalogs(git, &root, &dev_branch, db);
     let acceptances = db.list_rule_acceptances(repo.id).unwrap_or_default();
     let mut out = Vec::new();
-    for (file_name, (sha, p)) in &dev_p {
-        let receipt = dev_d
-            .values()
-            .find(|(_, d)| ss::logins_equal(&d.login, &p.login) && d.decided_rev == *sha);
+    for (file_name, u) in &cats.proposals {
+        let p = &u.proposal;
+        let receipt = cats.decisions.entries.values().find(|(_, d)| {
+            ss::logins_equal(&d.login, &p.login) && u.effective_shas.contains(&d.decided_rev)
+        });
         let acc = acceptances.iter().find(|a| {
             a.rule == p.rule
                 && ss::logins_equal(&a.proposer_login, &p.login)
-                && a.decided_rev == *sha
+                && u.effective_shas.contains(&a.decided_rev)
         });
         out.push(RuleProposalView {
             file_name: file_name.clone(),
@@ -416,9 +389,11 @@ pub(crate) fn list_owner_proposals(
             status: p.status.clone(),
             text: p.text.clone(),
             at: p.at.clone(),
-            rev: Some(sha.clone()),
-            on_dev: true,
-            on_origin: false,
+            // The CAS alias is deterministic — any effective sha names the
+            // same canonical version.
+            rev: u.effective_shas.iter().next().cloned(),
+            on_dev: cats.local.0.contains_key(file_name),
+            on_origin: cats.origin.0.contains_key(file_name),
             local_state: None,
             resolved_action: receipt.map(|(_, d)| d.action.clone()),
             resolved_by: receipt.map(|(_, d)| d.decided_by.clone()),
@@ -497,15 +472,15 @@ pub fn withdraw_rule_proposal(
 // The decision machine (owner): accept / reject, strict steps per spec R4.
 // ---------------------------------------------------------------------------
 
-/// Step 0+1: find or prepare the acceptance row. Returns the row to resume
-/// from — an existing one continues from its own status, never re-runs the
-/// steps already done.
+/// Step 0+1: find or prepare the acceptance row — against the union
+/// catalog view (T-000261/D9): an origin-only proposal is decidable, and
+/// `expected_rev` is the CAS — accepted when it names ANY alias of the
+/// effective version, refused when it names only a stale one. Returns the
+/// row to resume from — an existing one continues from its own status,
+/// never re-runs the steps already done.
 pub(crate) fn prepare_acceptance(
     db: &AppDb,
-    git: &GitBinary,
-    root: &Path,
-    dev_rev: &str,
-    dev_tip: &str,
+    cats: &crate::sync::shared::ProposalCatalogs,
     repo_id: i64,
     rule: &str,
     proposer_login: &str,
@@ -524,15 +499,19 @@ pub(crate) fn prepare_acceptance(
         }
         return Ok(a);
     }
-    // New key — the receipt-path pre-check at the pinned dev tip.
+    let pname = rp::proposal_file_name(rule, proposer_login);
+    // New key — the receipt-path pre-check in the union (D8: a byte
+    // conflict fails closed, it is never resolved into a row).
     let rname = rp::decision_file_name(rule, proposer_login, expected_rev);
     let rpath = format!("{}/{}", rp::RULE_DECISIONS_REL_DIR, rname);
-    if let Some(sha) = git_sync::blob_sha_at(git, root, dev_rev, &rpath)? {
-        let bytes = git_sync::show_file_capped(git, root, dev_rev, &rpath, rp::MAX_ARTIFACT_BYTES)?
-            .ok_or_else(|| format!("{}: unreadable", rpath))?;
-        let d: RuleDecisionFile =
-            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {}", rpath, e))?;
-        let _ = sha;
+    if let Some(shas) = cats.decisions.conflicts.get(&rname) {
+        return Err(format!(
+            "{}: conflicting receipts across dev refs ({}) — never resolved",
+            rpath,
+            shas.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if let Some((_, d)) = cats.decisions.entries.get(&rname) {
         if d.action != action {
             return Err(format!(
                 "{}: an immutable receipt holds action '{}' — never overwritten",
@@ -548,7 +527,11 @@ pub(crate) fn prepare_acceptance(
             decided_rev: expected_rev.to_string(),
             action: action.to_string(),
             receipt_json: serde_json::to_string(&d).unwrap_or_default(),
-            proposal_text: read_proposal_text(git, root, dev_rev, rule, proposer_login)?,
+            proposal_text: cats
+                .proposals
+                .get(&pname)
+                .map(|u| u.proposal.text.clone())
+                .ok_or_else(|| format!("{}: proposal gone", rule))?,
             status: acceptance_status::DECIDED.to_string(),
             pub_state: acceptance_pub_state::PENDING.to_string(),
             base_canon_hash: String::new(),
@@ -560,15 +543,14 @@ pub(crate) fn prepare_acceptance(
         return Ok(a);
     }
     // Absent — snapshot the open version; a moved revision refuses.
-    let (path, sha) = proposal_at(git, root, dev_rev, rule, proposer_login)?
+    let u = cats
+        .proposals
+        .get(&pname)
         .ok_or_else(|| format!("{}: no open proposal on dev", rule))?;
-    if sha != expected_rev {
+    if !u.effective_shas.contains(expected_rev) {
         return Err(ERR_PROPOSAL_CHANGED.to_string());
     }
-    let bytes = git_sync::show_file_capped(git, root, dev_rev, &path, rp::MAX_ARTIFACT_BYTES)?
-        .ok_or_else(|| format!("{}: unreadable", path))?;
-    let p: RuleProposalFile =
-        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {}", path, e))?;
+    let p = &u.proposal;
     if p.status != proposal_status::OPEN {
         return Err(ERR_PROPOSAL_CHANGED.to_string());
     }
@@ -608,29 +590,16 @@ pub(crate) fn prepare_acceptance(
         updated_at: now,
     };
     db.insert_rule_acceptance(&a).map_err(|e| e.to_string())?;
-    let _ = dev_tip;
     Ok(a)
-}
-
-pub(crate) fn read_proposal_text(
-    git: &GitBinary,
-    root: &Path,
-    rev: &str,
-    rule: &str,
-    login: &str,
-) -> Result<String, String> {
-    let (path, _) = proposal_at(git, root, rev, rule, login)?
-        .ok_or_else(|| format!("{}: proposal gone", rule))?;
-    let bytes = git_sync::show_file_capped(git, root, rev, &path, rp::MAX_ARTIFACT_BYTES)?
-        .ok_or_else(|| format!("{}: unreadable", path))?;
-    let p: RuleProposalFile =
-        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {}", path, e))?;
-    Ok(p.text)
 }
 
 /// Step 2 — RECEIPT inside the repo's policy guard (the per-repo git
 /// critical section): identical → decided; conflicting → error, never
 /// overwritten; absent → revalidate the open revision, commit the receipt.
+/// T-000261/D9: the checks read the union (a receipt only origin knows is
+/// seen), and the write honours the ancestry gate — a stale or diverged
+/// local dev is never forked; a missing one is created at
+/// `origin + the receipt`.
 pub(crate) fn publish_receipt(
     db: &AppDb,
     git: &GitBinary,
@@ -641,38 +610,43 @@ pub(crate) fn publish_receipt(
 ) -> Result<RuleAcceptance, String> {
     let _guard = crate::sync::shared::specs_policy_guard(repo_id);
     let _hold = _guard.lock().unwrap();
-    let dev_rev = format!("refs/heads/{}", dev_branch);
+    let cats = catalogs(Some(git), root, dev_branch, db);
+    let pname = rp::proposal_file_name(&a.rule, &a.proposer_login);
     let rname = rp::decision_file_name(&a.rule, &a.proposer_login, &a.decided_rev);
     let rpath = format!("{}/{}", rp::RULE_DECISIONS_REL_DIR, rname);
-    match git_sync::blob_sha_at(git, root, &dev_rev, &rpath)? {
-        Some(sha) => {
-            let bytes =
-                git_sync::show_file_capped(git, root, &dev_rev, &rpath, rp::MAX_ARTIFACT_BYTES)?
-                    .ok_or_else(|| format!("{}: unreadable", rpath))?;
-            let text = String::from_utf8_lossy(&bytes).to_string();
-            if text.trim() == a.receipt_json.trim() {
-                // Identical already there — a crash between commit and the
-                // status write resumes here.
-                let mut a = a.clone();
-                set_status(db, &mut a, acceptance_status::DECIDED)?;
-                return Ok(a);
-            }
-            return Err(format!(
-                "{}: an immutable receipt holds other bytes ({}): never overwritten",
-                rpath, sha
-            ));
-        }
-        None => {}
+    if let Some(shas) = cats.decisions.conflicts.get(&rname) {
+        return Err(format!(
+            "{}: conflicting receipts across dev refs ({}) — never overwritten",
+            rpath,
+            shas.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
     }
-    // Absent — the open revision must still be what was decided on.
-    let (_, sha) = proposal_at(git, root, &dev_rev, &a.rule, &a.proposer_login)?
+    if let Some((sha, d)) = cats.decisions.entries.get(&rname) {
+        let text = serde_json::to_string(d).map_err(|e| e.to_string())?;
+        if text.trim() == a.receipt_json.trim() {
+            // Identical already there — a crash between commit and the
+            // status write resumes here.
+            let mut a = a.clone();
+            set_status(db, &mut a, acceptance_status::DECIDED)?;
+            return Ok(a);
+        }
+        return Err(format!(
+            "{}: an immutable receipt holds other bytes ({}): never overwritten",
+            rpath, sha
+        ));
+    }
+    // Absent — the open revision must still be what was decided on: the
+    // decided_rev names the effective version (any alias), not a stale one.
+    let u = cats
+        .proposals
+        .get(&pname)
         .ok_or_else(|| format!("{}: proposal gone", a.rule))?;
-    if sha != a.decided_rev {
+    if !u.effective_shas.contains(&a.decided_rev) {
         let mut a = a.clone();
         set_status(db, &mut a, acceptance_status::EXPIRED)?;
         return Ok(a);
     }
-    // Commit the receipt to dev.
+    // Commit the receipt to dev — under the D9 ancestry gate.
     let change = FileChange {
         rel_path: PathBuf::from(&rpath),
         content: Some(FileContent::Bytes(a.receipt_json.clone().into_bytes())),
@@ -682,41 +656,71 @@ pub(crate) fn publish_receipt(
         "Rule proposal decision written by Solo Dev Hub.\n\nSDH-Participant: {}",
         db.github_login().unwrap_or_default()
     );
-    if current_branch(git, root)
-        .ok()
-        .flatten()
-        .as_deref()
-        .is_some_and(|c| c.eq_ignore_ascii_case(dev_branch))
-    {
-        let full = root.join(&rpath);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    match crate::sync::shared::dev_write_tip(git, root, dev_branch)? {
+        crate::sync::shared::DevWriteTip::Blocked => {
+            return Err(format!(
+                "shared_blocked: local {} lacks the fetched origin tip — the receipt retries after the merge",
+                dev_branch
+            ));
         }
-        std::fs::write(&full, &a.receipt_json).map_err(|e| e.to_string())?;
-        commit_paths(
-            git,
-            root,
-            dev_branch,
-            &[PathBuf::from(&rpath)],
-            subject,
-            Some(&body),
-            crate::sync::autocommit::SDH_COMMIT_NAME,
-            crate::sync::autocommit::SDH_COMMIT_EMAIL,
-        )
-        .map_err(|e| e.to_string())?;
-    } else {
-        git_sync::refuse_checked_out(git, root, dev_branch, "the receipt retries later")
-            .map_err(|e| format!("shared_blocked: {}", e))?;
-        git_sync::commit_files_to_branch(
-            git,
-            root,
-            dev_branch,
-            &[change],
-            &format!("{}\n\n{}", subject, body),
-            crate::sync::autocommit::SDH_COMMIT_NAME,
-            crate::sync::autocommit::SDH_COMMIT_EMAIL,
-        )
-        .map_err(|e| e.to_string())?;
+        crate::sync::shared::DevWriteTip::CreateAtOrigin(origin_tip) => {
+            git_sync::refuse_checked_out(git, root, dev_branch, "the receipt retries later")
+                .map_err(|e| format!("shared_blocked: {}", e))?;
+            if !crate::sync::shared::create_dev_at_origin(
+                git,
+                root,
+                dev_branch,
+                &origin_tip,
+                &[change],
+                &format!("{}\n\n{}", subject, body),
+                crate::sync::autocommit::SDH_COMMIT_NAME,
+                crate::sync::autocommit::SDH_COMMIT_EMAIL,
+            )
+            .map_err(|e| e.to_string())?
+            {
+                // The ref appeared concurrently or the tree was equal —
+                // either way the receipt did not land; retry next pass.
+                return Err("shared_blocked: dev moved; the receipt retries later".to_string());
+            }
+        }
+        crate::sync::shared::DevWriteTip::Local => {
+            if current_branch(git, root)
+                .ok()
+                .flatten()
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(dev_branch))
+            {
+                let full = root.join(&rpath);
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&full, &a.receipt_json).map_err(|e| e.to_string())?;
+                commit_paths(
+                    git,
+                    root,
+                    dev_branch,
+                    &[PathBuf::from(&rpath)],
+                    subject,
+                    Some(&body),
+                    crate::sync::autocommit::SDH_COMMIT_NAME,
+                    crate::sync::autocommit::SDH_COMMIT_EMAIL,
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                git_sync::refuse_checked_out(git, root, dev_branch, "the receipt retries later")
+                    .map_err(|e| format!("shared_blocked: {}", e))?;
+                git_sync::commit_files_to_branch(
+                    git,
+                    root,
+                    dev_branch,
+                    &[change],
+                    &format!("{}\n\n{}", subject, body),
+                    crate::sync::autocommit::SDH_COMMIT_NAME,
+                    crate::sync::autocommit::SDH_COMMIT_EMAIL,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
     }
     let mut a = a.clone();
     set_status(db, &mut a, acceptance_status::DECIDED)?;
@@ -844,16 +848,15 @@ pub(crate) fn decide(
     let git = git()?;
     let dev_branch = dev_branch_for(db, repo_id, &root)
         .ok_or_else(|| "the shared dev branch is not known".to_string())?;
-    let dev_rev = format!("refs/heads/{}", dev_branch);
-    let tip = git_sync::rev_parse(&git, &root, &dev_rev)?
-        .ok_or_else(|| format!("{}: no local dev branch", dev_branch))?;
-
+    // T-000261/D9: the union over BOTH dev refs — a proposal that only the
+    // fetched origin tip carries is decidable without a local `dev` ref.
+    let cats = catalogs(Some(&git), &root, &dev_branch, db);
+    if !cats.any {
+        return Err(format!("{}: no dev catalog", dev_branch));
+    }
     let a = prepare_acceptance(
         db,
-        &git,
-        &root,
-        &dev_rev,
-        &tip,
+        &cats,
         repo_id,
         rule,
         proposer_login,

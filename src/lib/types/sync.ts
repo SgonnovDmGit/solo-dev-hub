@@ -29,9 +29,11 @@ export const SYNC_ISSUE_CODES = [
   'shared_fetch_failed',
   'shared_push_failed',
   'shared_push_rejected',
+  'shared_remote_file_stale',
   'shared_needs_manual_merge',
   'shared_no_own_branch',
   'shared_pending_approval',
+  'shared_merge_deferred',
   'shared_no_login',
   'clone_target_invalid',
   'clone_failed',
@@ -194,6 +196,7 @@ export type SharedStatusCode =
   | 'fetch_failed'
   | 'push_failed'
   | 'push_rejected'
+  | 'remote_file_stale'
   | 'needs_manual_merge'
   | 'no_own_branch'
   | 'pending_approval'

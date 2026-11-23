@@ -57,10 +57,17 @@ const ZERO: &str = "0000000000000000000000000000000000000000";
 #[test]
 fn merge_driver_shim() {
     let args: Vec<String> = std::env::args().collect();
-    let Some(pos) = args.iter().position(|a| a == "sdh-shim") else {
-        return;
+    // T-000260: `sdh-shim-flat` marks an inner recursive merge — the flat
+    // driver `merge.sdhflat` git invokes for it (arm_driver points it here
+    // too). Anything else shaped like an ordinary `--merge-driver` call.
+    let (pos, flag) = match args.iter().position(|a| a == "sdh-shim-flat") {
+        Some(p) => (p, "--merge-driver-flat"),
+        None => match args.iter().position(|a| a == "sdh-shim") {
+            Some(p) => (p, "--merge-driver"),
+            None => return,
+        },
     };
-    let mut call = vec!["app".to_string(), "--merge-driver".to_string()];
+    let mut call = vec!["app".to_string(), flag.to_string()];
     call.extend(args[pos + 1..].iter().cloned());
     let code = crate::merge_driver::run_from_args(&call).unwrap_or(1);
     std::process::exit(code);
@@ -68,7 +75,8 @@ fn merge_driver_shim() {
 
 /// Make the clone merge with the shim. Idempotent. Needs the `[merge "sdh"]`
 /// section the product registered to exist already (the include comes after it
-/// and so wins); does nothing before that.
+/// and so wins); does nothing before that. The flat `sdhflat` driver of inner
+/// recursive merges is redirected the same way (T-000260).
 fn arm_driver(dir: &Path) {
     let cfg = dir.join(".git").join("config");
     let text = fs::read_to_string(&cfg).unwrap();
@@ -80,8 +88,9 @@ fn arm_driver(dir: &Path) {
         .to_string_lossy()
         .replace('\\', "/");
     let driver = format!(
-        "[merge \"sdh\"]\n\tdriver = \"{}\" --exact --nocapture sync::shared_e2e_tests::merge_driver_shim -- sdh-shim %O %A %B %P\n",
-        exe
+        "[merge \"sdh\"]\n\tdriver = \"{e}\" --exact --nocapture sync::shared_e2e_tests::merge_driver_shim -- sdh-shim %O %A %B %P\n\
+         [merge \"sdhflat\"]\n\tdriver = \"{e}\" --exact --nocapture sync::shared_e2e_tests::merge_driver_shim -- sdh-shim-flat %O %A %B %P\n",
+        e = exe
     );
     fs::write(dir.join(".git").join("sdh-test-driver.config"), driver).unwrap();
     let mut new = text;
@@ -1117,9 +1126,10 @@ fn v6_a_local_ai_edit_of_a_bug_is_undone_and_a_committed_task_edit_is_taken() {
 /// helper pushes a task. Both sides appended to the end of `todo.md`, which
 /// only the registered driver (merging by id) can resolve. T-000248: the
 /// owner's sync now runs that very merge itself -- the driver resolves
-/// `todo.md` by id, the merge commit lands on `dev` and is pushed in the
-/// same pass, master is untouched and every remote ref only moved forward.
-/// The Merge button is left with nothing to do.
+/// `todo.md` by id, the merge commit lands on `dev` and the shared half is
+/// published in the same pass (T-000256: shared-only, so the private
+/// `src.rs` stays local), master is untouched and every remote ref only
+/// moved forward. The Merge button is left with nothing to do.
 ///
 /// The driver in the clones is the app executable in production. A unit test
 /// runs inside the test harness, which is not the app; see `arm_driver` for how
@@ -1189,8 +1199,9 @@ fn v7_unpushed_code_and_a_helpers_push_auto_merge_by_id() {
         &["merge-base", "--is-ancestor", &old_dev, &new_dev],
     );
     assert!(
-        fx.remote_file("dev", "src.rs").is_some(),
-        "the owner's commit rides into origin/dev with the merge"
+        fx.remote_file("dev", "src.rs").is_none(),
+        "T-000256: the owner's private file stays local — the publication \
+         is shared-only; the merge's shared half rides the detached commit"
     );
     let remote_todo = fx.remote_file("dev", "docs/todo.md").unwrap();
     assert!(remote_todo.contains("T-000010") && remote_todo.contains("T-500000"));
@@ -1200,7 +1211,12 @@ fn v7_unpushed_code_and_a_helpers_push_auto_merge_by_id() {
         "master is untouched"
     );
 
-    // The button finds nothing left, and a repeated sync merges nothing new.
+    // The detached commit's planner-canonicalized shared bytes differ from
+    // the driver merge's bytes, so the button merges them in ONCE — then the
+    // remote tip is an ancestor and a second press finds nothing left, and a
+    // repeated sync merges nothing new.
+    let res = merge_shared_upstream(&fx.main_db, &gb(), fx.main_repo).unwrap();
+    assert_eq!(res.outcome, "merged", "{:?}", res);
     let res = merge_shared_upstream(&fx.main_db, &gb(), fx.main_repo).unwrap();
     assert_eq!(res.outcome, "up_to_date", "{:?}", res);
     let merges = g(&fx.main_dir, &["rev-list", "--merges", "--count", "HEAD"]);

@@ -378,6 +378,14 @@ fn same(a: &Ent, b: &Ent) -> bool {
     a.marker == b.marker && a.fields == b.fields && a.section == b.section
 }
 
+impl PartialEq for Ent {
+    /// History-state equality (see `same`): marker, fields and section — the
+    /// raw text and the key do not distinguish states.
+    fn eq(&self, other: &Self) -> bool {
+        same(self, other)
+    }
+}
+
 fn only_status_or_section_changed(kind: SharedFileKind, base: &Ent, cur: &Ent) -> bool {
     if base.marker != cur.marker || base.fields.len() != cur.fields.len() {
         return false;
@@ -580,7 +588,7 @@ pub fn merge_shared_file(
     ours: &str,
     theirs: &str,
 ) -> Result<String, MergeError> {
-    merge_with_bases(kind, base, ours, theirs, &HashMap::new())
+    merge_with_bases(kind, base, ours, theirs, &HashMap::new(), &HashMap::new())
 }
 
 /// Per-entity base (T-000226). `versions` are the distinct texts of the file
@@ -607,28 +615,172 @@ pub fn merge_shared_file_per_entity(
     ours: &str,
     theirs: &str,
 ) -> Result<String, MergeError> {
-    let overrides = entity_bases(
-        kind, base, ancestry, versions, ours_seq, theirs_seq, ours, theirs,
-    );
-    merge_with_bases(kind, base, ours, theirs, &overrides)
+    merge_shared_file_with_ancestors(
+        kind,
+        base,
+        ancestry,
+        versions,
+        ours_seq,
+        theirs_seq,
+        &[],
+        ours,
+        theirs,
+    )
 }
 
-/// Do two states of one row (`None` = absent) agree?
-fn same_state(a: Option<&Ent>, b: Option<&Ent>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => same(x, y),
-        _ => false,
+/// The per-entity merge plus the ancestor-history stale check (T-000260).
+/// `ancestors` is the file's ordered content timeline behind AND AT the
+/// real merge-base, oldest first, `None` where the file was absent at that
+/// commit — empty when there is no merge-base or it could not be read. On
+/// top of the per-entity bases this adds: per-header bases (D1, the same
+/// LCS keyed on `Doc::hdrs`) and the stale override (D5b) — where the
+/// merge-base and `theirs` both hold a PRESENT but different state, theirs'
+/// state is stale when the timeline superseded it before the merge-base.
+pub fn merge_shared_file_with_ancestors(
+    kind: SharedFileKind,
+    base: &str,
+    ancestry: Option<&str>,
+    versions: &[String],
+    ours_seq: &[usize],
+    theirs_seq: &[usize],
+    ancestors: &[Option<String>],
+    ours: &str,
+    theirs: &str,
+) -> Result<String, MergeError> {
+    let mut ent_overrides = entity_bases(
+        kind, base, ancestry, versions, ours_seq, theirs_seq, ours, theirs,
+    );
+    let mut hdr_overrides = header_bases(
+        kind, base, ancestry, versions, ours_seq, theirs_seq, ours, theirs,
+    );
+    apply_stale_overrides(
+        kind,
+        base,
+        theirs,
+        ancestors,
+        &mut ent_overrides,
+        &mut hdr_overrides,
+    );
+    merge_with_bases(kind, base, ours, theirs, &ent_overrides, &hdr_overrides)
+}
+
+/// True when `theirs` would overwrite `base` with entity or header content
+/// the shared timeline superseded before the merge-base — the check the
+/// `ours == base` merge shortcut needs before adopting `theirs` (T-000260
+/// D5b-gate). The full merge is unnecessary: in the `ours == base` case no
+/// LCS override can fire (`lcs_last` lands on the base state itself), so
+/// the stale sets alone decide.
+pub fn has_stale_remote_state(
+    kind: SharedFileKind,
+    base: &str,
+    theirs: &str,
+    ancestors: &[Option<String>],
+) -> bool {
+    let mut ent = HashMap::new();
+    let mut hdr = HashMap::new();
+    apply_stale_overrides(kind, base, theirs, ancestors, &mut ent, &mut hdr);
+    !ent.is_empty() || !hdr.is_empty()
+}
+
+/// The stale-content check (T-000260/D5b). For every entity key and header
+/// key where the BASE and THEIRS both hold a present but different state:
+/// `p_b` = last ancestor position whose state equals base's, `p_t` = last
+/// position equal to theirs'. The state is STALE when `p_b` and `p_t` are
+/// both defined and `p_t < p_b` — theirs' state sat on the shared timeline
+/// before the merge-base's state superseded it. `p_t` undefined means the
+/// state is new (not stale); `p_b` undefined means the bound proves nothing
+/// (not stale — never refuse on unproven age). The override the check
+/// installs is THEIRS' CURRENT STATE as the effective base, so the ordinary
+/// three-way rules keep ours. It fills only keys the LCS rules left
+/// untouched (`entry().or_insert`) — exactly the case `found == base`
+/// cannot see. Presence/absence stays with T-000255: a row absent at the
+/// merge-base is a re-add, never stale.
+fn apply_stale_overrides(
+    kind: SharedFileKind,
+    base: &str,
+    theirs: &str,
+    ancestors: &[Option<String>],
+    entity_overrides: &mut HashMap<String, Option<Ent>>,
+    header_overrides: &mut HashMap<String, Option<String>>,
+) {
+    if ancestors.is_empty() {
+        return;
+    }
+    let (b, t) = (parse(kind, base), parse(kind, theirs));
+    let ent_keys: Vec<String> = b
+        .by_key
+        .keys()
+        .filter(|k| {
+            t.by_key
+                .get(*k)
+                .is_some_and(|&i| !same(&b.ents[b.by_key[*k]], &t.ents[i]))
+        })
+        .cloned()
+        .collect();
+    let hdr_keys: Vec<String> = b
+        .hdrs
+        .keys()
+        .filter(|k| t.hdrs.get(*k).is_some_and(|x| *x != b.hdrs[*k]))
+        .cloned()
+        .collect();
+    if ent_keys.is_empty() && hdr_keys.is_empty() {
+        return;
+    }
+    // One parse per ancestor version, oldest first.
+    let docs: Vec<Option<Doc>> = ancestors
+        .iter()
+        .map(|s| s.as_deref().map(|s| parse(kind, s)))
+        .collect();
+    for k in &ent_keys {
+        let (Some(&bs), Some(&ts)) = (b.by_key.get(k), t.by_key.get(k)) else {
+            continue;
+        };
+        let (bs, ts) = (&b.ents[bs], &t.ents[ts]);
+        let p_b = docs.iter().rposition(|d| match d {
+            Some(doc) => doc.by_key.get(k).is_some_and(|&i| same(&doc.ents[i], bs)),
+            None => false,
+        });
+        let p_t = docs.iter().rposition(|d| match d {
+            Some(doc) => doc.by_key.get(k).is_some_and(|&i| same(&doc.ents[i], ts)),
+            None => false,
+        });
+        if matches!((p_b, p_t), (Some(pb), Some(pt)) if pt < pb) {
+            entity_overrides
+                .entry(k.clone())
+                .or_insert_with(|| Some(ts.clone()));
+        }
+    }
+    for k in &hdr_keys {
+        let (Some(bs), Some(ts)) = (b.hdrs.get(k), t.hdrs.get(k)) else {
+            continue;
+        };
+        let p_b = docs
+            .iter()
+            .rposition(|d| d.as_ref().and_then(|d| d.hdrs.get(k)) == Some(bs));
+        let p_t = docs
+            .iter()
+            .rposition(|d| d.as_ref().and_then(|d| d.hdrs.get(k)) == Some(ts));
+        if matches!((p_b, p_t), (Some(pb), Some(pt)) if pt < pb) {
+            header_overrides
+                .entry(k.clone())
+                .or_insert_with(|| Some(ts.clone()));
+        }
     }
 }
 
-/// The state sequence of one row over a history, consecutive repeats dropped.
-fn state_seq<'a>(
+/// Do two states of one row / header (`None` = absent) agree?
+fn same_state<T: PartialEq>(a: Option<&T>, b: Option<&T>) -> bool {
+    a == b
+}
+
+/// The state sequence of one row / header over a history, consecutive
+/// repeats dropped.
+fn state_seq<'a, T: PartialEq>(
     seq: &[usize],
-    states: &'a [HashMap<String, Ent>],
+    states: &'a [HashMap<String, T>],
     key: &str,
-) -> Vec<Option<&'a Ent>> {
-    let mut out: Vec<Option<&Ent>> = Vec::new();
+) -> Vec<Option<&'a T>> {
+    let mut out: Vec<Option<&T>> = Vec::new();
     for &i in seq {
         let st = states.get(i).and_then(|m| m.get(key));
         if out.last().map_or(true, |p| !same_state(*p, st)) {
@@ -640,7 +792,7 @@ fn state_seq<'a>(
 
 /// Last element of the longest common subsequence (latest on ours, then on
 /// theirs, among equals); `None` when the sequences share no state.
-fn lcs_last<'a>(a: &[Option<&'a Ent>], b: &[Option<&'a Ent>]) -> Option<Option<&'a Ent>> {
+fn lcs_last<'a, T: PartialEq>(a: &[Option<&'a T>], b: &[Option<&'a T>]) -> Option<Option<&'a T>> {
     let (n, m) = (a.len(), b.len());
     let mut f = vec![vec![0u32; m + 1]; n + 1];
     for i in 1..=n {
@@ -735,20 +887,104 @@ fn entity_bases(
     overrides
 }
 
+/// Per-header-key base (T-000260/D1): the same provenance `entity_bases`
+/// gives rows, applied to `## ` header lines — keyed on the FIRST
+/// occurrence of each key (`Doc::hdrs`). The override maps a contested key
+/// (ours' text != theirs' text) to the effective base text; `None` = the
+/// header was absent in that state. An override equal to the whole-file
+/// base entry is not stored, same convention as entities.
+fn header_bases(
+    kind: SharedFileKind,
+    base: &str,
+    ancestry: Option<&str>,
+    versions: &[String],
+    ours_seq: &[usize],
+    theirs_seq: &[usize],
+    ours: &str,
+    theirs: &str,
+) -> HashMap<String, Option<String>> {
+    let mut overrides = HashMap::new();
+    let (b, o, t) = (parse(kind, base), parse(kind, ours), parse(kind, theirs));
+    let anc = ancestry.map(|s| parse(kind, s));
+    let mut diff: HashSet<String> = HashSet::new();
+    for key in o.hdrs.keys().chain(t.hdrs.keys()) {
+        if o.hdrs.get(key) != t.hdrs.get(key) {
+            diff.insert(key.clone());
+        }
+    }
+    if diff.is_empty() {
+        return overrides;
+    }
+    let used: HashSet<usize> = ours_seq.iter().chain(theirs_seq.iter()).copied().collect();
+    let mut states: Vec<HashMap<String, String>> = vec![HashMap::new(); versions.len()];
+    for &i in &used {
+        let Some(text) = versions.get(i) else {
+            continue;
+        };
+        let mut m = HashMap::new();
+        for (key, text) in parse(kind, text).hdrs {
+            if diff.contains(&key) {
+                m.insert(key, text);
+            }
+        }
+        states[i] = m;
+    }
+    for key in &diff {
+        let a = state_seq(ours_seq, &states, key);
+        let bb = state_seq(theirs_seq, &states, key);
+        if let Some(found) = lcs_last(&a, &bb) {
+            // The T-000255 rule applies to headers too: an LCS ending in
+            // absence is ambiguous, so the real merge-base's copy (its
+            // `Doc::hdrs` entry) becomes the base.
+            if found.is_none() {
+                let st = anc.as_ref().and_then(|p| p.hdrs.get(key)).cloned();
+                overrides.insert(key.clone(), st);
+                continue;
+            }
+            if found != b.hdrs.get(key) {
+                overrides.insert(key.clone(), found.cloned());
+            }
+        }
+    }
+    overrides
+}
+
+/// The verbatim `## ` occurrences of every key in file order — what the
+/// trivial `base == ours → theirs` shortcut compares before adopting
+/// `theirs` wholesale (T-000260/D5c).
+fn header_occurrences(input: &str) -> HashMap<String, Vec<String>> {
+    let s = input.strip_prefix('\u{feff}').unwrap_or(input);
+    let mut m: HashMap<String, Vec<String>> = HashMap::new();
+    for l in s.split('\n') {
+        let l = l.strip_suffix('\r').unwrap_or(l);
+        if let Some(rest) = l.trim().strip_prefix("## ") {
+            m.entry(section_key(rest)).or_default().push(l.to_string());
+        }
+    }
+    m
+}
+
 fn merge_with_bases(
     kind: SharedFileKind,
     base: &str,
     ours: &str,
     theirs: &str,
     overrides: &HashMap<String, Option<Ent>>,
+    header_overrides: &HashMap<String, Option<String>>,
 ) -> Result<String, MergeError> {
     // Trivial merges: exactly what git itself would do. The base ones stand
-    // for the whole file only while no row has a base of its own.
+    // for the whole file only while no row or header has a base of its own
+    // (T-000260/D3 — a header override is exactly the evidence that flat
+    // `base == ours` would adopt stale bytes). And adopting `theirs`
+    // verbatim must honour the first-occurrence header policy (D5c): it is
+    // allowed only when theirs' header occurrences per key match ours'
+    // exactly, or the full path runs and keeps ours' later duplicates.
     if ours == theirs {
         return Ok(ours.to_string());
     }
-    if overrides.is_empty() {
-        if base == ours {
+    if overrides.is_empty() && header_overrides.is_empty() {
+        let ours_headers = header_occurrences(ours);
+        if base == ours && (ours_headers.is_empty() || ours_headers == header_occurrences(theirs)) {
             return Ok(theirs.to_string());
         }
         if base == theirs {
@@ -826,19 +1062,39 @@ fn merge_with_bases(
             _ => {}
         }
     }
+    // T-000260/D5c: the FIRST occurrence of each theirs header key decides;
+    // later duplicates of theirs never rename ours' first nor insert again.
+    let mut seen_hdr: HashSet<String> = HashSet::new();
     for (i, l) in t.lines.iter().enumerate() {
         match l {
             Line::Header { key, text } => {
+                if !seen_hdr.insert(key.clone()) {
+                    continue;
+                }
                 if let Some(otext) = o_hdr.get(key) {
-                    // Only theirs renamed the header -> take the new text.
-                    if b_hdr.get(key) == Some(otext) && text != otext {
+                    // T-000260/D2: the per-header base (LCS or stale override)
+                    // stands in for the whole-file one where it exists. Only
+                    // theirs renaming the effective base's text wins — a base
+                    // equal to theirs' current text marks ours' text the
+                    // newer knowledge, so the stale rename is refused.
+                    let hb = match header_overrides.get(key) {
+                        Some(h) => h.as_ref(),
+                        None => b_hdr.get(key),
+                    };
+                    if hb == Some(otext) && text != otext {
                         if let Some(p) = find_header(&out, key) {
                             out[p].text = text.clone();
                         }
                     }
-                } else if !b_hdr.contains_key(key) && find_header(&out, key).is_none() {
-                    let anchor = anchor_for(&t, i, &out);
-                    insert_header(&mut out, anchor, key, text);
+                } else {
+                    let base_had = match header_overrides.get(key) {
+                        Some(h) => h.is_some(),
+                        None => b_hdr.contains_key(key),
+                    };
+                    if !base_had && find_header(&out, key).is_none() {
+                        let anchor = anchor_for(&t, i, &out);
+                        insert_header(&mut out, anchor, key, text);
+                    }
                 }
             }
             Line::Other(s) => {
@@ -1647,5 +1903,222 @@ mod tests {
         )
         .unwrap();
         assert!(!merged.contains("T-000002"), "resurrected:\n{}", merged);
+    }
+
+    // ---- T-000260: per-header provenance + ancestor-history stale check ----
+
+    const ROW: &str = "- [ ] T-000001 | a | 1 | low | open | 2026-10-01\n";
+
+    fn m_a(
+        kind: SharedFileKind,
+        base: &str,
+        ancestry: Option<&str>,
+        versions: &[String],
+        os: &[usize],
+        ts: &[usize],
+        ancestors: &[Option<String>],
+        ours: &str,
+        theirs: &str,
+    ) -> String {
+        merge_shared_file_with_ancestors(
+            kind, base, ancestry, versions, os, ts, ancestors, ours, theirs,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stale_theirs_header_ours_edit_survives() {
+        // The remote side republishes the OLD header text as a descendant of
+        // the merge-base that already holds our rename — the stale-writer
+        // dogfood case. Ours' text is the newer knowledge and must survive.
+        let old = format!("## v1.20.0 — OLD\n\n{}", ROW);
+        let new = format!("## v1.20.0 — NEW\n\n{}", ROW);
+        let v = vec![old.clone(), new.clone()];
+        // LCS path: our history held OLD then NEW, theirs' holds OLD; the
+        // last shared state is OLD = theirs' current -> ours keeps.
+        let merged = m_a(Todo, &new, Some(&new), &v, &[0, 1], &[0], &[], &new, &old);
+        assert!(merged.contains("## v1.20.0 — NEW"), "{}", merged);
+        assert!(!merged.contains("## v1.20.0 — OLD"));
+        // Ancestor path alone (no LCS input): p_t (OLD) predates p_b (NEW).
+        let merged = m_a(
+            Todo,
+            &new,
+            Some(&new),
+            &[],
+            &[],
+            &[],
+            &[Some(old.clone()), Some(new.clone())],
+            &new,
+            &old,
+        );
+        assert!(merged.contains("## v1.20.0 — NEW"), "{}", merged);
+    }
+
+    #[test]
+    fn genuine_theirs_header_rename_still_wins() {
+        // Ours did not edit the header; theirs' rename is newer than the
+        // shared state and applies.
+        let base = format!("## v1.20.0 — A\n\n{}", ROW);
+        let theirs = format!("## v1.20.0 — B\n\n{}", ROW);
+        let v = vec![base.clone()];
+        let merged = m_a(
+            Todo,
+            &base,
+            Some(&base),
+            &v,
+            &[0],
+            &[0],
+            &[Some(base.clone())],
+            &base,
+            &theirs,
+        );
+        assert!(merged.contains("## v1.20.0 — B"), "{}", merged);
+        assert_eq!(merged.matches("## v1.20.0").count(), 1);
+    }
+
+    #[test]
+    fn both_renamed_header_ours_wins() {
+        let base = format!("## v1.20.0 — BASE\n\n{}", ROW);
+        let ours = format!("## v1.20.0 — OURS\n\n{}", ROW);
+        let theirs = format!("## v1.20.0 — THEIRS\n\n{}", ROW);
+        let v = vec![base.clone(), ours.clone(), theirs.clone()];
+        // LCS lands on BASE = whole-file base -> no override -> flat rule:
+        // base's text != ours' -> no rename, ours keeps.
+        let merged = m_a(
+            Todo,
+            &base,
+            Some(&base),
+            &v,
+            &[0, 1],
+            &[0, 2],
+            &[Some(base.clone())],
+            &ours,
+            &theirs,
+        );
+        assert!(merged.contains("## v1.20.0 — OURS"), "{}", merged);
+        assert!(!merged.contains("## v1.20.0 — THEIRS"));
+    }
+
+    #[test]
+    fn trivial_merge_guard_runs_when_headers_differ() {
+        // ours == base byte for byte; theirs changed only the header text to
+        // a state the timeline superseded. The `base == ours -> theirs`
+        // shortcut must NOT adopt it.
+        let old = format!("## v1.20.0 — OLD\n\n{}", ROW);
+        let new = format!("## v1.20.0 — NEW\n\n{}", ROW);
+        let merged = m_a(
+            Todo,
+            &new,
+            Some(&new),
+            &[],
+            &[],
+            &[],
+            &[Some(old.clone()), Some(new.clone())],
+            &new,
+            &old,
+        );
+        assert!(merged.contains("## v1.20.0 — NEW"), "{}", merged);
+        // A header-only diff on a NON-stale rename still fast-paths to
+        // theirs verbatim (the occurrences match per key).
+        let renamed = format!("## v1.20.0 — RENAMED\n\n{}", ROW);
+        let merged = m_a(Todo, &new, Some(&new), &[], &[], &[], &[], &new, &renamed);
+        assert_eq!(merged, renamed);
+    }
+
+    #[test]
+    fn duplicate_same_key_headers_first_occurrence_only() {
+        // Ours carries the key twice; theirs renamed BOTH occurrences. The
+        // first decides (theirs' rename wins as it is a genuine edit), the
+        // second stays verbatim ours.
+        let base = format!("## v1 — A\n\n{}## v1 — dupA\n\n", ROW);
+        let ours = base.clone();
+        let theirs = format!("## v1 — B\n\n{}## v1 — dupB\n\n", ROW);
+        let merged = m_a(Todo, &base, Some(&base), &[], &[], &[], &[], &ours, &theirs);
+        let l = lines(&merged);
+        let mut hdrs: Vec<&str> = l
+            .iter()
+            .filter(|x| x.starts_with("## v1"))
+            .copied()
+            .collect();
+        assert_eq!(hdrs, vec!["## v1 — B", "## v1 — dupA"], "{:?}", hdrs);
+        hdrs.clear();
+        // And the trivial `base == ours -> theirs` gate: differing
+        // occurrences keep the full path, which yields the same policy
+        // result instead of verbatim theirs.
+        let theirs2 = format!("## v1 — A\n\n{}## v1 — dupB\n\n", ROW);
+        let merged = m_a(
+            Todo,
+            &base,
+            Some(&base),
+            &[],
+            &[],
+            &[],
+            &[],
+            &ours,
+            &theirs2,
+        );
+        assert_ne!(merged, theirs2, "occurrence mismatch must not fast-path");
+        assert!(merged.contains("## v1 — dupA"));
+    }
+
+    #[test]
+    fn no_history_header_fallback_is_the_flat_rule() {
+        // No versions, no ancestors: the whole-file base governs exactly as
+        // before — theirs' rename of an ours-untouched header wins.
+        let base = format!("## v1.20.0 — A\n\n{}", ROW);
+        let theirs = format!("## v1.20.0 — B\n\n{}", ROW);
+        let merged = m_a(Todo, &base, Some(&base), &[], &[], &[], &[], &base, &theirs);
+        assert!(merged.contains("## v1.20.0 — B"));
+    }
+
+    #[test]
+    fn stale_entity_row_kept_and_legit_remote_edit_passes() {
+        // The remote tip holds a row state the shared timeline superseded
+        // before the merge-base: stale -> ours' (== base's) state survives.
+        let old_row = format!("## v1\n\n- [ ] T-000001 | old text | 1 | low | open | 2026-10-01\n");
+        let new_row = format!("## v1\n\n- [ ] T-000001 | new text | 1 | low | open | 2026-10-01\n");
+        let ancestors = vec![Some(old_row.clone()), Some(new_row.clone())];
+        assert!(has_stale_remote_state(Todo, &new_row, &old_row, &ancestors));
+        let merged = m_a(
+            Todo,
+            &new_row,
+            Some(&new_row),
+            &[],
+            &[],
+            &[],
+            &ancestors,
+            &new_row,
+            &old_row,
+        );
+        assert!(merged.contains("new text"), "{}", merged);
+        assert!(!merged.contains("old text"));
+        // A genuinely new remote state (never on the timeline) is not stale.
+        let fresh = format!("## v1\n\n- [ ] T-000001 | fresh | 1 | low | open | 2026-10-01\n");
+        assert!(!has_stale_remote_state(Todo, &new_row, &fresh, &ancestors));
+        // A remote re-add of a row absent at the merge-base is not stale
+        // either (T-000255), even when its text matches a pre-deletion one.
+        let absent_base = "## v1\n\n";
+        assert!(!has_stale_remote_state(
+            Todo,
+            absent_base,
+            &old_row,
+            &ancestors
+        ));
+    }
+
+    #[test]
+    fn stale_check_needs_proof_not_unseen_history() {
+        // base's state is not inside the ancestor bound -> not stale.
+        let old_row = format!("## v1\n\n- [ ] T-000001 | old text | 1 | low | open | 2026-10-01\n");
+        let new_row = format!("## v1\n\n- [ ] T-000001 | new text | 1 | low | open | 2026-10-01\n");
+        let unrelated = format!("## v1\n\n- [ ] T-000009 | other | 1 | low | open | 2026-10-01\n");
+        assert!(!has_stale_remote_state(
+            Todo,
+            &new_row,
+            &old_row,
+            &[Some(unrelated)]
+        ));
+        // Empty ancestors never flag.
+        assert!(!has_stale_remote_state(Todo, &new_row, &old_row, &[]));
     }
 }

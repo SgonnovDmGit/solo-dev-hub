@@ -40,7 +40,9 @@ export interface RepoSharedState {
   /**
    * What the status code is about (T-000223). `needs_manual_merge`: JSON
    * `{"branch":"dev","current":true}`; `push_rejected`: JSON
-   * `{"branch":"dev","message":"..."}`; the others: a plain reason text.
+   * `{"branch":"dev","message":"..."}`; `remote_file_stale` (T-000260): JSON
+   * `{"branch":"dev","paths":["docs/todo.md"]}`; the others: a plain reason
+   * text.
    */
   shared_status_detail: string | null;
   /**

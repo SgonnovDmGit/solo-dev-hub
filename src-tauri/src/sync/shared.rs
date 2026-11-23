@@ -38,7 +38,9 @@ use crate::models::{
 use crate::sync::autocommit::{
     CROSS_REPO_DIRS, MANAGED_ROOT_FILES, SDH_COMMIT_EMAIL, SDH_COMMIT_NAME,
 };
-use crate::sync::merge_by_id::{kind_for_path, merge_shared_bytes, merge_shared_file_per_entity};
+use crate::sync::merge_by_id::{
+    has_stale_remote_state, kind_for_path, merge_shared_bytes, merge_shared_file_with_ancestors,
+};
 use crate::sync::shared_structure::{
     self as ss, ApproveJoinResult, DiscoverOutcome, JoinRequest, ProjectStructure, Role,
     REQUESTS_REL_DIR, STRUCTURE_REL_PATH,
@@ -66,14 +68,20 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Status of a shared repo. The declaration order is the priority order: the
 /// first variant that applies wins (`shared_untrusted` > fetch / push failed >
-/// push rejected > needs manual merge > dev checked out elsewhere > no own
-/// branch > pending approval).
+/// push rejected > stale remote file > needs manual merge > dev checked out
+/// elsewhere > no own branch > pending approval).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SharedStatus {
     Untrusted,
     FetchFailed,
     PushFailed,
     PushRejected,
+    /// T-000260: the remote tip restores shared-file content the shared
+    /// timeline already superseded. Refusing, not merging — and the UI must
+    /// not offer the Merge button, which would install the stale bytes.
+    /// A publishing role repairs it with a detached commit on the remote
+    /// tip; a pending / merge-only install waits for the publisher.
+    RemoteFileStale,
     NeedsManualMerge,
     /// T-000241: the proposal channel's transport needs the dev branch, and
     /// dev is checked out in ANOTHER worktree — its files cannot be written
@@ -93,6 +101,7 @@ impl SharedStatus {
             SharedStatus::FetchFailed => "fetch_failed",
             SharedStatus::PushFailed => "push_failed",
             SharedStatus::PushRejected => "push_rejected",
+            SharedStatus::RemoteFileStale => "remote_file_stale",
             SharedStatus::NeedsManualMerge => "needs_manual_merge",
             SharedStatus::Blocked => "shared_blocked",
             SharedStatus::NoOwnBranch => "no_own_branch",
@@ -107,6 +116,7 @@ impl SharedStatus {
             SharedStatus::FetchFailed => Code::SharedFetchFailed,
             SharedStatus::PushFailed => Code::SharedPushFailed,
             SharedStatus::PushRejected => Code::SharedPushRejected,
+            SharedStatus::RemoteFileStale => Code::SharedRemoteFileStale,
             SharedStatus::NeedsManualMerge => Code::SharedNeedsManualMerge,
             SharedStatus::Blocked => Code::SharedNeedsManualMerge,
             SharedStatus::NoOwnBranch => Code::SharedNoOwnBranch,
@@ -864,13 +874,113 @@ fn active_paths(git: &GitBinary, root: &Path, pathspec: &[String]) -> Result<Vec
         .collect())
 }
 
-/// Are any of the shared files modified in the work tree (staged, unstaged or
-/// untracked)?
-fn shared_paths_dirty(git: &GitBinary, root: &Path, pathspec: &[String]) -> Result<bool, String> {
+/// Shared files modified in the work tree as `(path, untracked)` pairs —
+/// staged, unstaged and untracked all count.
+fn shared_dirty_paths(
+    git: &GitBinary,
+    root: &Path,
+    pathspec: &[String],
+) -> Result<Vec<(String, bool)>, String> {
     let mut specs = pathspec.to_vec();
     specs.extend(exclude_specs(pathspec));
     let out = git_bytes(git, root, &["status", "--porcelain", "-z"], &specs)?;
-    Ok(!out.is_empty())
+    let mut res = Vec::new();
+    let mut it = out.split(|b| *b == 0).filter(|s| !s.is_empty());
+    while let Some(e) = it.next() {
+        if e.len() < 4 {
+            continue;
+        }
+        // A rename/copy record carries a second NUL-separated path — skip it,
+        // both names stay dirty anyway.
+        let renamed = e[0] == b'R' || e[0] == b'C';
+        let untracked = e[0] == b'?' && e[1] == b'?';
+        res.push((String::from_utf8_lossy(&e[3..]).into_owned(), untracked));
+        if renamed {
+            let _ = it.next();
+        }
+    }
+    Ok(res)
+}
+
+/// Are any of the shared files modified in the work tree (staged, unstaged or
+/// untracked)?
+fn shared_paths_dirty(git: &GitBinary, root: &Path, pathspec: &[String]) -> Result<bool, String> {
+    shared_dirty_paths(git, root, pathspec).map(|v| !v.is_empty())
+}
+
+/// The dirt gate before a merge into the checked-out branch. A publish
+/// recipient defers silently (`Clean`) — phase B commits the dirt itself. A
+/// merge-only target (T-000262/D11b) first reconciles the one kind of dirt
+/// that is ours to touch: `.sdh/app-versions/<login>.json` residue —
+/// app-owned last-writer-wins metadata the remote may also write (the file
+/// name is keyed by LOGIN, and a second install under the same login can
+/// publish it). Tracked residue is reset to HEAD, untracked deleted, so the
+/// incoming change installs cleanly; any other shared dirt defers as
+/// `Deferred` — a merge-only install has no phase-B path that resolves it.
+fn merge_deferred(
+    git: &GitBinary,
+    root: &Path,
+    remote: &str,
+    login: &str,
+    pathspec: &[String],
+    merge_only: bool,
+) -> Result<Option<FfResult>, String> {
+    if merge_only && reconcile_own_version_dirt(git, root, remote, login, pathspec)? {
+        return Ok(None);
+    }
+    if shared_paths_dirty(git, root, pathspec)? {
+        return Ok(Some(if merge_only {
+            FfResult::Deferred {
+                reason: Some(
+                    "shared files are modified — commit or stash them to receive the merge".into(),
+                ),
+            }
+        } else {
+            // A publish recipient's dirt is phase B's job — deferred but
+            // reported as nothing.
+            FfResult::Deferred { reason: None }
+        }));
+    }
+    Ok(None)
+}
+
+/// Is the only dirty shared path this install's own app-version file? When it
+/// is and the incoming tree changes that path, restore a mergeable base at the
+/// git level (checkout from HEAD / drop the untracked residue). `false` means
+/// foreign dirt is present — the caller defers.
+fn reconcile_own_version_dirt(
+    git: &GitBinary,
+    root: &Path,
+    remote: &str,
+    login: &str,
+    pathspec: &[String],
+) -> Result<bool, String> {
+    let dirty = shared_dirty_paths(git, root, pathspec)?;
+    if dirty.is_empty() {
+        return Ok(true);
+    }
+    let rel = app_version_rel_path(login);
+    if dirty.iter().any(|(p, _)| *p != rel) {
+        return Ok(false);
+    }
+    let head_sha = git_sync::blob_sha_at(git, root, "HEAD", &rel)?;
+    let remote_sha = git_sync::blob_sha_at(git, root, remote, &rel)?;
+    if head_sha == remote_sha {
+        // The merge does not touch the file — the residue is ignorable.
+        return Ok(true);
+    }
+    for (p, untracked) in &dirty {
+        if *untracked {
+            std::fs::remove_file(root.join(p)).map_err(|e| format!("{}: {}", p, e))?;
+        } else if head_sha.is_some() {
+            // Tracked, present at HEAD → restore index + worktree.
+            git_bytes(git, root, &["checkout", "HEAD"], &[p.clone()])?;
+        } else {
+            // Staged-added or deleted at HEAD → drop it entirely.
+            git_bytes(git, root, &["rm", "-q", "-f"], &[p.clone()])?;
+        }
+    }
+    Ok(true)
 }
 
 fn cat_blob(git: &GitBinary, root: &Path, sha: &str) -> Result<Vec<u8>, String> {
@@ -996,6 +1106,7 @@ fn commit_message(login: &str) -> (String, String) {
 /// The blob sha `path` had the last time `rev`'s history held it: `rev`'s own
 /// copy, or the one before the commit that deleted it. `None` when `rev` never
 /// had the file.
+#[cfg(test)]
 fn last_version_sha(git: &GitBinary, root: &Path, rev: &str, path: &str) -> Option<String> {
     if let Ok(Some(sha)) = git_sync::blob_sha_at(git, root, rev, path) {
         return Some(sha);
@@ -1012,6 +1123,14 @@ fn last_version_sha(git: &GitBinary, root: &Path, rev: &str, path: &str) -> Opti
     git_sync::blob_sha_at(git, root, &format!("{}^", commit), path)
         .ok()
         .flatten()
+}
+
+/// Is `sub` a subsequence of `full` — every element found in order? The
+/// (None,Some) arm reads `is_subsequence(theirs_blobs, ours_blobs)` as "the
+/// branch is a pure follower of this path's history with us".
+fn is_subsequence(sub: &[String], full: &[String]) -> bool {
+    let mut it = full.iter();
+    sub.iter().all(|s| it.any(|f| f == s))
 }
 
 /// Files only the owner writes: the owner's copy always wins.
@@ -1124,11 +1243,30 @@ fn cat_blobs(
     root: &Path,
     shas: &[&str],
 ) -> Result<HashMap<String, Vec<u8>>, String> {
-    let mut got = HashMap::new();
-    if shas.is_empty() {
-        return Ok(got);
+    let specs: Vec<String> = shas.iter().map(|s| s.to_string()).collect();
+    let got = cat_specs(git, root, &specs)?;
+    let mut out = HashMap::new();
+    for (sha, data) in shas.iter().zip(got) {
+        if let Some(d) = data {
+            out.insert(sha.to_string(), d);
+        }
     }
-    let input = (shas.join("\n") + "\n").into_bytes();
+    Ok(out)
+}
+
+/// Object contents of `specs` in INPUT order — one `git cat-file --batch`
+/// call, `None` where git answered `missing` or resolved to a non-blob. A
+/// spec may be any rev expression (`<sha>` or `<rev>:<path>`); the answers
+/// keep position, which is what an ordered ancestor history needs.
+fn cat_specs(
+    git: &GitBinary,
+    root: &Path,
+    specs: &[String],
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let input = (specs.join("\n") + "\n").into_bytes();
     let out = run_with_stdin(git, root, &["cat-file", "--batch"], input)?;
     if !out.status.success() {
         return Err(format!(
@@ -1136,8 +1274,9 @@ fn cat_blobs(
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    // <sha> <type> <size>\n<content>\n, or <sha> missing\n
+    // <sha> <type> <size>\n<content>\n, or <spec> missing\n
     let buf = out.stdout;
+    let mut res: Vec<Option<Vec<u8>>> = Vec::with_capacity(specs.len());
     let mut pos = 0;
     while pos < buf.len() {
         let Some(nl) = buf[pos..].iter().position(|&c| c == b'\n') else {
@@ -1146,22 +1285,24 @@ fn cat_blobs(
         let header = String::from_utf8_lossy(&buf[pos..pos + nl]).into_owned();
         pos += nl + 1;
         let mut it = header.split_whitespace();
-        let (Some(sha), Some(kind)) = (it.next(), it.next()) else {
-            break;
-        };
-        if kind == "missing" {
-            continue;
+        let _sha = it.next();
+        match it.next() {
+            Some("missing") => res.push(None),
+            Some(kind) => {
+                let Some(size) = it.next().and_then(|s| s.parse::<usize>().ok()) else {
+                    break;
+                };
+                if pos + size > buf.len() {
+                    break;
+                }
+                let data = buf[pos..pos + size].to_vec();
+                pos += size + 1;
+                res.push((kind == "blob").then_some(data));
+            }
+            None => break,
         }
-        let Some(size) = it.next().and_then(|s| s.parse::<usize>().ok()) else {
-            break;
-        };
-        if pos + size > buf.len() {
-            break;
-        }
-        got.insert(sha.to_string(), buf[pos..pos + size].to_vec());
-        pos += size + 1;
     }
-    Ok(got)
+    Ok(res)
 }
 
 /// The versions of a shared file the two histories held, as the inputs of the
@@ -1203,6 +1344,101 @@ fn history_versions(
             .collect()
     };
     Some((versions, seq(ours), seq(theirs)))
+}
+
+/// How many positions of the file's timeline behind the merge-base the
+/// stale check looks at (T-000260/D5b).
+const ANCESTOR_CAP: usize = 32;
+
+/// The ordered ancestor history of `path` behind AND AT `merge_base`
+/// (T-000260/D5b-machinery): commits that touched the path, oldest first,
+/// bounded at the newest `ANCESTOR_CAP`; each position holds the file's
+/// text at that commit — `None` where the file was absent (or is not text).
+/// Two git calls: the log, then one `cat-file --batch` of `<commit>:<path>`
+/// specs — occurrences preserved, which a dedup lookup cannot do.
+pub(crate) fn ancestor_states(
+    git: &GitBinary,
+    root: &Path,
+    merge_base: &str,
+    path: &str,
+) -> Vec<Option<String>> {
+    let cap = format!("-n{}", ANCESTOR_CAP);
+    let Ok(out) = spawn_cmd(&git.0)
+        .args(["log", "--format=%H", cap.as_str(), merge_base, "--", path])
+        .current_dir(root)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let mut commits: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    commits.reverse();
+    let specs: Vec<String> = commits.iter().map(|c| format!("{}:{}", c, path)).collect();
+    let Ok(blobs) = cat_specs(git, root, &specs) else {
+        return Vec::new();
+    };
+    blobs
+        .into_iter()
+        .map(|b| b.and_then(|v| String::from_utf8(normalize(v)).ok()))
+        .collect()
+}
+
+/// T-000260/D5: the merge driver's provenance-aware entry — merge the
+/// three `%O`/`%A`/`%B` texts of `path` with the real remote commit
+/// `theirs_rev` (found through `GITHEAD_<oid>`): per-entity bases from both
+/// histories plus the ancestor timeline behind the merge-base for the
+/// stale check. Any failure means "no provenance" — the driver falls back
+/// to the flat merge (`merge.sdh.recursive = sdhflat` keeps inner
+/// recursive merges flat in the first place).
+pub(crate) fn merge_shared_with_history(
+    git: &GitBinary,
+    root: &Path,
+    path: &str,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    theirs_rev: &str,
+) -> Result<String, String> {
+    let kind = kind_for_path(path).ok_or_else(|| format!("not a shared file: {}", path))?;
+    let text = |v: &[u8]| -> Result<String, String> {
+        String::from_utf8(normalize(v.to_vec())).map_err(|e| e.to_string())
+    };
+    let (base, ours, theirs) = (text(base)?, text(ours)?, text(theirs)?);
+    let ours_hist = blobs_in_history(git, root, "HEAD", path);
+    let theirs_hist = blobs_in_history(git, root, theirs_rev, path);
+    let Some((versions, os, ts)) = history_versions(git, root, &ours_hist, &theirs_hist) else {
+        return Err("no shared history for the file".to_string());
+    };
+    let merge_base = git_sync::merge_base(git, root, "HEAD", theirs_rev)
+        .ok()
+        .flatten();
+    let ancestors = merge_base
+        .as_ref()
+        .map(|mb| ancestor_states(git, root, mb, path))
+        .unwrap_or_default();
+    let ancestry = merge_base
+        .as_ref()
+        .and_then(|mb| git_sync::blob_sha_at(git, root, mb, path).ok().flatten())
+        .and_then(|sha| cat_blob(git, root, &sha).ok())
+        .and_then(|v| String::from_utf8(normalize(v)).ok());
+    merge_shared_file_with_ancestors(
+        kind,
+        &base,
+        ancestry.as_deref(),
+        &versions,
+        &os,
+        &ts,
+        &ancestors,
+        &ours,
+        &theirs,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// What to do with one file of the target branch.
@@ -1376,6 +1612,20 @@ fn shared_plan_changes(
                             .and_then(|v| String::from_utf8(normalize(v)).ok()),
                         None => None,
                     };
+                    // T-000260/D5b: the file's timeline behind the
+                    // merge-base feeds the stale check — a remote holding a
+                    // state that predates the merge-base's own is refused,
+                    // not silently installed. Computed only for a file that
+                    // actually merges (the history lookup already ran).
+                    let ancestors = if ctx.has_merge_base {
+                        git_sync::merge_base(git, root, ctx.ours_rev, ctx.theirs_rev)
+                            .ok()
+                            .flatten()
+                            .map(|mb| ancestor_states(git, root, &mb, path))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     // Each row gets its own base from the two histories.
                     let per_entity = hist
                         .as_ref()
@@ -1387,13 +1637,14 @@ fn shared_plan_changes(
                                 std::str::from_utf8(&ours).ok()?,
                                 std::str::from_utf8(&theirs).ok()?,
                             );
-                            Some(merge_shared_file_per_entity(
+                            Some(merge_shared_file_with_ancestors(
                                 kind,
                                 b,
                                 ancestry.as_deref(),
                                 &versions,
                                 &os,
                                 &ts,
+                                &ancestors,
                                 o,
                                 t,
                             ))
@@ -1453,20 +1704,22 @@ fn shared_plan_changes(
             }
             (None, Some(_)) if is_approved_request(path, ctx.approved) => Plan::Delete,
             (None, Some(b)) => {
-                // We deleted it iff the branch still holds the version we last
-                // had. With a merge base that version is the base's — nothing
-                // else counts: a file already gone AT the fork whose content
-                // returns on the branch is the branch's own re-add, not our
-                // retraction; deleting it would resurrect the A/D oscillation
-                // (T-000257). The historical fallback applies only when the
-                // histories share no merge base at all.
-                let ours_before = if ctx.has_merge_base {
-                    merge_base_blob.map(String::from)
-                } else {
-                    bs.map(String::from)
-                        .or_else(|| last_version_sha(git, root, ctx.ours_rev, path))
-                };
-                if Some(b) == ours_before.as_deref() {
+                // We deleted it iff the branch is a pure follower of this
+                // path's history with us: every blob it ever held is a
+                // subsequence of ours, so its current copy is a version WE
+                // delivered and later retracted — a file born after the fork
+                // that reached the branch through our own deliveries counts
+                // the same (T-000257 could not see it behind the merge base).
+                // A byte-identical re-add is NOT a follower: the re-add commit
+                // is an extra entry in the branch's history ours never had,
+                // so the foreign work lives on (the A/D guard, T-000257; the
+                // re-dropped `.ack/` markers of T-000245).
+                let follows = hist.as_ref().is_some_and(|(o, t)| {
+                    !o.is_empty()
+                        && t.first().map(String::as_str) == Some(b)
+                        && is_subsequence(t, o)
+                });
+                if follows {
                     Plan::Delete
                 } else {
                     Plan::Skip
@@ -2035,6 +2288,17 @@ struct RepoPass {
     /// lifecycle one; the status stays untouched as well — the issue carries
     /// the reason).
     halt: bool,
+    /// T-000260: lower-cased merge-target branches whose remote tip the stale
+    /// gate refused. For a PUBLISH recipient phase B repairs the remote with
+    /// a detached sync commit on its tip — never a force-push, never a merge
+    /// of the stale content.
+    stale_refused: HashSet<String>,
+    /// T-000260: the stale gate evaluated the checked-out merge target this
+    /// pass (every `Ok` of `ff_current` — including `Clean`, which means the
+    /// remote is behind or clean). `settle_status` retains a persisted
+    /// `RemoteFileStale` only while the gate has not run: an unevaluated
+    /// pass must not clear a verdict it never checked.
+    stale_checked: bool,
 }
 
 impl RepoPass {
@@ -2113,6 +2377,24 @@ impl RepoPass {
             diverged: Some((branch.to_string(), current)),
             rejected_branch: None,
             ui: None,
+        });
+    }
+
+    /// `RemoteFileStale` for `branch`: the remote tip restores content the
+    /// shared timeline superseded. `diverged` stays `None` — the UI detail
+    /// carries the branch and the refused paths, and nothing in it may arm
+    /// the Merge action (T-000260).
+    fn note_remote_stale(&mut self, branch: &str, paths: &[String]) {
+        self.notes.push(StatusNote {
+            status: SharedStatus::RemoteFileStale,
+            detail: format!(
+                "{}: remote holds superseded shared content in: {}",
+                branch,
+                paths.join(", ")
+            ),
+            diverged: None,
+            rejected_branch: None,
+            ui: Some(serde_json::json!({ "branch": branch, "paths": paths }).to_string()),
         });
     }
 
@@ -2691,6 +2973,8 @@ fn new_pass(repo: &Repository, root: &Path, login: &str) -> RepoPass {
         own_bumps: 0,
         driver_ready: false,
         halt: false,
+        stale_refused: HashSet::new(),
+        stale_checked: false,
     }
 }
 
@@ -2906,10 +3190,20 @@ fn phase_a_foreign(
             pass.role = Some(role);
             let expected = gen0 + u64::from(pass.own_bumps);
             register_driver(git, &mut pass, expected);
-            pass.own_branch = own_branch_of(db, repo.id)
-                .filter(|b| !same_branch(b, &s.main.dev_branch) || role != Role::Pending);
+            pass.own_branch = own_branch_of(db, repo.id);
             let main_dev = s.main.dev_branch.clone();
+            // T-000262: a pending helper always talks to the main's dev —
+            // including when its configured branch IS dev or none is set:
+            // the join request names the branch it chose (dev included) and
+            // `NoOwnBranch` now means "nothing to name", never "no
+            // transport". The old `own == dev ⇒ own_branch = None` filter
+            // made a pending-on-dev install a dead pass: no request, no
+            // merge, approval only by manual `git pull`.
             match (&pass.own_branch, role) {
+                (None, Role::Pending) => {
+                    pass.note(SharedStatus::NoOwnBranch, "");
+                    pass.recipients = clean_recipients(vec![main_dev]);
+                }
                 (None, _) => pass.note(SharedStatus::NoOwnBranch, ""),
                 (Some(own), Role::Contributor) => {
                     pass.recipients = clean_recipients(vec![own.clone(), main_dev]);
@@ -3455,10 +3749,27 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
             }
             let cur = current_branch(git, &pass.root).ok().flatten();
             let pathspec = shared_pathspec(role, &pass.login, pass.share_specs);
-            for b in &recipients {
+            // T-000262: merging remote truth into the checked-out branch is
+            // separate from publishing to a recipient — a role whose publish
+            // list does not include the main's dev still merges it when that
+            // is the checked-out branch (a pending or no-own-branch install
+            // receives the approval structure without a manual `git pull`).
+            // A merge-only target never sets `pass.committed` and is never
+            // pushed — phase B keeps iterating `recipients` for that.
+            let mut merge_targets = recipients.clone();
+            if let (Some(c), Some(s)) = (cur.as_deref(), pass.structure.as_ref()) {
+                let main_dev = s.main.dev_branch.as_str();
+                if same_branch(c, main_dev)
+                    && !merge_targets.iter().any(|t| same_branch(t, main_dev))
+                {
+                    merge_targets.push(main_dev.to_string());
+                }
+            }
+            for b in &merge_targets {
                 if pass.halt {
                     break;
                 }
+                let merge_only = !recipients.iter().any(|r| same_branch(r, b));
                 let remote = remote_ref(b);
                 let has_remote =
                     matches!(git_sync::rev_parse(git, &pass.root, &remote), Ok(Some(_)));
@@ -3467,7 +3778,7 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
                     if !has_remote {
                         continue;
                     }
-                    match ff_current(
+                    let ff = ff_current(
                         git,
                         &pass.root,
                         &remote,
@@ -3476,9 +3787,43 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
                         &pass.login,
                         b,
                         pass.driver_ready,
-                    ) {
+                        merge_only,
+                    );
+                    // Every `Ok` reached the stale gate — `Clean` included:
+                    // it means the remote is behind ours or carried nothing
+                    // stale. Only a git-level `Err` leaves the gate
+                    // unevaluated.
+                    if ff.is_ok() {
+                        pass.stale_checked = true;
+                    }
+                    match ff {
                         Ok(FfResult::Clean) => {}
-                        Ok(FfResult::Merged) => pass.committed = true,
+                        Ok(FfResult::Deferred { reason }) => {
+                            // `Some`: a merge-only target's dirt — no phase-B
+                            // commit resolves it, so it surfaces as an issue.
+                            // `None`: a publish recipient's dirt — phase B
+                            // handles it silently.
+                            if let Some(reason) = reason {
+                                pass.issue(
+                                    repo_issue(Code::SharedMergeDeferred, &pass.repo)
+                                        .target(b)
+                                        .detail(reason),
+                                );
+                            }
+                        }
+                        Ok(FfResult::Stale { paths }) => {
+                            // Refused before any adoption — a publish
+                            // recipient is repaired in phase B (detached
+                            // commit on the remote tip); a merge-only target
+                            // waits for its publisher.
+                            pass.stale_refused.insert(b.to_ascii_lowercase());
+                            pass.note_remote_stale(b, &paths);
+                        }
+                        Ok(FfResult::Merged) => {
+                            if !merge_only {
+                                pass.committed = true;
+                            }
+                        }
                         Ok(FfResult::Conflict { files }) => {
                             pass.note_conflict(b, &files);
                         }
@@ -3508,28 +3853,51 @@ fn after_fetch(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, gen0: u64) {
                 // Not the current branch: it may only ever hold our own sync commits.
                 let mut check = true;
                 if has_remote {
-                    match git_sync::fast_forward_ref(git, &pass.root, b, &remote) {
-                        Ok(FfOutcome::Diverged) => {
-                            check = false;
-                            let tip = if pass.fetched {
-                                local_tip_if_ours(git, &pass.root, b).unwrap_or(None)
-                            } else {
-                                None
-                            };
-                            let reset = tip.is_some_and(|t| {
-                                reset_to_origin(git, &pass.root, b, &t).unwrap_or(false)
-                            });
-                            if !reset {
-                                pass.blocked.insert(b.to_ascii_lowercase());
-                                pass.note_diverged(b, false);
+                    // T-000260: a stale remote must not be adopted — neither
+                    // by a fast-forward of the local ref nor by the diverged
+                    // branch's reset onto it. The gate runs only when a local
+                    // `b` exists to protect (no local tip → the remote is
+                    // adopted wholesale, which is its owner's business).
+                    let merge_base = git_sync::merge_base(git, &pass.root, b, &remote)
+                        .ok()
+                        .flatten();
+                    let stale = stale_remote_paths(
+                        git,
+                        &pass.root,
+                        b,
+                        &remote,
+                        merge_base.as_deref(),
+                        &pathspec,
+                    );
+                    if !stale.is_empty() {
+                        check = false;
+                        pass.stale_refused.insert(b.to_ascii_lowercase());
+                        pass.note_remote_stale(b, &stale);
+                    } else {
+                        match git_sync::fast_forward_ref(git, &pass.root, b, &remote) {
+                            Ok(FfOutcome::Diverged) => {
+                                check = false;
+                                let tip = if pass.fetched {
+                                    local_tip_if_ours(git, &pass.root, b).unwrap_or(None)
+                                } else {
+                                    None
+                                };
+                                let reset = tip.is_some_and(|t| {
+                                    reset_to_origin(git, &pass.root, b, &t).unwrap_or(false)
+                                });
+                                if !reset {
+                                    pass.blocked.insert(b.to_ascii_lowercase());
+                                    pass.note_diverged(b, false);
+                                }
                             }
-                        }
-                        Ok(FfOutcome::LocalAhead) => {}
-                        Ok(_) => check = false,
-                        Err(e) => {
-                            check = false;
-                            let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
-                            pass.issue(issue)
+                            Ok(FfOutcome::LocalAhead) => {}
+                            Ok(_) => check = false,
+                            Err(e) => {
+                                check = false;
+                                let issue =
+                                    repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                                pass.issue(issue)
+                            }
                         }
                     }
                 }
@@ -3740,6 +4108,74 @@ fn wire_of(p: &crate::models::RuleProposal) -> RuleProposalFile {
     }
 }
 
+/// Where a proposal-channel write may land on the local dev branch
+/// (T-000261/D9).
+pub(crate) enum DevWriteTip {
+    /// The local branch exists and contains the origin tip — write to it.
+    Local,
+    /// No local branch but the origin tip resolves — the write's base is
+    /// the origin tip; the branch is created at `origin + the commit`,
+    /// which contains the fetched tip by construction.
+    CreateAtOrigin(String),
+    /// The local tip does not contain the origin tip (stale or diverged),
+    /// or neither ref resolves — the channel forks nothing.
+    Blocked,
+}
+
+/// The D9 ancestry gate: writes to local `dev` require its tip to contain
+/// the fetched origin tip — a stale or diverged local dev is never forked
+/// by the proposal channel. `Blocked` when writing would fork or when
+/// there is no tip to write onto at all.
+pub(crate) fn dev_write_tip(
+    git: &GitBinary,
+    root: &Path,
+    dev_branch: &str,
+) -> Result<DevWriteTip, String> {
+    let local = git_sync::rev_parse(git, root, &local_ref(dev_branch))?;
+    let origin = git_sync::rev_parse(git, root, &remote_ref(dev_branch))?;
+    Ok(match (local, origin) {
+        (Some(l), Some(o)) => {
+            if git_sync::is_ancestor(git, root, &o, &l)? {
+                DevWriteTip::Local
+            } else {
+                DevWriteTip::Blocked
+            }
+        }
+        (Some(_), None) => DevWriteTip::Local,
+        (None, Some(o)) => DevWriteTip::CreateAtOrigin(o),
+        (None, None) => DevWriteTip::Blocked,
+    })
+}
+
+/// Commit `changes` on top of `origin_tip` and create `refs/heads/<dev>`
+/// at the result — the CreateAtOrigin arm of the write gate: the fresh
+/// branch contains the fetched tip by construction. `false` when the ref
+/// appeared concurrently or the tree ended up equal.
+pub(crate) fn create_dev_at_origin(
+    git: &GitBinary,
+    root: &Path,
+    dev_branch: &str,
+    origin_tip: &str,
+    changes: &[FileChange],
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+) -> Result<bool, String> {
+    let Some(new) = git_sync::commit_files_onto_rev(
+        git,
+        root,
+        origin_tip,
+        changes,
+        message,
+        author_name,
+        author_email,
+    )?
+    else {
+        return Ok(false);
+    };
+    git_sync::update_ref_cas(git, root, &format!("refs/heads/{}", dev_branch), &new, None)
+}
+
 /// Write `changes` to the dev branch and return the subject used, or report
 /// the blockage on the pass. `None` = nothing written (empty, moved, or
 /// blocked — the pass notes it and the next sync retries).
@@ -3755,8 +4191,37 @@ fn commit_to_dev(
     }
     let root = pass.root.clone();
     let (_, body) = commit_message(&pass.login);
+    // T-000261/D9: the ancestry gate precedes every write path — a local
+    // dev that lacks the fetched origin tip is stale or diverged, and the
+    // channel never forks it (the merge side of the pass already reported
+    // the divergence). This gates the checked-out write too: a worktree
+    // commit on a stale base forks the ref exactly like a plumbing one.
+    let tip = match dev_write_tip(git, &root, dev_branch) {
+        Ok(t) => t,
+        Err(e) => {
+            pass.note(SharedStatus::Blocked, format!("{}: {}", dev_branch, e));
+            return;
+        }
+    };
     let cur = current_branch(git, &root).ok().flatten();
     if cur.as_deref().is_some_and(|c| same_branch(c, dev_branch)) {
+        match tip {
+            DevWriteTip::Local => {}
+            // Dev is checked out here but its ref does not exist (unborn):
+            // a worktree commit would make it a ROOT commit without the
+            // fetched truth, and the plumbing alternative cannot create the
+            // ref underneath an active checkout. The channel waits.
+            _ => {
+                pass.note(
+                    SharedStatus::Blocked,
+                    format!(
+                        "{} is checked out but lacks the fetched origin tip — the channel retries after the merge",
+                        dev_branch
+                    ),
+                );
+                return;
+            }
+        }
         // Dev checked out HERE: write the artifacts into the work tree and
         // commit them scoped — foreign work outside our paths is untouched.
         for ch in changes {
@@ -3813,8 +4278,10 @@ fn commit_to_dev(
         return;
     }
     // Dev checked out in ANOTHER worktree: its files cannot be written here
-    // (the current-checkout case returned above). `refuse_checked_out`
-    // already compares ASCII-insensitively across every worktree.
+    // (the current-checkout case returned above), and an unborn checkout
+    // there means the ref must not be created underneath it either.
+    // `refuse_checked_out` already compares ASCII-insensitively across
+    // every worktree — it precedes BOTH plumbing arms below.
     if let Err(e) = git_sync::refuse_checked_out(
         git,
         &root,
@@ -3823,6 +4290,41 @@ fn commit_to_dev(
     ) {
         pass.note(SharedStatus::Blocked, e);
         return;
+    }
+    // A missing local branch is created at `origin + the commit`, which
+    // contains the fetched tip by construction.
+    match tip {
+        DevWriteTip::Local => {}
+        DevWriteTip::CreateAtOrigin(origin_tip) => {
+            match create_dev_at_origin(
+                git,
+                &root,
+                dev_branch,
+                &origin_tip,
+                changes,
+                &format!("{}\n\n{}", subject, body),
+                SDH_COMMIT_NAME,
+                SDH_COMMIT_EMAIL,
+            ) {
+                Ok(true) => pass.committed = true,
+                Ok(false) => {}
+                Err(e) => pass.note(
+                    SharedStatus::Blocked,
+                    format!("commit to {}: {}", dev_branch, e),
+                ),
+            }
+            return;
+        }
+        DevWriteTip::Blocked => {
+            pass.note(
+                SharedStatus::Blocked,
+                format!(
+                    "local {} lacks the fetched origin tip — the channel retries after the merge",
+                    dev_branch
+                ),
+            );
+            return;
+        }
     }
     match git_sync::commit_files_to_branch(
         git,
@@ -3864,31 +4366,20 @@ fn commit_to_dev(
 /// `proposed` history event is recorded once per newly seen open version.
 fn sync_rule_proposals(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, dev_branch: &str) {
     let root = pass.root.clone();
-    let local_ref = local_ref(dev_branch);
-    let origin_ref = remote_ref(dev_branch);
-    let Some(dev_tip) = git_sync::rev_parse(git, &root, &local_ref).ok().flatten() else {
-        return; // No local dev yet — the fast-forward creates it this pass.
-    };
     let known: HashSet<String> = crate::sync::skills::list_skill_templates(db)
         .map(|v| v.into_iter().map(|(name, _)| name).collect())
         .unwrap_or_default();
     let known_fn = |r: &str| known.contains(r);
     let mut issues = Vec::new();
-    let (dev_proposals, dev_decisions) =
-        read_proposal_catalogs(git, &root, &dev_tip, &known_fn, &mut issues);
-    // The confirmed origin snapshot — `remote_ver` and `pub_state` are only
-    // ever set from it, never from the local tip's guess.
-    let (origin_proposals, origin_decisions) = if pass.fetched
-        && git_sync::rev_parse(git, &root, &origin_ref)
-            .ok()
-            .flatten()
-            .is_some()
-    {
-        let mut skip = Vec::new();
-        read_proposal_catalogs(git, &root, &origin_ref, &known_fn, &mut skip)
-    } else {
-        (BTreeMap::new(), BTreeMap::new())
-    };
+    // T-000261/D6: the union of BOTH dev refs — the origin snapshot joins
+    // only when this pass fetched. The early return is "neither rev
+    // resolves": a fresh clone may lack a local `dev` ref entirely and
+    // still must read the catalogs (and `remote_ver`/`pub_state` still
+    // confirm from origin only).
+    let cats = proposal_catalogs(git, &root, dev_branch, &known_fn, &mut issues, pass.fetched);
+    if !cats.any {
+        return;
+    }
     for i in issues {
         pass.issue(
             repo_issue(Code::ManagedFileFailed, &pass.repo)
@@ -3899,44 +4390,25 @@ fn sync_rule_proposals(db: &AppDb, git: &GitBinary, pass: &mut RepoPass, dev_bra
 
     match pass.role {
         Some(Role::Contributor) => {
-            contributor_proposals_transport(
-                db,
-                git,
-                pass,
-                dev_branch,
-                &dev_proposals,
-                &dev_decisions,
-                &origin_proposals,
-                &origin_decisions,
-            );
+            contributor_proposals_transport(db, git, pass, dev_branch, &cats);
         }
         Some(Role::Main) => {
-            main_decisions_transport(
-                db,
-                git,
-                pass,
-                dev_branch,
-                &dev_proposals,
-                &dev_decisions,
-                &origin_decisions,
-            );
+            main_decisions_transport(db, git, pass, dev_branch, &cats);
         }
         _ => {}
     }
 }
 
 /// The contributor half: pull / upload own proposals and refresh the
-/// receipt overlay.
-#[allow(clippy::too_many_arguments)]
+/// receipt overlay — all against the union view (T-000261): the effective
+/// proposal version decides pull-vs-upload, and a receipt resolves only
+/// when its `decided_rev` names THAT version's alias set (D7).
 fn contributor_proposals_transport(
     db: &AppDb,
     git: &GitBinary,
     pass: &mut RepoPass,
     dev_branch: &str,
-    dev_proposals: &BTreeMap<String, (String, RuleProposalFile)>,
-    dev_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
-    origin_proposals: &BTreeMap<String, (String, RuleProposalFile)>,
-    _origin_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+    cats: &ProposalCatalogs,
 ) {
     use rp::Effective;
     let rows = db.list_rule_proposals(pass.repo.id).unwrap_or_default();
@@ -3946,14 +4418,14 @@ fn contributor_proposals_transport(
             continue; // Single-writer: only this install's own proposals move.
         }
         let local_wire = wire_of(row);
-        let dev = dev_proposals.get(&row.file_name);
+        let dev = cats.proposals.get(&row.file_name);
         let outcome = match dev {
-            Some((_, d)) => rp::effective_version(&local_wire, d),
+            Some(u) => rp::effective_version(&local_wire, &u.proposal),
             None => Effective::Local,
         };
         match outcome {
             Effective::Remote => {
-                let (_, d) = dev.expect("dev checked above");
+                let d = &dev.expect("dev checked above").proposal;
                 let _ = db.pull_rule_proposal(
                     pass.repo.id,
                     &row.file_name,
@@ -3982,11 +4454,13 @@ fn contributor_proposals_transport(
         // A proposal our login has on dev but no row for — created on
         // another install of the same person: pull it in, still to apply.
         // (Handled below, after this loop.)
-        // Receipt overlay: only the dev blob sha of THIS version resolves it.
-        if let Some((sha, _)) = dev {
-            let matching = dev_decisions
-                .values()
-                .find(|(_, d)| ss::logins_equal(&d.login, &row.login) && d.decided_rev == *sha);
+        // Receipt overlay: a receipt resolves the EFFECTIVE version only —
+        // `decided_rev` must name one of its alias shas; a receipt an older
+        // revision closed must not resolve this one (D7).
+        if let Some(u) = dev {
+            let matching = cats.decisions.entries.values().find(|(_, d)| {
+                ss::logins_equal(&d.login, &row.login) && u.effective_shas.contains(&d.decided_rev)
+            });
             let _ = db.set_rule_proposal_resolved(
                 pass.repo.id,
                 &row.file_name,
@@ -4003,7 +4477,7 @@ fn contributor_proposals_transport(
             let _ = db.set_rule_proposal_resolved(pass.repo.id, &row.file_name, None);
         }
         // remote_ver — the confirmed origin tuple for the GC.
-        if let Some((sha, d)) = origin_proposals.get(&row.file_name) {
+        if let Some((sha, d)) = cats.origin.0.get(&row.file_name) {
             let tuple =
                 serde_json::json!({"seq": d.seq, "status": d.status, "sha": sha}).to_string();
             let _ = db.set_rule_proposal_remote_ver(pass.repo.id, &row.file_name, Some(&tuple));
@@ -4012,7 +4486,8 @@ fn contributor_proposals_transport(
     // Own proposals on dev this install never wrote (same person, another
     // machine): pull in as pending_apply so the local-work sweep applies
     // their text to the canon.
-    for (file_name, (_, d)) in dev_proposals {
+    for (file_name, u) in &cats.proposals {
+        let d = &u.proposal;
         if !ss::logins_equal(&d.login, &pass.login) {
             continue;
         }
@@ -4042,28 +4517,22 @@ fn contributor_proposals_transport(
 
 /// The owner half: publish pending receipts and confirm `pub_state` from
 /// origin; record a `proposed` event once per newly seen open version.
+/// The union view decides both (T-000261): an open proposal only origin
+/// knows still reaches the owner, and a receipt only origin holds is never
+/// republished (D8).
 fn main_decisions_transport(
     db: &AppDb,
     git: &GitBinary,
     pass: &mut RepoPass,
     dev_branch: &str,
-    dev_proposals: &BTreeMap<String, (String, RuleProposalFile)>,
-    dev_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
-    origin_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+    cats: &ProposalCatalogs,
 ) {
-    publish_pending_receipts(
-        db,
-        git,
-        pass,
-        dev_branch,
-        dev_proposals,
-        dev_decisions,
-        origin_decisions,
-    );
+    publish_pending_receipts(db, git, pass, dev_branch, cats);
     // Owner-side `proposed` history: once per newly seen OPEN version —
     // note `(<file> seq <n>)` is the dedup key.
     let mut seen: HashSet<String> = HashSet::new();
-    for (file_name, (_, d)) in dev_proposals {
+    for (file_name, u) in &cats.proposals {
+        let d = &u.proposal;
         if d.status != proposal_status::OPEN {
             continue;
         }
@@ -4100,15 +4569,12 @@ fn main_decisions_transport(
 /// origin snapshot only, and mark `overtaken` the rows whose decided
 /// revision is no longer the open version on dev — a re-proposal passed
 /// them; the immutable receipt still stands where it was committed.
-#[allow(clippy::too_many_arguments)]
 fn publish_pending_receipts(
     db: &AppDb,
     git: &GitBinary,
     pass: &mut RepoPass,
     dev_branch: &str,
-    dev_proposals: &BTreeMap<String, (String, RuleProposalFile)>,
-    dev_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
-    origin_decisions: &BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+    cats: &ProposalCatalogs,
 ) {
     use crate::models::acceptance_pub_state as ps;
     let mut writes: Vec<FileChange> = Vec::new();
@@ -4117,7 +4583,12 @@ fn publish_pending_receipts(
             continue;
         }
         let name = rp::decision_file_name(&a.rule, &a.proposer_login, &a.decided_rev);
-        match dev_decisions.get(&name) {
+        if cats.decisions.conflicts.contains_key(&name) {
+            // D8: the refs carry different bytes under this name — a write
+            // would join the conflict; the union already surfaced it.
+            continue;
+        }
+        match cats.decisions.entries.get(&name) {
             Some((_, d))
                 if serde_json::to_string(d).ok().as_deref() == Some(a.receipt_json.as_str()) =>
             {
@@ -4141,7 +4612,7 @@ fn publish_pending_receipts(
             }
         }
         // Publication is confirmed from origin only.
-        if let Some((_, d)) = origin_decisions.get(&name) {
+        if let Some((_, d)) = cats.origin.1.get(&name) {
             if serde_json::to_string(d).ok().as_deref() == Some(a.receipt_json.as_str()) {
                 let _ = db.set_rule_acceptance_pub_state(
                     pass.repo.id,
@@ -4158,6 +4629,9 @@ fn publish_pending_receipts(
     // dev was overtaken by a re-proposal: it stops chasing publication.
     // The check covers every decided row, published included — `overtaken`
     // is the receipt's standing, orthogonal to whether origin saw it.
+    // T-000261: "the open version" is the EFFECTIVE union version — a
+    // receipt whose decided_rev still names that version (any alias) was
+    // never overtaken.
     for a in db.list_rule_acceptances(pass.repo.id).unwrap_or_default() {
         if a.pub_state == ps::OVERTAKEN
             || !matches!(
@@ -4172,9 +4646,10 @@ fn publish_pending_receipts(
             continue;
         }
         let pname = rp::proposal_file_name(&a.rule, &a.proposer_login);
-        if dev_proposals
+        if cats
+            .proposals
             .get(&pname)
-            .is_some_and(|(sha, _)| sha != &a.decided_rev)
+            .is_some_and(|u| !u.effective_shas.contains(&a.decided_rev))
         {
             let _ = db.set_rule_acceptance_pub_state(
                 pass.repo.id,
@@ -4204,35 +4679,19 @@ pub(crate) fn sweep_rule_publications(
     let login = db.github_login().unwrap_or_default();
     let mut pass = new_pass(repo, root, &login);
     pass.role = Some(Role::Main);
-    let Some(dev_tip) = git_sync::rev_parse(git, root, &local_ref(dev_branch))
-        .ok()
-        .flatten()
-    else {
-        return Vec::new();
-    };
     let known: HashSet<String> = crate::sync::skills::list_skill_templates(db)
         .map(|v| v.into_iter().map(|(name, _)| name).collect())
         .unwrap_or_default();
     let known_fn = |r: &str| known.contains(r);
     let mut issues = Vec::new();
-    let (dev_proposals, dev_decisions) =
-        read_proposal_catalogs(git, root, &dev_tip, &known_fn, &mut issues);
-    let origin = remote_ref(dev_branch);
-    let (_, origin_decisions) = if matches!(git_sync::rev_parse(git, root, &origin), Ok(Some(_))) {
-        let mut skip = Vec::new();
-        read_proposal_catalogs(git, root, &origin, &known_fn, &mut skip)
-    } else {
-        (BTreeMap::new(), BTreeMap::new())
-    };
-    publish_pending_receipts(
-        db,
-        git,
-        &mut pass,
-        dev_branch,
-        &dev_proposals,
-        &dev_decisions,
-        &origin_decisions,
-    );
+    // T-000261: the union view — the last-seen origin ref is read as-is
+    // (no fetch here), and a repo without a local `dev` ref still confirms
+    // `pub_state` from origin.
+    let cats = proposal_catalogs(git, root, dev_branch, &known_fn, &mut issues, true);
+    if !cats.any {
+        return issues;
+    }
+    publish_pending_receipts(db, git, &mut pass, dev_branch, &cats);
     issues.extend(
         pass.issues
             .iter()
@@ -4253,6 +4712,11 @@ enum FfResult {
     /// Up-to-date, fast-forwarded, or deferred on dirty shared paths — the
     /// pass continues without a merge.
     Clean,
+    /// T-000262: the merge could not run because shared files are dirty —
+    /// `Some` for a merge-only target (no phase-B commit resolves the dirt
+    /// for an install that publishes nothing, so it surfaces as an issue),
+    /// `None` for a publish recipient whose dirt phase B handles silently.
+    Deferred { reason: Option<String> },
     /// A merge commit landed on the current branch — the pass counts it as
     /// its commit (phase B pushes it like any sync commit).
     Merged,
@@ -4261,9 +4725,15 @@ enum FfResult {
     /// The merge attempt was refused or failed before completing — the repo
     /// was either never touched or verified restored.
     Refused { reason: String },
-    /// The attempt left the repo unverified — the rest of the pass must not
+    /// The attempt left the repo unverified — the rest of this pass must not
     /// mutate it (`RepoPass::halt`).
     Unrestored { reason: String },
+    /// T-000260/D5b: the remote tip restores file content the shared
+    /// timeline superseded before the merge-base — merging it would install
+    /// stale bytes. NOT `Refused`: a generic refusal would stamp
+    /// `needs_manual_merge` and arm the Merge button, which bypasses this
+    /// gate and installs exactly the refused content.
+    Stale { paths: Vec<String> },
 }
 
 /// The commit message of a sync-created merge: `SDH-Participant:` marks a
@@ -4302,6 +4772,199 @@ fn foreign_staged_paths(
     Ok(foreign)
 }
 
+/// The in-process stale-remote gate (T-000260/D5b-gate): merge-ort adopts
+/// `theirs` whenever ours' blob equals the merge-base's — exactly the shape
+/// of a stale writer restoring pre-base bytes (a descendant commit, so no
+/// provenance rule can see it). For every task file in that shape the
+/// ancestor history decides whether theirs' content predates the
+/// merge-base's own; flagged paths are refused as `RemoteFileStale`, never
+/// silently installed.
+fn stale_remote_paths(
+    git: &GitBinary,
+    root: &Path,
+    ours_rev: &str,
+    remote: &str,
+    merge_base: Option<&str>,
+    pathspec: &[String],
+) -> Vec<String> {
+    let mut stale = Vec::new();
+    for path in pathspec {
+        let Some(kind) = kind_for_path(path) else {
+            continue;
+        };
+        // Only the file git itself would hand to `theirs` needs a check:
+        // ours unchanged since the merge-base. A remote deletion is never
+        // stale (an absent theirs cannot restore old bytes).
+        let (Ok(Some(ours_sha)), Ok(Some(theirs_sha))) = (
+            git_sync::blob_sha_at(git, root, ours_rev, path),
+            git_sync::blob_sha_at(git, root, remote, path),
+        ) else {
+            continue;
+        };
+        if ours_sha == theirs_sha {
+            continue;
+        }
+        let base_sha =
+            merge_base.and_then(|mb| git_sync::blob_sha_at(git, root, mb, path).ok().flatten());
+        if base_sha.as_deref() != Some(ours_sha.as_str()) {
+            continue;
+        }
+        let Ok(ours) = cat_blob(git, root, &ours_sha) else {
+            continue;
+        };
+        let Ok(theirs) = cat_blob(git, root, &theirs_sha) else {
+            continue;
+        };
+        // `base == ours`: the gate ran only because ours' blob is the
+        // merge-base's — normalizing it once serves both roles.
+        let (Ok(base), Ok(theirs)) = (
+            String::from_utf8(normalize(ours)),
+            String::from_utf8(normalize(theirs)),
+        ) else {
+            continue;
+        };
+        let ancestors = merge_base
+            .map(|mb| ancestor_states(git, root, mb, path))
+            .unwrap_or_default();
+        if has_stale_remote_state(kind, &base, &theirs, &ancestors) {
+            stale.push(path.clone());
+        }
+    }
+    stale
+}
+
+/// Would `git merge <remote>` produce exactly HEAD's tree AND is every
+/// commit the remote holds past HEAD this install's own republication?
+/// Both halves are required. The tree check alone cannot tell a detached
+/// shared-only publication made from this very state (T-000256 — merging
+/// it anyway mints a merge commit every pass while the local tip stays
+/// unpushable) from a FOREIGN commit whose tree happens to end at bytes
+/// HEAD lacks: a participant's `.ack` marker re-dropped after a revision
+/// reset merges to "deletion wins", so the endpoint diff reports nothing
+/// even though the remote's ancestry must still be adopted. The
+/// `SDH-Participant:` trailer answers whose commits the remote is made
+/// of; anything not signed by this install fails open to the real merge.
+fn merge_result_is_ours(git: &GitBinary, root: &Path, remote: &str, login: &str) -> bool {
+    let me = login.trim().to_ascii_lowercase();
+    if me.is_empty() {
+        return false;
+    }
+    let Ok(out) = spawn_cmd(&git.0)
+        .args([
+            "log",
+            remote,
+            "--not",
+            "HEAD",
+            "--format=%(trailers:key=SDH-Participant,valueonly,separator=%x2C)",
+        ])
+        .current_dir(root)
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let mut any = false;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        any = true;
+        if !line.trim().eq_ignore_ascii_case(&me) {
+            return false;
+        }
+    }
+    if !any {
+        return false;
+    }
+    let Ok(out) = spawn_cmd(&git.0)
+        .args(["merge-tree", "--write-tree", "HEAD", remote])
+        .current_dir(root)
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Some(tree) = text.lines().next().map(str::trim) else {
+        return false;
+    };
+    matches!(
+        git_sync::rev_parse(git, root, "HEAD^{tree}"),
+        Ok(Some(t)) if t == tree
+    )
+}
+
+/// After a clean merge ort's endpoint diff can still hide remote work: a
+/// path ours deleted after the merge base and the remote re-added ends at
+/// the base's blob, so "theirs unchanged" lets our deletion win — the
+/// remote's post-base event survives only as ancestry. Honor what the
+/// tree comparison cannot see: any shared path the remote touched since
+/// the merge base and still holds is checked out into the worktree, where
+/// phase B's commit records it as new shared content (the `.ack` marker a
+/// participant re-drops after a revision reset rides exactly this lane).
+/// A path the remote did NOT touch since the base is the base version we
+/// retracted — the deletion stands and there is nothing to adopt.
+fn adopt_remote_re_adds(
+    git: &GitBinary,
+    root: &Path,
+    remote: &str,
+    merge_base: Option<&str>,
+    pathspec: &[String],
+) -> Result<(), String> {
+    for path in ls_tree(git, root, remote, pathspec)?
+        .into_keys()
+        .filter(|p| !is_excluded_file(p))
+    {
+        if git_sync::blob_sha_at(git, root, "HEAD", &path)?.is_some() {
+            continue;
+        }
+        let touched = match merge_base {
+            None => true,
+            Some(mb) => {
+                let out = spawn_cmd(&git.0)
+                    .args([
+                        "log",
+                        "-1",
+                        "--format=%H",
+                        remote,
+                        "--not",
+                        mb,
+                        "--",
+                        path.as_str(),
+                    ])
+                    .current_dir(root)
+                    .output()
+                    .map_err(|e| format!("git log failed to start: {}", e))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "git log exit {}: {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+            }
+        };
+        if !touched {
+            continue;
+        }
+        let out = spawn_cmd(&git.0)
+            .args(["checkout", remote, "--", path.as_str()])
+            .current_dir(root)
+            .output()
+            .map_err(|e| format!("git checkout failed to start: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git checkout exit {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Bring the CURRENT branch up to `remote`: fast-forward when it is only
 /// behind, attempt `git merge` when it truly diverged (T-000248 — the manual
 /// "Merge" button remains for real conflicts). `expected` is the branch the
@@ -4311,7 +4974,9 @@ fn foreign_staged_paths(
 /// attempt: without the merge driver a both-sides-changed shared file
 /// conflicts textually. A dirty shared path waits for phase B either way
 /// (`shared_paths_dirty`), and a staged path outside the shared set refuses —
-/// it must not ride into the merge commit.
+/// it must not ride into the merge commit. Before any merge the stale-remote
+/// gate refuses paths the `ours == base` shortcut would install stale
+/// (T-000260/D5b).
 fn ff_current(
     git: &GitBinary,
     root: &Path,
@@ -4321,14 +4986,25 @@ fn ff_current(
     login: &str,
     expected: &str,
     driver_ready: bool,
+    merge_only: bool,
 ) -> Result<FfResult, String> {
     if git_sync::is_ancestor(git, root, remote, "HEAD")? {
         return Ok(FfResult::Clean);
     }
+    // The stale gate precedes even the dirty-worktree deferral: it reads
+    // only rev data, so a deferred pass still flags (and thereby retains)
+    // the stale verdict it could not act on (T-000260/D5b). A pure
+    // fast-forward adopts `theirs` wholesale and a merge's `ours == base`
+    // shortcut does the same per file — the same check guards both paths.
+    let merge_base = git_sync::merge_base(git, root, "HEAD", remote)?;
+    let stale = stale_remote_paths(git, root, "HEAD", remote, merge_base.as_deref(), pathspec);
+    if !stale.is_empty() {
+        return Ok(FfResult::Stale { paths: stale });
+    }
     if !git_sync::is_ancestor(git, root, "HEAD", remote)? {
         // True divergence: both sides moved.
-        if shared_paths_dirty(git, root, pathspec)? {
-            return Ok(FfResult::Clean);
+        if let Some(deferred) = merge_deferred(git, root, remote, login, pathspec, merge_only)? {
+            return Ok(deferred);
         }
         if !driver_ready {
             return Ok(FfResult::Refused {
@@ -4344,11 +5020,17 @@ fn ff_current(
                 ),
             });
         }
+        if merge_result_is_ours(git, root, remote, login) {
+            return Ok(FfResult::Clean);
+        }
         let msg = sync_merge_msg(role, login, remote);
         return Ok(
             match git_sync::merge_or_abort_msg(git, root, remote, Some(&msg), Some(expected))? {
                 MergeAttempt::UpToDate => FfResult::Clean,
-                MergeAttempt::Merged => FfResult::Merged,
+                MergeAttempt::Merged => {
+                    adopt_remote_re_adds(git, root, remote, merge_base.as_deref(), pathspec)?;
+                    FfResult::Merged
+                }
                 MergeAttempt::Conflict { files } => FfResult::Conflict { files },
                 MergeAttempt::Failed {
                     reason,
@@ -4358,8 +5040,8 @@ fn ff_current(
             },
         );
     }
-    if shared_paths_dirty(git, root, pathspec)? {
-        return Ok(FfResult::Clean);
+    if let Some(deferred) = merge_deferred(git, root, remote, login, pathspec, merge_only)? {
+        return Ok(deferred);
     }
     match git_sync::merge_ff_only(git, root, remote)? {
         FfOutcome::Diverged => Ok(FfResult::Refused {
@@ -4458,6 +5140,17 @@ fn settle_status(db: &AppDb, pass: &RepoPass, out: &mut SharedOutcome) {
     let new_detail = best.and_then(|n| n.ui_detail());
     let old_state = db.get_shared_state(pass.repo.id).ok();
     let old = old_state.as_ref().and_then(|s| s.shared_status.clone());
+    // T-000260: a `RemoteFileStale` verdict clears only when the gate
+    // actually evaluated the remote this pass (a successful check that
+    // flagged nothing, a merge, or a repair). A pass that settled nothing —
+    // it errored or deferred before the gate — must not read as "stale
+    // gone".
+    if new.is_none()
+        && old.as_deref() == Some(SharedStatus::RemoteFileStale.as_str())
+        && !pass.stale_checked
+    {
+        return;
+    }
     if old.as_deref() == new {
         // The code is the same; its detail may still have moved (another
         // branch, another reason): keep it fresh without announcing again.
@@ -4893,7 +5586,10 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
     // recipients check so the same scoped commit carries it, and only on a
     // bytes change so a steady state produces no commit churn. An install
     // without a validated login writes nothing (never a guessed file).
-    if ss::is_valid_request_login(&login) {
+    // T-000262 (D11b): no publish target ⇒ no write — a merge-only install's
+    // version file would stay uncommitted forever inside its shared pathspec
+    // and deadlock the read-only merge channel on `shared_paths_dirty`.
+    if !pass.recipients.is_empty() && ss::is_valid_request_login(&login) {
         if let Err(e) = write_own_app_version(&root, &login) {
             let issue = repo_issue(Code::ManagedFileFailed, &pass.repo)
                 .target(APP_VERSIONS_REL_DIR)
@@ -5151,6 +5847,34 @@ fn push_recipients(
         if remote.as_deref() == Some(local.as_str()) {
             continue;
         }
+        // T-000260/D5b-repair: a recipient whose remote tip the stale gate
+        // refused is NEVER pushed the branch (non-ff → Merge button →
+        // bypass). The shared content is republished as a detached commit on
+        // the remote tip instead — the remote absorbs our fresh bytes
+        // without force-push and without losing its unrelated commits.
+        if pass.stale_refused.contains(&b.to_ascii_lowercase()) {
+            if let Some(remote) = remote.as_deref() {
+                let held = pending_skill_holds_for(catalogs, pass, &b);
+                match shared_commit_on_tip(
+                    git,
+                    &root,
+                    &local,
+                    remote,
+                    &pass.login,
+                    plumb_spec,
+                    approved,
+                    &held,
+                ) {
+                    Ok(Some(sha)) => onto_remote.push((b.clone(), sha)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        let issue = repo_issue(Code::AutocommitFailed, &pass.repo).detail(e);
+                        pass.issue(issue)
+                    }
+                }
+            }
+            continue;
+        }
         if !local_only_commits_are_ours(git, &root, &b).unwrap_or(false) {
             if !is_current {
                 pass.blocked.insert(b.to_ascii_lowercase());
@@ -5326,6 +6050,168 @@ fn branch_owner_login(pass: &RepoPass, branch: &str) -> String {
     pass.login.clone()
 }
 
+/// A parsed-proposal catalog of one rev: file name → (blob sha, wire file).
+pub(crate) type ProposalMap = BTreeMap<String, (String, RuleProposalFile)>;
+/// A parsed-receipt catalog of one rev: file name → (blob sha, wire file).
+pub(crate) type DecisionMap = BTreeMap<String, (String, crate::models::RuleDecisionFile)>;
+
+/// One proposal file folded across the observed revs (T-000261/D6): the
+/// EFFECTIVE wire version plus the alias set of blob shas that carry its
+/// canonical content — `decided_rev` resolves against this set only — and
+/// every sha the file was ever seen under (visibility only, never
+/// resolves: a receipt for an older revision must not close a newer one).
+#[derive(Debug, Clone)]
+pub(crate) struct UnionProposal {
+    pub proposal: RuleProposalFile,
+    /// Blob shas whose canonical content equals the effective version's.
+    pub effective_shas: BTreeSet<String>,
+    /// Every blob sha the file was observed under, any version.
+    pub seen_shas: BTreeSet<String>,
+}
+
+/// The receipt union of the observed revs (T-000261/D8): identical bytes
+/// dedup by blob sha; a same-name receipt whose bytes disagree across revs
+/// is a CONFLICT — excluded from resolution and surfaced, never picked by
+/// ref order.
+#[derive(Debug, Default)]
+pub(crate) struct DecisionUnion {
+    /// Unambiguous receipts: file name → (blob sha, wire file).
+    pub entries: DecisionMap,
+    /// Names whose blob shas disagree across revs — fail closed.
+    pub conflicts: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Fold per-rev proposal catalogs into the union view. `effective_version`
+/// makes the fold order-independent: the greater seq wins; equal seq
+/// prefers `withdrawn`; still-equal differing contents order by canonical
+/// hash; canonically equal entries join the winner's alias set.
+pub(crate) fn union_proposals<'a>(
+    maps: impl IntoIterator<Item = &'a ProposalMap>,
+) -> BTreeMap<String, UnionProposal> {
+    let mut out: BTreeMap<String, UnionProposal> = BTreeMap::new();
+    for map in maps {
+        for (name, (sha, p)) in map {
+            match out.get_mut(name) {
+                None => {
+                    out.insert(
+                        name.clone(),
+                        UnionProposal {
+                            proposal: p.clone(),
+                            effective_shas: BTreeSet::from([sha.clone()]),
+                            seen_shas: BTreeSet::from([sha.clone()]),
+                        },
+                    );
+                }
+                Some(u) => {
+                    u.seen_shas.insert(sha.clone());
+                    match rp::effective_version(&u.proposal, p) {
+                        rp::Effective::Local => {}
+                        rp::Effective::Remote => {
+                            u.proposal = p.clone();
+                            u.effective_shas = BTreeSet::from([sha.clone()]);
+                        }
+                        rp::Effective::Same => {
+                            u.effective_shas.insert(sha.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fold per-rev receipt catalogs into the union view. The blob sha IS the
+/// bytes check: same name + same sha dedups, same name + different sha is
+/// a byte conflict — moved out of `entries`, into `conflicts`.
+pub(crate) fn union_decisions<'a>(
+    maps: impl IntoIterator<Item = &'a DecisionMap>,
+) -> DecisionUnion {
+    let mut out = DecisionUnion::default();
+    for map in maps {
+        for (name, (sha, d)) in map {
+            if out.conflicts.contains_key(name) {
+                out.conflicts
+                    .get_mut(name)
+                    .expect("checked")
+                    .insert(sha.clone());
+                continue;
+            }
+            match out.entries.get(name) {
+                None => {
+                    out.entries.insert(name.clone(), (sha.clone(), d.clone()));
+                }
+                Some((seen, _)) if seen == sha => {}
+                Some((seen, _)) => {
+                    let shas = BTreeSet::from([seen.clone(), sha.clone()]);
+                    out.entries.remove(name);
+                    out.conflicts.insert(name.clone(), shas);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The proposal-channel catalogs of one read: both dev refs' views (local
+/// markers, origin confirmations) and their folded union (D6/D8) — the
+/// input every reader and writer of the channel shares (D9).
+#[derive(Debug, Default)]
+pub(crate) struct ProposalCatalogs {
+    /// `(proposals, decisions)` at `refs/heads/<dev>` — empty when absent.
+    pub local: (ProposalMap, DecisionMap),
+    /// Same at `refs/remotes/origin/<dev>` — read only when asked (a sync
+    /// pass gates it on `fetched`; sweeps read the last-seen ref as-is).
+    pub origin: (ProposalMap, DecisionMap),
+    /// Folded proposals by file name.
+    pub proposals: BTreeMap<String, UnionProposal>,
+    /// Deduped/conflicted receipts by file name.
+    pub decisions: DecisionUnion,
+    /// At least one rev resolved — the catalogs' readers' early return.
+    pub any: bool,
+}
+
+/// Read both dev refs' catalogs and fold them (D6/D8). `read_origin`
+/// decides whether the last-seen `origin/<dev>` ref joins the read.
+pub(crate) fn proposal_catalogs(
+    git: &GitBinary,
+    root: &Path,
+    dev_branch: &str,
+    known: &dyn Fn(&str) -> bool,
+    issues: &mut Vec<String>,
+    read_origin: bool,
+) -> ProposalCatalogs {
+    let mut out = ProposalCatalogs::default();
+    if let Some(tip) = git_sync::rev_parse(git, root, &local_ref(dev_branch))
+        .ok()
+        .flatten()
+    {
+        out.local = read_proposal_catalogs(git, root, &tip, known, issues);
+        out.any = true;
+    }
+    if read_origin {
+        if let Some(tip) = git_sync::rev_parse(git, root, &remote_ref(dev_branch))
+            .ok()
+            .flatten()
+        {
+            let mut skip = Vec::new();
+            out.origin = read_proposal_catalogs(git, root, &tip, known, &mut skip);
+            out.any = true;
+        }
+    }
+    out.proposals = union_proposals([&out.local.0, &out.origin.0]);
+    out.decisions = union_decisions([&out.local.1, &out.origin.1]);
+    for (name, shas) in &out.decisions.conflicts {
+        issues.push(format!(
+            "{}/{}: conflicting receipt bytes across dev refs ({}) — excluded from resolution",
+            rp::RULE_DECISIONS_REL_DIR,
+            name,
+            shas.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out
+}
+
 /// The proposal/decision catalogs of the shared dev refs, read ONCE per
 /// pass — every branch derives its own held-skill set from the same data,
 /// because the catalogs behind it do not differ between branches (T-000257).
@@ -5340,8 +6226,12 @@ struct ProposalSnapshot {
         BTreeMap<String, String>,
         BTreeMap<String, (String, RuleProposalFile)>,
     )>,
-    /// Decisions from BOTH revs merged — a receipt on either tip resolves.
-    decisions: BTreeMap<String, (String, crate::models::RuleDecisionFile)>,
+    /// Folded proposals by file name (T-000261/D6) — the effective version
+    /// a hold is evaluated on (D7b).
+    proposals: BTreeMap<String, UnionProposal>,
+    /// Receipts from BOTH revs deduped/conflicted (T-000261/D8) — a receipt
+    /// on either tip resolves; a byte conflict never does.
+    decisions: DecisionUnion,
 }
 
 /// `docs/sdh_skills/<rule>.md` paths the shared planner must not touch on the
@@ -5384,8 +6274,10 @@ fn load_proposal_snapshot(
     let proposals_dir = [rp::RULE_PROPOSALS_REL_DIR.to_string()];
     let mut snap = ProposalSnapshot {
         revs: Vec::new(),
-        decisions: BTreeMap::new(),
+        proposals: BTreeMap::new(),
+        decisions: DecisionUnion::default(),
     };
+    let mut decision_maps = Vec::new();
     for rev in &revs {
         let names = match ls_tree(git, root, rev, &proposals_dir) {
             Ok(m) => m,
@@ -5395,25 +6287,34 @@ fn load_proposal_snapshot(
         // channel's pass; here malformed files only matter as "hold by name".
         let mut issues = Vec::new();
         let (proposals, decisions) = read_proposal_catalogs(git, root, rev, &known_fn, &mut issues);
-        snap.decisions.extend(decisions);
+        decision_maps.push(decisions);
         snap.revs.push((names, proposals));
     }
+    snap.proposals = union_proposals(snap.revs.iter().map(|(_, p)| p));
+    snap.decisions = union_decisions(decision_maps.iter());
     Some(snap)
 }
 
 /// The held-skill set of one branch owner, derived from a snapshot already
 /// read for the pass — pure computation, no git calls.
+///
+/// T-000261/D7b: the hold follows the EFFECTIVE version of each proposal
+/// file — an older revision the union fold dropped never holds on its own
+/// (a local seq-1 without a receipt does not hold once the effective seq-2
+/// resolved on origin; a withdrawn effective version's stale open revision
+/// stops holding too). Conservative cases keep holding: a file listed but
+/// unparseable on any rev, a malformed receipt, and the D8 same-name
+/// receipt conflict — none of them resolves anything.
 fn held_skills_for(snapshot: &ProposalSnapshot, owner_login: &str) -> BTreeSet<String> {
-    // Proposal blob shas a receipt already closes (union over both
-    // snapshots: a receipt visible on either dev tip resolves the proposal).
+    // `decided_rev`s of every parsed receipt of this login — conflicted
+    // names are absent from `entries` by construction, so a byte-conflicted
+    // receipt never releases a hold.
     let mut resolved: BTreeSet<String> = BTreeSet::new();
-    for (_, (_, d)) in &snapshot.decisions {
+    for (_, (_, d)) in &snapshot.decisions.entries {
         if ss::logins_equal(&d.login, owner_login) {
             resolved.insert(d.decided_rev.clone());
         }
     }
-    // (rule, blob sha, status) of every parsed proposal of this login.
-    let mut parsed: Vec<(String, String, String)> = Vec::new();
     let mut held: BTreeSet<String> = BTreeSet::new();
     for (names, proposals) in &snapshot.revs {
         for path in names.keys() {
@@ -5429,19 +6330,21 @@ fn held_skills_for(snapshot: &ProposalSnapshot, owner_login: &str) -> BTreeSet<S
             if !ss::logins_equal(login, owner_login) {
                 continue;
             }
-            match proposals.get(name) {
-                Some((sha, p)) => parsed.push((rule.to_string(), sha.clone(), p.status.clone())),
+            if !proposals.contains_key(name) {
                 // Listed but unparseable / unreadable / capped / symlinked:
                 // it might be an unresolved proposal — hold the skill.
-                None => {
-                    held.insert(format!("{}/{}.md", SKILLS_DIR, rule));
-                }
+                held.insert(format!("{}/{}.md", SKILLS_DIR, rule));
             }
         }
     }
-    for (rule, sha, status) in &parsed {
-        if status == crate::models::proposal_status::OPEN && !resolved.contains(sha) {
-            held.insert(format!("{}/{}.md", SKILLS_DIR, rule));
+    for u in snapshot.proposals.values() {
+        if !ss::logins_equal(&u.proposal.login, owner_login) {
+            continue;
+        }
+        if u.proposal.status == crate::models::proposal_status::OPEN
+            && u.effective_shas.iter().all(|s| !resolved.contains(s))
+        {
+            held.insert(format!("{}/{}.md", SKILLS_DIR, u.proposal.rule));
         }
     }
     held
@@ -6530,6 +7433,36 @@ pub fn merge_shared_upstream(
     if matches!(role, Role::Contributor | Role::Pending) && login.is_empty() {
         return Err("no GitHub login on this install — cannot sign the merge".to_string());
     }
+    // T-000260: the same stale-remote gate the pass applies — the manual
+    // Merge must never install content the shared timeline already
+    // superseded (that would be the bypass `RemoteFileStale` exists to
+    // close).
+    let pathspec = shared_pathspec(role, &login, own_share_specs(db, repo_id));
+    let merge_base = git_sync::merge_base(git, &root, "HEAD", &upstream)?;
+    let stale = stale_remote_paths(
+        git,
+        &root,
+        "HEAD",
+        &upstream,
+        merge_base.as_deref(),
+        &pathspec,
+    );
+    if !stale.is_empty() {
+        return Err(format!(
+            "the remote holds superseded shared content in: {} — it cannot be merged; a sync on a publishing install repairs the remote",
+            stale.join(", ")
+        ));
+    }
+    // The same no-op probe the pass applies: a merge whose result is HEAD's
+    // own tree AND whose remote-only commits are all this install's own
+    // carries nothing — the button reports up_to_date instead of minting a
+    // merge commit the detached publication can never push.
+    if merge_result_is_ours(git, &root, &upstream, &login) {
+        return Ok(SharedMergeResult {
+            outcome: "up_to_date".into(),
+            files: vec![],
+        });
+    }
     let msg = sync_merge_msg(role, &login, &upstream);
     let outcome = git_sync::merge_or_abort_msg(git, &root, &upstream, Some(&msg), Some(&cur))?;
     Ok(match outcome {
@@ -6538,6 +7471,7 @@ pub fn merge_shared_upstream(
             files: vec![],
         },
         MergeAttempt::Merged => {
+            adopt_remote_re_adds(git, &root, &upstream, merge_base.as_deref(), &pathspec)?;
             // T-000243 review (seventh pass): a successful merge invalidates
             // every pre-merge observation — bump unconditionally, whether or
             // not `needs_manual_merge` was persisted. `root` IS the guarded
@@ -9267,6 +10201,434 @@ mod tests {
 
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
+    fn pending_on_dev_publishes_request_and_receives_approval() {
+        let fx = two_installs();
+        // The helper sits on `dev` and names it as its branch — the request
+        // must still ride out and the approval come back by sync alone.
+        g(&fx.helper_dir, &["checkout", "-q", "dev"]);
+        fx.helper_db
+            .set_autocommit_branch(fx.helper_repo, Some("dev"))
+            .unwrap();
+        fx.enable_main();
+        let before = fx.remote_rev("dev").unwrap();
+
+        let out = fx.sync_helper();
+        assert_eq!(fx.helper_status().as_deref(), Some("pending_approval"));
+        assert!(codes(&out).contains(&Code::SharedPendingApproval));
+        let req = fx.remote_file("dev", ".sdh/requests/helper.json").unwrap();
+        assert!(
+            req.contains("\"branch\":\"dev\"") || req.contains("\"branch\": \"dev\""),
+            "{req}"
+        );
+
+        // The owner's sync merges the request into its checkout; approving
+        // names `dev` — a participant on dev is legal — and the approval
+        // commits + pushes itself to origin/dev.
+        fx.sync_main();
+        approve_join_request(&fx.main_db, Some(&gb()), fx.main_repo, "helper").unwrap();
+        assert_ne!(fx.remote_rev("dev").unwrap(), before);
+
+        // The next helper sync merges the approval into the checked-out dev —
+        // no manual `git pull`: the worktree structure flips to contributor.
+        fx.sync_helper();
+        assert_eq!(fx.helper_status(), None, "{:?}", fx.helper_status_detail());
+        let s = get_repo_structure(&fx.helper_db, Some(&gb()), fx.helper_repo)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.participants.len(), 1);
+        assert_eq!(s.participants[0].login, "helper");
+        let worktree_s = std::fs::read_to_string(fx.helper_dir.join(".sdh/project.json")).unwrap();
+        assert!(worktree_s.contains("\"helper\""), "{worktree_s}");
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn contributor_without_own_branch_on_dev_receives_merges() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.helper_db
+            .set_autocommit_branch(fx.helper_repo, None)
+            .unwrap();
+        g(&fx.helper_dir, &["checkout", "-q", "dev"]);
+
+        // The owner publishes a task-file change on dev.
+        write(
+            &fx.main_dir,
+            "docs/todo.md",
+            &todo(&["T-000001", "T-500000"]),
+        );
+        fx.sync_main();
+        let remote_dev = fx.remote_rev("dev").unwrap();
+
+        // The merge-only install still receives the change — as a
+        // fast-forward, not by publishing anything.
+        let out = fx.sync_helper();
+        assert!(out.committed.is_empty(), "{:?}", out.committed);
+        assert_eq!(g(&fx.helper_dir, &["rev-parse", "dev"]), remote_dev);
+        assert!(std::fs::read_to_string(fx.helper_dir.join("docs/todo.md"))
+            .unwrap()
+            .contains("T-000001"));
+        // And the remote gained nothing from the helper.
+        assert_eq!(fx.remote_rev("dev").unwrap(), remote_dev);
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn merge_only_version_file_dirt_does_not_deadlock() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.helper_db
+            .set_autocommit_branch(fx.helper_repo, None)
+            .unwrap();
+        g(&fx.helper_dir, &["checkout", "-q", "dev"]);
+
+        // Pre-existing residue on the install's own version file (written by
+        // an older version, or a second install under the same login that
+        // changed it on dev) must reconcile, not deadlock: the incoming tree
+        // does not touch it, so the dirt is ignorable.
+        write(
+            &fx.helper_dir,
+            ".sdh/app-versions/helper.json",
+            "{\"app_version\":\"9.9.9-dirty\"}\n",
+        );
+
+        write(
+            &fx.main_dir,
+            "docs/todo.md",
+            &todo(&["T-000002", "T-500000"]),
+        );
+        fx.sync_main();
+        let remote_dev = fx.remote_rev("dev").unwrap();
+
+        let out = fx.sync_helper();
+        assert!(
+            !codes(&out).contains(&Code::SharedMergeDeferred),
+            "{:?}",
+            out.issues
+        );
+        assert_eq!(g(&fx.helper_dir, &["rev-parse", "dev"]), remote_dev);
+        assert!(std::fs::read_to_string(fx.helper_dir.join("docs/todo.md"))
+            .unwrap()
+            .contains("T-000002"));
+
+        // The incoming tree CHANGING the version file (another install under
+        // the same login) reconciles the residue and merges too.
+        write(
+            &fx.helper_dir,
+            ".sdh/app-versions/helper.json",
+            "{\"app_version\":\"8.8.8-dirty-again\"}\n",
+        );
+        write(
+            &fx.main_dir,
+            ".sdh/app-versions/helper.json",
+            "{\"app_version\":\"7.7.7\"}\n",
+        );
+        g(
+            &fx.main_dir,
+            &["add", "-f", ".sdh/app-versions/helper.json"],
+        );
+        g(&fx.main_dir, &["commit", "-q", "-m", "same-login version"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        let remote_dev2 = fx.remote_rev("dev").unwrap();
+        let out2 = fx.sync_helper();
+        assert!(
+            !codes(&out2).contains(&Code::SharedMergeDeferred),
+            "{:?}",
+            out2.issues
+        );
+        assert_eq!(g(&fx.helper_dir, &["rev-parse", "dev"]), remote_dev2);
+        // The merge installed the incoming bytes; residue did not block it.
+        assert!(
+            std::fs::read_to_string(fx.helper_dir.join(".sdh/app-versions/helper.json"))
+                .unwrap()
+                .contains("7.7.7")
+        );
+
+        // The incoming tree DELETING the version file reconciles residue too:
+        // the file is restored to HEAD for the merge, then deleted by it.
+        write(
+            &fx.helper_dir,
+            ".sdh/app-versions/helper.json",
+            "{\"app_version\":\"6.6.6-dirty-thrice\"}\n",
+        );
+        g(&fx.main_dir, &["rm", "-q", ".sdh/app-versions/helper.json"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "drop version file"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        let remote_dev3 = fx.remote_rev("dev").unwrap();
+        let out3 = fx.sync_helper();
+        assert!(
+            !codes(&out3).contains(&Code::SharedMergeDeferred),
+            "{:?}",
+            out3.issues
+        );
+        assert_eq!(g(&fx.helper_dir, &["rev-parse", "dev"]), remote_dev3);
+        assert!(!fx.helper_dir.join(".sdh/app-versions/helper.json").exists());
+
+        // Untracked residue under the same path vs an incoming add: the stale
+        // copy is dropped so the merge can install the tracked one.
+        write(
+            &fx.helper_dir,
+            ".sdh/app-versions/helper.json",
+            "{\"app_version\":\"5.5.5-untracked\"}\n",
+        );
+        write(
+            &fx.main_dir,
+            ".sdh/app-versions/helper.json",
+            "{\"app_version\":\"4.4.4\"}\n",
+        );
+        g(
+            &fx.main_dir,
+            &["add", "-f", ".sdh/app-versions/helper.json"],
+        );
+        g(&fx.main_dir, &["commit", "-q", "-m", "re-add version file"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        let remote_dev4 = fx.remote_rev("dev").unwrap();
+        let out4 = fx.sync_helper();
+        assert!(
+            !codes(&out4).contains(&Code::SharedMergeDeferred),
+            "{:?}",
+            out4.issues
+        );
+        assert_eq!(g(&fx.helper_dir, &["rev-parse", "dev"]), remote_dev4);
+        assert!(
+            std::fs::read_to_string(fx.helper_dir.join(".sdh/app-versions/helper.json"))
+                .unwrap()
+                .contains("4.4.4")
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn merge_only_foreign_dirt_defers_with_a_note() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.helper_db
+            .set_autocommit_branch(fx.helper_repo, None)
+            .unwrap();
+        g(&fx.helper_dir, &["checkout", "-q", "dev"]);
+        // A shared path beyond the version file is dirty — the merge defers.
+        write(&fx.helper_dir, "docs/todo.md", &todo(&["T-500000"]));
+        g(&fx.helper_dir, &["add", "docs/todo.md"]);
+        g(&fx.helper_dir, &["commit", "-q", "-m", "helper edit"]);
+        write(
+            &fx.helper_dir,
+            "docs/todo.md",
+            &todo(&["T-500000", "T-500001"]),
+        );
+
+        write(
+            &fx.main_dir,
+            "docs/todo.md",
+            &todo(&["T-000003", "T-500000"]),
+        );
+        fx.sync_main();
+        let remote_dev = fx.remote_rev("dev").unwrap();
+
+        let out = fx.sync_helper();
+        assert!(
+            codes(&out).contains(&Code::SharedMergeDeferred),
+            "{:?}",
+            out.issues
+        );
+        assert_ne!(g(&fx.helper_dir, &["rev-parse", "dev"]), remote_dev);
+    }
+
+    /// A new commit holding `content` of `path` pushed straight onto
+    /// `origin/dev`'s tip from the helper clone — the stale writer of the
+    /// T-000260 scenario (an install that publishes file bytes the shared
+    /// timeline already superseded). The helper's own checkout is restored
+    /// to `back` afterwards.
+    fn push_onto_remote_dev(fx: &TwoInstalls, path: &str, content: &str, back: &str) {
+        g(&fx.helper_dir, &["fetch", "-q", "origin"]);
+        g(
+            &fx.helper_dir,
+            &["checkout", "-q", "--detach", "origin/dev"],
+        );
+        write(&fx.helper_dir, path, content);
+        g(&fx.helper_dir, &["add", "-f", path]);
+        g(&fx.helper_dir, &["commit", "-q", "-m", "stale writer"]);
+        g(&fx.helper_dir, &["push", "-q", "origin", "HEAD:dev"]);
+        g(&fx.helper_dir, &["checkout", "-q", back]);
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_stale_remote_task_file_is_refused_then_repaired() {
+        let fx = two_installs();
+        fx.enable_main();
+
+        // v1 is published, then superseded by v2 — the shared timeline
+        // knows both states behind the merge-base. The files differ by the
+        // TEXT of one row and of the version header — present-vs-present,
+        // so a restore is provably stale (a removed row would be T-000255's
+        // deletion, never this gate).
+        let v1 = "## v1.0.0 \u{2014} alpha\n\n\
+            - [ ] T-000001 | first text | 1 | low | open | 2026-10-01\n";
+        let v2 = "## v1.0.0 \u{2014} beta\n\n\
+            - [ ] T-000001 | second text | 1 | low | open | 2026-10-01\n";
+        write(&fx.main_dir, "docs/todo.md", v1);
+        fx.sync_main();
+        write(&fx.main_dir, "docs/todo.md", v2);
+        fx.sync_main();
+        let local_tip = g(&fx.main_dir, &["rev-parse", "dev"]);
+
+        // The stale writer restores v1's bytes on a DESCENDANT of the
+        // remote tip — the shape merge-ort's `ours == base` shortcut would
+        // adopt silently.
+        push_onto_remote_dev(&fx, "docs/todo.md", v1, "helper-dev");
+        let stale_tip = fx.remote_rev("dev").unwrap();
+
+        let out = fx.sync_main();
+        assert!(
+            codes(&out).contains(&Code::SharedRemoteFileStale),
+            "{:?}",
+            out.issues
+        );
+        assert_eq!(fx.main_status().as_deref(), Some("remote_file_stale"));
+        let detail = fx.main_status_detail().unwrap();
+        assert!(detail.contains("docs/todo.md"), "{detail}");
+        // Local never adopted the stale commit …
+        assert_eq!(g(&fx.main_dir, &["rev-parse", "dev"]), local_tip);
+        // … and the same pass already repaired the remote: our fresh bytes
+        // on top of the stale tip — no force-push, no merge of stale
+        // content.
+        let remote = fx.remote_file("dev", "docs/todo.md").unwrap();
+        assert!(remote.contains("second text"), "{remote}");
+        let new_tip = fx.remote_rev("dev").unwrap();
+        g(
+            &fx.origin,
+            &["merge-base", "--is-ancestor", &stale_tip, &new_tip],
+        );
+
+        // The next pass fast-forwards onto the repair commit and the
+        // verdict clears itself.
+        fx.sync_main();
+        assert_eq!(fx.main_status(), None);
+        assert_eq!(g(&fx.main_dir, &["rev-parse", "dev"]), new_tip);
+        assert!(std::fs::read_to_string(fx.main_dir.join("docs/todo.md"))
+            .unwrap()
+            .contains("second text"));
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_remote_entity_level_revert_is_flagged_too() {
+        let fx = two_installs();
+        fx.enable_main();
+
+        // v1 → v2 edits one row AND adds another. The remote's tip file is
+        // neither v1 nor v2: the new row kept, the edited row reverted — a
+        // hybrid whose file bytes are new but whose ENTITY state predates
+        // the merge-base's own.
+        let v1 = todo(&["T-000001"]);
+        let v2 = "## v1.0.0 \u{2014} first\n\n\
+            - [ ] T-000001 | edited | 1 | low | open | 2026-10-01\n\
+            - [ ] T-000009 | task T-000009 | 1 | low | open | 2026-10-01\n";
+        let hybrid = "## v1.0.0 \u{2014} first\n\n\
+            - [ ] T-000001 | task T-000001 | 1 | low | open | 2026-10-01\n\
+            - [ ] T-000009 | task T-000009 | 1 | low | open | 2026-10-01\n";
+        write(&fx.main_dir, "docs/todo.md", &v1);
+        fx.sync_main();
+        write(&fx.main_dir, "docs/todo.md", v2);
+        fx.sync_main();
+        let local_tip = g(&fx.main_dir, &["rev-parse", "dev"]);
+
+        push_onto_remote_dev(&fx, "docs/todo.md", hybrid, "helper-dev");
+        let out = fx.sync_main();
+        assert!(
+            codes(&out).contains(&Code::SharedRemoteFileStale),
+            "{:?}",
+            out.issues
+        );
+        assert_eq!(fx.main_status().as_deref(), Some("remote_file_stale"));
+        assert_eq!(g(&fx.main_dir, &["rev-parse", "dev"]), local_tip);
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_remote_readd_with_identical_text_is_not_stale() {
+        let fx = two_installs();
+        fx.enable_main();
+
+        write(&fx.main_dir, "docs/todo.md", &todo(&["T-000001"]));
+        fx.sync_main();
+        // The file leaves the timeline entirely — a re-add later is never
+        // stale (presence/absence stays T-000255's business).
+        g(&fx.main_dir, &["rm", "-q", "docs/todo.md"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "drop todo"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+
+        push_onto_remote_dev(&fx, "docs/todo.md", &todo(&["T-000001"]), "helper-dev");
+        let out = fx.sync_main();
+        assert!(
+            !codes(&out).contains(&Code::SharedRemoteFileStale),
+            "{:?}",
+            out.issues
+        );
+        assert_eq!(fx.main_status(), None);
+        assert_eq!(
+            g(&fx.main_dir, &["rev-parse", "dev"]),
+            fx.remote_rev("dev").unwrap()
+        );
+        assert!(fx.main_dir.join("docs/todo.md").exists());
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_merge_only_install_reports_stale_and_waits_for_the_publisher() {
+        let fx = two_installs();
+        fx.make_participant();
+        fx.helper_db
+            .set_autocommit_branch(fx.helper_repo, None)
+            .unwrap();
+        g(&fx.helper_dir, &["checkout", "-q", "dev"]);
+
+        let v1 = "## v1.0.0 \u{2014} alpha\n\n\
+            - [ ] T-000001 | first text | 1 | low | open | 2026-10-01\n";
+        let v2 = "## v1.0.0 \u{2014} beta\n\n\
+            - [ ] T-000001 | second text | 1 | low | open | 2026-10-01\n";
+        write(&fx.main_dir, "docs/todo.md", v1);
+        fx.sync_main();
+        write(&fx.main_dir, "docs/todo.md", v2);
+        fx.sync_main();
+        fx.sync_helper(); // the merge-only install receives v2
+        let helper_tip = g(&fx.helper_dir, &["rev-parse", "dev"]);
+
+        push_onto_remote_dev(&fx, "docs/todo.md", v1, "dev");
+        let stale_tip = fx.remote_rev("dev").unwrap();
+
+        let out = fx.sync_helper();
+        assert!(
+            codes(&out).contains(&Code::SharedRemoteFileStale),
+            "{:?}",
+            out.issues
+        );
+        assert_eq!(fx.helper_status().as_deref(), Some("remote_file_stale"));
+        // A merge-only install repairs nothing: the remote tip is still the
+        // stale writer's, the local tip never moved.
+        assert_eq!(g(&fx.helper_dir, &["rev-parse", "dev"]), helper_tip);
+        assert_eq!(fx.remote_rev("dev").unwrap(), stale_tip);
+
+        // The owner syncs — a publishing role — and repairs the remote.
+        fx.sync_main();
+        assert!(fx
+            .remote_file("dev", "docs/todo.md")
+            .unwrap()
+            .contains("second text"));
+
+        // The helper's next pass receives the repair and the stale verdict
+        // clears — only this install's standing `no_own_branch` advisory
+        // (it publishes nothing) remains.
+        fx.sync_helper();
+        assert_eq!(fx.helper_status().as_deref(), Some("no_own_branch"));
+        assert_eq!(
+            g(&fx.helper_dir, &["rev-parse", "dev"]),
+            fx.remote_rev("dev").unwrap()
+        );
+    }
+
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
     fn pending_helper_sends_only_its_request_to_mains_dev() {
         let fx = two_installs();
         fx.enable_main();
@@ -9381,8 +10743,9 @@ mod tests {
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     /// T-000248: a clean divergence of the CURRENT branch merges itself in
-    /// the same pass — no `needs_manual_merge`, no Merge button. Both files
-    /// land on origin/dev in one sync, and a repeated pass stays a no-op.
+    /// the same pass — no `needs_manual_merge`, no Merge button. T-000256:
+    /// the publication onto origin/dev is shared-only — the private source
+    /// file stays local; a repeated pass stays a no-op.
     fn diverged_current_branch_auto_merges_without_the_button() {
         let fx = two_installs();
         fx.enable_main();
@@ -9410,7 +10773,10 @@ mod tests {
             parents
         );
         assert!(fx.main_dir.join(".sdh/requests/helper.json").exists());
-        assert!(fx.remote_file("dev", "src.rs").is_some());
+        // T-000256: the merge carries the private file locally, but the
+        // publication is shared-only — `src.rs` stays off the remote until
+        // the owner pushes dev themselves. The shared request does ride.
+        assert!(fx.remote_file("dev", "src.rs").is_none());
         assert!(fx.remote_file("dev", ".sdh/requests/helper.json").is_some());
 
         // The button agrees nothing is left, and the next pass merges again.
@@ -9500,18 +10866,25 @@ mod tests {
         write(&fx.main_dir, "src.rs", "fn main() { /* union */ }\n");
         g(&fx.main_dir, &["add", "src.rs"]);
         g(&fx.main_dir, &["commit", "-q", "-m", "resolve src.rs"]);
+        let dev_before = fx.remote_rev("dev").unwrap();
         fx.sync_main();
         assert_eq!(fx.main_status(), None);
         assert_eq!(fx.main_status_detail(), None);
+        // T-000256: the resolved PRIVATE file stays local — the remote keeps
+        // the helper's copy until the owner pushes dev themselves. The union
+        // holds in the owner's tree, and the remote only ever moved forward.
+        assert_eq!(
+            fs::read_to_string(fx.main_dir.join("src.rs")).unwrap(),
+            "fn main() { /* union */ }\n"
+        );
         assert_eq!(
             fx.remote_file("dev", "src.rs").as_deref(),
-            Some("fn main() { /* union */ }\n")
+            Some("fn main() { /* helper */ }\n")
         );
-        // Both histories reached origin/dev.
         let new_dev = fx.remote_rev("dev").unwrap();
         g(
             &fx.origin,
-            &["merge-base", "--is-ancestor", &head_before, &new_dev],
+            &["merge-base", "--is-ancestor", &dev_before, &new_dev],
         );
     }
 
@@ -11673,6 +13046,89 @@ mod tests {
         assert!(got.contains("T-000002"));
     }
 
+    /// Base holds the marker; we deleted it; the remote deleted and re-added
+    /// the same bytes. ort's endpoint diff reads "theirs == base" and lets
+    /// our deletion win — the post-merge adoption must still land the
+    /// remote's re-add in the worktree (the `.ack` re-drop lane, T-000245).
+    #[test]
+    fn a_remote_re_add_hidden_by_an_equal_endpoint_is_adopted_by_the_merge() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        write(d, "docs/InOutBox/inbox/ms/A.md", "v2\n");
+        write(d, "docs/InOutBox/inbox/ms/A.md.ack/helper", "");
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "base"]);
+        g(d, &["checkout", "-q", "-b", "rtmp"]);
+        g(d, &["rm", "-rq", "docs/InOutBox/inbox/ms/A.md.ack"]);
+        g(d, &["commit", "-q", "-m", "remote delete"]);
+        write(d, "docs/InOutBox/inbox/ms/A.md.ack/helper", "");
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "remote re-add"]);
+        let remote = g(d, &["rev-parse", "HEAD"]);
+        g(d, &["checkout", "-q", "dev"]);
+        g(d, &["rm", "-rq", "docs/InOutBox/inbox/ms/A.md.ack"]);
+        g(d, &["commit", "-q", "-m", "our delete"]);
+        g(d, &["update-ref", "refs/remotes/origin/dev", &remote]);
+        let spec = vec!["docs/InOutBox/".to_string()];
+        let ff = ff_current(
+            &gb(),
+            d,
+            "origin/dev",
+            &spec,
+            Role::Main,
+            "Owner",
+            "dev",
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(ff, FfResult::Merged));
+        assert!(d.join("docs/InOutBox/inbox/ms/A.md.ack/helper").is_file());
+    }
+
+    /// Same graph without the remote's re-add: the file at the remote tip is
+    /// the base version we retracted — the merge must NOT adopt it back.
+    #[test]
+    fn a_merge_does_not_adopt_a_remote_copy_we_retracted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        write(d, "docs/InOutBox/inbox/ms/A.md", "v2\n");
+        write(d, "docs/InOutBox/inbox/ms/A.md.ack/helper", "");
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "base"]);
+        g(d, &["checkout", "-q", "-b", "rtmp"]);
+        write(d, "docs/InOutBox/inbox/ms/B.md", "unrelated\n");
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "remote work elsewhere"]);
+        let remote = g(d, &["rev-parse", "HEAD"]);
+        g(d, &["checkout", "-q", "dev"]);
+        g(d, &["rm", "-rq", "docs/InOutBox/inbox/ms/A.md.ack"]);
+        g(d, &["commit", "-q", "-m", "our delete"]);
+        g(d, &["update-ref", "refs/remotes/origin/dev", &remote]);
+        let spec = vec!["docs/InOutBox/".to_string()];
+        let ff = ff_current(
+            &gb(),
+            d,
+            "origin/dev",
+            &spec,
+            Role::Main,
+            "Owner",
+            "dev",
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(ff, FfResult::Merged));
+        assert!(!d.join("docs/InOutBox/inbox/ms/A.md.ack/helper").exists());
+        assert!(d.join("docs/InOutBox/inbox/ms/B.md").is_file());
+    }
+
     #[test]
     fn one_unreadable_old_version_does_not_spoil_the_per_row_base() {
         let s0 = todo(&["T-000001", "T-000002"]);
@@ -13466,5 +14922,301 @@ mod tests {
         assert!(g(d, &["ls-tree", "--name-only", "dev", "--", ".sdh"]).is_empty());
         let held = holds(&db, d, "dev", "helper");
         assert_eq!(held, BTreeSet::from([HELD.to_string()]));
+    }
+
+    // ----- T-000261: the union catalog view ---------------------------------
+
+    fn prop(seq: i64, status: &str, text: &str) -> RuleProposalFile {
+        RuleProposalFile {
+            format: crate::models::PROPOSAL_FORMAT,
+            login: "helper".into(),
+            rule: "sdh-alpha".into(),
+            text: text.into(),
+            at: "2026-11-18T00:00:00Z".into(),
+            seq,
+            status: status.into(),
+        }
+    }
+
+    fn dec(rev: &str) -> crate::models::RuleDecisionFile {
+        crate::models::RuleDecisionFile {
+            format: 1,
+            action: "accept".into(),
+            login: "helper".into(),
+            rule: "sdh-alpha".into(),
+            decided_by: "owner".into(),
+            decided_at: "2026-11-18T01:00:00Z".into(),
+            decided_rev: rev.into(),
+            seq: 1,
+        }
+    }
+
+    const PNAME: &str = "sdh-alpha.helper.json";
+    const PPATH: &str = ".sdh/rule-proposals/sdh-alpha.helper.json";
+
+    #[test]
+    fn union_proposals_fold_by_the_effective_version_not_the_read_order() {
+        // Greater seq wins, whichever rev the fold saw first.
+        let older: ProposalMap = BTreeMap::from([(
+            PNAME.to_string(),
+            ("s1".to_string(), prop(1, "open", "OLD")),
+        )]);
+        let newer: ProposalMap = BTreeMap::from([(
+            PNAME.to_string(),
+            ("s2".to_string(), prop(2, "open", "NEW")),
+        )]);
+        for maps in [vec![&older, &newer], vec![&newer, &older]] {
+            let u = union_proposals(maps);
+            let u = &u[PNAME];
+            assert_eq!(u.proposal.seq, 2);
+            assert_eq!(u.proposal.text, "NEW");
+            assert_eq!(u.effective_shas, BTreeSet::from(["s2".to_string()]));
+            assert_eq!(
+                u.seen_shas,
+                BTreeSet::from(["s1".to_string(), "s2".to_string()])
+            );
+        }
+        // Equal seq: the terminal status dominates.
+        let open: ProposalMap =
+            BTreeMap::from([(PNAME.to_string(), ("s1".to_string(), prop(1, "open", "X")))]);
+        let gone: ProposalMap = BTreeMap::from([(
+            PNAME.to_string(),
+            ("s9".to_string(), prop(1, "withdrawn", "X")),
+        )]);
+        let u = union_proposals([&open, &gone]);
+        assert_eq!(u[PNAME].proposal.status, "withdrawn");
+        // Canonically equal content under different blob shas: one version,
+        // both aliases resolve (D7 — the CAS accepts either name).
+        let a: ProposalMap = BTreeMap::from([(
+            PNAME.to_string(),
+            ("shaA".to_string(), prop(1, "open", "X")),
+        )]);
+        let b: ProposalMap = BTreeMap::from([(
+            PNAME.to_string(),
+            ("shaB".to_string(), prop(1, "open", "X")),
+        )]);
+        let u = union_proposals([&a, &b]);
+        assert_eq!(
+            u[PNAME].effective_shas,
+            BTreeSet::from(["shaA".to_string(), "shaB".to_string()])
+        );
+    }
+
+    #[test]
+    fn union_decisions_dedup_identical_receipts_and_fail_closed_on_conflicts() {
+        // Same name + same sha on both refs: one entry, no conflict.
+        let a: DecisionMap =
+            BTreeMap::from([("d.json".to_string(), ("s1".to_string(), dec("rev")))]);
+        let b = a.clone();
+        let u = union_decisions([&a, &b]);
+        assert_eq!(u.entries.len(), 1);
+        assert!(u.conflicts.is_empty());
+        // Same name, different bytes → out of `entries`, into `conflicts`.
+        let c: DecisionMap =
+            BTreeMap::from([("d.json".to_string(), ("s2".to_string(), dec("rev")))]);
+        let u = union_decisions([&a, &c]);
+        assert!(u.entries.is_empty());
+        assert_eq!(
+            u.conflicts["d.json"],
+            BTreeSet::from(["s1".to_string(), "s2".to_string()])
+        );
+    }
+
+    /// A snapshot built by hand — the (names, proposals) pairs per rev the
+    /// loader would have produced, folded the way it folds them.
+    fn snap(
+        revs: Vec<(BTreeMap<String, String>, ProposalMap)>,
+        decision_maps: Vec<DecisionMap>,
+    ) -> ProposalSnapshot {
+        let proposals = union_proposals(revs.iter().map(|(_, p)| p));
+        let decisions = union_decisions(decision_maps.iter());
+        ProposalSnapshot {
+            revs,
+            proposals,
+            decisions,
+        }
+    }
+
+    fn names() -> BTreeMap<String, String> {
+        BTreeMap::from([(PPATH.to_string(), "x".to_string())])
+    }
+
+    #[test]
+    fn a_hold_follows_the_effective_version_across_refs() {
+        // The stale local rev carries the open seq 1; the origin rev moved
+        // to seq 2 AND its receipt arrived. The effective version resolved —
+        // the hold releases, even though the visible stale revision never
+        // got a receipt of its own (D7b).
+        let local: ProposalMap = BTreeMap::from([(
+            PNAME.to_string(),
+            ("s1".to_string(), prop(1, "open", "OLD")),
+        )]);
+        let origin: ProposalMap = BTreeMap::from([(
+            PNAME.to_string(),
+            ("s2".to_string(), prop(2, "open", "NEW")),
+        )]);
+        let receipts: DecisionMap =
+            BTreeMap::from([("r.json".to_string(), ("rs".to_string(), dec("s2")))]);
+        let s = snap(
+            vec![(names(), local.clone()), (names(), origin)],
+            vec![BTreeMap::new(), receipts],
+        );
+        assert!(held_skills_for(&s, "helper").is_empty());
+        // The control: a receipt that names only the STALE revision never
+        // resolves the effective one — the skill stays held.
+        let origin2: ProposalMap = BTreeMap::from([(
+            PNAME.to_string(),
+            ("s2".to_string(), prop(2, "open", "NEW")),
+        )]);
+        let stale_receipt: DecisionMap =
+            BTreeMap::from([("r.json".to_string(), ("rs".to_string(), dec("s1")))]);
+        let s = snap(
+            vec![(names(), local), (names(), origin2)],
+            vec![BTreeMap::new(), stale_receipt],
+        );
+        assert_eq!(
+            held_skills_for(&s, "helper"),
+            BTreeSet::from([HELD.to_string()])
+        );
+    }
+
+    /// T-000261/D9: a local dev that lacks the fetched origin tip is stale
+    /// or diverged — the proposal channel never forks it: `commit_to_dev`
+    /// writes nothing, the branch tip does not move. Checked out here or
+    /// not, the gate is the same.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_diverged_local_dev_never_takes_a_proposal_channel_write() {
+        let (dir, db) = proposal_repo();
+        let d = dir.path();
+        // `origin/dev` one commit ahead, then a foreign commit on the local
+        // tip — a real divergence, dev checked out in this very worktree.
+        let before = g(d, &["rev-parse", "dev"]);
+        g(d, &["commit", "-q", "--allow-empty", "-m", "origin-only"]);
+        let otip = g(d, &["rev-parse", "dev"]);
+        g(d, &["update-ref", "refs/remotes/origin/dev", &otip]);
+        g(d, &["reset", "-q", "--hard", &before]);
+        g(d, &["commit", "-q", "--allow-empty", "-m", "foreign"]);
+        let diverged_tip = g(d, &["rev-parse", "dev"]);
+        assert!(matches!(
+            dev_write_tip(&gb(), d, "dev").unwrap(),
+            DevWriteTip::Blocked
+        ));
+        let repo = db
+            .upsert_repository("o/r", None, None, None, None, None)
+            .unwrap();
+        let mut pass = new_pass(&repo, d, "helper");
+        let change = FileChange {
+            rel_path: PathBuf::from(format!("{}/x.json", rp::RULE_PROPOSALS_REL_DIR)),
+            content: Some(FileContent::Bytes(b"{}".to_vec())),
+        };
+        commit_to_dev(&gb(), &mut pass, "dev", &[change], "subject");
+        assert_eq!(
+            g(d, &["rev-parse", "dev"]),
+            diverged_tip,
+            "the diverged dev was not forked"
+        );
+        assert!(!pass.committed);
+        assert!(pass
+            .notes
+            .iter()
+            .any(|n| n.status == SharedStatus::Blocked && n.detail.contains("origin tip")));
+    }
+
+    /// T-000261/D9: no local dev ref but the origin tip resolves — the
+    /// write's base is the origin tip and the branch is created at
+    /// `origin + the commit`: it contains the fetched truth by construction.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_missing_local_dev_is_created_at_the_origin_tip_for_a_write() {
+        let (dir, db) = proposal_repo();
+        let d = dir.path();
+        g(d, &["commit", "-q", "--allow-empty", "-m", "origin-only"]);
+        let otip = g(d, &["rev-parse", "dev"]);
+        g(d, &["update-ref", "refs/remotes/origin/dev", &otip]);
+        g(d, &["checkout", "-q", "-b", "other"]);
+        g(d, &["update-ref", "-d", "refs/heads/dev"]);
+        assert!(matches!(
+            dev_write_tip(&gb(), d, "dev").unwrap(),
+            DevWriteTip::CreateAtOrigin(_)
+        ));
+        let repo = db
+            .upsert_repository("o/r", None, None, None, None, None)
+            .unwrap();
+        let mut pass = new_pass(&repo, d, "helper");
+        let change = FileChange {
+            rel_path: PathBuf::from(format!("{}/x.json", rp::RULE_PROPOSALS_REL_DIR)),
+            content: Some(FileContent::Bytes(b"{}".to_vec())),
+        };
+        commit_to_dev(&gb(), &mut pass, "dev", &[change], "subject");
+        assert!(pass.committed);
+        let tip = g(d, &["rev-parse", "dev"]);
+        assert_eq!(
+            g(d, &["rev-parse", &format!("{}^", tip)]),
+            otip,
+            "the new branch sits on the fetched tip"
+        );
+        assert_eq!(
+            g(
+                d,
+                &[
+                    "show",
+                    &format!("dev:{}/x.json", rp::RULE_PROPOSALS_REL_DIR)
+                ]
+            ),
+            "{}"
+        );
+    }
+
+    /// T-000261, the reported bug end to end: the owner's receipt rides
+    /// `origin/dev`; the contributor's LOCAL dev is diverged and cannot
+    /// fast-forward. The union read still resolves the proposal — the old
+    /// single-ref read never saw the receipt until a manual git repair.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn a_receipt_on_origin_alone_still_resolves_on_a_diverged_local_dev() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        let rev = proposal_dev_sha(&fx.main_dir);
+        crate::commands::rule_proposals::decide(
+            &fx.main_db,
+            fx.main_repo,
+            "sdh-alpha",
+            "helper",
+            &rev,
+            "accept",
+        )
+        .unwrap();
+        fx.sync_main(); // the receipt pushes to origin/dev
+                        // The helper's local dev carries a foreign commit — it cannot ff,
+                        // so the ref goes stale and the merge side reports the divergence.
+        g(&fx.helper_dir, &["checkout", "-q", "dev"]);
+        write(&fx.helper_dir, "foreign.txt", "x");
+        g(&fx.helper_dir, &["add", "foreign.txt"]);
+        g(&fx.helper_dir, &["commit", "-q", "-m", "foreign"]);
+        let stale_tip = g(&fx.helper_dir, &["rev-parse", "dev"]);
+        g(&fx.helper_dir, &["checkout", "-q", "helper-dev"]);
+        fx.sync_helper();
+        let p = fx
+            .helper_db
+            .get_rule_proposal(fx.helper_repo, PNAME)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            p.resolved_action.as_deref(),
+            Some("accept"),
+            "the union read resolved the receipt: {:?}",
+            p
+        );
+        assert_eq!(
+            g(&fx.helper_dir, &["rev-parse", "dev"]),
+            stale_tip,
+            "the diverged local dev was not forked or reset by the channel"
+        );
     }
 }

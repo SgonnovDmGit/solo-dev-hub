@@ -14,32 +14,90 @@
 use crate::git_ops::GitBinary;
 use crate::git_sync::{config_get, config_set};
 use crate::sync::merge_by_id::{kind_for_path, merge_shared_bytes};
-use std::path::Path;
+use crate::sync::shared::merge_shared_with_history;
+use std::path::{Path, PathBuf};
 
 const FLAG: &str = "--merge-driver";
+/// T-000260: inner merges of the recursive strategy must stay flat — git
+/// re-exports the same `GITHEAD_*` env for the virtual-base passes, where
+/// the "remote" is a synthetic commit the provenance path cannot read.
+/// `merge.sdh.recursive = sdhflat` names this driver for those passes.
+const FLAG_FLAT: &str = "--merge-driver-flat";
 
-/// Handle a `--merge-driver O A B P` invocation. `None` when `args` is not a
-/// driver call (the app then starts normally); otherwise the process exit code.
-/// A malformed call (flag without four paths) is a driver call that failed: 1.
+/// Handle a `--merge-driver[-flat] O A B P` invocation. `None` when `args`
+/// is not a driver call (the app then starts normally); otherwise the
+/// process exit code. A malformed call (flag without four paths) is a
+/// driver call that failed: 1.
 pub fn run_from_args(args: &[String]) -> Option<i32> {
-    let pos = args.iter().position(|a| a == FLAG)?;
+    let (pos, flat) = match args.iter().position(|a| a == FLAG_FLAT) {
+        Some(p) => (p, true),
+        None => (args.iter().position(|a| a == FLAG)?, false),
+    };
     let rest = &args[pos + 1..];
     if rest.len() < 4 {
         return Some(1);
     }
     let (o, a, b, p) = (&rest[0], &rest[1], &rest[2], &rest[3]);
-    Some(match run(o, a, b, p) {
+    Some(match run(o, a, b, p, flat) {
         Ok(()) => 0,
         Err(_) => 1,
     })
 }
 
-fn run(o: &str, a: &str, b: &str, p: &str) -> Result<(), String> {
+/// The single remote commit git is merging into HEAD, or `None` — git
+/// exposes it as `GITHEAD_<oid>=<name>` environment variables while the
+/// merge strategy runs (`MERGE_HEAD` is not written yet at driver time).
+/// Exactly one valid oid that differs from HEAD counts; zero (rebase,
+/// cherry-pick, a manual invocation) or several (octopus) mean "no
+/// provenance" and the caller falls back to the flat merge.
+fn remote_merge_oid(git: &GitBinary, root: &Path) -> Option<String> {
+    let head = crate::git_sync::rev_parse(git, root, "HEAD")
+        .ok()
+        .flatten()?;
+    pick_remote_oid(&head, std::env::vars())
+}
+
+/// The env-scan half of `remote_merge_oid`, pure for tests: among
+/// `GITHEAD_<oid>` keys exactly one valid, non-HEAD oid may stand.
+fn pick_remote_oid(head: &str, vars: impl IntoIterator<Item = (String, String)>) -> Option<String> {
+    let mut oids: Vec<String> = vars
+        .into_iter()
+        .filter_map(|(k, _)| k.strip_prefix("GITHEAD_").map(str::to_owned))
+        .filter(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        .filter(|s| !s.eq_ignore_ascii_case(head))
+        .collect();
+    oids.dedup();
+    (oids.len() == 1).then(|| oids.remove(0))
+}
+
+fn run(o: &str, a: &str, b: &str, p: &str, flat: bool) -> Result<(), String> {
     let kind = kind_for_path(p).ok_or_else(|| format!("not a shared file: {}", p))?;
     let base = std::fs::read(o).map_err(|e| format!("read {}: {}", o, e))?;
     let ours = std::fs::read(a).map_err(|e| format!("read {}: {}", a, e))?;
     let theirs = std::fs::read(b).map_err(|e| format!("read {}: {}", b, e))?;
-    let merged = merge_shared_bytes(kind, &base, &ours, &theirs).map_err(|e| e.to_string())?;
+    // T-000260: with exactly one real remote commit visible, merge with the
+    // file histories and the ancestor timeline behind the merge-base —
+    // versioned headers and stale-remote bytes then resolve by provenance,
+    // not by the flat last-writer rule. Every gap in that chain (no
+    // GITHEAD_*, no merge-base, missing history) degrades to the flat
+    // merge, never to a refusal.
+    let merged = if flat {
+        None
+    } else {
+        let git = GitBinary(PathBuf::from("git"));
+        std::env::current_dir()
+            .ok()
+            .and_then(|root| {
+                remote_merge_oid(&git, &root).map(|oid| {
+                    merge_shared_with_history(&git, &root, p, &base, &ours, &theirs, &oid)
+                })
+            })
+            .and_then(|r| r.ok())
+    };
+    let merged = match merged {
+        Some(m) => m,
+        None => merge_shared_bytes(kind, &base, &ours, &theirs).map_err(|e| e.to_string())?,
+    };
     // Write next to A and rename, so a failure never leaves A half-written.
     let tmp = format!("{}.sdh-merge.tmp", a);
     std::fs::write(&tmp, merged.as_bytes()).map_err(|e| format!("write {}: {}", tmp, e))?;
@@ -67,22 +125,43 @@ pub(crate) fn driver_command(exe: &str) -> String {
     format!("\"{}\" {} %O %A %B %P", exe, FLAG)
 }
 
-const DRIVER_NAME: &str = "Solo Dev Hub merge by id";
+/// The `merge.sdhflat.driver` value — the same executable with the flat
+/// flag (T-000260).
+fn flat_driver_command(exe: &str) -> String {
+    format!("\"{}\" {} %O %A %B %P", exe, FLAG_FLAT)
+}
 
-/// Register the `sdh` merge driver in the repo's local git config. Writes only
-/// what differs from the current values; returns whether anything was written.
+const DRIVER_NAME: &str = "Solo Dev Hub merge by id";
+const FLAT_DRIVER_NAME: &str = "Solo Dev Hub merge by id (flat)";
+
+/// Register the `sdh` merge driver in the repo's local git config — and the
+/// `sdhflat` variant `merge.sdh.recursive` names for the internal merges
+/// of the recursive strategy (T-000260: they inherit the top-level
+/// `GITHEAD_*` env, whose entries do not describe the virtual bases they
+/// merge). Writes only what differs from the current values; returns
+/// whether anything was written.
 pub fn register_merge_driver(git: &GitBinary, repo: &Path) -> Result<bool, String> {
     let exe_path = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
     let appimage = std::env::var("APPIMAGE").ok();
-    let command = driver_command(&resolve_exe(appimage.as_deref(), &exe_path));
-    register_with(git, repo, &command)
+    let exe = resolve_exe(appimage.as_deref(), &exe_path);
+    let command = driver_command(&exe);
+    let flat = flat_driver_command(&exe);
+    register_with(git, repo, &command, &flat)
 }
 
-fn register_with(git: &GitBinary, repo: &Path, command: &str) -> Result<bool, String> {
+fn register_with(
+    git: &GitBinary,
+    repo: &Path,
+    command: &str,
+    flat_command: &str,
+) -> Result<bool, String> {
     let mut wrote = false;
     for (key, value) in [
         ("merge.sdh.name", DRIVER_NAME),
         ("merge.sdh.driver", command),
+        ("merge.sdh.recursive", "sdhflat"),
+        ("merge.sdhflat.name", FLAT_DRIVER_NAME),
+        ("merge.sdhflat.driver", flat_command),
     ] {
         if config_get(git, repo, key)?.as_deref() != Some(value) {
             config_set(git, repo, key, value)?;
@@ -259,24 +338,112 @@ mod tests {
         let dir = TempDir::new().unwrap();
         git(dir.path(), &["init", "-q"]);
         let gb = GitBinary(PathBuf::from("git"));
-        let cmd = driver_command("C:/Program Files/App/app.exe");
-        assert_eq!(register_with(&gb, dir.path(), &cmd), Ok(true));
-        assert_eq!(register_with(&gb, dir.path(), &cmd), Ok(false));
-        assert_eq!(
-            config_get(&gb, dir.path(), "merge.sdh.driver")
-                .unwrap()
-                .as_deref(),
-            Some(cmd.as_str())
-        );
-        assert_eq!(
-            config_get(&gb, dir.path(), "merge.sdh.name")
-                .unwrap()
-                .as_deref(),
-            Some(DRIVER_NAME)
-        );
-        // a changed exe path rewrites only the driver
+        let exe = "C:/Program Files/App/app.exe";
+        let cmd = driver_command(exe);
+        let flat = flat_driver_command(exe);
+        assert_eq!(register_with(&gb, dir.path(), &cmd, &flat), Ok(true));
+        assert_eq!(register_with(&gb, dir.path(), &cmd, &flat), Ok(false));
+        for (key, want) in [
+            ("merge.sdh.driver", cmd.as_str()),
+            ("merge.sdh.name", DRIVER_NAME),
+            ("merge.sdh.recursive", "sdhflat"),
+            ("merge.sdhflat.driver", flat.as_str()),
+            ("merge.sdhflat.name", FLAT_DRIVER_NAME),
+        ] {
+            assert_eq!(
+                config_get(&gb, dir.path(), key).unwrap().as_deref(),
+                Some(want),
+                "{}",
+                key
+            );
+        }
+        // a changed exe path rewrites only the two driver commands
         let cmd2 = driver_command("D:/new/app.exe");
-        assert_eq!(register_with(&gb, dir.path(), &cmd2), Ok(true));
-        assert_eq!(register_with(&gb, dir.path(), &cmd2), Ok(false));
+        let flat2 = flat_driver_command("D:/new/app.exe");
+        assert_eq!(register_with(&gb, dir.path(), &cmd2, &flat2), Ok(true));
+        assert_eq!(register_with(&gb, dir.path(), &cmd2, &flat2), Ok(false));
+    }
+
+    #[test]
+    fn flat_flag_merges_without_history_or_env() {
+        let dir = TempDir::new().unwrap();
+        let ours = BASE.replace("one", "one ours");
+        let theirs = BASE.replace("two", "два theirs");
+        let (o, a, b) = setup(&dir, BASE.as_bytes(), ours.as_bytes(), theirs.as_bytes());
+        let code = run_from_args(&args(&[
+            "app.exe",
+            "--merge-driver-flat",
+            &o,
+            &a,
+            &b,
+            "docs/todo.md",
+        ]));
+        assert_eq!(code, Some(0));
+        let res = fs::read_to_string(&a).unwrap();
+        assert!(res.contains("one ours") && res.contains("два theirs"));
+    }
+
+    #[test]
+    fn remote_oid_detection_accepts_exactly_one_valid_non_head_oid() {
+        let head = "a".repeat(40);
+        let remote = "b".repeat(40);
+        let other = "c".repeat(40);
+        let env = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        // One valid remote oid → provenance.
+        assert_eq!(
+            pick_remote_oid(&head, env(&[(&format!("GITHEAD_{}", remote), "dev")])),
+            Some(remote.clone())
+        );
+        // Absent (rebase, cherry-pick, a manual call) → flat.
+        assert_eq!(pick_remote_oid(&head, env(&[])), None);
+        assert_eq!(pick_remote_oid(&head, env(&[("GITHEAD_", "x")])), None);
+        // Several (octopus) → flat.
+        assert_eq!(
+            pick_remote_oid(
+                &head,
+                env(&[
+                    (&format!("GITHEAD_{}", remote), "dev"),
+                    (&format!("GITHEAD_{}", other), "next"),
+                ])
+            ),
+            None
+        );
+        // HEAD's own oid does not count; and a non-hex suffix is not an oid.
+        assert_eq!(
+            pick_remote_oid(
+                &head,
+                env(&[
+                    (&format!("GITHEAD_{}", head), "ours"),
+                    ("GITHEAD_short", "s"),
+                    ("GITHEAD_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "x"),
+                ])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_driver_call_without_githead_env_falls_back_to_flat() {
+        // No GITHEAD_* in this process's env (the test harness exports
+        // none): the ordinary flag must still merge, just without
+        // provenance.
+        let dir = TempDir::new().unwrap();
+        let ours = BASE.replace("one", "one ours");
+        let (o, a, b) = setup(&dir, BASE.as_bytes(), ours.as_bytes(), BASE.as_bytes());
+        let code = run_from_args(&args(&[
+            "app.exe",
+            "--merge-driver",
+            &o,
+            &a,
+            &b,
+            "docs/todo.md",
+        ]));
+        assert_eq!(code, Some(0));
+        assert!(fs::read_to_string(&a).unwrap().contains("one ours"));
     }
 }
