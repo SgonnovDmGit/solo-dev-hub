@@ -107,7 +107,7 @@ enum Line {
     Other(String),
 }
 
-struct Doc {
+pub(crate) struct Doc {
     lines: Vec<Line>,
     ents: Vec<Ent>,
     by_key: HashMap<String, usize>,
@@ -1210,6 +1210,68 @@ fn header_occurrences(input: &str) -> HashMap<String, Vec<String>> {
     m
 }
 
+/// The structural fingerprint of a parsed document: the ordered sequence of
+/// section-header keys and entity keys — exactly what `__structure__` stamps
+/// bind to. Prose lines are deliberately outside the fingerprint: prose carries
+/// its own content-hash keys and never reorders entities.
+pub(crate) fn skeleton_fingerprint(doc: &Doc) -> String {
+    let mut s = String::new();
+    for l in &doc.lines {
+        match l {
+            Line::Header { key, .. } => {
+                s.push_str("H:");
+                s.push_str(key);
+                s.push('\n');
+            }
+            Line::Ent(i) => {
+                s.push_str("E:");
+                s.push_str(&doc.ents[*i].key);
+                s.push('\n');
+            }
+            _ => {}
+        }
+    }
+    crate::sync::edit_clocks::value_hash(s.as_bytes())
+}
+
+/// Which side's skeleton the assembly follows in clocked mode: the side whose
+/// fingerprint the `__structure__` stamp validly binds to. The ledger holds at
+/// most one structure entry, so at most one side can match; a neither-match is
+/// degraded — ours keeps the skeleton (positional assembly is unchanged) and
+/// the key is reported.
+fn structure_prefers_theirs(clocks: &Clocks, o: &Doc, t: &Doc) -> bool {
+    use crate::sync::edit_clocks::STRUCTURE_KEY;
+    let ho = skeleton_fingerprint(o);
+    let ht = skeleton_fingerprint(t);
+    if ho == ht {
+        return false;
+    }
+    let e = match clocks.ledger.get(STRUCTURE_KEY) {
+        Some(e) if !e.del => e,
+        _ => {
+            // Diverging skeletons with no structure stamp at all is degraded
+            // mode: the positional fallback below is ours-relative, so it
+            // must be loud — the caller turns this into a sync issue.
+            clocks.diag(format!(
+                "missing {} stamp for diverging skeletons — ordering is positional",
+                STRUCTURE_KEY
+            ));
+            return false;
+        }
+    };
+    match (e.h == ho, e.h == ht) {
+        (true, _) => false,
+        (false, true) => true,
+        (false, false) => {
+            clocks.diag(format!(
+                "no valid {} stamp for either skeleton — ours keeps the ordering",
+                STRUCTURE_KEY
+            ));
+            false
+        }
+    }
+}
+
 fn merge_with_bases(
     kind: SharedFileKind,
     base: &str,
@@ -1242,6 +1304,15 @@ fn merge_with_bases(
     let b = parse(kind, base);
     let o = parse(kind, ours);
     let t = parse(kind, theirs);
+
+    // Clocked structure (spec D2/T-000267 slice 2): the assembly skeleton is
+    // the side with the newer valid `__structure__` stamp — entity resolution
+    // is direction-independent under clocks, so swapping the parses for the
+    // whole pipeline below cannot skew content, only ordering and prose.
+    let (o, t) = match clocks {
+        Some(c) if structure_prefers_theirs(c, &o, &t) => (t, o),
+        _ => (o, t),
+    };
 
     // Decide every entity.
     let mut merged: HashMap<String, Option<Merged>> = HashMap::new();
@@ -1328,7 +1399,18 @@ fn merge_with_bases(
                         Some(h) => h.as_ref(),
                         None => b_hdr.get(key),
                     };
-                    if hb == Some(otext) && text != otext {
+                    let adopt = if hb == Some(otext) && text != otext {
+                        true
+                    } else if let (Some(c), true) = (clocks, text != otext) {
+                        // Clocked rename (T-000267): both sides hold the key
+                        // with different texts and the base rules did not
+                        // decide — the later valid stamp wins, either way.
+                        use crate::sync::edit_clocks::header_key;
+                        pick_clocked(c, &header_key(key), otext, text) == text.as_str()
+                    } else {
+                        false
+                    };
+                    if adopt {
                         if let Some(p) = find_header(&out, key) {
                             out[p].text = text.clone();
                         }
@@ -2373,7 +2455,9 @@ mod tests {
 #[cfg(test)]
 mod clocked_tests {
     use super::*;
-    use crate::sync::edit_clocks::{field_key, row_key, value_hash, ClockEntry, ClockLedger};
+    use crate::sync::edit_clocks::{
+        field_key, header_key, row_key, value_hash, ClockEntry, ClockLedger, STRUCTURE_KEY,
+    };
 
     fn ent(h_val: &str, t: i64, src: &str, del: bool) -> ClockEntry {
         ClockEntry {
@@ -2502,5 +2586,102 @@ mod clocked_tests {
         assert!(t1.contains("| beta |"), "{}", t1);
         assert!(!d1.is_empty());
         assert!(!d2.is_empty());
+    }
+
+    #[test]
+    fn clocked_structure_stamp_moves_the_skeleton() {
+        // Both sides changed the structure off base: ours reordered v2 before
+        // v1, theirs appended a new section v3 at the end. The structure stamp
+        // binds to THEIRS' fingerprint (their structural edit is the later
+        // decision) — the merged skeleton must follow theirs' ordering even
+        // though the assembly is ours-relative without clocks.
+        let base = "## v1
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+
+## v2
+
+- [ ] T-000002 | b | 1 | low | open | 2026-10-01
+";
+        let reordered = "## v2
+
+- [ ] T-000002 | b | 1 | low | open | 2026-10-01
+
+## v1
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+";
+        let appended = "## v1
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+
+## v2
+
+- [ ] T-000002 | b | 1 | low | open | 2026-10-01
+
+## v3
+
+- [ ] T-000003 | c | 1 | low | open | 2026-10-01
+";
+        let fp_theirs = {
+            let d = parse(SharedFileKind::Todo, appended);
+            skeleton_fingerprint(&d)
+        };
+        let l = ledger_of(&[(
+            STRUCTURE_KEY,
+            ClockEntry {
+                h: fp_theirs,
+                t: 500,
+                src: "s".to_string(),
+                del: false,
+            },
+        )]);
+        let (text, _) = merge6(base, reordered, appended, &l);
+        let v1 = text.find("## v1").unwrap();
+        let v2 = text.find("## v2").unwrap();
+        let v3 = match text.find("## v3") {
+            Some(p) => p,
+            None => panic!(
+                "v3 section missing:
+{}",
+                text
+            ),
+        };
+        assert!(v1 < v2 && v2 < v3, "{}", text);
+        // And commutativity: the same merge with the sides swapped yields the
+        // same ordering — the stamp decides, not the machine position.
+        let (text2, _) = merge6(base, appended, reordered, &l);
+        assert_eq!(text, text2);
+    }
+
+    #[test]
+    fn clocked_header_rename_later_stamp_wins() {
+        // Both renamed the same section header differently off base; the
+        // stamp on theirs' text is later — theirs wins regardless of position.
+        let base = "## v1 old
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+";
+        let ours = "## v1 alpha
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+";
+        let theirs = "## v1 beta
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+";
+        // Section keys derive from the header text; the rename target key is
+        // the base key. The stamp binds to theirs' header TEXT.
+        let key = {
+            let d = parse(SharedFileKind::Todo, base);
+            match &d.lines[0] {
+                Line::Header { key, .. } => key.clone(),
+                _ => panic!("no header"),
+            }
+        };
+        let l = ledger_of(&[(&header_key(&key), ent("v1 beta", 600, "s", false))]);
+        let (text, _) = merge6(base, ours, theirs, &l);
+        assert!(text.contains("## v1 beta"), "{}", text);
+        assert!(!text.contains("## v1 alpha"), "{}", text);
     }
 }
