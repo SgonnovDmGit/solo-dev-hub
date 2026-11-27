@@ -13,6 +13,7 @@
 
 use crate::git_ops::GitBinary;
 use crate::git_sync::{config_get, config_set};
+use crate::sync::edit_clocks::ClockLedger;
 use crate::sync::merge_by_id::{kind_for_path, merge_shared_bytes};
 use crate::sync::shared::merge_shared_with_history;
 use std::path::{Path, PathBuf};
@@ -23,12 +24,25 @@ const FLAG: &str = "--merge-driver";
 /// the "remote" is a synthetic commit the provenance path cannot read.
 /// `merge.sdh.recursive = sdhflat` names this driver for those passes.
 const FLAG_FLAT: &str = "--merge-driver-flat";
+/// T-000265: union merge driver for the edit-clock ledgers — CRDT per-key
+/// max, commutative by construction, never positional.
+const FLAG_CLOCKS: &str = "--merge-driver-clocks";
 
-/// Handle a `--merge-driver[-flat] O A B P` invocation. `None` when `args`
-/// is not a driver call (the app then starts normally); otherwise the
+/// Handle a `--merge-driver[-flat|-clocks] O A B P` invocation. `None` when
+/// `args` is not a driver call (the app then starts normally); otherwise the
 /// process exit code. A malformed call (flag without four paths) is a
 /// driver call that failed: 1.
 pub fn run_from_args(args: &[String]) -> Option<i32> {
+    if let Some(pos) = args.iter().position(|a| a == FLAG_CLOCKS) {
+        let rest = &args[pos + 1..];
+        if rest.len() < 4 {
+            return Some(1);
+        }
+        return Some(match run_clocks(&rest[1], &rest[2]) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        });
+    }
     let (pos, flat) = match args.iter().position(|a| a == FLAG_FLAT) {
         Some(p) => (p, true),
         None => (args.iter().position(|a| a == FLAG)?, false),
@@ -42,6 +56,31 @@ pub fn run_from_args(args: &[String]) -> Option<i32> {
         Ok(()) => 0,
         Err(_) => 1,
     })
+}
+
+/// Union-merge an edit-clock ledger: the CRDT makes the base irrelevant —
+/// ours ∪ theirs by per-key maximum is the unique correct result whatever
+/// the ancestor held. Both sides must parse; a corrupt ledger fails the
+/// merge into a manual conflict rather than silently dropping entries.
+fn run_clocks(a: &str, b: &str) -> Result<(), String> {
+    let ours = std::fs::read(a).map_err(|e| format!("read {}: {}", a, e))?;
+    let theirs = std::fs::read(b).map_err(|e| format!("read {}: {}", b, e))?;
+    let lo = ClockLedger::parse(&ours, a)?;
+    let lt = ClockLedger::parse(&theirs, b)?;
+    let merged = lo.merge(&lt).serialize()?;
+    write_over(a, merged.as_bytes())
+}
+
+/// Write next to `target` and rename into place, so a failure never leaves
+/// the merge result half-written.
+fn write_over(target: &str, bytes: &[u8]) -> Result<(), String> {
+    let tmp = format!("{}.sdh-merge.tmp", target);
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {}", tmp, e))?;
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rename onto {}: {}", target, e));
+    }
+    Ok(())
 }
 
 /// The single remote commit git is merging into HEAD, or `None` — git
@@ -98,14 +137,7 @@ fn run(o: &str, a: &str, b: &str, p: &str, flat: bool) -> Result<(), String> {
         Some(m) => m,
         None => merge_shared_bytes(kind, &base, &ours, &theirs).map_err(|e| e.to_string())?,
     };
-    // Write next to A and rename, so a failure never leaves A half-written.
-    let tmp = format!("{}.sdh-merge.tmp", a);
-    std::fs::write(&tmp, merged.as_bytes()).map_err(|e| format!("write {}: {}", tmp, e))?;
-    if let Err(e) = std::fs::rename(&tmp, a) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("rename onto {}: {}", a, e));
-    }
-    Ok(())
+    write_over(a, merged.as_bytes())
 }
 
 /// The executable the driver command must point at. On a Linux AppImage
@@ -131,8 +163,15 @@ fn flat_driver_command(exe: &str) -> String {
     format!("\"{}\" {} %O %A %B %P", exe, FLAG_FLAT)
 }
 
+/// The `merge.sdhclocks.driver` value — the same executable with the clocks
+/// flag (T-000265).
+fn clocks_driver_command(exe: &str) -> String {
+    format!("\"{}\" {} %O %A %B %P", exe, FLAG_CLOCKS)
+}
+
 const DRIVER_NAME: &str = "Solo Dev Hub merge by id";
 const FLAT_DRIVER_NAME: &str = "Solo Dev Hub merge by id (flat)";
+const CLOCKS_DRIVER_NAME: &str = "Solo Dev Hub edit-clock union merge";
 
 /// Register the `sdh` merge driver in the repo's local git config — and the
 /// `sdhflat` variant `merge.sdh.recursive` names for the internal merges
@@ -146,7 +185,8 @@ pub fn register_merge_driver(git: &GitBinary, repo: &Path) -> Result<bool, Strin
     let exe = resolve_exe(appimage.as_deref(), &exe_path);
     let command = driver_command(&exe);
     let flat = flat_driver_command(&exe);
-    register_with(git, repo, &command, &flat)
+    let clocks = clocks_driver_command(&exe);
+    register_with(git, repo, &command, &flat, &clocks)
 }
 
 fn register_with(
@@ -154,6 +194,7 @@ fn register_with(
     repo: &Path,
     command: &str,
     flat_command: &str,
+    clocks_command: &str,
 ) -> Result<bool, String> {
     let mut wrote = false;
     for (key, value) in [
@@ -162,6 +203,8 @@ fn register_with(
         ("merge.sdh.recursive", "sdhflat"),
         ("merge.sdhflat.name", FLAT_DRIVER_NAME),
         ("merge.sdhflat.driver", flat_command),
+        ("merge.sdhclocks.name", CLOCKS_DRIVER_NAME),
+        ("merge.sdhclocks.driver", clocks_command),
     ] {
         if config_get(git, repo, key)?.as_deref() != Some(value) {
             config_set(git, repo, key, value)?;
@@ -341,14 +384,23 @@ mod tests {
         let exe = "C:/Program Files/App/app.exe";
         let cmd = driver_command(exe);
         let flat = flat_driver_command(exe);
-        assert_eq!(register_with(&gb, dir.path(), &cmd, &flat), Ok(true));
-        assert_eq!(register_with(&gb, dir.path(), &cmd, &flat), Ok(false));
+        let clocks = clocks_driver_command(exe);
+        assert_eq!(
+            register_with(&gb, dir.path(), &cmd, &flat, &clocks),
+            Ok(true)
+        );
+        assert_eq!(
+            register_with(&gb, dir.path(), &cmd, &flat, &clocks),
+            Ok(false)
+        );
         for (key, want) in [
             ("merge.sdh.driver", cmd.as_str()),
             ("merge.sdh.name", DRIVER_NAME),
             ("merge.sdh.recursive", "sdhflat"),
             ("merge.sdhflat.driver", flat.as_str()),
             ("merge.sdhflat.name", FLAT_DRIVER_NAME),
+            ("merge.sdhclocks.driver", clocks.as_str()),
+            ("merge.sdhclocks.name", CLOCKS_DRIVER_NAME),
         ] {
             assert_eq!(
                 config_get(&gb, dir.path(), key).unwrap().as_deref(),
@@ -357,11 +409,18 @@ mod tests {
                 key
             );
         }
-        // a changed exe path rewrites only the two driver commands
+        // a changed exe path rewrites only the three driver commands
         let cmd2 = driver_command("D:/new/app.exe");
         let flat2 = flat_driver_command("D:/new/app.exe");
-        assert_eq!(register_with(&gb, dir.path(), &cmd2, &flat2), Ok(true));
-        assert_eq!(register_with(&gb, dir.path(), &cmd2, &flat2), Ok(false));
+        let clocks2 = clocks_driver_command("D:/new/app.exe");
+        assert_eq!(
+            register_with(&gb, dir.path(), &cmd2, &flat2, &clocks2),
+            Ok(true)
+        );
+        assert_eq!(
+            register_with(&gb, dir.path(), &cmd2, &flat2, &clocks2),
+            Ok(false)
+        );
     }
 
     #[test]

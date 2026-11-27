@@ -592,6 +592,9 @@ pub const SHARED_ATTRIBUTE_LINES: &[&str] = &[
     "docs/todo.md merge=sdh",
     "docs/done.md merge=sdh",
     "docs/bug-reports.md merge=sdh",
+    // T-000265: edit-clock ledgers merge by CRDT union per key, never
+    // positionally — the driver is commutative by construction.
+    ".sdh/edit-clocks/*.json merge=sdhclocks",
 ];
 
 /// The `.gitignore` template to render for a repo: unchanged when it is not

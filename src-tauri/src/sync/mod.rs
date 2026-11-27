@@ -7,6 +7,7 @@ pub mod autocommit;
 pub mod bugs;
 pub mod claude_md;
 pub mod codex;
+pub mod edit_clocks;
 pub mod fs;
 pub mod gitattributes;
 pub mod gitignore;

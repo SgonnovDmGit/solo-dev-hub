@@ -1,0 +1,318 @@
+// T-000265 / UTC-chronology sync: the committed edit-clock ledger.
+//
+// `.sdh/edit-clocks/<file>.json` is a CRDT LWW-register keyed by the elements
+// of one shared file (rows, fields, section headers, prose, structure) or by
+// `file` for a file-level artifact. Every entry binds a stamp to ONE value:
+// `h` is the sha256 of the value the stamp belongs to — a stamp is valid only
+// together with its value. Tombstones (`del: true`) are never removed
+// automatically: an offline clone returning months later must still lose to
+// the deletion it never saw.
+//
+// The ledger merges per key by maximum `t`, tie-broken by maximum `src` —
+// commutative, associative and idempotent by construction, so no positional
+// "who merges" rule can ever leak into it. Far-future stamps are quarantined
+// (reported as sync issues, key frozen) rather than silently corrected.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
+pub const CLOCKS_DIR: &str = ".sdh/edit-clocks";
+pub const FORMAT_VERSION: u32 = 1;
+/// Hard caps — exceeding them is a sync-blocking error, never a silent trim.
+/// A todo.md of 2_000 rows x ~8 fields lands near 20k keys; the caps leave
+/// an order of magnitude of headroom.
+pub const MAX_ENTRIES: usize = 200_000;
+pub const MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Stamps further than this into the future are quarantined, not trusted.
+pub const MAX_FUTURE_SKEW_SECS: i64 = 24 * 3600;
+
+/// sha256 hex of a value — the `h` field of every entry.
+pub fn value_hash(bytes: &[u8]) -> String {
+    hex_lower(&Sha256::digest(bytes))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+/// Encode a repo-relative shared path into a ledger file name:
+/// `docs/todo.md` -> `docs--todo.md.json`. Slashes are the only separator
+/// in repo paths; `--` cannot collide with real names since `/` never
+/// appears inside a single path component.
+pub fn ledger_file_name(repo_path: &str) -> String {
+    format!("{}.json", repo_path.replace(['/', '\\'], "--"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockEntry {
+    /// sha256 of the value this stamp belongs to. Empty when unknown
+    /// (legacy bootstrap edges); a mismatched hash invalidates the stamp.
+    pub h: String,
+    /// UTC seconds of the edit decision.
+    pub t: i64,
+    /// Commit (or authoring marker) the decision is provenanced by — the
+    /// deterministic tie-breaker when two stamps share `t`.
+    pub src: String,
+    /// Tombstone: the element was deleted at `t`.
+    #[serde(default)]
+    pub del: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClockLedger {
+    pub format: u32,
+    pub file: String,
+    pub entries: BTreeMap<String, ClockEntry>,
+}
+
+impl ClockLedger {
+    pub fn new(file: &str) -> Self {
+        ClockLedger {
+            format: FORMAT_VERSION,
+            file: file.to_string(),
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Canonical serialization: sorted keys (BTreeMap), compact separators —
+    /// byte-stable across machines so identical content never dirties git.
+    pub fn serialize(&self) -> Result<String, String> {
+        let out = serde_json::to_string(self).map_err(|e| format!("serialize clocks: {}", e))?;
+        if out.len() > MAX_BYTES {
+            return Err(format!(
+                "edit-clock ledger for {} exceeds {} bytes — refusing to silently drop entries",
+                self.file, MAX_BYTES
+            ));
+        }
+        Ok(out)
+    }
+
+    pub fn parse(bytes: &[u8], file_hint: &str) -> Result<Self, String> {
+        if bytes.len() > MAX_BYTES {
+            return Err(format!(
+                "edit-clock ledger for {} exceeds {} bytes",
+                file_hint, MAX_BYTES
+            ));
+        }
+        let text = std::str::from_utf8(bytes).map_err(|e| format!("clocks utf8: {}", e))?;
+        let ledger: ClockLedger = serde_json::from_str(text)
+            .map_err(|e| format!("parse clocks for {}: {}", file_hint, e))?;
+        if ledger.entries.len() > MAX_ENTRIES {
+            return Err(format!(
+                "edit-clock ledger for {} exceeds {} entries",
+                file_hint, MAX_ENTRIES
+            ));
+        }
+        Ok(ledger)
+    }
+
+    /// CRDT merge: per key, the entry with the higher `t` wins; equal `t`
+    /// is broken by the higher `src` (deterministic on both machines).
+    /// Tombstones participate exactly like live entries — a deletion at 12:00
+    /// beats a write at 11:00 and loses to a re-add at 13:00.
+    pub fn merge(&self, other: &ClockLedger) -> ClockLedger {
+        let mut entries = self.entries.clone();
+        for (key, theirs) in &other.entries {
+            let winner = match entries.get(key) {
+                None => theirs.clone(),
+                Some(ours) => pick_winner(ours, theirs).clone(),
+            };
+            entries.insert(key.clone(), winner);
+        }
+        ClockLedger {
+            format: FORMAT_VERSION,
+            file: self.file.clone(),
+            entries,
+        }
+    }
+
+    /// Record (or refresh) one key. Same LWW rule as `merge`: a stale stamp
+    /// never overwrites a newer one. Returns whether the entry changed.
+    pub fn stamp(&mut self, key: &str, entry: ClockEntry) -> bool {
+        let winner = match self.entries.get(key) {
+            None => entry,
+            Some(existing) => pick_winner(existing, &entry).clone(),
+        };
+        let changed = self.entries.get(key) != Some(&winner);
+        self.entries.insert(key.to_string(), winner);
+        changed
+    }
+
+    /// Keys whose stamps lie beyond the trustable future — wrong-clock
+    /// machines. The caller surfaces them as sync issues and freezes the key;
+    /// nothing here silently rewrites the time.
+    pub fn quarantined_keys(&self, now_utc: i64) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.t > now_utc + MAX_FUTURE_SKEW_SECS)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// The entry that decides `key`, if any — tombstones included.
+    pub fn get(&self, key: &str) -> Option<&ClockEntry> {
+        self.entries.get(key)
+    }
+}
+
+fn pick_winner<'a>(a: &'a ClockEntry, b: &'a ClockEntry) -> &'a ClockEntry {
+    if b.t > a.t || (b.t == a.t && b.src > a.src) {
+        b
+    } else {
+        a
+    }
+}
+
+// Key constructors — the single place that knows the key grammar.
+
+pub fn row_key(id: &str) -> String {
+    format!("r:{}", id)
+}
+
+pub fn field_key(id: &str, field_index: usize) -> String {
+    format!("r:{}.f{}", id, field_index)
+}
+
+pub fn header_key(section_key: &str) -> String {
+    format!("h:{}", section_key)
+}
+
+pub fn prose_key(content_hash: &str) -> String {
+    format!("p:{}", content_hash)
+}
+
+pub const STRUCTURE_KEY: &str = "__structure__";
+pub const FILE_KEY: &str = "file";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(h: &str, t: i64, src: &str, del: bool) -> ClockEntry {
+        ClockEntry {
+            h: h.to_string(),
+            t,
+            src: src.to_string(),
+            del,
+        }
+    }
+
+    fn ledger_with(pairs: &[(&str, ClockEntry)]) -> ClockLedger {
+        let mut l = ClockLedger::new("docs/todo.md");
+        for (k, e) in pairs {
+            l.entries.insert(k.to_string(), e.clone());
+        }
+        l
+    }
+
+    #[test]
+    fn file_name_encoding() {
+        assert_eq!(ledger_file_name("docs/todo.md"), "docs--todo.md.json");
+        assert_eq!(
+            ledger_file_name("docs/backend-requirements/REQ-001_x.md"),
+            "docs--backend-requirements--REQ-001_x.md.json"
+        );
+    }
+
+    #[test]
+    fn serialize_is_canonical_and_roundtrips() {
+        let l = ledger_with(&[
+            ("r:T-000002", entry("h2", 200, "srcb", false)),
+            ("r:T-000001", entry("h1", 100, "srca", false)),
+        ]);
+        let s1 = l.serialize().unwrap();
+        // BTreeMap ordering: T-000001 before T-000002 regardless of insertion.
+        assert!(s1.find("T-000001").unwrap() < s1.find("T-000002").unwrap());
+        let back = ClockLedger::parse(s1.as_bytes(), "docs/todo.md").unwrap();
+        assert_eq!(back.entries, l.entries);
+        assert_eq!(back.serialize().unwrap(), s1);
+    }
+
+    #[test]
+    fn merge_picks_higher_t() {
+        let a = ledger_with(&[("r:X", entry("ha", 100, "sa", false))]);
+        let b = ledger_with(&[("r:X", entry("hb", 200, "sb", false))]);
+        let m = a.merge(&b);
+        assert_eq!(m.entries["r:X"].h, "hb");
+        assert_eq!(m.entries["r:X"].t, 200);
+    }
+
+    #[test]
+    fn merge_is_commutative_associative_idempotent() {
+        let a = ledger_with(&[
+            ("r:X", entry("ha", 100, "sa", false)),
+            ("r:Y", entry("hy1", 150, "sa", true)),
+        ]);
+        let b = ledger_with(&[
+            ("r:X", entry("hb", 200, "sb", false)),
+            ("r:Z", entry("hz", 50, "sb", false)),
+        ]);
+        let c = ledger_with(&[("r:X", entry("hc", 200, "sc", false))]);
+        // commutative
+        assert_eq!(a.merge(&b).entries, b.merge(&a).entries);
+        // associative
+        assert_eq!(a.merge(&b).merge(&c).entries, a.merge(&b.merge(&c)).entries);
+        // idempotent
+        assert_eq!(a.merge(&a).entries, a.entries);
+        // tie broken deterministically by src
+        let m = b.merge(&c);
+        assert_eq!(m.entries["r:X"].src, "sc");
+    }
+
+    #[test]
+    fn tombstone_beats_older_write_loses_to_newer_readd() {
+        let deletion = ledger_with(&[("r:X", entry("ha", 300, "sd", true))]);
+        let stale_write = ledger_with(&[("r:X", entry("ha", 100, "sw", false))]);
+        let readd = ledger_with(&[("r:X", entry("ha", 400, "sr", false))]);
+        // deletion at 300 beats write at 100
+        let m = deletion.merge(&stale_write);
+        assert!(m.entries["r:X"].del);
+        // re-add at 400 beats deletion at 300
+        let m2 = deletion.merge(&readd);
+        assert!(!m2.entries["r:X"].del);
+        assert_eq!(m2.entries["r:X"].src, "sr");
+    }
+
+    #[test]
+    fn stamp_never_overwrites_newer() {
+        let mut l = ClockLedger::new("docs/todo.md");
+        assert!(l.stamp("r:X", entry("h1", 200, "s1", false)));
+        assert!(!l.stamp("r:X", entry("h0", 100, "s0", false)));
+        assert_eq!(l.entries["r:X"].h, "h1");
+        assert!(l.stamp("r:X", entry("h2", 300, "s2", false)));
+        assert_eq!(l.entries["r:X"].h, "h2");
+    }
+
+    #[test]
+    fn quarantine_catches_far_future_only() {
+        let now = 1_000_000;
+        let l = ledger_with(&[
+            ("r:ok", entry("h", now + 3600, "s", false)),
+            (
+                "r:bad",
+                entry("h", now + MAX_FUTURE_SKEW_SECS + 1, "s", false),
+            ),
+        ]);
+        assert_eq!(l.quarantined_keys(now), vec!["r:bad".to_string()]);
+    }
+
+    #[test]
+    fn value_hash_is_stable() {
+        assert_eq!(value_hash(b"abc"), value_hash(b"abc"));
+        assert_ne!(value_hash(b"abc"), value_hash(b"abd"));
+        assert_eq!(value_hash(b"abc").len(), 64);
+    }
+
+    #[test]
+    fn key_grammar() {
+        assert_eq!(row_key("T-000123"), "r:T-000123");
+        assert_eq!(field_key("T-000123", 3), "r:T-000123.f3");
+        assert_eq!(header_key("v1.25.0"), "h:v1.25.0");
+        assert_eq!(prose_key("abc"), "p:abc");
+    }
+}
