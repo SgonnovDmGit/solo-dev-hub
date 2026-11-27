@@ -1792,6 +1792,7 @@ fn plan_clock_union(
     root: &Path,
     ctx: &SharedPlan,
     path: &str,
+    clock_diags: &mut Vec<String>,
 ) -> Result<Option<FileContent>, String> {
     use crate::sync::edit_clocks::ClockLedger;
     let ours_bytes = match ctx.ours.sha(path) {
@@ -1802,13 +1803,22 @@ fn plan_clock_union(
         Some(b) => cat_blob(git, root, b)?,
         None => Vec::new(),
     };
-    let side = |bytes: &[u8]| -> Option<ClockLedger> {
+    let mut side = |bytes: &[u8], name: &str| -> Option<ClockLedger> {
         if bytes.is_empty() {
             return Some(ClockLedger::new(path));
         }
-        ClockLedger::parse(bytes, path).ok()
+        match ClockLedger::parse(bytes, path) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                clock_diags.push(format!(
+                    "{}: corrupt {} clock ledger ({}); the file freezes for this pass",
+                    path, name, e
+                ));
+                None
+            }
+        }
     };
-    let (Some(lo), Some(lt)) = (side(&ours_bytes), side(&theirs_bytes)) else {
+    let (Some(lo), Some(lt)) = (side(&ours_bytes, "ours"), side(&theirs_bytes, "theirs")) else {
         return Ok(None);
     };
     // The merge is commutative, so orient it for the authentic `file` field:
@@ -1820,7 +1830,13 @@ fn plan_clock_union(
     };
     let text = match merged.serialize() {
         Ok(t) => t,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            clock_diags.push(format!(
+                "{}: clock ledger union cannot serialize ({}); the file freezes for this pass",
+                path, e
+            ));
+            return Ok(None);
+        }
     };
     if text.as_bytes() == theirs_bytes.as_slice() {
         return Ok(None);
@@ -1859,7 +1875,7 @@ fn shared_plan_changes(
         // freezes the file for this pass rather than propagating or dropping
         // entries; the union is identical on every machine by construction.
         if path.starts_with(&format!("{}/", crate::sync::edit_clocks::CLOCKS_DIR)) {
-            if let Some(content) = plan_clock_union(git, root, &ctx, path)? {
+            if let Some(content) = plan_clock_union(git, root, &ctx, path, clock_diags)? {
                 changes.push(FileChange {
                     rel_path: PathBuf::from(path),
                     content: Some(content),
@@ -2101,6 +2117,7 @@ fn plumb_into_branch(
     login: &str,
     approved: &[String],
     held_skills: &Option<BTreeSet<String>>,
+    clock_diags: &mut Vec<String>,
 ) -> Result<BranchCommit, String> {
     let refname = local_ref(branch);
     let base_rev = git_sync::merge_base(git, root, "HEAD", &refname)?;
@@ -2132,12 +2149,7 @@ fn plumb_into_branch(
         approved,
         held_skills,
     };
-    let mut clock_diags: Vec<String> = Vec::new();
-    let mut changes = shared_plan_changes(git, root, &ctx, &mut clock_diags)?;
-    // Degraded clocked resolutions are collected for the diagnostics slice
-    // of T-000266; pre-activation the clocked path never runs and this
-    // stays empty.
-    let _ = &clock_diags;
+    let mut changes = shared_plan_changes(git, root, &ctx, clock_diags)?;
     // T-000244: rule hand-back markers this branch still tracks leave it as
     // deletions. The content exclusions above keep a marker out of every other
     // plan; here the branch's own markers are enumerated directly, because a
@@ -2960,6 +2972,24 @@ fn fresh_issues(repo_id: i64, root: &Path, issues: Vec<SyncIssue>) -> Vec<SyncIs
 
 fn repo_issue(code: Code, repo: &Repository) -> SyncIssue {
     SyncIssue::new(code, repo.display_name())
+}
+
+/// T-000266: degraded clocked resolutions surface as sync issues — one per
+/// diagnostic, the file it concerns as the target. The strings arrive as
+/// `"<path>: <text>"` (the planners prefix every diagnostic with its file);
+/// a string without the prefix still surfaces, with the file left unnamed.
+fn report_clock_diags(pass: &mut RepoPass, diags: Vec<String>) {
+    for d in diags {
+        let (file, text) = match d.split_once(": ") {
+            Some((f, t)) if f.starts_with("docs/") || f.contains(".sdh/") => {
+                (Some(f.to_string()), t.to_string())
+            }
+            _ => (None, d.clone()),
+        };
+        let mut issue = repo_issue(Code::SharedClockDegraded, &pass.repo).detail(text);
+        issue.target = file;
+        pass.issue(issue);
+    }
 }
 
 // ----- safety guards ----------------------------------------------------------------
@@ -6113,7 +6143,17 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
                 continue;
             }
             let held = pending_skill_holds_for(&catalogs, pass, b);
-            match plumb_into_branch(git, &root, b, &plumb_spec, &login, &approved, &held) {
+            let mut clock_diags: Vec<String> = Vec::new();
+            match plumb_into_branch(
+                git,
+                &root,
+                b,
+                &plumb_spec,
+                &login,
+                &approved,
+                &held,
+                &mut clock_diags,
+            ) {
                 Ok(BranchCommit::Committed { .. }) => pass.committed = true,
                 // RefMoved: left for the next sync.
                 Ok(_) => {}
@@ -6122,6 +6162,7 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
                     pass.issue(issue)
                 }
             }
+            report_clock_diags(pass, clock_diags);
         }
     }
 
@@ -6207,6 +6248,7 @@ fn push_recipients(
         if pass.stale_refused.contains(&b.to_ascii_lowercase()) {
             if let Some(remote) = remote.as_deref() {
                 let held = pending_skill_holds_for(catalogs, pass, &b);
+                let mut clock_diags: Vec<String> = Vec::new();
                 match shared_commit_on_tip(
                     git,
                     &root,
@@ -6216,6 +6258,7 @@ fn push_recipients(
                     plumb_spec,
                     approved,
                     &held,
+                    &mut clock_diags,
                 ) {
                     Ok(Some(sha)) => onto_remote.push((b.clone(), sha)),
                     Ok(None) => {}
@@ -6224,6 +6267,7 @@ fn push_recipients(
                         pass.issue(issue)
                     }
                 }
+                report_clock_diags(pass, clock_diags);
             }
             continue;
         }
@@ -6236,6 +6280,7 @@ fn push_recipients(
                 // `remote` absent (a never-pushed branch) defers silently —
                 // an orphan remote branch would only fork the history.
                 let held = pending_skill_holds_for(catalogs, pass, &b);
+                let mut clock_diags: Vec<String> = Vec::new();
                 match shared_commit_on_tip(
                     git,
                     &root,
@@ -6245,6 +6290,7 @@ fn push_recipients(
                     plumb_spec,
                     approved,
                     &held,
+                    &mut clock_diags,
                 ) {
                     Ok(Some(sha)) => onto_remote.push((b.clone(), sha)),
                     Ok(None) => {}
@@ -6253,6 +6299,7 @@ fn push_recipients(
                         pass.issue(issue)
                     }
                 }
+                report_clock_diags(pass, clock_diags);
             }
             continue;
         }
@@ -6338,6 +6385,7 @@ fn shared_commit_on_tip(
     pathspec: &[String],
     approved: &[String],
     held_skills: &Option<BTreeSet<String>>,
+    clock_diags: &mut Vec<String>,
 ) -> Result<Option<String>, String> {
     let l = ls_tree_with_modes(git, root, local, pathspec)?;
     let r = ls_tree(git, root, remote, pathspec)?;
@@ -6356,9 +6404,7 @@ fn shared_commit_on_tip(
         approved,
         held_skills,
     };
-    let mut clock_diags: Vec<String> = Vec::new();
-    let mut changes = shared_plan_changes(git, root, &ctx, &mut clock_diags)?;
-    let _ = &clock_diags;
+    let mut changes = shared_plan_changes(git, root, &ctx, clock_diags)?;
     // T-000244: markers the remote branch still tracks leave it as deletions,
     // same as in `plumb_into_branch`.
     for path in ls_tree(git, root, remote, &[SKILLS_DIR.to_string()])?
@@ -13619,7 +13665,7 @@ mod tests {
         commit_lineage(d, "other", true, theirs);
         commit_lineage(d, "dev", true, ours);
         let spec = vec!["docs/todo.md".to_string()];
-        plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None).unwrap();
+        plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None, &mut Vec::new()).unwrap();
         g(d, &["show", "other:docs/todo.md"])
     }
 
@@ -13683,9 +13729,11 @@ mod tests {
         g(d, &["show", &format!("{}:{}", branch, CLOCK_REL)])
     }
 
-    fn plumb_clocks(d: &Path) {
+    fn plumb_clocks(d: &Path) -> Vec<String> {
         let spec = vec![".sdh/edit-clocks".to_string()];
-        plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None).unwrap();
+        let mut diags = Vec::new();
+        plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None, &mut diags).unwrap();
+        diags
     }
 
     #[test]
@@ -13790,11 +13838,16 @@ mod tests {
         g(d, &["commit", "-q", "-m", "corrupt"]);
         let before = g(d, &["rev-parse", "other"]);
         g(d, &["checkout", "-q", "dev"]);
-        plumb_clocks(d);
+        let diags = plumb_clocks(d);
         assert_eq!(
             g(d, &["rev-parse", "other"]),
             before,
             "corruption must not propagate"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("corrupt") && d.contains(CLOCK_REL)),
+            "the freeze explains itself through the diagnostics: {:?}",
+            diags
         );
     }
 
@@ -13941,7 +13994,7 @@ mod tests {
         g(d, &["add", "-A"]);
         g(d, &["commit", "-q", "-m", "ours review"]);
         let spec = vec!["docs/todo.md".to_string(), ".sdh/edit-clocks".to_string()];
-        plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None).unwrap();
+        plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None, &mut Vec::new()).unwrap();
         g(d, &["show", "other:docs/todo.md"])
     }
 
@@ -14252,7 +14305,7 @@ mod tests {
             g(d, &["checkout", "-q", "dev"]);
         }
         let spec = vec!["docs/InOutBox".to_string()];
-        plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None).unwrap();
+        plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None, &mut Vec::new()).unwrap();
         if g(d, &["ls-tree", "--name-only", "other", "--", rel]).is_empty() {
             None
         } else {
@@ -15457,6 +15510,7 @@ mod tests {
             &spec,
             &[],
             &Some(BTreeSet::new()),
+            &mut Vec::new(),
         )
         .unwrap()
         .expect("the retraction must publish");
@@ -15524,7 +15578,8 @@ mod tests {
                 "me",
                 &spec,
                 &[],
-                &Some(BTreeSet::new())
+                &Some(BTreeSet::new()),
+                &mut Vec::new(),
             )
             .unwrap(),
             None,
@@ -15556,6 +15611,7 @@ mod tests {
             &spec,
             &[],
             &Some(BTreeSet::new()),
+            &mut Vec::new(),
         )
         .unwrap()
         .expect("both sides added a row — the merge must publish");
@@ -15624,6 +15680,7 @@ mod tests {
             &spec,
             &[],
             &Some(BTreeSet::new()),
+            &mut Vec::new(),
         )
         .unwrap()
         .expect("the new blobs must publish");
@@ -15669,6 +15726,7 @@ mod tests {
             &spec,
             &[],
             &Some(BTreeSet::new()),
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -15711,6 +15769,7 @@ mod tests {
             &spec,
             &[],
             &Some(BTreeSet::new()),
+            &mut Vec::new(),
         )
         .unwrap()
         .expect("canon must republish over sole-writer drift");
@@ -15761,6 +15820,7 @@ mod tests {
             &spec,
             &[],
             &Some(BTreeSet::new()),
+            &mut Vec::new(),
         )
         .unwrap()
         .expect("the exec and symlink entries must publish");
@@ -15808,6 +15868,7 @@ mod tests {
             &spec,
             &[],
             &Some(BTreeSet::new()),
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(res, None, "nothing in scope differs");
@@ -15845,7 +15906,7 @@ mod tests {
         g(d, &["commit", "-q", "-m", "newer canon"]);
         let spec = vec!["docs/sdh_skills".to_string()];
         let held = BTreeSet::from(["docs/sdh_skills/sdh-alpha.md".to_string()]);
-        plumb_into_branch(&gb(), d, "helper-dev", &spec, "me", &[], &Some(held)).unwrap();
+        plumb_into_branch(&gb(), d, "helper-dev", &spec, "me", &[], &Some(held), &mut Vec::new()).unwrap();
         assert_eq!(
             g(d, &["show", "helper-dev:docs/sdh_skills/sdh-alpha.md"]),
             "PROPOSED",

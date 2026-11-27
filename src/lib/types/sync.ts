@@ -35,6 +35,7 @@ export const SYNC_ISSUE_CODES = [
   'shared_pending_approval',
   'shared_merge_deferred',
   'shared_no_login',
+  'shared_clock_degraded',
   'clone_target_invalid',
   'clone_failed',
   'clone_attach_failed',

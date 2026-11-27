@@ -97,6 +97,10 @@ pub enum SyncIssueCode {
     SharedMergeDeferred,
     /// F-000044: the GitHub login of this install is unknown. subject = repo.
     SharedNoLogin,
+    /// T-000266: a clocked (UTC-chronology) resolution degraded or a clock
+    /// ledger froze: corrupt ledger side, far-future quarantine, a cap hit.
+    /// subject = repo, target = the shared file, detail = the diagnostic.
+    SharedClockDegraded,
     /// F-000045: the picked clone target cannot be used (a file, an unreadable
     /// folder, a non-empty non-git folder, another repo's clone, a nested
     /// folder of one). Nothing was touched. subject = repo, target = path.
@@ -572,6 +576,7 @@ mod tests {
             CloneTargetInvalid,
             CloneFailed,
             CloneAttachFailed,
+            SharedClockDegraded,
         ];
         for code in &all {
             match code {
@@ -606,7 +611,8 @@ mod tests {
                 | SharedNoLogin
                 | CloneTargetInvalid
                 | CloneFailed
-                | CloneAttachFailed => {}
+                | CloneAttachFailed
+                | SharedClockDegraded => {}
             }
         }
         all
