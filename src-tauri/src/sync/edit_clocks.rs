@@ -160,6 +160,17 @@ impl ClockLedger {
     }
 }
 
+impl ClockEntry {
+    /// True when the stamp lies beyond the trustable future — a wrong-clock
+    /// machine wrote it. A quarantined entry never decides resolution: the
+    /// key freezes out of every winner/tombstone read (degraded fallback,
+    /// reported as a sync issue), but the stamp itself is never rewritten —
+    /// when the machine's clock is repaired its honest entries merge back in.
+    pub fn is_quarantined(&self, now_utc: i64) -> bool {
+        self.t > now_utc + MAX_FUTURE_SKEW_SECS
+    }
+}
+
 fn pick_winner<'a>(a: &'a ClockEntry, b: &'a ClockEntry) -> &'a ClockEntry {
     if b.t > a.t || (b.t == a.t && b.src > a.src) {
         b

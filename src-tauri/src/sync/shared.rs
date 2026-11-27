@@ -1327,7 +1327,8 @@ fn clock_verdict_for_adopt(
     let clock_rel = format!("{}/{}", CLOCKS_DIR, ledger_file_name(path));
     let entry = read_worktree(root, &clock_rel)
         .and_then(|bytes| ClockLedger::parse(&bytes, &clock_rel).ok())
-        .and_then(|l| l.get(FILE_KEY).cloned())?;
+        .and_then(|l| l.get(FILE_KEY).cloned())
+        .filter(|e| !e.is_quarantined(unix_now()))?;
     if entry.del {
         return Some(false);
     }
@@ -2065,9 +2066,20 @@ fn shared_plan_changes(
         {
             let (union, udiags) = union_clock_for(git, root, &ctx, path);
             clock_diags.extend(udiags);
-            union
-                .get(crate::sync::edit_clocks::FILE_KEY)
-                .cloned()
+            match union.get(crate::sync::edit_clocks::FILE_KEY).cloned() {
+                Some(e) if e.is_quarantined(unix_now()) => {
+                    // T-000267 quarantine consumption: a far-future stamp on
+                    // the file key freezes it — the winner decides nothing
+                    // (a wrong-clock machine must not rule the fleet), the
+                    // positional fallback takes over, and the freeze is loud.
+                    clock_diags.push(format!(
+                        "{}: file key frozen by a far-future stamp — positional fallback",
+                        path
+                    ));
+                    None
+                }
+                other => other,
+            }
         } else {
             None
         };
@@ -8230,7 +8242,9 @@ pub fn activate_chronology(
                 continue;
             };
             let h = value_hash(&content_bytes);
-            let honest = union.get(FILE_KEY).is_some_and(|e| !e.del && e.h == h);
+            let honest = union
+                .get(FILE_KEY)
+                .is_some_and(|e| !e.del && e.h == h && !e.is_quarantined(now));
             if honest {
                 continue;
             }

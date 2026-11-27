@@ -309,6 +309,9 @@ use std::cell::RefCell;
 pub struct Clocks<'a> {
     pub ledger: &'a ClockLedger,
     pub diags: RefCell<Vec<String>>,
+    /// UTC seconds at the merge start — the reference for far-future
+    /// quarantine (T-000267): stamps beyond now+skew never decide resolution.
+    pub now: i64,
 }
 
 impl<'a> Clocks<'a> {
@@ -316,6 +319,10 @@ impl<'a> Clocks<'a> {
         Clocks {
             ledger,
             diags: RefCell::new(Vec::new()),
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
         }
     }
     fn diag(&self, msg: String) {
@@ -327,8 +334,16 @@ impl<'a> Clocks<'a> {
 /// or the stamp belongs to a different value and conservatively counts as
 /// absent (spec D1: separate convergence of content and ledger can never pair
 /// a new stamp with an old value).
-fn valid_stamp<'a>(ledger: &'a ClockLedger, key: &str, value: &str) -> Option<&'a ClockEntry> {
+fn valid_stamp<'a>(
+    ledger: &'a ClockLedger,
+    key: &str,
+    value: &str,
+    now: i64,
+) -> Option<&'a ClockEntry> {
     let e = ledger.get(key)?;
+    if e.is_quarantined(now) {
+        return None;
+    }
     if !e.del && e.h == value_hash(value.as_bytes()) {
         Some(e)
     } else {
@@ -342,8 +357,8 @@ fn valid_stamp<'a>(ledger: &'a ClockLedger, key: &str, value: &str) -> Option<&'
 /// order decides (deterministic on every machine, keeping commutativity) and
 /// the key is reported.
 fn pick_clocked(clocks: &Clocks, key: &str, o: &str, t: &str) -> String {
-    let so = valid_stamp(clocks.ledger, key, o);
-    let st = valid_stamp(clocks.ledger, key, t);
+    let so = valid_stamp(clocks.ledger, key, o, clocks.now);
+    let st = valid_stamp(clocks.ledger, key, t, clocks.now);
     match (so, st) {
         (Some(a), Some(b)) => {
             if b.t > a.t || (b.t == a.t && b.src > a.src) {
@@ -587,8 +602,11 @@ fn decide(
                 // the deletion legitimately resurrects). The positional
                 // "status/section-only" exception is abolished.
                 let key = row_key(&x.key);
-                let tomb = c.ledger.get(&key).filter(|e| e.del);
-                let edit = valid_stamp(c.ledger, &key, &x.raw);
+                let tomb = c
+                    .ledger
+                    .get(&key)
+                    .filter(|e| e.del && !e.is_quarantined(c.now));
+                let edit = valid_stamp(c.ledger, &key, &x.raw, c.now);
                 let keep = match (tomb, edit) {
                     (Some(d), Some(e)) => e.t > d.t || (e.t == d.t && e.src > d.src),
                     // A changed survivor with no stamps either way: genuine
@@ -873,6 +891,16 @@ pub fn merge_shared_file_clocked(
         &mut hdr_overrides,
     );
     let clocks = Clocks::new(ledger);
+    let quarantined = ledger.quarantined_keys(clocks.now);
+    if !quarantined.is_empty() {
+        let shown: Vec<&str> = quarantined.iter().take(3).map(|s| s.as_str()).collect();
+        clocks.diag(format!(
+            "{} key(s) frozen by far-future stamps (a wrong-clock machine wrote them) — they decide nothing here: {}{}",
+            quarantined.len(),
+            shown.join(", "),
+            if quarantined.len() > 3 { ", ..." } else { "" }
+        ));
+    }
     let text = merge_with_bases(
         kind,
         base,
@@ -1247,7 +1275,7 @@ fn structure_prefers_theirs(clocks: &Clocks, o: &Doc, t: &Doc) -> bool {
         return false;
     }
     let e = match clocks.ledger.get(STRUCTURE_KEY) {
-        Some(e) if !e.del => e,
+        Some(e) if !e.del && !e.is_quarantined(clocks.now) => e,
         _ => {
             // Diverging skeletons with no structure stamp at all is degraded
             // mode: the positional fallback below is ours-relative, so it
@@ -2688,4 +2716,81 @@ mod clocked_tests {
         assert!(text.contains("## v1 beta"), "{}", text);
         assert!(!text.contains("## v1 zeta"), "{}", text);
     }
+
+    fn far_future() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 48 * 3600
+    }
+
+    #[test]
+    fn quarantined_field_stamp_decides_nothing_and_reports() {
+        // Ours moved the status to zulu, theirs to alpha; the ledger stamps
+        // "alpha" in the FAR FUTURE — a wrong-clock machine. Without
+        // quarantine consumption that poisoned stamp wins every merge
+        // forever. Frozen, it decides nothing: the degraded deterministic
+        // fallback keeps ours ("zulu" > "alpha" in content order would pick
+        // zulu whichever machine merges), and the freeze is reported.
+        let ours = "## v1
+
+- [ ] T-000001 | task | 1 | low | zulu | 2026-10-01
+";
+        let theirs = "## v1
+
+- [ ] T-000001 | task | 1 | low | alpha | 2026-10-01
+";
+        let l = ledger_of(&[(&field_key("T-000001", 4), ent("alpha", far_future(), "bad", false))]);
+        let (text, diags) = merge6(BASE, ours, theirs, &l);
+        assert!(text.contains("| zulu |"), "{}", text);
+        assert!(!text.contains("| alpha |"), "{}", text);
+        assert!(
+            diags.iter().any(|d| d.contains("far-future")),
+            "the freeze must be reported: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn quarantined_tombstone_cannot_delete_a_honestly_edited_row() {
+        // Ours edited the row (honest stamp t=100), theirs deleted it and a
+        // wrong-clock machine stamped the tombstone in the far future.
+        // Unconsumed, the poisoned tombstone deletes the row on every merge.
+        // Frozen, the honest edit stamp stands alone and the row survives.
+        let live = "- [ ] T-000001 | task | 1 | low | in-progress | 2026-10-01";
+        let ours_with_row = format!(
+            "## v1
+
+{}
+",
+            live
+        );
+        let deleted_side = "## v1
+
+";
+        let tomb = {
+            let mut e = ent("", far_future(), "bad", true);
+            e.h = String::new();
+            e
+        };
+        // One ledger key holds one winner — model the union result directly:
+        // the tombstone is the key's entry (later stamp won the CRDT merge),
+        // so the freeze must come from quarantine, not from losing the union.
+        let l = ledger_of(&[(&row_key("T-000001"), tomb)]);
+        let (text, _) = merge6(BASE, &ours_with_row, deleted_side, &l);
+        // With the tombstone frozen there is no deletion evidence at all;
+        // the row changed vs base, so the conservative survivor rule keeps it.
+        assert!(text.contains("T-000001"), "{}", text);
+        // And sanity: a NON-quarantined tombstone still deletes it.
+        let honest_tomb = {
+            let mut e = ent("", 400, "sdel", true);
+            e.h = String::new();
+            e
+        };
+        let l2 = ledger_of(&[(&row_key("T-000001"), honest_tomb)]);
+        let (text2, _) = merge6(BASE, &ours_with_row, deleted_side, &l2);
+        assert!(!text2.contains("T-000001"), "{}", text2);
+    }
+
 }
