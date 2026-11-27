@@ -88,6 +88,11 @@ prepared ──publish──► decided ──canon txn──► applied ──d
 - `disable_shared_mode` / detach контрибутора: строки [rule_proposals](../schema/rule_proposals.md), [rule_acceptances](../schema/rule_acceptances.md) и [rule_proposal_seq](../schema/rule_proposal_seq.md) репо удаляются вместе с остальным `.sdh/`-следам.
 - GC терминальных строк только при **доминировании remote-версии**: удалить `withdrawn`-строку можно, когда remote не моложе её (по `remote_ver` — `{seq,status,sha}`), чтобы отзыв не воскрес из-под ещё не дошедшего remote.
 
+
+## Граница хронологии (v1.25.0)
+
+Каталоги предложений **не входят** в shared-pathspec и не разрешаются edit-clock хронологией: у них собственный транспорт (`sync_rule_proposals` по строкам-квитанциям), свои субъекты и свои писатели. Канон правил — sole-writer артефакт главного (публикует только он), поэтому гонки «чьё новее» для него не существует по построению и штампы не нужны. Хронология касается этого flow ровно одним краем: `docs/todo.md`/`done.md`, где живут карточки решений, разрешаются по штампам после активации — см. [contributor-mode](./contributor-mode.md), раздел «Хронология правок по UTC».
+
 ## События истории
 
 Миграция v36 расширила `rule_events.kind`: `proposed` (главный, раз на новую версию), `proposal_accepted`, `proposal_rejected`, `proposal_withdrawn` — видны на вкладке «История» правила.
