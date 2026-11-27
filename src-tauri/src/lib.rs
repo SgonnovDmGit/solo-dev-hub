@@ -271,6 +271,8 @@ pub fn run() {
             commands::shared::set_shared_admin_verified,
             commands::shared::disable_shared_mode,
             commands::shared::approve_join_request,
+            commands::shared::chronology_gate,
+            commands::shared::activate_chronology,
             commands::shared::accept_new_main_branch,
             commands::shared::merge_shared_upstream,
             commands::shared::list_join_requests,

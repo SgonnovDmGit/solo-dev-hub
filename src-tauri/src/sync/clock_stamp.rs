@@ -150,6 +150,32 @@ pub fn stamp_file_delta(
     changed
 }
 
+/// Baseline stamping for the activation commit (T-000266, spec D1a): every
+/// live key of `content` that lacks a VALID stamp gets one at the baseline
+/// time — but an honest earlier stamp of the same value is never overwritten
+/// (the whole point of stamping continuously since the first v1.25.0 pass).
+/// "Valid" means same key AND same value hash: a stale entry of a superseded
+/// value does not protect the key — the current value is what gets stamped.
+/// Tombstones are untouched: nothing here revives or rewrites a deletion.
+pub fn stamp_file_baseline(
+    kind: SharedFileKind,
+    content: &str,
+    ledger: &mut ClockLedger,
+    now: i64,
+    src: &str,
+) -> bool {
+    let mut fresh = ClockLedger::new(&ledger.file);
+    stamp_file_delta(kind, "", content, &mut fresh, now, src);
+    let mut changed = false;
+    for (k, e) in fresh.entries {
+        let honest = ledger.entries.get(&k).is_some_and(|x| x.h == e.h && !x.del);
+        if !honest {
+            changed |= ledger.stamp(&k, e);
+        }
+    }
+    changed
+}
+
 fn header_text<'a>(d: &'a Doc, key: &str) -> Option<&'a str> {
     d.lines.iter().find_map(|l| match l {
         Line::Header { key: k, text } if k == key => Some(text.as_str()),
@@ -166,6 +192,64 @@ mod tests {
     }
 
     const V1: &str = "## v1\n\n- [ ] T-000001 | task | 1 | low | open | 2026-10-01\n";
+
+    #[test]
+    fn baseline_stamps_all_live_content_once() {
+        let mut l = ledger();
+        assert!(stamp_file_baseline(
+            SharedFileKind::Todo,
+            V1,
+            &mut l,
+            1000,
+            "base"
+        ));
+        assert!(l.get(&row_key("T-000001")).is_some());
+        assert!(l.get(&crate::sync::edit_clocks::STRUCTURE_KEY).is_some());
+        // A second baseline is inert — same values, already honest.
+        assert!(!stamp_file_baseline(
+            SharedFileKind::Todo,
+            V1,
+            &mut l,
+            2000,
+            "base2"
+        ));
+    }
+
+    #[test]
+    fn baseline_never_overwrites_an_honest_earlier_stamp() {
+        let mut l = ledger();
+        // The honest stamp of the same value at t=100.
+        stamp_file_delta(SharedFileKind::Todo, "", V1, &mut l, 100, "honest");
+        let before: Vec<(String, i64)> = l.entries.iter().map(|(k, e)| (k.clone(), e.t)).collect();
+        assert!(stamp_file_baseline(SharedFileKind::Todo, V1, &mut l, 9000, "base") == false);
+        let after: Vec<(String, i64)> = l.entries.iter().map(|(k, e)| (k.clone(), e.t)).collect();
+        assert_eq!(before, after, "honest times survive the baseline");
+    }
+
+    #[test]
+    fn baseline_replaces_a_stamp_of_a_superseded_value() {
+        let mut l = ledger();
+        // v-old stamped the row's old text; the current content differs.
+        let old = "## v1
+
+- [ ] T-000001 | old text | 1 | low | open | 2026-10-01
+";
+        stamp_file_delta(SharedFileKind::Todo, "", old, &mut l, 100, "honest");
+        assert!(stamp_file_baseline(
+            SharedFileKind::Todo,
+            V1,
+            &mut l,
+            500,
+            "base"
+        ));
+        use crate::sync::edit_clocks::value_hash;
+        let row = l.get(&row_key("T-000001")).unwrap();
+        assert_eq!(row.t, 500, "the current value gets the baseline time");
+        // The row hash is the CURRENT row's hash now.
+        let cur = parse(SharedFileKind::Todo, V1);
+        let ent = &cur.ents[0];
+        assert_eq!(row.h, value_hash(ent.raw.as_bytes()));
+    }
 
     #[test]
     fn no_diff_stamps_nothing() {

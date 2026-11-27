@@ -7750,6 +7750,239 @@ pub fn accept_new_main_branch(db: &AppDb, repo_id: i64) -> Result<(), String> {
 /// (the registered driver merges the shared files by id). A conflict in code is
 /// aborted and reported. The `needs_manual_merge` status is cleared only after
 /// a real merge; the next sync recomputes it either way.
+// ---------------------------------------------------------------------------
+// T-000266: chronology activation (spec D1a)
+// ---------------------------------------------------------------------------
+
+/// The first version carrying the UTC-chronology machinery — the activation
+/// gate's minimum for every participant of the shared repo.
+pub const CHRONOLOGY_MIN_VERSION: &str = "1.25.0";
+
+/// SemVer-ish `v >= min` on numeric triples; a malformed side never passes.
+fn version_gte(v: &str, min: &str) -> bool {
+    let triple = |s: &str| -> Option<(u64, u64, u64)> {
+        let mut it = s.split('.');
+        let a = it.next()?.parse().ok()?;
+        let b = it.next()?.parse().ok()?;
+        let c = it.next()?.parse().ok()?;
+        Some((a, b, c))
+    };
+    match (triple(v), triple(min)) {
+        (Some(x), Some(m)) => x >= m,
+        _ => false,
+    }
+}
+
+/// Activation readiness of one shared repo (spec D1a steps 1-2): the UI
+/// button is enabled exactly when `ready` — every participant of the trusted
+/// structure publishes a version file of at least CHRONOLOGY_MIN_VERSION on
+/// the dev branch. `active` means the protocol already rides the refs.
+pub struct ChronologyGate {
+    pub active: bool,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+}
+
+pub fn chronology_gate(
+    db: &AppDb,
+    git: &GitBinary,
+    repo_id: i64,
+) -> Result<ChronologyGate, String> {
+    let Some(structure) = get_repo_structure(db, Some(git), repo_id)? else {
+        return Err("no trusted structure — the repo is not shared here".to_string());
+    };
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let root = repo_root(&repo)?;
+    let dev = &structure.main.dev_branch;
+    let versions_rev = if matches!(
+        git_sync::rev_parse(git, &root, &remote_ref(dev)),
+        Ok(Some(_))
+    ) {
+        remote_ref(dev)
+    } else {
+        local_ref(dev)
+    };
+    let active = protocol_active_in(git, &root, &[&local_ref(dev), &versions_rev]);
+    let versions = app_versions_at(git, &root, &versions_rev);
+    let mut blockers = Vec::new();
+    let mut logins: Vec<&str> = vec![structure.main.login.as_str()];
+    logins.extend(structure.participants.iter().map(|p| p.login.as_str()));
+    for login in logins {
+        match versions.get(&login.to_ascii_lowercase()) {
+            Some(v) if version_gte(v, CHRONOLOGY_MIN_VERSION) => {}
+            Some(v) => blockers.push(format!(
+                "{} is on v{} (need >= v{})",
+                login, v, CHRONOLOGY_MIN_VERSION
+            )),
+            None => blockers.push(format!("{} has not published a version yet", login)),
+        }
+    }
+    Ok(ChronologyGate {
+        active,
+        ready: !active && blockers.is_empty(),
+        blockers,
+    })
+}
+
+pub struct ActivationOutcome {
+    pub commit: Option<String>,
+    pub pushed: bool,
+    pub note: Option<String>,
+}
+
+/// The activation commit (spec D1a steps 3-4): `.sdh/protocol.json` plus the
+/// baseline-stamped ledgers of every task file, one commit on the dev branch.
+/// The baseline unions the ledgers of every participant branch first, so
+/// honest pre-activation stamps anywhere in the fleet survive; only keys
+/// with no valid stamp receive the uniform baseline time. This is the last
+/// commit whose transport resolves positionally.
+pub fn activate_chronology(
+    db: &AppDb,
+    git: &GitBinary,
+    repo_id: i64,
+) -> Result<ActivationOutcome, String> {
+    use crate::sync::edit_clocks::{
+        ledger_file_name, render_protocol, ClockLedger, CLOCKS_DIR, PROTOCOL_PATH,
+    };
+    let repo = db.get_repository(repo_id).map_err(|e| e.to_string())?;
+    let root = repo_root(&repo)?;
+    let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if !state.shared_mode || state.shared_role.as_deref() != Some("main") {
+        return Err("only the owner of a shared repo activates the chronology".to_string());
+    }
+    let gate = chronology_gate(db, git, repo_id)?;
+    if gate.active {
+        return Err("the chronology protocol is already active".to_string());
+    }
+    if !gate.ready {
+        return Err(format!(
+            "not every participant is ready: {}",
+            gate.blockers.join("; ")
+        ));
+    }
+    let Some(structure) = get_repo_structure(db, Some(git), repo_id)? else {
+        return Err("no trusted structure".to_string());
+    };
+    let dev = structure.main.dev_branch.clone();
+    let dev_ref = local_ref(&dev);
+    let dev_tip = git_sync::rev_parse(git, &root, &dev_ref)?
+        .ok_or_else(|| format!("the dev branch '{}' does not exist locally", dev))?;
+
+    // Union the ledgers of every participant branch known locally — honest
+    // pre-activation stamps survive the baseline wherever they were written.
+    let mut ledger_revs: Vec<String> = vec![dev_ref.clone()];
+    for p in &structure.participants {
+        ledger_revs.push(local_ref(&p.branch));
+    }
+    let file_content = |rev: &str, rel: &str| -> Option<Vec<u8>> {
+        git_sync::blob_sha_at(git, &root, rev, rel)
+            .ok()
+            .flatten()
+            .and_then(|sha| cat_blob(git, &root, &sha).ok())
+    };
+    let now = unix_now();
+    let src = stamp_src_marker(&dev_tip, "activation");
+    let mut changes: Vec<FileChange> = Vec::new();
+    for rel in IMPORT_FILES {
+        let Some(kind) = kind_for_path(rel) else {
+            continue;
+        };
+        let clock_rel = format!("{}/{}", CLOCKS_DIR, ledger_file_name(rel));
+        let mut union = ClockLedger::new(rel);
+        for rev in &ledger_revs {
+            if let Some(bytes) = file_content(rev, &clock_rel) {
+                if let Ok(l) = ClockLedger::parse(&bytes, &clock_rel) {
+                    union = union.merge(&l);
+                }
+            }
+        }
+        let Some(content_bytes) = file_content(&dev_ref, rel) else {
+            continue;
+        };
+        let Ok(content) = String::from_utf8(normalize(content_bytes)) else {
+            continue;
+        };
+        let before = union.serialize().unwrap_or_default();
+        crate::sync::clock_stamp::stamp_file_baseline(kind, &content, &mut union, now, &src);
+        let after = union.serialize().unwrap_or_default();
+        if after != before {
+            changes.push(FileChange {
+                rel_path: PathBuf::from(&clock_rel),
+                content: Some(FileContent::Bytes(after.into_bytes())),
+            });
+        }
+    }
+    let activated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let protocol = render_protocol(&activated_at, &dev_tip);
+    changes.push(FileChange {
+        rel_path: PathBuf::from(PROTOCOL_PATH),
+        content: Some(FileContent::Bytes(protocol.into_bytes())),
+    });
+
+    let (_, body) = commit_message(db.github_login().as_deref().unwrap_or(""));
+    let msg = format!("chore(sdh-sync): activate UTC chronology\n\n{}", body);
+    let cur = current_branch(git, &root).ok().flatten();
+    let committed: Option<String> = if cur.as_deref().is_some_and(|c| same_branch(c, &dev)) {
+        // dev is checked out: write the activation files and commit exactly
+        // them — the user's other work never rides along.
+        for c in &changes {
+            let target = root.join(&c.rel_path);
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Some(FileContent::Bytes(b)) = &c.content {
+                std::fs::write(&target, b).map_err(|e| format!("write {:?}: {}", target, e))?;
+            }
+        }
+        let paths: Vec<PathBuf> = changes.iter().map(|c| c.rel_path.clone()).collect();
+        match commit_paths(
+            git,
+            &root,
+            &dev,
+            &paths,
+            &msg,
+            Some(&body),
+            SDH_COMMIT_NAME,
+            SDH_COMMIT_EMAIL,
+        ) {
+            Ok(CommitOutcome::Committed { .. }) => git_sync::rev_parse(git, &root, "HEAD")?,
+            Ok(_) => None,
+            Err(e) => return Err(format!("activation commit failed: {}", e)),
+        }
+    } else {
+        match git_sync::commit_files_to_branch(
+            git,
+            &root,
+            &dev,
+            &changes,
+            &msg,
+            SDH_COMMIT_NAME,
+            SDH_COMMIT_EMAIL,
+        ) {
+            Ok(BranchCommit::Committed { sha }) => Some(sha),
+            Ok(BranchCommit::NothingToCommit) => None,
+            Ok(BranchCommit::RefMoved) => {
+                return Err("the dev branch moved meanwhile — try again".to_string())
+            }
+            Err(e) => return Err(format!("activation commit failed: {}", e)),
+        }
+    };
+    let Some(sha) = committed else {
+        return Err("nothing committed — the activation produced no change".to_string());
+    };
+    let pushed = match git_sync::push_branches(git, &root, REMOTE, &[dev.as_str()]) {
+        Ok(results) => results
+            .iter()
+            .all(|(_, o)| matches!(o, PushOutcome::Pushed | PushOutcome::UpToDate)),
+        Err(_) => false,
+    };
+    Ok(ActivationOutcome {
+        commit: Some(sha),
+        pushed,
+        note: (!pushed).then(|| "the sync will propagate the activation".to_string()),
+    })
+}
+
 pub fn merge_shared_upstream(
     db: &AppDb,
     git: &GitBinary,
@@ -13460,9 +13693,15 @@ mod tests {
         let dir = clock_fixture();
         let d = dir.path();
         // Ours: A@100, B@200. Theirs: B@150 (staler), C@300.
-        commit_clock(d, &ledger_json(&[("r:A", "ha", 100, false), ("r:B", "hb2", 200, false)]));
+        commit_clock(
+            d,
+            &ledger_json(&[("r:A", "ha", 100, false), ("r:B", "hb2", 200, false)]),
+        );
         g(d, &["checkout", "-q", "other"]);
-        commit_clock(d, &ledger_json(&[("r:B", "hb1", 150, false), ("r:C", "hc", 300, false)]));
+        commit_clock(
+            d,
+            &ledger_json(&[("r:B", "hb1", 150, false), ("r:C", "hc", 300, false)]),
+        );
         g(d, &["checkout", "-q", "dev"]);
         plumb_clocks(d);
         let merged = branch_clock(d, "other");
@@ -13483,9 +13722,15 @@ mod tests {
         let one = {
             let dir = clock_fixture();
             let d = dir.path();
-            commit_clock(d, &ledger_json(&[("r:A", "ha", 100, false), ("r:B", "hb2", 200, false)]));
+            commit_clock(
+                d,
+                &ledger_json(&[("r:A", "ha", 100, false), ("r:B", "hb2", 200, false)]),
+            );
             g(d, &["checkout", "-q", "other"]);
-            commit_clock(d, &ledger_json(&[("r:B", "hb1", 150, false), ("r:C", "hc", 300, false)]));
+            commit_clock(
+                d,
+                &ledger_json(&[("r:B", "hb1", 150, false), ("r:C", "hc", 300, false)]),
+            );
             g(d, &["checkout", "-q", "dev"]);
             plumb_clocks(d);
             branch_clock(d, "other")
@@ -13493,9 +13738,15 @@ mod tests {
         let two = {
             let dir = clock_fixture();
             let d = dir.path();
-            commit_clock(d, &ledger_json(&[("r:B", "hb1", 150, false), ("r:C", "hc", 300, false)]));
+            commit_clock(
+                d,
+                &ledger_json(&[("r:B", "hb1", 150, false), ("r:C", "hc", 300, false)]),
+            );
             g(d, &["checkout", "-q", "other"]);
-            commit_clock(d, &ledger_json(&[("r:A", "ha", 100, false), ("r:B", "hb2", 200, false)]));
+            commit_clock(
+                d,
+                &ledger_json(&[("r:A", "ha", 100, false), ("r:B", "hb2", 200, false)]),
+            );
             g(d, &["checkout", "-q", "dev"]);
             plumb_clocks(d);
             branch_clock(d, "other")
@@ -13540,7 +13791,11 @@ mod tests {
         let before = g(d, &["rev-parse", "other"]);
         g(d, &["checkout", "-q", "dev"]);
         plumb_clocks(d);
-        assert_eq!(g(d, &["rev-parse", "other"]), before, "corruption must not propagate");
+        assert_eq!(
+            g(d, &["rev-parse", "other"]),
+            before,
+            "corruption must not propagate"
+        );
     }
 
     // ----- T-000274: write-side stamping at the auto-commit path -----------
@@ -13651,7 +13906,14 @@ mod tests {
         let theirs = base.replace("| open |", "| done |");
         write(d, "docs/todo.md", &theirs);
         let mut lth = ClockLedger::new("docs/todo.md");
-        stamp_file_delta(SharedFileKind::Todo, &base, &theirs, &mut lth, t_theirs, "src-theirs");
+        stamp_file_delta(
+            SharedFileKind::Todo,
+            &base,
+            &theirs,
+            &mut lth,
+            t_theirs,
+            "src-theirs",
+        );
         write(d, CLOCK_REL, &lth.serialize().unwrap());
         g(d, &["add", "-A"]);
         g(d, &["commit", "-q", "-m", "theirs done"]);
@@ -13660,10 +13922,21 @@ mod tests {
         let ours = base.replace("| open |", "| review |");
         write(d, "docs/todo.md", &ours);
         let mut lou = ClockLedger::new("docs/todo.md");
-        stamp_file_delta(SharedFileKind::Todo, &base, &ours, &mut lou, t_ours, "src-ours");
+        stamp_file_delta(
+            SharedFileKind::Todo,
+            &base,
+            &ours,
+            &mut lou,
+            t_ours,
+            "src-ours",
+        );
         write(d, CLOCK_REL, &lou.serialize().unwrap());
         if with_protocol {
-            write(d, ".sdh/protocol.json", &render_protocol("2026-11-27T00:00:00Z", "abc"));
+            write(
+                d,
+                ".sdh/protocol.json",
+                &render_protocol("2026-11-27T00:00:00Z", "abc"),
+            );
         }
         g(d, &["add", "-A"]);
         g(d, &["commit", "-q", "-m", "ours review"]);
@@ -13677,13 +13950,21 @@ mod tests {
         // Their edit is LATER (200 > 100): theirs wins although the merge
         // runs on dev — positional resolution would have kept ours.
         let got = clocked_plumb(100, 200, true);
-        assert!(got.contains("| done |"), "theirs must win:
-{}", got);
+        assert!(
+            got.contains("| done |"),
+            "theirs must win:
+{}",
+            got
+        );
         assert!(!got.contains("| review |"));
         // And the mirror: our edit later — ours wins.
         let got = clocked_plumb(300, 200, true);
-        assert!(got.contains("| review |"), "ours must win:
-{}", got);
+        assert!(
+            got.contains("| review |"),
+            "ours must win:
+{}",
+            got
+        );
     }
 
     #[test]
@@ -13691,8 +13972,12 @@ mod tests {
         // Identical fixture without the protocol file: ours wins positionally
         // even though their stamp is later — the gate is real.
         let got = clocked_plumb(100, 200, false);
-        assert!(got.contains("| review |"), "positional ours:
-{}", got);
+        assert!(
+            got.contains("| review |"),
+            "positional ours:
+{}",
+            got
+        );
     }
 
     // ----- T-000267: the merge driver's clocked twin ------------------------
@@ -13701,6 +13986,74 @@ mod tests {
     /// REFS (HEAD and the merging rev), never from the work tree — prove the
     /// union reaches the resolution: their later stamp wins although the
     /// work tree is ours.
+    #[test]
+    fn version_gte_compares_numeric_triples() {
+        assert!(version_gte("1.25.0", "1.25.0"));
+        assert!(version_gte("1.26.3", "1.25.0"));
+        assert!(version_gte("2.0.0", "1.25.0"));
+        assert!(!version_gte("1.24.6", "1.25.0"));
+        assert!(!version_gte("0.99.99", "1.25.0"));
+        assert!(!version_gte("garbage", "1.25.0"));
+        assert!(!version_gte("1.25.0", "garbage"));
+    }
+
+    /// T-000266: the activation commit carries the protocol file and the
+    /// baseline-stamped ledgers onto dev, and the gate blocks until every
+    /// participant publishes a chronology-capable version.
+    #[test]
+    fn activation_writes_protocol_and_baseline_ledgers() {
+        let fx = two_installs();
+        fx.make_participant_via_syncs();
+        // The fleet still runs the pre-chronology build: the gate must block.
+        let gate = chronology_gate(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(!gate.active);
+        assert!(
+            !gate.ready,
+            "1.24.x participants must not pass the gate: {:?}",
+            gate.blockers
+        );
+        assert!(!gate.blockers.is_empty());
+        // Both installs upgrade: their version files on dev say 1.25.0.
+        for login in ["owner", "helper"] {
+            write(
+                &fx.main_dir,
+                &format!(".sdh/app-versions/{}.json", login),
+                "{\"app_version\":\"1.25.0\"}\n",
+            );
+        }
+        // Real content to baseline-stamp: two live rows in docs/todo.md.
+        write(
+            &fx.main_dir,
+            "docs/todo.md",
+            &todo(&["T-000001", "T-000002"]),
+        );
+        g(&fx.main_dir, &["add", ".sdh/app-versions", "docs/todo.md"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "versions"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        let gate = chronology_gate(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(gate.ready, "blockers: {:?}", gate.blockers);
+        // Activate.
+        let out = activate_chronology(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(out.commit.is_some());
+        // The protocol file rides dev now.
+        let protocol = g(&fx.main_dir, &["show", "dev:.sdh/protocol.json"]);
+        assert!(protocol.contains("\"chronology\""), "{}", protocol);
+        assert!(protocol.contains("baseline_commit"), "{}", protocol);
+        // The ledger of docs/todo.md carries a baseline stamp of its rows.
+        let ledger = g(
+            &fx.main_dir,
+            &["show", "dev:.sdh/edit-clocks/docs--todo.md.json"],
+        );
+        assert!(ledger.contains("T-"), "ledger has row stamps: {}", ledger);
+        assert!(ledger.contains("__structure__"), "{}", ledger);
+        // The gate now reports active.
+        let gate = chronology_gate(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        assert!(gate.active, "activation visible through the refs");
+        assert!(!gate.ready);
+        // A second activation refuses.
+        assert!(activate_chronology(&fx.main_db, &gb(), fx.main_repo).is_err());
+    }
+
     #[test]
     fn the_driver_merge_reads_clocks_from_the_refs() {
         use crate::sync::clock_stamp::stamp_file_delta;
@@ -13719,7 +14072,14 @@ mod tests {
         let theirs = base.replace("| open |", "| done |");
         write(d, "docs/todo.md", &theirs);
         let mut lth = ClockLedger::new("docs/todo.md");
-        stamp_file_delta(SharedFileKind::Todo, &base, &theirs, &mut lth, 200, "src-theirs");
+        stamp_file_delta(
+            SharedFileKind::Todo,
+            &base,
+            &theirs,
+            &mut lth,
+            200,
+            "src-theirs",
+        );
         write(d, CLOCK_REL, &lth.serialize().unwrap());
         g(d, &["add", "-A"]);
         g(d, &["commit", "-q", "-m", "theirs done"]);
@@ -13727,7 +14087,14 @@ mod tests {
         let ours = base.replace("| open |", "| review |");
         write(d, "docs/todo.md", &ours);
         let mut lou = ClockLedger::new("docs/todo.md");
-        stamp_file_delta(SharedFileKind::Todo, &base, &ours, &mut lou, 100, "src-ours");
+        stamp_file_delta(
+            SharedFileKind::Todo,
+            &base,
+            &ours,
+            &mut lou,
+            100,
+            "src-ours",
+        );
         write(d, CLOCK_REL, &lou.serialize().unwrap());
         g(d, &["add", "-A"]);
         g(d, &["commit", "-q", "-m", "ours review"]);
@@ -13741,8 +14108,12 @@ mod tests {
             "other",
         )
         .unwrap();
-        assert!(merged.contains("| done |"), "their later stamp:
-{}", merged);
+        assert!(
+            merged.contains("| done |"),
+            "their later stamp:
+{}",
+            merged
+        );
         assert!(!merged.contains("| review |"));
     }
 

@@ -101,6 +101,33 @@ pub fn merge_shared_upstream(db: State<AppDb>, repo_id: i64) -> Result<SharedMer
     shared::merge_shared_upstream(&db, &need_git()?, repo_id)
 }
 
+/// T-000266: the chronology-activation readiness of a shared repo — the
+/// version gate of spec D1a. ready is exactly when the owner may press the
+/// activation button.
+#[tauri::command(async)]
+pub fn chronology_gate(db: State<AppDb>, repo_id: i64) -> Result<serde_json::Value, String> {
+    let gate = shared::chronology_gate(&db, &need_git()?, repo_id)?;
+    Ok(serde_json::json!({
+        "active": gate.active,
+        "ready": gate.ready,
+        "blockers": gate.blockers,
+    }))
+}
+
+/// T-000266: the activation commit — .sdh/protocol.json plus the
+/// baseline-stamped ledgers, one commit on dev, pushed best-effort. Owner
+/// only; the backend re-checks the role, the gate and the absence of an
+/// existing protocol, so a direct IPC call cannot bypass them either.
+#[tauri::command(async)]
+pub fn activate_chronology(db: State<AppDb>, repo_id: i64) -> Result<serde_json::Value, String> {
+    let out = shared::activate_chronology(&db, &need_git()?, repo_id)?;
+    Ok(serde_json::json!({
+        "commit": out.commit,
+        "pushed": out.pushed,
+        "note": out.note,
+    }))
+}
+
 #[tauri::command(async)]
 pub fn list_join_requests(db: State<AppDb>, repo_id: i64) -> Result<Vec<JoinRequest>, String> {
     shared::list_join_requests(&db, cached_git().as_ref(), repo_id)

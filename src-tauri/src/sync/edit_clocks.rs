@@ -234,7 +234,6 @@ pub fn prose_key(content_hash: &str) -> String {
 }
 
 pub const STRUCTURE_KEY: &str = "__structure__";
-pub const FILE_KEY: &str = "file";
 
 #[cfg(test)]
 mod tests {
