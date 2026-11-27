@@ -125,6 +125,10 @@ pub struct SyncIssue {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// T-000263: the repo an actionable issue can be acted on in. Only codes
+    /// carrying their own action populate it (`rule_unknown_skill` today).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<i64>,
 }
 
 /// T-000198: what a `lookup_failed` issue was reading — the fixed `target`
@@ -153,7 +157,14 @@ impl SyncIssue {
             subject: subject.into(),
             target: None,
             detail: None,
+            repo_id: None,
         }
+    }
+
+    /// T-000263: the repo the issue's action runs in.
+    pub fn repo_id(mut self, repo_id: i64) -> Self {
+        self.repo_id = Some(repo_id);
+        self
     }
 
     pub fn target(mut self, target: impl Into<String>) -> Self {

@@ -65,6 +65,9 @@ export interface SyncIssue {
   subject: string;
   target?: string;
   detail?: string;
+  /** T-000263: the repo an actionable issue can be acted on in
+   *  (`rule_unknown_skill` today); absent on every other code. */
+  repo_id?: number;
 }
 
 export interface SyncResult {

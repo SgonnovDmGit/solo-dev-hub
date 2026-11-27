@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatSyncIssues } from '$lib/utils/sync-issues';
+  import { formatSyncIssues, toastSyncIssues } from '$lib/utils/sync-issues';
   import { open } from '@tauri-apps/plugin-dialog';
   import { allRepos, assignRepo, loadAllRepos, isSyncing, adminRepos } from '$lib/stores/repos';
   import { projects, loadProjects } from '$lib/stores/projects';
@@ -612,10 +612,7 @@
       // pending hand-backs across the portfolio first.
       toastRulesFindings(outcome.rules);
       if (outcome.rules.errors.length > 0) {
-        addToast(
-          $tStore('toast.ruleApplyErrors' as any).replace('{0}', formatSyncIssues(outcome.rules.errors)),
-          'error'
-        );
+        toastSyncIssues($tStore('toast.ruleApplyErrors' as any), outcome.rules.errors, 'error');
       }
     } catch (err) {
       addToast(String(err), 'error');

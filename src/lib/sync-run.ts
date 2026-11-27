@@ -7,7 +7,7 @@ import { refreshAfterSync } from '$lib/stores/shared';
 import { noteManualSync } from '$lib/stores/autosync';
 import { syncProjectCore, probeSharedCore } from '$lib/sync-core';
 import { toastRulesFindings } from '$lib/utils/rules-report';
-import { formatSyncIssues } from '$lib/utils/sync-issues';
+import { toastSyncIssues } from '$lib/utils/sync-issues';
 import { tf } from '$lib/i18n';
 import type { SyncResult } from '$lib/types';
 
@@ -33,7 +33,7 @@ export async function runProjectSync(projectId: number): Promise<SyncResult | nu
     if (result.errors.length > 0) {
       // T-000198: one translated line per issue under a counted header.
       const header = tf('sync.errors', result.errors.length);
-      addToast(`${header}\n${formatSyncIssues(result.errors)}`, 'warning');
+      toastSyncIssues(`${header}\n{0}`, result.errors, 'warning');
     }
     // F-000039: report REQ pairs auto-closed via .impl.md acknowledgement.
     if (result.auto_closed.length > 0) {
@@ -71,7 +71,7 @@ export async function runSharedProbe(): Promise<void> {
     const result = await probeSharedCore();
     if (result.errors.length > 0) {
       const header = tf('sync.errors', result.errors.length);
-      addToast(`${header}\n${formatSyncIssues(result.errors)}`, 'warning');
+      toastSyncIssues(`${header}\n{0}`, result.errors, 'warning');
     }
   } catch {
     // The probe is a side job of the repo-list sync: a failure must not

@@ -7,6 +7,19 @@ use tauri::State;
 
 // ── Templates (0.6.0) ─────────────────────────────────────────────────────────
 
+/// T-000263: the action of the `rule_unknown_skill` issue — delete the stale
+/// `.approved` marker in that repo. The backend re-validates against the
+/// canon under the rules lock, so a click on a stale toast cannot drop a
+/// hand-back that has become legitimate meanwhile.
+#[tauri::command(async)]
+pub fn remove_unknown_skill_marker(
+    db: State<AppDb>,
+    repo_id: i64,
+    file_name: String,
+) -> Result<(), String> {
+    sync::skills::remove_unknown_skill_marker(&db, repo_id, &file_name)
+}
+
 #[tauri::command]
 pub fn list_template_languages(db: State<AppDb>) -> Result<Vec<TemplateLanguage>, String> {
     let keys = db.list_template_languages().map_err(|e| e.to_string())?;

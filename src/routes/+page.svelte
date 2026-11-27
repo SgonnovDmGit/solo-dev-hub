@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatSyncIssues } from '$lib/utils/sync-issues';
+  import { toastSyncIssues } from '$lib/utils/sync-issues';
   import { onMount } from 'svelte';
   import '../app.css';
   import { currentScreen, navigateTo, goBack } from '$lib/stores/ui';
@@ -13,7 +13,7 @@
   import { addToast } from '$lib/stores/ui';
   import { resolveMergeWithLocal, forceInsertGithubRepo, takeStartupRulesReport } from '$lib/api/tauri-commands';
   import { toastRulesFindings } from '$lib/utils/rules-report';
-  import { tStore, tf, initLocale } from '$lib/i18n';
+  import { tStore, tf, t, initLocale } from '$lib/i18n';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { checkForUpdate, updaterStatus } from '$lib/stores/updater';
   import Toast from '$lib/components/Toast.svelte';
@@ -63,7 +63,7 @@
       if (!report) return;
       toastRulesFindings(report);
       if (report.errors.length > 0) {
-        addToast(tf('toast.rulesStartupErrors', formatSyncIssues(report.errors)), 'warning');
+        toastSyncIssues(t('toast.rulesStartupErrors'), report.errors, 'warning');
       }
     } catch (e) {
       console.warn('startup rules report unavailable', e);
