@@ -235,6 +235,11 @@ pub fn prose_key(content_hash: &str) -> String {
 
 pub const STRUCTURE_KEY: &str = "__structure__";
 
+/// The single key of a whole-file artifact's ledger (T-000273): the file is
+/// the atom — one entry binds the content hash to its stamp, `del` marks the
+/// tombstone. File-level existence/content resolution reads nothing else.
+pub const FILE_KEY: &str = "file";
+
 #[cfg(test)]
 mod tests {
     use super::*;
