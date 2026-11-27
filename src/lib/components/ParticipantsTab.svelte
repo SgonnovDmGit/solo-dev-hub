@@ -5,6 +5,8 @@
   import { tStore, locale } from '$lib/i18n';
   import type { ParticipantRow } from '$lib/utils/shared-mode';
   import { formatRelativeTime, nowTick } from '$lib/utils/time-format';
+  import type { ChronologyGate } from '$lib/types';
+  import ConfirmDialog from './ConfirmDialog.svelte';
 
   interface Props {
     rows: ParticipantRow[];
@@ -15,9 +17,27 @@
     onApprove: (login: string) => void;
     /** Last push + app version per login, keyed by lower-cased login (owner's install only). */
     activity?: Map<string, { last_at: string | null; app_version: string | null }>;
+    /** T-000266: chronology-activation readiness (owner's install only; null while loading). */
+    gate?: ChronologyGate | null;
+    /** Activation commit in flight. */
+    activating?: boolean;
+    /** The owner confirmed the activation dialog. */
+    onActivate?: () => void;
   }
 
-  let { rows, isOwnerInstall, approving, onApprove, activity = new Map() }: Props = $props();
+  let {
+    rows,
+    isOwnerInstall,
+    approving,
+    onApprove,
+    activity = new Map(),
+    gate = null,
+    activating = false,
+    onActivate = () => {},
+  }: Props = $props();
+
+  // T-000266: the activation is a one-way door — the button always confirms.
+  let confirmingActivation = $state(false);
 
   // The column is the owner's view: a contributor's install has no such data.
   const lastPush = (row: ParticipantRow): string | null =>
@@ -34,6 +54,39 @@
 </script>
 
 <div class="participants">
+  {#if isOwnerInstall && gate}
+    <div class="chrono" class:chrono-active={gate.active}>
+      {#if gate.active}
+        <div class="chrono-line" title={$tStore('shared.chrono.activeHint' as any)}>
+          {$tStore('shared.chrono.active' as any)}
+        </div>
+      {:else}
+        <div class="chrono-line">
+          {#if gate.ready}
+            {$tStore('shared.chrono.ready' as any)}
+          {:else}
+            {$tStore('shared.chrono.blocked' as any)}
+          {/if}
+        </div>
+        {#if gate.blockers.length > 0}
+          <ul class="chrono-blockers">
+            {#each gate.blockers as blocker}
+              <li>{blocker}</li>
+            {/each}
+          </ul>
+        {/if}
+        <div class="chrono-what">{$tStore('shared.chrono.what' as any)}</div>
+        <button
+          type="button"
+          class="chrono-btn"
+          disabled={!gate.ready || activating}
+          onclick={() => (confirmingActivation = true)}
+        >
+          {activating ? $tStore('shared.chrono.working' as any) : $tStore('shared.chrono.activate' as any)}
+        </button>
+      {/if}
+    </div>
+  {/if}
   {#if rows.length === 0}
     <div class="empty">{$tStore('shared.participantsEmpty' as any)}</div>
   {:else}
@@ -106,6 +159,18 @@
     {/if}
   {/if}
 </div>
+
+{#if confirmingActivation}
+  <ConfirmDialog
+    title={$tStore('shared.chrono.confirmTitle' as any)}
+    message={$tStore('shared.chrono.confirmBody' as any)}
+    onConfirm={() => {
+      confirmingActivation = false;
+      onActivate();
+    }}
+    onCancel={() => (confirmingActivation = false)}
+  />
+{/if}
 
 <style>
   .participants {
@@ -206,6 +271,61 @@
   .approve:disabled {
     opacity: 0.5;
     cursor: wait;
+  }
+
+  .chrono {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-size: 13px;
+  }
+
+  .chrono-active {
+    border-color: var(--accent);
+  }
+
+  .chrono-active .chrono-line {
+    color: var(--accent);
+  }
+
+  .chrono-line {
+    font-weight: 600;
+  }
+
+  .chrono-blockers {
+    margin: 6px 0 0;
+    padding-left: 18px;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  .chrono-what {
+    margin-top: 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .chrono-btn {
+    margin-top: 8px;
+    font-size: 12px;
+    padding: 3px 14px;
+    border-radius: 4px;
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+  }
+
+  .chrono-btn:hover:not(:disabled) {
+    background: var(--accent);
+    color: white;
+  }
+
+  .chrono-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .empty {

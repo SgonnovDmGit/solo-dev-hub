@@ -237,6 +237,24 @@ export interface ApproveJoinResult {
   note: string | null;
 }
 
+/** T-000266: chronology-activation readiness of a shared repo (spec D1a gate). */
+export interface ChronologyGate {
+  /** The protocol already rides the refs — the question is settled. */
+  active: boolean;
+  /** Every participant publishes a chronology-capable version — the button may be pressed. */
+  ready: boolean;
+  /** Human-readable blockers: who is missing or too old. */
+  blockers: string[];
+}
+
+/** T-000266: result of the activation commit. */
+export interface ActivationOutcome {
+  commit: string | null;
+  /** The activation commit is on origin already; false = it rides the next sync. */
+  pushed: boolean;
+  note: string | null;
+}
+
 /** A helper's request to join a shared project (`.sdh/requests/<login>.json`). */
 export interface JoinRequest {
   login: string;
