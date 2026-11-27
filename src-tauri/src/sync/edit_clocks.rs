@@ -168,6 +168,53 @@ fn pick_winner<'a>(a: &'a ClockEntry, b: &'a ClockEntry) -> &'a ClockEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// T-000266: the activation protocol file.
+// ---------------------------------------------------------------------------
+
+/// `.sdh/protocol.json` — written once by the owner's activation click,
+/// travels the ordinary owner-only structure transport. From the moment it
+/// appears in the fetched refs the clocked semantics are unconditional and
+/// the positional fallback is abolished; an outdated snapshot of observed
+/// versions can never roll activation back, because the flag rides the refs,
+/// not the observation (spec D1a).
+pub const PROTOCOL_PATH: &str = ".sdh/protocol.json";
+pub const CHRONOLOGY_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolFile {
+    pub chronology: u32,
+    pub activated_at: String,
+    pub baseline_commit: String,
+}
+
+/// Parse the protocol file — `None` when absent, malformed, or not yet at
+/// the chronology version this binary understands. A corrupt protocol file
+/// post-activation is a sync issue for the caller to raise, not a silent
+/// legacy fallback: the caller distinguishes absent (None, pre-activation)
+/// from corrupt (Err) exactly for that reason.
+pub fn parse_protocol(bytes: &[u8]) -> Result<Option<ProtocolFile>, String> {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => return Ok(None),
+    };
+    let pf: ProtocolFile =
+        serde_json::from_str(text).map_err(|e| format!("parse protocol.json: {}", e))?;
+    if pf.chronology < CHRONOLOGY_VERSION {
+        return Ok(None);
+    }
+    Ok(Some(pf))
+}
+
+pub fn render_protocol(activated_at: &str, baseline_commit: &str) -> String {
+    serde_json::to_string_pretty(&ProtocolFile {
+        chronology: CHRONOLOGY_VERSION,
+        activated_at: activated_at.to_string(),
+        baseline_commit: baseline_commit.to_string(),
+    })
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
 // Key constructors — the single place that knows the key grammar.
 
 pub fn row_key(id: &str) -> String {
@@ -314,5 +361,24 @@ mod tests {
         assert_eq!(field_key("T-000123", 3), "r:T-000123.f3");
         assert_eq!(header_key("v1.25.0"), "h:v1.25.0");
         assert_eq!(prose_key("abc"), "p:abc");
+    }
+
+    #[test]
+    fn protocol_roundtrip_and_gate() {
+        let text = render_protocol("2026-11-27T10:00:00Z", "deadbeef");
+        let pf = parse_protocol(text.as_bytes()).unwrap().unwrap();
+        assert_eq!(pf.chronology, CHRONOLOGY_VERSION);
+        assert_eq!(pf.baseline_commit, "deadbeef");
+        // empty and absent parse as no-protocol
+        assert!(parse_protocol(b"").unwrap().is_none());
+        assert!(parse_protocol(b"  ").unwrap().is_none());
+        // corrupt is an Err, never a silent fallback
+        assert!(parse_protocol(b"{not json").is_err());
+        // a future/older chronology version below the gate is inactive
+        assert!(parse_protocol(
+            b"{\"chronology\":0,\"activated_at\":\"x\",\"baseline_commit\":\"y\"}"
+        )
+        .unwrap()
+        .is_none());
     }
 }
