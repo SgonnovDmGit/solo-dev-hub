@@ -170,7 +170,7 @@ pub fn parse_todo_tasks(content: &str) -> (Vec<TodoTask>, Vec<String>) {
 /// Parse `docs/done.md` (v0.13.9+ format).
 ///
 /// Structure:
-/// ```
+/// ```text
 /// ## 2026-04-21             ← date header; applies to tasks below until next header
 /// - D-001 | Task X | v0.13.9
 /// -  | Task without id | v0.13.9

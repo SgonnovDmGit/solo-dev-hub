@@ -119,10 +119,7 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
 /// The edit-clock ledger of one shared file, read from the repo's
 /// `.sdh/edit-clocks/` — `None` when absent or unreadable.
 fn load_clock_ledger(repo: &Path, rel: &str) -> Option<crate::sync::edit_clocks::ClockLedger> {
-    use crate::sync::edit_clocks::{ledger_file_name, ClockLedger, CLOCKS_DIR};
-    let path = repo.join(CLOCKS_DIR).join(ledger_file_name(rel));
-    let bytes = std::fs::read(path).ok()?;
-    ClockLedger::parse(&bytes, rel).ok()
+    crate::sync::edit_clocks::load_worktree_ledger(repo, rel)
 }
 
 /// Text of `path` and its modification day (`YYYY-MM-DD`); `(None, "")` when the
@@ -330,16 +327,23 @@ fn sync_tasks_core(
     // todo wins only strictly newer (ties stay with done, the legacy rule);
     // a missing entry on either side is degraded — the legacy rule stands,
     // because guessing here is how rows flap.
+    // T-000268 tail: a quarantined stamp (far-future, wrong-clock machine)
+    // decides nothing here either — the key is frozen out of the comparison
+    // exactly as in the merge resolution, and the legacy rule stands.
+    let now_secs = chrono::Utc::now().timestamp();
     let todo_wins = |id: &str| -> bool {
         let Some((tl, dl)) = opts.clocks else {
             return false;
         };
+        let live = |e: &&crate::sync::edit_clocks::ClockEntry| {
+            !e.del && !e.is_quarantined(now_secs)
+        };
         let te = tl
             .get(&crate::sync::edit_clocks::row_key(id))
-            .filter(|e| !e.del);
+            .filter(live);
         let de = dl
             .get(&crate::sync::edit_clocks::row_key(id))
-            .filter(|e| !e.del);
+            .filter(live);
         match (te, de) {
             (Some(t), Some(d)) => t.t > d.t,
             _ => false,
@@ -1519,6 +1523,26 @@ mod tests {
             assert_eq!(dones.len(), 1);
             std::mem::forget(tmp);
         }
+    }
+
+    #[test]
+    fn quarantined_todo_stamp_does_not_resurrect_the_todo_side() {
+        // A far-future todo stamp (wrong-clock machine) is numerically newer
+        // than any honest stamp — without the quarantine filter it would win
+        // every comparison forever. Frozen out, the comparison is degraded and
+        // the legacy done-wins rule stands.
+        let (db, tmp, repo_id) = setup_both_files("T-000086");
+        let repo_path = tmp.path().to_path_buf();
+        let far_future = chrono::Utc::now().timestamp() + 48 * 3600;
+        write_clocks(&repo_path, "docs/todo.md", "T-000086", far_future);
+        write_clocks(&repo_path, "docs/done.md", "T-000086", 300);
+        sync_tasks_for_repo(&db, repo_id).unwrap();
+        assert!(
+            db.list_tasks_by_repo(repo_id, "todo").unwrap().is_empty(),
+            "a quarantined todo stamp must decide nothing"
+        );
+        assert_eq!(db.list_tasks_by_repo(repo_id, "done").unwrap().len(), 1);
+        std::mem::forget(tmp);
     }
 
     #[test]

@@ -13489,6 +13489,103 @@ mod tests {
             .contains("local AI changed it"));
     }
 
+    /// T-000268: the fleet-deletion convergence for bugs. The helper
+    /// hard-deletes the bug through the UI path (DB delete + regen) — the only
+    /// channel that can birth a tombstone, because reconcile has nothing left
+    /// to restore — the auto-commit stamps it, the owner merges the file
+    /// without the row, and reconcile reads the tombstone: the DB row follows
+    /// the deletion instead of being resurrected into an endless ping-pong.
+    #[ignore = "spawns git: very slow on Windows (7 full sync passes); run with --include-ignored (CI does)"]
+    #[test]
+    fn a_fleet_deleted_bug_leaves_every_database_and_stays_dead() {
+        let fx = two_installs();
+        fx.make_participant_via_syncs();
+        for login in ["owner", "helper"] {
+            write(
+                &fx.main_dir,
+                &format!(".sdh/app-versions/{}.json", login),
+                "{\"app_version\":\"1.25.0\"}\n",
+            );
+        }
+        g(&fx.main_dir, &["add", ".sdh/app-versions"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "versions"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
+        activate_chronology(&fx.main_db, &gb(), fx.main_repo).unwrap();
+        fx.sync_helper();
+        fx.main_db
+            .set_bugs_migrated_at(fx.main_repo, "2026-10-01T00:00:00Z")
+            .unwrap();
+        owner_bug(&fx, 1, "doomed row", "created", 0);
+        crate::sync::bugs::regenerate_bugs_md(&fx.main_db, fx.main_repo).unwrap();
+        fx.sync_main();
+        fx.sync_helper();
+
+        // The helper holds the row in its own database — the fixture premise.
+        let hb = fx
+            .helper_db
+            .get_bug_by_display_id(fx.helper_repo, "B-000001")
+            .unwrap()
+            .expect("the helper migrated the arriving row");
+
+        // The UI delete path: DB row gone, the regen drops the line.
+        fx.helper_db.delete_bug(hb.id).unwrap();
+        crate::sync::bugs::regenerate_bugs_md(&fx.helper_db, fx.helper_repo).unwrap();
+        fx.sync_helper();
+
+        // Premise check: the tombstone rode the helper's commit.
+        let ledger_text = fs::read_to_string(
+            fx.helper_dir
+                .join(".sdh/edit-clocks/docs--bug-reports.md.json"),
+        )
+        .expect("the ledger exists post-activation");
+        assert!(
+            ledger_text.contains("r:B-000001"),
+            "the deletion stamped the row key: {}",
+            ledger_text
+        );
+
+        // The owner merges: the file arrives without the row, the unioned
+        // ledger carries the tombstone — reconcile must delete, not restore.
+        fx.sync_main();
+        assert!(
+            fx.main_db
+                .get_bug_by_display_id(fx.main_repo, "B-000001")
+                .unwrap()
+                .is_none(),
+            "the owner DB row follows the fleet deletion"
+        );
+        assert!(
+            !fs::read_to_string(fx.main_dir.join("docs/bug-reports.md"))
+                .unwrap()
+                .contains("B-000001"),
+            "the render must not resurrect the tombstoned row"
+        );
+
+        // Convergence: a full round settles whatever the propagation carried,
+        // then the fleet must fall silent — no resurrection, no new commits.
+        fx.sync_helper();
+        fx.sync_main();
+        let count = |dir: &Path, rev: &str| -> String { g(dir, &["rev-list", "--count", rev]) };
+        let before = count(&fx.main_dir, "dev");
+        fx.sync_main();
+        fx.sync_helper();
+        fx.sync_main();
+        assert!(
+            fx.main_db
+                .get_bug_by_display_id(fx.main_repo, "B-000001")
+                .unwrap()
+                .is_none(),
+            "the row stays dead"
+        );
+        assert!(
+            !fs::read_to_string(fx.helper_dir.join("docs/bug-reports.md"))
+                .unwrap()
+                .contains("B-000001"),
+            "the helper copy stays clean"
+        );
+        assert_eq!(before, count(&fx.main_dir, "dev"), "converged means silent");
+    }
+
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_row_only_the_work_tree_has_is_not_a_bug() {

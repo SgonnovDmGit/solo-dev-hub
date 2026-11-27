@@ -232,6 +232,18 @@ pub fn row_key(id: &str) -> String {
     format!("r:{}", id)
 }
 
+/// T-000268: the edit-clock ledger of one shared file, read from the repo
+/// worktree's `.sdh/edit-clocks/` — `None` when absent or unreadable. The
+/// absence keeps every consumer in its legacy rule (pre-activation repos);
+/// a corrupt ledger reads as absent too — the sync layer already reports
+/// ledger corruption as its own sync issue (spec D1a), so double-reporting
+/// from a consumer would only spam.
+pub(crate) fn load_worktree_ledger(repo: &std::path::Path, rel: &str) -> Option<ClockLedger> {
+    let path = repo.join(CLOCKS_DIR).join(ledger_file_name(rel));
+    let bytes = std::fs::read(path).ok()?;
+    ClockLedger::parse(&bytes, rel).ok()
+}
+
 pub fn field_key(id: &str, field_index: usize) -> String {
     format!("r:{}.f{}", id, field_index)
 }
