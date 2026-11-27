@@ -83,19 +83,19 @@ pub fn merge_shared_bytes(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct Ent {
-    key: String,
+pub(crate) struct Ent {
+    pub(crate) key: String,
     /// Line prefix after the indentation: `- `, `- [ ] `, `- [x] `.
-    marker: String,
+    pub(crate) marker: String,
     /// Raw (escape-preserving, trimmed) pipe-separated fields.
-    fields: Vec<String>,
+    pub(crate) fields: Vec<String>,
     /// Key of the nearest preceding `## ` header, `""` before the first one.
-    section: String,
+    pub(crate) section: String,
     /// The original line text without the line ending.
-    raw: String,
+    pub(crate) raw: String,
 }
 
-enum Line {
+pub(crate) enum Line {
     Header {
         key: String,
         text: String,
@@ -108,9 +108,9 @@ enum Line {
 }
 
 pub(crate) struct Doc {
-    lines: Vec<Line>,
-    ents: Vec<Ent>,
-    by_key: HashMap<String, usize>,
+    pub(crate) lines: Vec<Line>,
+    pub(crate) ents: Vec<Ent>,
+    pub(crate) by_key: HashMap<String, usize>,
     /// header key -> full header line
     hdrs: HashMap<String, String>,
     crlf: bool,
@@ -223,7 +223,7 @@ fn detect(kind: SharedFileKind, trimmed: &str) -> Option<(String, Vec<String>)> 
     }
 }
 
-fn parse(kind: SharedFileKind, input: &str) -> Doc {
+pub(crate) fn parse(kind: SharedFileKind, input: &str) -> Doc {
     let (bom, s) = match input.strip_prefix('\u{feff}') {
         Some(rest) => (true, rest),
         None => (false, input),
@@ -2662,7 +2662,11 @@ mod clocked_tests {
 
 - [ ] T-000001 | a | 1 | low | open | 2026-10-01
 ";
-        let ours = "## v1 alpha
+        // Anti-degraded ordering: ours' text is lexicographically LARGER, so
+        // the content-order fallback would keep ours — a pass here can only
+        // come from the stamp truly deciding. Header text is the full raw
+        // line, `## ` included — the hash must bind to exactly that.
+        let ours = "## v1 zeta
 
 - [ ] T-000001 | a | 1 | low | open | 2026-10-01
 ";
@@ -2679,9 +2683,9 @@ mod clocked_tests {
                 _ => panic!("no header"),
             }
         };
-        let l = ledger_of(&[(&header_key(&key), ent("v1 beta", 600, "s", false))]);
+        let l = ledger_of(&[(&header_key(&key), ent("## v1 beta", 600, "s", false))]);
         let (text, _) = merge6(base, ours, theirs, &l);
         assert!(text.contains("## v1 beta"), "{}", text);
-        assert!(!text.contains("## v1 alpha"), "{}", text);
+        assert!(!text.contains("## v1 zeta"), "{}", text);
     }
 }
