@@ -39,7 +39,8 @@ use crate::sync::autocommit::{
     CROSS_REPO_DIRS, MANAGED_ROOT_FILES, SDH_COMMIT_EMAIL, SDH_COMMIT_NAME,
 };
 use crate::sync::merge_by_id::{
-    has_stale_remote_state, kind_for_path, merge_shared_bytes, merge_shared_file_with_ancestors,
+    has_stale_remote_state, kind_for_path, merge_shared_bytes, merge_shared_file_clocked,
+    merge_shared_file_with_ancestors,
 };
 use crate::sync::shared_structure::{
     self as ss, ApproveJoinResult, DiscoverOutcome, JoinRequest, ProjectStructure, Role,
@@ -698,6 +699,10 @@ pub fn shared_pathspec(role: Role, login: &str, share_specs: bool) -> Vec<String
         .map(|s| s.to_string())
         .collect();
     v.extend(["docs/todo.md", "docs/done.md", "docs/bug-reports.md"].map(String::from));
+    // T-000265/274: the edit-clock ledgers travel with the shared files they
+    // describe — every publishing role carries them (a pending helper stays
+    // in its join-request zone). They merge by CRDT union, never positionally.
+    v.push(crate::sync::edit_clocks::CLOCKS_DIR.to_string());
     if role == Role::Main {
         v.push(STRUCTURE_REL_PATH.to_string());
         v.push(REQUESTS_REL_DIR.to_string());
@@ -1080,6 +1085,93 @@ fn read_worktree(root: &Path, rel: &str) -> Option<Vec<u8>> {
     std::fs::read(&p).ok()
 }
 
+/// The deterministic authoring marker of one stamping event (spec: `src`
+/// cannot be the commit sha — the ledger rides INSIDE the commit it would
+/// name). Derived from the branch parent and the file, so a re-run of the
+/// same event reproduces the same marker and no transport copy can ever
+/// collide with it.
+fn stamp_src_marker(head_sha: &str, rel: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(head_sha.as_bytes());
+    h.update(b":");
+    h.update(rel.as_bytes());
+    let hex: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+    format!("w:{}", &hex[..16])
+}
+
+/// T-000274: the write side of the UTC chronology at the primary commit
+/// path. Before the current branch's auto-commit, diff each shared task
+/// file's work-tree content against HEAD and stamp exactly what changed —
+/// the ledger files then ride the SAME commit as the content they describe
+/// (the atomic content+clocks rule). Transport/merge results produce no
+/// diff here (their bytes arrived through refs, not the work tree delta) and
+/// therefore never restamp. A corrupt ledger freezes its file for the pass
+/// — never silently rewritten, never dropped (the diagnostics slice of
+/// T-000266 surfaces the freeze as a sync issue).
+fn stamp_worktree_clocks(git: &GitBinary, root: &Path) {
+    use crate::sync::edit_clocks::{ledger_file_name, ClockLedger, CLOCKS_DIR};
+    for rel in IMPORT_FILES {
+        let Some(kind) = kind_for_path(rel) else {
+            continue;
+        };
+        let Some(wt) = read_worktree(root, rel) else {
+            continue;
+        };
+        let head = git_sync::blob_sha_at(git, root, "HEAD", rel)
+            .ok()
+            .flatten()
+            .and_then(|sha| cat_blob(git, root, &sha).ok())
+            .unwrap_or_default();
+        if head == wt {
+            continue;
+        }
+        let (Ok(head_text), Ok(wt_text)) = (std::str::from_utf8(&head), std::str::from_utf8(&wt))
+        else {
+            continue;
+        };
+        let clock_rel = format!("{}/{}", CLOCKS_DIR, ledger_file_name(rel));
+        // The work-tree ledger is authoritative (it is what the commit will
+        // carry); HEAD's copy is the fallback for a ledger not yet written
+        // here. Either being corrupt freezes the file — parse failures skip.
+        let wt_clock = read_worktree(root, &clock_rel);
+        let clock_bytes = wt_clock.or_else(|| {
+            git_sync::blob_sha_at(git, root, "HEAD", &clock_rel)
+                .ok()
+                .flatten()
+                .and_then(|sha| cat_blob(git, root, &sha).ok())
+        });
+        let mut ledger = match clock_bytes {
+            Some(bytes) => match ClockLedger::parse(&bytes, &clock_rel) {
+                Ok(l) => l,
+                Err(_) => continue,
+            },
+            None => ClockLedger::new(rel),
+        };
+        let head_sha = git_sync::rev_parse(git, root, "HEAD")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let src = stamp_src_marker(&head_sha, rel);
+        if crate::sync::clock_stamp::stamp_file_delta(
+            kind,
+            head_text,
+            wt_text,
+            &mut ledger,
+            unix_now(),
+            &src,
+        ) {
+            if let Ok(text) = ledger.serialize() {
+                let p = root.join(&clock_rel);
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&p, text);
+            }
+        }
+    }
+}
+
 fn same_branch(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -1444,6 +1536,86 @@ pub(crate) fn merge_shared_with_history(
     .map_err(|e| e.to_string())
 }
 
+/// The clocked twin of `merge_shared_with_history` (T-000267/D1a): the
+/// merge driver's post-activation path. Same history assembly for the
+/// per-entity bases, but every tie resolves by the union ledger of HEAD and
+/// the merging ref — and a missing shared history is no longer an error,
+/// because stamps need no ancestry (the positional fallback the positional
+/// twin degrades to is abolished post-activation). Returns the diagnostics
+/// alongside: a stamp-poor resolution is loud, never silent.
+pub(crate) fn merge_shared_with_history_clocked(
+    git: &GitBinary,
+    root: &Path,
+    path: &str,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    theirs_rev: &str,
+) -> Result<(String, Vec<String>), String> {
+    use crate::sync::edit_clocks::{ledger_file_name, ClockLedger, CLOCKS_DIR};
+    let kind = kind_for_path(path).ok_or_else(|| format!("not a shared file: {}", path))?;
+    let text = |v: &[u8]| -> Result<String, String> {
+        String::from_utf8(normalize(v.to_vec())).map_err(|e| e.to_string())
+    };
+    let (base, ours, theirs) = (text(base)?, text(ours)?, text(theirs)?);
+    let ours_hist = blobs_in_history(git, root, "HEAD", path);
+    let theirs_hist = blobs_in_history(git, root, theirs_rev, path);
+    let (versions, os, ts) = history_versions(git, root, &ours_hist, &theirs_hist)
+        .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
+    let merge_base = git_sync::merge_base(git, root, "HEAD", theirs_rev)
+        .ok()
+        .flatten();
+    let ancestors = merge_base
+        .as_ref()
+        .map(|mb| ancestor_states(git, root, mb, path))
+        .unwrap_or_default();
+    let ancestry = merge_base
+        .as_ref()
+        .and_then(|mb| git_sync::blob_sha_at(git, root, mb, path).ok().flatten())
+        .and_then(|sha| cat_blob(git, root, &sha).ok())
+        .and_then(|v| String::from_utf8(normalize(v)).ok());
+    // The union ledger of the two merging sides — HEAD's copy and the merging
+    // ref's. A corrupt side degrades to empty with a diagnostic; entries are
+    // never dropped silently.
+    let clock_rel = format!("{}/{}", CLOCKS_DIR, ledger_file_name(path));
+    let mut diags: Vec<String> = Vec::new();
+    let mut side = |rev: &str| -> ClockLedger {
+        let bytes = git_sync::blob_sha_at(git, root, rev, &clock_rel)
+            .ok()
+            .flatten()
+            .and_then(|sha| cat_blob(git, root, &sha).ok());
+        match bytes {
+            Some(b) if !b.is_empty() => match ClockLedger::parse(&b, &clock_rel) {
+                Ok(l) => l,
+                Err(e) => {
+                    diags.push(format!(
+                        "{}: corrupt clock ledger at {} ({}); resolving without its stamps",
+                        path, rev, e
+                    ));
+                    ClockLedger::new(path)
+                }
+            },
+            _ => ClockLedger::new(path),
+        }
+    };
+    let union = side("HEAD").merge(&side(theirs_rev));
+    let (merged, mdiags) = merge_shared_file_clocked(
+        kind,
+        &base,
+        ancestry.as_deref(),
+        &versions,
+        &os,
+        &ts,
+        &ancestors,
+        &ours,
+        &theirs,
+        &union,
+    )
+    .map_err(|e| e.to_string())?;
+    diags.extend(mdiags);
+    Ok((merged, diags))
+}
+
 /// What to do with one file of the target branch.
 #[derive(Debug, PartialEq, Eq)]
 enum Plan {
@@ -1552,6 +1724,110 @@ impl SharedPlan<'_> {
     }
 }
 
+/// Is the UTC-chronology protocol active for a merge (spec D1a)? The flag
+/// rides the refs, not any local observation: present in EITHER input tree
+/// means activation has propagated and the positional fallback is abolished
+/// for the resolution. A corrupt protocol file is not activation — the
+/// caller's diagnostics slice surfaces corruption separately.
+pub(crate) fn protocol_active_in(git: &GitBinary, root: &Path, revs: &[&str]) -> bool {
+    use crate::sync::edit_clocks::{parse_protocol, PROTOCOL_PATH};
+    revs.iter().any(|rev| {
+        git_sync::blob_sha_at(git, root, rev, PROTOCOL_PATH)
+            .ok()
+            .flatten()
+            .and_then(|sha| cat_blob(git, root, &sha).ok())
+            .and_then(|bytes| parse_protocol(&bytes).ok().flatten())
+            .is_some()
+    })
+}
+
+/// The union ledger one shared file resolves against: both sides' copies
+/// merged per key. A corrupt side degrades to empty WITH a diagnostic — the
+/// resolution then runs stamp-poor but deterministic, never positional.
+fn union_clock_for(
+    git: &GitBinary,
+    root: &Path,
+    ctx: &SharedPlan,
+    path: &str,
+) -> (crate::sync::edit_clocks::ClockLedger, Vec<String>) {
+    use crate::sync::edit_clocks::{ledger_file_name, ClockLedger, CLOCKS_DIR};
+    let clock_rel = format!("{}/{}", CLOCKS_DIR, ledger_file_name(path));
+    let mut diags = Vec::new();
+    let ours_bytes = match ctx.ours.sha(&clock_rel) {
+        Some(w) => ctx.ours.bytes(git, root, &clock_rel, w).ok(),
+        None => None,
+    };
+    let theirs_bytes = ctx
+        .theirs
+        .get(&clock_rel)
+        .and_then(|b| cat_blob(git, root, b).ok());
+    let mut parse_side = |bytes: Option<Vec<u8>>, side: &str| -> ClockLedger {
+        match bytes {
+            Some(b) if !b.is_empty() => match ClockLedger::parse(&b, &clock_rel) {
+                Ok(l) => l,
+                Err(e) => {
+                    diags.push(format!(
+                        "{}: corrupt {} clock ledger ({}); resolving without its stamps",
+                        path, side, e
+                    ));
+                    ClockLedger::new(path)
+                }
+            },
+            _ => ClockLedger::new(path),
+        }
+    };
+    let lo = parse_side(ours_bytes, "ours");
+    let lt = parse_side(theirs_bytes, "theirs");
+    (lo.merge(&lt), diags)
+}
+
+/// Union-merge one edit-clock ledger for the plumbing plan (T-000265/274).
+/// `None` — nothing to write: either the union is what the target already
+/// holds, or a side is corrupt / over the caps (the file freezes for this
+/// pass; the anomaly surfaces through the clock diagnostics, never through
+/// a silent positional pick). The result is the canonical serialization, so
+/// a recipient converges byte-wise after one write. Never a Delete.
+fn plan_clock_union(
+    git: &GitBinary,
+    root: &Path,
+    ctx: &SharedPlan,
+    path: &str,
+) -> Result<Option<FileContent>, String> {
+    use crate::sync::edit_clocks::ClockLedger;
+    let ours_bytes = match ctx.ours.sha(path) {
+        Some(w) => ctx.ours.bytes(git, root, path, w)?,
+        None => Vec::new(),
+    };
+    let theirs_bytes = match ctx.theirs.get(path) {
+        Some(b) => cat_blob(git, root, b)?,
+        None => Vec::new(),
+    };
+    let side = |bytes: &[u8]| -> Option<ClockLedger> {
+        if bytes.is_empty() {
+            return Some(ClockLedger::new(path));
+        }
+        ClockLedger::parse(bytes, path).ok()
+    };
+    let (Some(lo), Some(lt)) = (side(&ours_bytes), side(&theirs_bytes)) else {
+        return Ok(None);
+    };
+    // The merge is commutative, so orient it for the authentic `file` field:
+    // the side that actually carries the ledger leads.
+    let merged = if ours_bytes.is_empty() {
+        lt.merge(&lo)
+    } else {
+        lo.merge(&lt)
+    };
+    let text = match merged.serialize() {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    if text.as_bytes() == theirs_bytes.as_slice() {
+        return Ok(None);
+    }
+    Ok(Some(FileContent::Bytes(text.into_bytes())))
+}
+
 /// The shared planner: decides one FileChange per path that differs between
 /// OUR version and THEIR tree, using the merge base to tell a stale copy of
 /// ours from a re-add and to never clobber foreign work (T-000257). Task
@@ -1562,13 +1838,33 @@ fn shared_plan_changes(
     git: &GitBinary,
     root: &Path,
     ctx: &SharedPlan,
+    clock_diags: &mut Vec<String>,
 ) -> Result<Vec<FileChange>, String> {
     let mut all: BTreeSet<String> = ctx.ours.keys().cloned().collect();
     all.extend(ctx.theirs.keys().cloned());
+    // Spec D1a: the chronology flag rides the refs — once `.sdh/protocol.json`
+    // is in either input tree, resolution is clocked and the positional
+    // fallback is abolished. Pre-activation nothing changes below.
+    let chronology = protocol_active_in(git, root, &[ctx.ours_rev, ctx.theirs_rev]);
 
     let mut changes: Vec<FileChange> = Vec::new();
     for path in &all {
         if is_excluded_file(path) || ctx.held(path) {
+            continue;
+        }
+        // T-000265/274: an edit-clock ledger never enters the positional
+        // three-way matrix — the CRDT union of both sides is the unique
+        // correct content, the base is irrelevant and file-level deletion is
+        // meaningless (tombstones live inside the register). A corrupt side
+        // freezes the file for this pass rather than propagating or dropping
+        // entries; the union is identical on every machine by construction.
+        if path.starts_with(&format!("{}/", crate::sync::edit_clocks::CLOCKS_DIR)) {
+            if let Some(content) = plan_clock_union(git, root, &ctx, path)? {
+                changes.push(FileChange {
+                    rel_path: PathBuf::from(path),
+                    content: Some(content),
+                });
+            }
             continue;
         }
         let wt = ctx.ours.sha(path);
@@ -1630,11 +1926,47 @@ fn shared_plan_changes(
                         Vec::new()
                     };
                     // Each row gets its own base from the two histories.
-                    let per_entity = hist
+                    let hv = hist
                         .as_ref()
                         .filter(|(o, t)| !o.is_empty() && !t.is_empty())
-                        .and_then(|(o, t)| history_versions(git, root, o, t))
-                        .and_then(|(versions, os, ts)| {
+                        .and_then(|(o, t)| history_versions(git, root, o, t));
+                    let merged = if chronology {
+                        // T-000267/D1a: post-activation every tie resolves by
+                        // the union ledger's UTC stamps. The history machinery
+                        // still feeds the per-entity bases (what "changed"
+                        // means); the stamps decide who won — position never
+                        // does. Absent history is fine here: stamps need no
+                        // ancestry, so the positional fallback split is gone.
+                        let (versions, os, ts) =
+                            hv.unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
+                        let (union, udiags) = union_clock_for(git, root, &ctx, path);
+                        clock_diags.extend(udiags);
+                        match (
+                            std::str::from_utf8(&base),
+                            std::str::from_utf8(&ours),
+                            std::str::from_utf8(&theirs),
+                        ) {
+                            (Ok(b), Ok(o), Ok(t)) => merge_shared_file_clocked(
+                                kind,
+                                b,
+                                ancestry.as_deref(),
+                                &versions,
+                                &os,
+                                &ts,
+                                &ancestors,
+                                o,
+                                t,
+                                &union,
+                            )
+                            .map(|(text, diags)| {
+                                clock_diags
+                                    .extend(diags.into_iter().map(|d| format!("{}: {}", path, d)));
+                                text
+                            }),
+                            _ => merge_shared_bytes(kind, &base, &ours, &theirs),
+                        }
+                    } else {
+                        let per_entity = hv.and_then(|(versions, os, ts)| {
                             let (b, o, t) = (
                                 std::str::from_utf8(&base).ok()?,
                                 std::str::from_utf8(&ours).ok()?,
@@ -1652,9 +1984,10 @@ fn shared_plan_changes(
                                 t,
                             ))
                         });
-                    let merged = match per_entity {
-                        Some(r) => r,
-                        None => merge_shared_bytes(kind, &base, &ours, &theirs),
+                        match per_entity {
+                            Some(r) => r,
+                            None => merge_shared_bytes(kind, &base, &ours, &theirs),
+                        }
                     };
                     match merged {
                         Ok(m) if m.as_bytes() == theirs.as_slice() => Plan::Skip,
@@ -1799,7 +2132,12 @@ fn plumb_into_branch(
         approved,
         held_skills,
     };
-    let mut changes = shared_plan_changes(git, root, &ctx)?;
+    let mut clock_diags: Vec<String> = Vec::new();
+    let mut changes = shared_plan_changes(git, root, &ctx, &mut clock_diags)?;
+    // Degraded clocked resolutions are collected for the diagnostics slice
+    // of T-000266; pre-activation the clocked path never runs and this
+    // stays empty.
+    let _ = &clock_diags;
     // T-000244: rule hand-back markers this branch still tracks leave it as
     // deletions. The content exclusions above keep a marker out of every other
     // plan; here the branch's own markers are enumerated directly, because a
@@ -5678,6 +6016,22 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
             ),
         );
     }
+    let cur = current_branch(git, &root).ok().flatten();
+    let head_born = matches!(git_sync::rev_parse(git, &root, "HEAD"), Ok(Some(_)));
+    if !head_born {
+        return;
+    }
+    // T-000274: stamp the work tree's task-file edits into the edit-clock
+    // ledgers BEFORE the dirty-set enumeration — the ledger files then ride
+    // the same auto-commit as the content (atomic content+clocks rule).
+    // Inert pre-activation; from the first v1.25.0 pass the honest times
+    // accumulate for the activation baseline to inherit.
+    if cur
+        .as_deref()
+        .is_some_and(|c| pass.recipients.iter().any(|b| same_branch(c, b)))
+    {
+        stamp_worktree_clocks(git, &root);
+    }
     let active = match active_paths(git, &root, &pathspec) {
         Ok(a) => a,
         Err(e) => {
@@ -5686,11 +6040,6 @@ fn phase_b_repo(db: &AppDb, git: &GitBinary, pass: &mut RepoPass) {
             return;
         }
     };
-    let cur = current_branch(git, &root).ok().flatten();
-    let head_born = matches!(git_sync::rev_parse(git, &root, "HEAD"), Ok(Some(_)));
-    if !head_born {
-        return;
-    }
 
     let recipients = pass.recipients.clone();
     for b in &recipients {
@@ -6007,7 +6356,9 @@ fn shared_commit_on_tip(
         approved,
         held_skills,
     };
-    let mut changes = shared_plan_changes(git, root, &ctx)?;
+    let mut clock_diags: Vec<String> = Vec::new();
+    let mut changes = shared_plan_changes(git, root, &ctx, &mut clock_diags)?;
+    let _ = &clock_diags;
     // T-000244: markers the remote branch still tracks leave it as deletions,
     // same as in `plumb_into_branch`.
     for path in ls_tree(git, root, remote, &[SKILLS_DIR.to_string()])?
@@ -9911,11 +10262,13 @@ mod tests {
         let contributor = shared_pathspec(Role::Contributor, "helper", true);
         assert!(contributor.iter().any(|x| x == "docs/todo.md"));
         assert!(contributor.iter().any(|x| x == "docs/superpowers"));
-        // T-000190: the only `.sdh` path of a non-main role is its own
-        // version file — never the owner-only structure or requests dir.
-        assert!(contributor
-            .iter()
-            .all(|x| !x.starts_with(".sdh") || x == ".sdh/app-versions/helper.json"));
+        // T-000190: the only `.sdh` paths of a non-main role are its own
+        // version file and the edit-clock ledgers (T-000265 — every
+        // publishing role carries them, they merge by CRDT union) — never
+        // the owner-only structure or requests dir.
+        assert!(contributor.iter().all(|x| !x.starts_with(".sdh")
+            || x == ".sdh/app-versions/helper.json"
+            || x == crate::sync::edit_clocks::CLOCKS_DIR));
         assert!(!contributor.iter().any(|x| x == "docs/sdh_skills"));
         // T-000247: a helper never publishes the codex mirror — it arrives
         // through merge/ff, not through the helper's commits.
@@ -13047,6 +13400,350 @@ mod tests {
         let got = plumb_lineages(&[&s0, &k, &s0, &k], &[&s0, &k, &s0]);
         assert!(!got.contains("T-000001"), "resurrected:\n{}", got);
         assert!(got.contains("T-000002"));
+    }
+
+    // ----- T-000265/274: clock-ledger union plumbing -----------------------
+
+    fn clock_fixture() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        write(d, "docs/todo.md", &todo(&["T-000001"]));
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "base"]);
+        g(d, &["checkout", "-q", "-b", "other"]);
+        write(d, "docs/todo.md", &todo(&["T-000002"]));
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "other"]);
+        g(d, &["checkout", "-q", "dev"]);
+        dir
+    }
+
+    fn ledger_json(pairs: &[(&str, &str, i64, bool)]) -> String {
+        use crate::sync::edit_clocks::{ClockEntry, ClockLedger};
+        let mut l = ClockLedger::new("docs/todo.md");
+        for (k, h, t, del) in pairs {
+            l.entries.insert(
+                k.to_string(),
+                ClockEntry {
+                    h: h.to_string(),
+                    t: *t,
+                    src: format!("src-{}", t),
+                    del: *del,
+                },
+            );
+        }
+        l.serialize().unwrap()
+    }
+
+    const CLOCK_REL: &str = ".sdh/edit-clocks/docs--todo.md.json";
+
+    fn commit_clock(d: &Path, json: &str) {
+        write(d, CLOCK_REL, json);
+        g(d, &["add", CLOCK_REL]);
+        g(d, &["commit", "-q", "-m", "clock"]);
+    }
+
+    fn branch_clock(d: &Path, branch: &str) -> String {
+        g(d, &["show", &format!("{}:{}", branch, CLOCK_REL)])
+    }
+
+    fn plumb_clocks(d: &Path) {
+        let spec = vec![".sdh/edit-clocks".to_string()];
+        plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None).unwrap();
+    }
+
+    #[test]
+    fn clock_ledgers_union_by_key_maximum_not_by_side() {
+        let dir = clock_fixture();
+        let d = dir.path();
+        // Ours: A@100, B@200. Theirs: B@150 (staler), C@300.
+        commit_clock(d, &ledger_json(&[("r:A", "ha", 100, false), ("r:B", "hb2", 200, false)]));
+        g(d, &["checkout", "-q", "other"]);
+        commit_clock(d, &ledger_json(&[("r:B", "hb1", 150, false), ("r:C", "hc", 300, false)]));
+        g(d, &["checkout", "-q", "dev"]);
+        plumb_clocks(d);
+        let merged = branch_clock(d, "other");
+        use crate::sync::edit_clocks::ClockLedger;
+        let l = ClockLedger::parse(merged.as_bytes(), CLOCK_REL).unwrap();
+        assert_eq!(l.entries.len(), 3, "{:?}", l.entries.keys());
+        // The NEWER B wins even though it is ours — position never decides.
+        assert_eq!(l.entries["r:B"].h, "hb2");
+        assert_eq!(l.entries["r:B"].t, 200);
+        assert_eq!(l.entries["r:A"].t, 100);
+        assert_eq!(l.entries["r:C"].t, 300);
+    }
+
+    #[test]
+    fn clock_union_is_commutative_across_machines() {
+        // The same two ledgers plumbed in the opposite orientation must
+        // produce the same bytes — the transport cannot be positional.
+        let one = {
+            let dir = clock_fixture();
+            let d = dir.path();
+            commit_clock(d, &ledger_json(&[("r:A", "ha", 100, false), ("r:B", "hb2", 200, false)]));
+            g(d, &["checkout", "-q", "other"]);
+            commit_clock(d, &ledger_json(&[("r:B", "hb1", 150, false), ("r:C", "hc", 300, false)]));
+            g(d, &["checkout", "-q", "dev"]);
+            plumb_clocks(d);
+            branch_clock(d, "other")
+        };
+        let two = {
+            let dir = clock_fixture();
+            let d = dir.path();
+            commit_clock(d, &ledger_json(&[("r:B", "hb1", 150, false), ("r:C", "hc", 300, false)]));
+            g(d, &["checkout", "-q", "other"]);
+            commit_clock(d, &ledger_json(&[("r:A", "ha", 100, false), ("r:B", "hb2", 200, false)]));
+            g(d, &["checkout", "-q", "dev"]);
+            plumb_clocks(d);
+            branch_clock(d, "other")
+        };
+        assert_eq!(one, two);
+    }
+
+    #[test]
+    fn a_branch_side_clock_we_lack_is_not_clobbered() {
+        let dir = clock_fixture();
+        let d = dir.path();
+        // Only the branch holds a ledger; we have none — the union is the
+        // branch's own content, so nothing is written.
+        g(d, &["checkout", "-q", "other"]);
+        commit_clock(d, &ledger_json(&[("r:C", "hc", 300, false)]));
+        let before = g(d, &["rev-parse", "other"]);
+        g(d, &["checkout", "-q", "dev"]);
+        plumb_clocks(d);
+        assert_eq!(g(d, &["rev-parse", "other"]), before, "no write expected");
+    }
+
+    #[test]
+    fn our_clock_publishes_to_a_branch_without_one() {
+        let dir = clock_fixture();
+        let d = dir.path();
+        commit_clock(d, &ledger_json(&[("r:A", "ha", 100, false)]));
+        plumb_clocks(d);
+        use crate::sync::edit_clocks::ClockLedger;
+        let l = ClockLedger::parse(branch_clock(d, "other").as_bytes(), CLOCK_REL).unwrap();
+        assert_eq!(l.entries["r:A"].t, 100);
+    }
+
+    #[test]
+    fn a_corrupt_branch_clock_freezes_the_file() {
+        let dir = clock_fixture();
+        let d = dir.path();
+        commit_clock(d, &ledger_json(&[("r:A", "ha", 100, false)]));
+        g(d, &["checkout", "-q", "other"]);
+        write(d, CLOCK_REL, "{not json");
+        g(d, &["add", CLOCK_REL]);
+        g(d, &["commit", "-q", "-m", "corrupt"]);
+        let before = g(d, &["rev-parse", "other"]);
+        g(d, &["checkout", "-q", "dev"]);
+        plumb_clocks(d);
+        assert_eq!(g(d, &["rev-parse", "other"]), before, "corruption must not propagate");
+    }
+
+    // ----- T-000274: write-side stamping at the auto-commit path -----------
+
+    fn stamp_fixture() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        write(d, "docs/todo.md", &todo(&["T-000001"]));
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "base"]);
+        dir
+    }
+
+    fn worktree_clock(d: &Path) -> Option<String> {
+        let p = d.join(CLOCK_REL);
+        std::fs::read_to_string(p).ok()
+    }
+
+    #[test]
+    fn stamping_marks_exactly_the_worktree_delta() {
+        let dir = stamp_fixture();
+        let d = dir.path();
+        // Edit one field (status) of the one row in the work tree.
+        let edited = todo(&["T-000001"]).replace("| open |", "| review |");
+        write(d, "docs/todo.md", &edited);
+        stamp_worktree_clocks(&gb(), d);
+        let json = worktree_clock(d).expect("ledger written");
+        use crate::sync::edit_clocks::{field_key, row_key, ClockLedger};
+        let l = ClockLedger::parse(json.as_bytes(), CLOCK_REL).unwrap();
+        assert!(l.get(&row_key("T-000001")).is_some(), "row key stamped");
+        assert!(
+            l.get(&field_key("T-000001", 4)).is_some(),
+            "the changed field stamped"
+        );
+        assert!(
+            l.get(&field_key("T-000001", 1)).is_none(),
+            "untouched fields must not restamp"
+        );
+        assert!(l.entries.values().all(|e| e.src.starts_with("w:")));
+        assert!(!l.entries.values().any(|e| e.del));
+    }
+
+    #[test]
+    fn no_worktree_edit_writes_no_ledger() {
+        let dir = stamp_fixture();
+        let d = dir.path();
+        stamp_worktree_clocks(&gb(), d);
+        assert!(worktree_clock(d).is_none(), "inert without a delta");
+    }
+
+    #[test]
+    fn stamping_preserves_the_ledgers_existing_entries() {
+        let dir = stamp_fixture();
+        let d = dir.path();
+        // HEAD carries a ledger with an entry the new diff does not touch.
+        write(d, CLOCK_REL, &ledger_json(&[("r:OLD", "hold", 50, false)]));
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "with clock"]);
+        let edited = todo(&["T-000001"]).replace("| open |", "| review |");
+        write(d, "docs/todo.md", &edited);
+        stamp_worktree_clocks(&gb(), d);
+        use crate::sync::edit_clocks::ClockLedger;
+        let l = ClockLedger::parse(worktree_clock(d).unwrap().as_bytes(), CLOCK_REL).unwrap();
+        assert_eq!(l.entries.get("r:OLD").map(|e| e.t), Some(50));
+        assert!(l.entries.len() > 1);
+    }
+
+    #[test]
+    fn a_corrupt_worktree_ledger_freezes_stamping() {
+        let dir = stamp_fixture();
+        let d = dir.path();
+        write(d, CLOCK_REL, "{corrupt");
+        let edited = todo(&["T-000001"]).replace("| open |", "| review |");
+        write(d, "docs/todo.md", &edited);
+        stamp_worktree_clocks(&gb(), d);
+        assert_eq!(
+            worktree_clock(d).as_deref(),
+            Some("{corrupt"),
+            "corruption is frozen, never silently rewritten"
+        );
+    }
+
+    // ----- T-000267/D1a: clocked resolution in the plumbing planner --------
+
+    /// Both sides edited the same row's status away from the base's `open`:
+    /// dev carries `review` (stamped at `t_ours`), other carries `done`
+    /// (stamped at `t_theirs`), each side's ledger committed on its branch.
+    /// `with_protocol` commits `.sdh/protocol.json` on dev. Returns the todo
+    /// the plumbing writes onto `other`.
+    fn clocked_plumb(t_ours: i64, t_theirs: i64, with_protocol: bool) -> String {
+        use crate::sync::clock_stamp::stamp_file_delta;
+        use crate::sync::edit_clocks::{render_protocol, ClockLedger};
+        use crate::sync::merge_by_id::SharedFileKind;
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        let base = todo(&["T-000001"]);
+        write(d, "docs/todo.md", &base);
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "base"]);
+        g(d, &["checkout", "-q", "-b", "other"]);
+        // Their side: status done, ledger stamped at t_theirs.
+        let theirs = base.replace("| open |", "| done |");
+        write(d, "docs/todo.md", &theirs);
+        let mut lth = ClockLedger::new("docs/todo.md");
+        stamp_file_delta(SharedFileKind::Todo, &base, &theirs, &mut lth, t_theirs, "src-theirs");
+        write(d, CLOCK_REL, &lth.serialize().unwrap());
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "theirs done"]);
+        g(d, &["checkout", "-q", "dev"]);
+        // Our side: status review, ledger stamped at t_ours.
+        let ours = base.replace("| open |", "| review |");
+        write(d, "docs/todo.md", &ours);
+        let mut lou = ClockLedger::new("docs/todo.md");
+        stamp_file_delta(SharedFileKind::Todo, &base, &ours, &mut lou, t_ours, "src-ours");
+        write(d, CLOCK_REL, &lou.serialize().unwrap());
+        if with_protocol {
+            write(d, ".sdh/protocol.json", &render_protocol("2026-11-27T00:00:00Z", "abc"));
+        }
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "ours review"]);
+        let spec = vec!["docs/todo.md".to_string(), ".sdh/edit-clocks".to_string()];
+        plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None).unwrap();
+        g(d, &["show", "other:docs/todo.md"])
+    }
+
+    #[test]
+    fn post_activation_the_later_utc_stamp_wins_regardless_of_side() {
+        // Their edit is LATER (200 > 100): theirs wins although the merge
+        // runs on dev — positional resolution would have kept ours.
+        let got = clocked_plumb(100, 200, true);
+        assert!(got.contains("| done |"), "theirs must win:
+{}", got);
+        assert!(!got.contains("| review |"));
+        // And the mirror: our edit later — ours wins.
+        let got = clocked_plumb(300, 200, true);
+        assert!(got.contains("| review |"), "ours must win:
+{}", got);
+    }
+
+    #[test]
+    fn pre_activation_resolution_stays_positional() {
+        // Identical fixture without the protocol file: ours wins positionally
+        // even though their stamp is later — the gate is real.
+        let got = clocked_plumb(100, 200, false);
+        assert!(got.contains("| review |"), "positional ours:
+{}", got);
+    }
+
+    // ----- T-000267: the merge driver's clocked twin ------------------------
+
+    /// The driver's post-activation merge reads both sides' ledgers from the
+    /// REFS (HEAD and the merging rev), never from the work tree — prove the
+    /// union reaches the resolution: their later stamp wins although the
+    /// work tree is ours.
+    #[test]
+    fn the_driver_merge_reads_clocks_from_the_refs() {
+        use crate::sync::clock_stamp::stamp_file_delta;
+        use crate::sync::edit_clocks::ClockLedger;
+        use crate::sync::merge_by_id::SharedFileKind;
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = dir.path();
+        g(d, &["init", "-q"]);
+        g(d, &["symbolic-ref", "HEAD", "refs/heads/dev"]);
+        configure(d);
+        let base = todo(&["T-000001"]);
+        write(d, "docs/todo.md", &base);
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "base"]);
+        g(d, &["checkout", "-q", "-b", "other"]);
+        let theirs = base.replace("| open |", "| done |");
+        write(d, "docs/todo.md", &theirs);
+        let mut lth = ClockLedger::new("docs/todo.md");
+        stamp_file_delta(SharedFileKind::Todo, &base, &theirs, &mut lth, 200, "src-theirs");
+        write(d, CLOCK_REL, &lth.serialize().unwrap());
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "theirs done"]);
+        g(d, &["checkout", "-q", "dev"]);
+        let ours = base.replace("| open |", "| review |");
+        write(d, "docs/todo.md", &ours);
+        let mut lou = ClockLedger::new("docs/todo.md");
+        stamp_file_delta(SharedFileKind::Todo, &base, &ours, &mut lou, 100, "src-ours");
+        write(d, CLOCK_REL, &lou.serialize().unwrap());
+        g(d, &["add", "-A"]);
+        g(d, &["commit", "-q", "-m", "ours review"]);
+        let (merged, _diags) = merge_shared_with_history_clocked(
+            &gb(),
+            d,
+            "docs/todo.md",
+            base.as_bytes(),
+            ours.as_bytes(),
+            theirs.as_bytes(),
+            "other",
+        )
+        .unwrap();
+        assert!(merged.contains("| done |"), "their later stamp:
+{}", merged);
+        assert!(!merged.contains("| review |"));
     }
 
     /// Base holds the marker; we deleted it; the remote deleted and re-added

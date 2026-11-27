@@ -128,7 +128,24 @@ fn run(o: &str, a: &str, b: &str, p: &str, flat: bool) -> Result<(), String> {
             .ok()
             .and_then(|root| {
                 remote_merge_oid(&git, &root).map(|oid| {
-                    merge_shared_with_history(&git, &root, p, &base, &ours, &theirs, &oid)
+                    // T-000267/D1a: once the chronology protocol rides either
+                    // input ref, every tie of this merge resolves by the union
+                    // ledger's UTC stamps — position never decides again.
+                    if crate::sync::shared::protocol_active_in(&git, &root, &["HEAD", &oid]) {
+                        match crate::sync::shared::merge_shared_with_history_clocked(
+                            &git, &root, p, &base, &ours, &theirs, &oid,
+                        ) {
+                            Ok((text, diags)) => {
+                                for d in &diags {
+                                    eprintln!("sdh-clock[{}]: {}", p, d);
+                                }
+                                Ok(text)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        merge_shared_with_history(&git, &root, p, &base, &ours, &theirs, &oid)
+                    }
                 })
             })
             .and_then(|r| r.ok())
