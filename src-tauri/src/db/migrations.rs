@@ -92,6 +92,7 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         "peer_channel_deliveries",
         mig_v37_peer_channel_deliveries,
     ),
+    (38, "rule_proposals_mode", mig_v38_rule_proposals_mode),
 ];
 
 impl AppDb {
@@ -1203,6 +1204,21 @@ fn mig_v36_rule_proposals(conn: &Connection) -> SqlResult<()> {
          ALTER TABLE rule_events_v36 RENAME TO rule_events;
          CREATE INDEX idx_rule_events_rule ON rule_events(rule, created_at);
          PRAGMA user_version = 36;",
+    )
+}
+
+fn mig_v38_rule_proposals_mode(conn: &Connection) -> SqlResult<()> {
+    // T-000264 (v1.25.0): the owner's answer to "who decides rule
+    // proposals" — per repository, because proposals travel the shared
+    // repo's transport and the canon owner decides per product. 'auto'
+    // (the default): a proposal without a conflict is accepted by the
+    // post-pass machine without a click; 'manual': every proposal waits
+    // for the owner, exactly as before the setting existed.
+    conn.execute_batch(
+        "ALTER TABLE repositories ADD COLUMN rule_proposals_mode
+             TEXT NOT NULL DEFAULT 'auto'
+             CHECK (rule_proposals_mode IN ('auto', 'manual'));
+         PRAGMA user_version = 38;",
     )
 }
 
