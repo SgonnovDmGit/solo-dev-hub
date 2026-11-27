@@ -14705,7 +14705,40 @@ mod tests {
             "docs/todo.md",
             &todo(&["T-000001", "T-000002"]),
         );
-        g(&fx.main_dir, &["add", ".sdh/app-versions", "docs/todo.md"]);
+        // T-000273 artifact baseline coverage: two whole-file artifacts.
+        // The first has no ledger at all — activation must baseline-stamp it.
+        write(
+            &fx.main_dir,
+            "docs/backend-requirements/REQ-001_fresh.md",
+            "# REQ-001\n\nfresh artifact\n",
+        );
+        // The second carries an honest pre-activation ledger whose stamp
+        // matches its content — activation must NOT rewrite honest time.
+        let honest_content = "# REQ-002\n\nhonestly stamped\n";
+        write(
+            &fx.main_dir,
+            "docs/backend-requirements/REQ-002_honest.md",
+            honest_content,
+        );
+        {
+            use crate::sync::edit_clocks::{
+                ledger_file_name, value_hash, ClockEntry, ClockLedger, CLOCKS_DIR, FILE_KEY,
+            };
+            let rel = "docs/backend-requirements/REQ-002_honest.md";
+            let mut l = ClockLedger::new(rel);
+            l.entries.insert(
+                FILE_KEY.to_string(),
+                ClockEntry {
+                    h: value_hash(honest_content.as_bytes()),
+                    t: 50,
+                    src: "honestpast".to_string(),
+                    del: false,
+                },
+            );
+            let clock_rel = format!("{}/{}", CLOCKS_DIR, ledger_file_name(rel));
+            write(&fx.main_dir, &clock_rel, &l.serialize().unwrap());
+        }
+        g(&fx.main_dir, &["add", ".sdh/app-versions", "docs/todo.md", "docs/backend-requirements", ".sdh/edit-clocks"]);
         g(&fx.main_dir, &["commit", "-q", "-m", "versions"]);
         g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
         let gate = chronology_gate(&fx.main_db, &gb(), fx.main_repo).unwrap();
@@ -14724,6 +14757,44 @@ mod tests {
         );
         assert!(ledger.contains("T-"), "ledger has row stamps: {}", ledger);
         assert!(ledger.contains("__structure__"), "{}", ledger);
+        // Whole-file artifacts: the ledger-less one got a baseline file-key
+        // stamp of its content hash...
+        let fresh_clock = g(
+            &fx.main_dir,
+            &[
+                "show",
+                "dev:.sdh/edit-clocks/docs--backend-requirements--REQ-001_fresh.md.json",
+            ],
+        );
+        assert!(fresh_clock.contains("\"file\""), "{}", fresh_clock);
+        assert!(!fresh_clock.is_empty());
+        {
+            use crate::sync::edit_clocks::{value_hash, ClockLedger, FILE_KEY};
+            let l = ClockLedger::parse(fresh_clock.as_bytes(), "x").unwrap();
+            let e = l.get(FILE_KEY).expect("file key");
+            assert!(!e.del);
+            assert_eq!(
+                e.h,
+                value_hash("# REQ-001\n\nfresh artifact\n".as_bytes()),
+                "the baseline stamps the dev content hash"
+            );
+        }
+        // ...and the honestly stamped one kept its original early time —
+        // activation never rewrites honest stamps.
+        let honest_clock = g(
+            &fx.main_dir,
+            &[
+                "show",
+                "dev:.sdh/edit-clocks/docs--backend-requirements--REQ-002_honest.md.json",
+            ],
+        );
+        {
+            use crate::sync::edit_clocks::{ClockLedger, FILE_KEY};
+            let l = ClockLedger::parse(honest_clock.as_bytes(), "x").unwrap();
+            let e = l.get(FILE_KEY).expect("file key");
+            assert_eq!(e.t, 50, "honest stamp preserved: {:?}", e);
+            assert_eq!(e.src, "honestpast");
+        }
         // The gate now reports active.
         let gate = chronology_gate(&fx.main_db, &gb(), fx.main_repo).unwrap();
         assert!(gate.active, "activation visible through the refs");
