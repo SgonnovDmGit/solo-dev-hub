@@ -4729,6 +4729,7 @@ fn wire_of(p: &crate::models::RuleProposal) -> RuleProposalFile {
         at: p.at.clone(),
         seq: p.seq,
         status: p.status.clone(),
+        base_canon_hash: p.base_canon_hash.clone(),
     }
 }
 
@@ -5133,6 +5134,7 @@ fn contributor_proposals_transport(
             resolved_at: None,
             resolved_rev: None,
             remote_ver: None,
+            base_canon_hash: d.base_canon_hash.clone(),
             updated_at: String::new(),
         });
     }
@@ -16953,6 +16955,7 @@ mod tests {
             at: "2026-11-18T00:00:00Z".into(),
             seq,
             status: status.into(),
+            base_canon_hash: None,
         }
     }
 

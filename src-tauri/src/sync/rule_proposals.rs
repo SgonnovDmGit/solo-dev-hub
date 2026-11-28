@@ -148,6 +148,16 @@ pub fn validate_proposal_file(
     if !is_rfc3339(&p.at) {
         return Err(format!("{}: `at` is not RFC 3339: {}", file_name, p.at));
     }
+    // T-000264: the base hash, when the chain carries one, is a sha256 —
+    // 64 lowercase hex, never a blob sha (40) and never uppercase.
+    if let Some(h) = &p.base_canon_hash {
+        let ok = h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+        if !ok {
+            return Err(format!("{}: base_canon_hash is not a sha256 hex", file_name));
+        }
+    }
     Ok(())
 }
 
@@ -285,6 +295,7 @@ mod tests {
             at: "2026-11-08T00:00:00Z".into(),
             seq,
             status: status.into(),
+            base_canon_hash: None,
         }
     }
 

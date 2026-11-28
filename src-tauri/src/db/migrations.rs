@@ -93,6 +93,7 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         mig_v37_peer_channel_deliveries,
     ),
     (38, "rule_proposals_mode", mig_v38_rule_proposals_mode),
+    (39, "proposal_base_canon_hash", mig_v39_proposal_base_canon_hash),
 ];
 
 impl AppDb {
@@ -1204,6 +1205,19 @@ fn mig_v36_rule_proposals(conn: &Connection) -> SqlResult<()> {
          ALTER TABLE rule_events_v36 RENAME TO rule_events;
          CREATE INDEX idx_rule_events_rule ON rule_events(rule, created_at);
          PRAGMA user_version = 36;",
+    )
+}
+
+fn mig_v39_proposal_base_canon_hash(conn: &Connection) -> SqlResult<()> {
+    // T-000264 (v1.25.0): the proposal's proof of what it is based on —
+    // sha256 of the canon text the contributor's install held when the
+    // proposal chain began. Without it the auto-decider cannot tell "the
+    // canon never moved under this proposal" from "the owner edited since",
+    // so NULL rows (every legacy one) stay manual forever. Nullable rather
+    // than defaulted: an empty string would read as a provable base of "".
+    conn.execute_batch(
+        "ALTER TABLE rule_proposals ADD COLUMN base_canon_hash TEXT;
+         PRAGMA user_version = 39;",
     )
 }
 

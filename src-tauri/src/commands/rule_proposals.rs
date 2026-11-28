@@ -315,6 +315,7 @@ pub(crate) fn list_contributor_proposals(
             at: p.at.clone(),
             seq: p.seq,
             status: p.status.clone(),
+            base_canon_hash: p.base_canon_hash.clone(),
         };
         let rev = match (git, root.as_deref()) {
             (Some(g), Some(r)) => local_rev(g, r, &wire),
@@ -992,6 +993,7 @@ mod tests {
             resolved_at: None,
             resolved_rev: None,
             remote_ver: remote_ver.map(str::to_string),
+            base_canon_hash: None,
             updated_at: String::new(),
         }
     }
