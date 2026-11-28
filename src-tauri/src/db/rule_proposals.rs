@@ -705,6 +705,33 @@ mod tests {
     }
 
     #[test]
+    fn scan_missing_root_is_an_error_and_auto_decides_nothing() {
+        let db = db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("missing-checkout");
+        db.set_repo_local_path(1, Some(missing.to_str().unwrap()))
+            .unwrap();
+        db.set_shared_role(1, Some("main")).unwrap();
+
+        let scan = crate::commands::rule_proposals::scan_open_candidates(&db);
+        assert!(
+            scan.scan_errors.iter().any(|e| e.contains("no local checkout")),
+            "missing root must be a scan error, got {:?}",
+            scan.scan_errors
+        );
+        assert!(scan.candidates.is_empty());
+
+        let outcome = crate::commands::rule_proposals::auto_decide_rule_proposals(&db);
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.held, 0);
+        assert!(
+            outcome.errors.iter().any(|e| e.contains("no local checkout")),
+            "the scan error must reach the auto-decider, got {:?}",
+            outcome.errors
+        );
+    }
+
+    #[test]
     fn the_publishable_queue_retries_every_decided_state_but_never_prepared_or_expired() {
         let db = db();
         let rev = |n: usize| n.to_string().repeat(40);

@@ -1892,6 +1892,17 @@ pub(crate) fn protocol_active_in(git: &GitBinary, root: &Path, revs: &[&str]) ->
     })
 }
 
+/// Is UTC chronology active for one repository checkout? Activation is read
+/// from the canonical dev refs only — local or fetched remote, either one is
+/// enough because the flag propagates through the ordinary shared transport.
+/// Absent, unreadable, or corrupt protocol data is inactive here; corruption
+/// diagnostics belong to the sync-resolution slice, not to these consumers.
+pub(crate) fn chronology_active_for_repo(git: &GitBinary, root: &Path) -> bool {
+    let local_dev = local_ref("dev");
+    let remote_dev = remote_ref("dev");
+    protocol_active_in(git, root, &[&local_dev, &remote_dev])
+}
+
 /// The union ledger one shared file resolves against: both sides' copies
 /// merged per key. A corrupt side degrades to empty WITH a diagnostic — the
 /// resolution then runs stamp-poor but deterministic, never positional.
@@ -6842,21 +6853,34 @@ pub(crate) fn proposal_catalogs(
     read_origin: bool,
 ) -> ProposalCatalogs {
     let mut out = ProposalCatalogs::default();
-    if let Some(tip) = git_sync::rev_parse(git, root, &local_ref(dev_branch))
-        .ok()
-        .flatten()
-    {
-        out.local = read_proposal_catalogs(git, root, &tip, known, issues);
-        out.any = true;
+    let local_rev = local_ref(dev_branch);
+    match git_sync::rev_parse(git, root, &local_rev) {
+        Ok(Some(tip)) => {
+            out.local = read_proposal_catalogs(git, root, &tip, known, issues);
+            out.any = true;
+        }
+        Ok(None) => {}
+        Err(e) => issues.push(format!("{}: {}", local_rev, e)),
     }
     if read_origin {
-        if let Some(tip) = git_sync::rev_parse(git, root, &remote_ref(dev_branch))
-            .ok()
-            .flatten()
-        {
-            let mut skip = Vec::new();
-            out.origin = read_proposal_catalogs(git, root, &tip, known, &mut skip);
-            out.any = true;
+        let origin_rev = remote_ref(dev_branch);
+        match git_sync::rev_parse(git, root, &origin_rev) {
+            Ok(Some(tip)) => {
+                // Origin issues are decision-relevant too: the union reads origin
+                // proposals, so a skipped artifact there can hide a competitor.
+                // Dedup exact messages — after a fast-forward both refs often
+                // carry the same malformed bytes.
+                let mut origin_issues = Vec::new();
+                out.origin = read_proposal_catalogs(git, root, &tip, known, &mut origin_issues);
+                for issue in origin_issues {
+                    if !issues.contains(&issue) {
+                        issues.push(issue);
+                    }
+                }
+                out.any = true;
+            }
+            Ok(None) => {}
+            Err(e) => issues.push(format!("{}: {}", origin_rev, e)),
         }
     }
     out.proposals = union_proposals([&out.local.0, &out.origin.0]);

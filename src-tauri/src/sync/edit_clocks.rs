@@ -8,7 +8,7 @@
 // automatically: an offline clone returning months later must still lose to
 // the deletion it never saw.
 //
-// The ledger merges per key by maximum `t`, tie-broken by maximum `src` —
+// The ledger merges per key by the total order over `(t, src, h, del)` —
 // commutative, associative and idempotent by construction, so no positional
 // "who merges" rule can ever leak into it. Far-future stamps are quarantined
 // (reported as sync issues, key frozen) rather than silently corrected.
@@ -111,8 +111,8 @@ impl ClockLedger {
         Ok(ledger)
     }
 
-    /// CRDT merge: per key, the entry with the higher `t` wins; equal `t`
-    /// is broken by the higher `src` (deterministic on both machines).
+    /// CRDT merge: per key, the winner is the maximum entry in the total
+    /// order over `(t, src, h, del)` — deterministic on both machines.
     /// Tombstones participate exactly like live entries — a deletion at 12:00
     /// beats a write at 11:00 and loses to a re-add at 13:00.
     pub fn merge(&self, other: &ClockLedger) -> ClockLedger {
@@ -171,8 +171,16 @@ impl ClockEntry {
     }
 }
 
+/// Pick the maximum entry in the total order over `(t, src, h, del)`:
+/// larger `t` wins, then larger `src`, then larger `h`; if all three tie,
+/// a tombstone (`del: true`) wins over a live entry. The final direction is
+/// arbitrary but fixed — it makes same-second/same-source union results
+/// commutative even when the two stamps bind different values. Identical
+/// entries compare equal, so returning the left side is correct there.
 fn pick_winner<'a>(a: &'a ClockEntry, b: &'a ClockEntry) -> &'a ClockEntry {
-    if b.t > a.t || (b.t == a.t && b.src > a.src) {
+    let a_key = (a.t, a.src.as_str(), a.h.as_str(), a.del);
+    let b_key = (b.t, b.src.as_str(), b.h.as_str(), b.del);
+    if b_key > a_key {
         b
     } else {
         a
@@ -336,6 +344,27 @@ mod tests {
         // tie broken deterministically by src
         let m = b.merge(&c);
         assert_eq!(m.entries["r:X"].src, "sc");
+    }
+
+    #[test]
+    fn merge_full_tie_is_commutative_and_uses_hash_then_tombstone() {
+        // Same `(t, src)`, different value hashes: the larger hash wins in
+        // either merge order, byte-for-byte.
+        let low_hash = ledger_with(&[("r:X", entry("aaa", 200, "same-src", false))]);
+        let high_hash = ledger_with(&[("r:X", entry("bbb", 200, "same-src", false))]);
+        let ab = low_hash.merge(&high_hash).serialize().unwrap();
+        let ba = high_hash.merge(&low_hash).serialize().unwrap();
+        assert_eq!(ab, ba);
+        assert_eq!(low_hash.merge(&high_hash).entries["r:X"].h, "bbb");
+
+        // Same `(t, src, h)`, different tombstone flags: `del: true` is the
+        // fixed final tie-breaker in either merge order.
+        let live = ledger_with(&[("r:X", entry("same-hash", 200, "same-src", false))]);
+        let deleted = ledger_with(&[("r:X", entry("same-hash", 200, "same-src", true))]);
+        let live_deleted = live.merge(&deleted).serialize().unwrap();
+        let deleted_live = deleted.merge(&live).serialize().unwrap();
+        assert_eq!(live_deleted, deleted_live);
+        assert!(live.merge(&deleted).entries["r:X"].del);
     }
 
     #[test]
