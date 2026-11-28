@@ -148,6 +148,19 @@ pub fn validate_proposal_file(
     if !is_rfc3339(&p.at) {
         return Err(format!("{}: `at` is not RFC 3339: {}", file_name, p.at));
     }
+    // T-000264: the base hash, when the chain carries one, is a sha256 —
+    // 64 lowercase hex, never a blob sha (40) and never uppercase.
+    if let Some(h) = &p.base_canon_hash {
+        let ok = h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+        if !ok {
+            return Err(format!(
+                "{}: base_canon_hash is not a sha256 hex",
+                file_name
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -272,6 +285,64 @@ pub fn effective_version(local: &RuleProposalFile, dev: &RuleProposalFile) -> Ef
     }
 }
 
+// ---------------------------------------------------------------------------
+// T-000264: the auto-decision conflict detector (spec D4)
+// ---------------------------------------------------------------------------
+
+/// Why a proposal may not be auto-decided. Every non-`Clean` verdict means
+/// the same thing operationally — the proposal waits for the owner — but
+/// they are distinct for the attention surface, because each tells the
+/// owner a different story.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoVerdict {
+    /// No conflict — the post-pass machine may accept without a click.
+    Clean,
+    /// The proposal carries no provable base (legacy, or no canon existed
+    /// when the chain began): nothing to compare against, manual forever.
+    NoProvableBase,
+    /// Two or more unresolved open proposals of the same rule carry
+    /// different texts somewhere in the portfolio. Deciding either by
+    /// machine would pick a winner nobody chose.
+    CompetingProposals,
+    /// The owner's canon moved since the proposal's base — the proposal
+    /// was written against a text that is no longer the rule.
+    CanonDiverged,
+}
+
+/// The verdict for one open proposal. Pure logic; the caller supplies:
+///
+/// - `base_canon_hash` — the chain's base, exactly as the wire carries it;
+/// - `canon_now_hash` — `sha256_hex` of the owner's canon AS IT STANDS
+///   (the same digest the base was captured with);
+/// - `unresolved_texts` — the distinct texts of EVERY unresolved open
+///   proposal of this rule found in the portfolio-wide scan, the
+///   candidate's own text included. "Unresolved" is the scan's contract:
+///   withdrawn versions and versions a receipt closes never reach this
+///   slice, and the scan always covers ALL shared repos before any of
+///   them is decided — the traversal order must never become the policy.
+///
+/// Verdict order is deliberate: a baseless proposal is manual whatever
+/// else is true; competition is reported before divergence because it is
+/// the verdict the owner can act on directly (pick one, withdraw the
+/// other) — divergence under competition is noise until the winner stands.
+pub fn auto_verdict(
+    base_canon_hash: Option<&str>,
+    canon_now_hash: &str,
+    unresolved_texts: &[&str],
+) -> AutoVerdict {
+    let Some(base) = base_canon_hash else {
+        return AutoVerdict::NoProvableBase;
+    };
+    let distinct: std::collections::HashSet<&&str> = unresolved_texts.iter().collect();
+    if distinct.len() > 1 {
+        return AutoVerdict::CompetingProposals;
+    }
+    if base != canon_now_hash {
+        return AutoVerdict::CanonDiverged;
+    }
+    AutoVerdict::Clean
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +356,7 @@ mod tests {
             at: "2026-11-08T00:00:00Z".into(),
             seq,
             status: status.into(),
+            base_canon_hash: None,
         }
     }
 
@@ -299,6 +371,63 @@ mod tests {
             decided_rev: rev.into(),
             seq: 8,
         }
+    }
+
+    fn texts<'a>(texts: &[&'a str]) -> Vec<&'a str> {
+        texts.to_vec()
+    }
+
+    #[test]
+    fn auto_verdict_clean_when_single_text_and_base_matches() {
+        let canon = sha256_hex(b"CANON");
+        assert_eq!(
+            auto_verdict(Some(&canon), &canon, &texts(&["T1"])),
+            AutoVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn auto_verdict_baseless_is_manual_whatever_else_is_true() {
+        let canon = sha256_hex(b"CANON");
+        assert_eq!(
+            auto_verdict(None, &canon, &texts(&["T1"])),
+            AutoVerdict::NoProvableBase
+        );
+        assert_eq!(
+            auto_verdict(None, "bogus", &texts(&["T1", "T2"])),
+            AutoVerdict::NoProvableBase,
+            "baseless wins over every other verdict"
+        );
+    }
+
+    #[test]
+    fn auto_verdict_competition_is_two_distinct_texts_not_two_proposals() {
+        let canon = sha256_hex(b"CANON");
+        // The same text proposed from two repos of the portfolio is one
+        // intent, not a conflict — only distinct texts compete.
+        assert_eq!(
+            auto_verdict(Some(&canon), &canon, &texts(&["T1", "T1"])),
+            AutoVerdict::Clean
+        );
+        assert_eq!(
+            auto_verdict(Some(&canon), &canon, &texts(&["T1", "T2"])),
+            AutoVerdict::CompetingProposals
+        );
+        // Competition outranks divergence: pick the winner first.
+        assert_eq!(
+            auto_verdict(Some(&canon), "moved-canon-hash", &texts(&["T1", "T2"])),
+            AutoVerdict::CompetingProposals
+        );
+    }
+
+    #[test]
+    fn auto_verdict_divergence_is_any_canon_move_since_the_base() {
+        let base = sha256_hex(b"CANON-AT-PROPOSAL-TIME");
+        let moved = sha256_hex(b"CANON-OWNER-EDITED-SINCE");
+        assert_eq!(
+            auto_verdict(Some(base.as_str()), &moved, &texts(&["T1"])),
+            AutoVerdict::CanonDiverged
+        );
     }
 
     #[test]

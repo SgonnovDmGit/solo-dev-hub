@@ -32,6 +32,13 @@ pub struct RuleProposalFile {
     pub seq: i64,
     /// `open` | `withdrawn` — never a decision; decisions live in receipts.
     pub status: String,
+    /// T-000264: sha256 of the canon this proposal chain is based on —
+    /// the auto-decider's compare-and-swap base. `None` (and absent on the
+    /// wire) marks every legacy proposal: manual forever. Optional without
+    /// a format bump because serde ignores unknown fields on older installs
+    /// and the file's only writer is the proposer himself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_canon_hash: Option<String>,
 }
 
 /// `.sdh/rule-decisions/<rule>.<login>.<oid>.json` — the owner's immutable
@@ -123,6 +130,8 @@ pub struct RuleProposal {
     /// `{seq,status,sha}` JSON tuple of the last origin-confirmed dev
     /// version — the GC's dominance check.
     pub remote_ver: Option<String>,
+    /// T-000264: the wire base hash mirrored locally; None = legacy/manual.
+    pub base_canon_hash: Option<String>,
     pub updated_at: String,
 }
 
@@ -189,6 +198,10 @@ pub struct RuleAcceptance {
     pub base_canon_hash: String,
     /// sha256 of the canon this row applied, once it did.
     pub canon_hash: Option<String>,
+    /// T-000264: the post-pass machine took this decision, not the owner's
+    /// click — the persisted "auto-decided" surface derives from the flag.
+    #[serde(default)]
+    pub auto_decided: bool,
     pub created_at: String,
     pub updated_at: String,
 }

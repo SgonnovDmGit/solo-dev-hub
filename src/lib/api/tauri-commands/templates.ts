@@ -9,6 +9,7 @@ import type {
   RuleConflictSide,
   RuleProposalView,
   RuleAcceptance,
+  RuleProposalsSummary,
 } from '$lib/types';
 
 
@@ -63,12 +64,25 @@ export async function resolveRuleConflict(rule: string, accept: string | null): 
   return invoke<TemplateSaveOutcome>('resolve_rule_conflict', { rule, accept });
 }
 
+/** T-000263: the action of a `rule_unknown_skill` issue — delete the stale
+ *  `.approved` marker in that repo. Rejects with `rule_marker_now_known` when
+ *  the canon learnt the rule meanwhile (the marker is a live hand-back then). */
+export async function removeUnknownSkillMarker(repoId: number, fileName: string): Promise<void> {
+  return invoke<void>('remove_unknown_skill_marker', { repoId, fileName });
+}
+
 // ── Rule proposals (T-000241, contributor mode) ─────────────────────────────
 
 /** Proposals of one shared repo — the owner's read comes off the local dev
  *  tip, the contributor's off its own rows; the sweeps ran first. */
 export async function listRuleProposals(repoId: number): Promise<RuleProposalView[]> {
   return invoke<RuleProposalView[]>('list_rule_proposals', { repoId });
+}
+
+/** T-000264: the header chip's summary — open manual-actionable count,
+ *  attention state, recent machine decisions. */
+export async function ruleProposalsSummary(): Promise<RuleProposalsSummary> {
+  return invoke<RuleProposalsSummary>('rule_proposals_summary');
 }
 
 /** Owner: the decision pipeline rows for the repo. */

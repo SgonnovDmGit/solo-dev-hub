@@ -51,6 +51,22 @@ export interface RepoSharedState {
    * is independent of `shared_mode`.
    */
   share_specs: boolean;
+  /** T-000264: who decides rule proposals — 'auto' (the post-pass machine
+   *  accepts conflict-free ones) or 'manual' (every one waits for the
+   *  owner's click). Column default is 'auto'; the string is raw because
+   *  the CHECK constraint is the DB's business. */
+  rule_proposals_mode: string;
+}
+
+/** T-000264: the header chip's numbers — all derived from live state. */
+export interface RuleProposalsSummary {
+  /** Open proposals waiting for the owner's click (manual repos: all;
+   *  auto repos: the machine-held ones). */
+  open_manual: number;
+  /** Held-by-conflict proposals or a blocked receipt publication exist. */
+  attention: boolean;
+  /** Machine decisions of the last 72 hours. */
+  auto_decided_recent: number;
 }
 
 export interface RenderedFile {

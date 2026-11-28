@@ -69,6 +69,37 @@ pub fn set_repo_share_specs(
     shared::set_repo_share_specs(&db, repo_id, share_specs)
 }
 
+/// T-000264: the owner's per-repo rule-proposals mode switch — 'auto' lets
+/// the post-pass machine accept conflict-free proposals without a click,
+/// 'manual' keeps every proposal waiting for the owner. Unlike the specs
+/// switch this needs no policy guard and no capability verification: the mode
+/// is installation-local, changes nothing in the shared content, and is read
+/// only by the post-pass auto-decider, which runs after the sync pass — and
+/// its guard — is over. A contributor / pending install is still refused: it
+/// never decides proposals, so the switch would be a lie there.
+#[tauri::command]
+pub fn set_repo_rule_proposals_mode(
+    db: State<AppDb>,
+    repo_id: i64,
+    mode: String,
+) -> Result<(), String> {
+    if mode != "auto" && mode != "manual" {
+        return Err(format!("mode must be auto|manual, got {}", mode));
+    }
+    let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if matches!(
+        state.shared_role.as_deref(),
+        Some("contributor") | Some("pending")
+    ) {
+        return Err(format!(
+            "the proposals-mode switch belongs to the repo's main: this install participates as a {}",
+            state.shared_role.unwrap_or_default()
+        ));
+    }
+    db.set_repo_rule_proposals_mode(repo_id, &mode)
+        .map_err(|e| e.to_string())
+}
+
 /// Switch shared mode off; the deletion of `.sdh/` is committed and pushed now.
 #[tauri::command(async)]
 pub fn disable_shared_mode(db: State<AppDb>, repo_id: i64) -> Result<SharedDisableResult, String> {
@@ -99,6 +130,33 @@ pub fn accept_new_main_branch(db: State<AppDb>, repo_id: i64) -> Result<(), Stri
 #[tauri::command(async)]
 pub fn merge_shared_upstream(db: State<AppDb>, repo_id: i64) -> Result<SharedMergeResult, String> {
     shared::merge_shared_upstream(&db, &need_git()?, repo_id)
+}
+
+/// T-000266: the chronology-activation readiness of a shared repo — the
+/// version gate of spec D1a. ready is exactly when the owner may press the
+/// activation button.
+#[tauri::command(async)]
+pub fn chronology_gate(db: State<AppDb>, repo_id: i64) -> Result<serde_json::Value, String> {
+    let gate = shared::chronology_gate(&db, &need_git()?, repo_id)?;
+    Ok(serde_json::json!({
+        "active": gate.active,
+        "ready": gate.ready,
+        "blockers": gate.blockers,
+    }))
+}
+
+/// T-000266: the activation commit — .sdh/protocol.json plus the
+/// baseline-stamped ledgers, one commit on dev, pushed best-effort. Owner
+/// only; the backend re-checks the role, the gate and the absence of an
+/// existing protocol, so a direct IPC call cannot bypass them either.
+#[tauri::command(async)]
+pub fn activate_chronology(db: State<AppDb>, repo_id: i64) -> Result<serde_json::Value, String> {
+    let out = shared::activate_chronology(&db, &need_git()?, repo_id)?;
+    Ok(serde_json::json!({
+        "commit": out.commit,
+        "pushed": out.pushed,
+        "note": out.note,
+    }))
 }
 
 #[tauri::command(async)]

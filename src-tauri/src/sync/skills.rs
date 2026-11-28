@@ -182,6 +182,61 @@ pub fn render_skills_to_repo(db: &AppDb, repo_base: &Path) -> Result<RepoRender,
     Ok(out)
 }
 
+/// T-000263: the error of `remove_unknown_skill_marker` when the canon knows
+/// the skill meanwhile — the marker is a live hand-back now, deleting it
+/// would lose the edit. The frontend matches the string.
+pub const ERR_MARKER_RULE_KNOWN: &str = "rule_marker_now_known";
+
+/// T-000263: delete a stale `.approved` marker the scan keeps reporting as
+/// `rule_unknown_skill`. The marker is a local service file (it never travels
+/// in git — T-000244), so the app may delete it on the owner's word; the rule
+/// copy beside it is left alone either way.
+///
+/// The refusal matters more than the deletion: when the canon has learnt the
+/// skill since the issue was raised (the owner canonised it, or a bundle
+/// update seeded it), the marker is a live hand-back of that rule and
+/// deleting it would silently drop the edit — so the delete re-checks the
+/// canon under the rules lock rather than trusting the toast's stale premise.
+pub fn remove_unknown_skill_marker(
+    db: &AppDb,
+    repo_id: i64,
+    file_name: &str,
+) -> Result<(), String> {
+    // The name is a file name, never a path: anything else is rejected before
+    // it can reach the filesystem.
+    let valid = file_name.ends_with(&format!(".md{}", APPROVED_SUFFIX))
+        && !file_name.contains('/')
+        && !file_name.contains('\\')
+        && !file_name.contains("..")
+        && file_name.len() > ".md".len() + APPROVED_SUFFIX.len();
+    if !valid {
+        return Err(format!("not a marker file name: {file_name}"));
+    }
+    let name = file_name
+        .strip_suffix(APPROVED_SUFFIX)
+        .and_then(|stem| stem.strip_suffix(".md"))
+        .unwrap_or_default()
+        .to_string();
+
+    let _guard = rules_guard();
+    let known = list_skill_templates(db)?;
+    if known.iter().any(|(skill, _)| skill == &name) {
+        return Err(ERR_MARKER_RULE_KNOWN.to_string());
+    }
+    let repo = db
+        .get_repository(repo_id)
+        .map_err(|e| format!("repo {repo_id}: {e}"))?;
+    let path = repo
+        .local_path
+        .as_deref()
+        .ok_or_else(|| format!("repo {repo_id} has no local path"))?;
+    let marker = Path::new(path)
+        .join("docs")
+        .join("sdh_skills")
+        .join(file_name);
+    remove_if_present(&marker).map_err(|e| format!("{}: {e}", marker.display()))
+}
+
 /// Whether `<dir>/<name>.md.approved` exists.
 fn has_marker(dir: &Path, name: &str) -> bool {
     dir.join(format!("{}.md{}", name, APPROVED_SUFFIX)).exists()
@@ -641,7 +696,8 @@ fn classify(
             let Some(current) = known.get(name) else {
                 out.errors.push(
                     SyncIssue::new(SyncIssueCode::RuleUnknownSkill, label)
-                        .target(marker.file_name()),
+                        .target(marker.file_name())
+                        .repo_id(scan.repo_id),
                 );
                 continue;
             };
@@ -2345,6 +2401,7 @@ mod tests {
         let (repo, skills) = rendered_repo(&db, &tmp, "a");
         hand_back(&skills, "sdh-invented", "BRAND NEW RULE", "");
 
+        let repo_id = repo.id;
         let Collected { taken, errors, .. } = collect_approved_skill_edits(&db, &[repo], None);
 
         assert!(taken.is_empty());
@@ -2359,6 +2416,78 @@ mod tests {
             errors[0].target.as_deref(),
             Some("sdh-invented.md.approved")
         );
+        // T-000263: the issue carries the repo it can be acted on in.
+        assert_eq!(errors[0].repo_id, Some(repo_id));
+    }
+
+    // ── T-000263: deleting a stale marker from the app ───────────────────────
+
+    #[test]
+    fn test_remove_unknown_skill_marker_deletes_only_the_marker() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        hand_back(&skills, "sdh-invented", "BRAND NEW RULE", "");
+
+        remove_unknown_skill_marker(&db, repo.id, "sdh-invented.md.approved").unwrap();
+
+        assert!(
+            !skills.join("sdh-invented.md.approved").exists(),
+            "the marker is gone, so the next pass reports nothing"
+        );
+        assert_eq!(
+            fs::read_to_string(skills.join("sdh-invented.md")).unwrap(),
+            "BRAND NEW RULE",
+            "the copy beside it — the local rule's text — is left alone"
+        );
+    }
+
+    #[test]
+    fn test_remove_unknown_skill_marker_refuses_a_live_hand_back() {
+        // The premise of the issue is stale the moment the canon learns the
+        // skill: the same marker is then a live hand-back of that rule, and
+        // deleting it would silently drop the edit.
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        hand_back(&skills, "sdh-alpha", "ALPHA REVISED", "");
+
+        let err = remove_unknown_skill_marker(&db, repo.id, "sdh-alpha.md.approved")
+            .expect_err("a known skill's marker is a live hand-back");
+
+        assert_eq!(err, ERR_MARKER_RULE_KNOWN);
+        assert!(
+            skills.join("sdh-alpha.md.approved").exists(),
+            "the marker survives — the next pass collects it as a hand-back"
+        );
+    }
+
+    #[test]
+    fn test_remove_unknown_skill_marker_rejects_paths_and_is_idempotent() {
+        let db = db_with_skill();
+        let tmp = TempDir::new().unwrap();
+        let (repo, skills) = rendered_repo(&db, &tmp, "a");
+        // A canary outside docs/sdh_skills the traversal must never reach.
+        let canary = tmp.path().join("docs").join("todo.md");
+        fs::write(&canary, "canary").unwrap();
+
+        for bad in [
+            "../todo.md.approved",
+            "..\\x.md.approved",
+            "a/b.md.approved",
+            ".md.approved",
+        ] {
+            assert!(
+                remove_unknown_skill_marker(&db, repo.id, bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "canary");
+
+        // Already gone counts as removed (remove_if_present semantics): a
+        // second click, or a pass that cleared it first, is not an error.
+        remove_unknown_skill_marker(&db, repo.id, "sdh-ghost.md.approved").unwrap();
+        let _ = skills;
     }
 
     // ── T-000174: the collection leaves a history behind ─────────────────────

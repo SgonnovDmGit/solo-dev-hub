@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatSyncIssues } from '$lib/utils/sync-issues';
+  import { toastSyncIssues } from '$lib/utils/sync-issues';
   import { onMount } from 'svelte';
   import '../app.css';
   import { currentScreen, navigateTo, goBack } from '$lib/stores/ui';
@@ -13,9 +13,10 @@
   import { addToast } from '$lib/stores/ui';
   import { resolveMergeWithLocal, forceInsertGithubRepo, takeStartupRulesReport } from '$lib/api/tauri-commands';
   import { toastRulesFindings } from '$lib/utils/rules-report';
-  import { tStore, tf, initLocale } from '$lib/i18n';
+  import { tStore, tf, t, initLocale } from '$lib/i18n';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { checkForUpdate, updaterStatus } from '$lib/stores/updater';
+  import { proposalsSummary, startProposalsPolling } from '$lib/stores/proposals';
   import Toast from '$lib/components/Toast.svelte';
   import MergeChoiceDialog from '$lib/components/MergeChoiceDialog.svelte';
   import Sidebar from '$lib/components/Sidebar.svelte';
@@ -63,7 +64,7 @@
       if (!report) return;
       toastRulesFindings(report);
       if (report.errors.length > 0) {
-        addToast(tf('toast.rulesStartupErrors', formatSyncIssues(report.errors)), 'warning');
+        toastSyncIssues(t('toast.rulesStartupErrors'), report.errors, 'warning');
       }
     } catch (e) {
       console.warn('startup rules report unavailable', e);
@@ -79,6 +80,7 @@
   }
 
   onMount(async () => {
+    startProposalsPolling();
     await initLocale();
     await loadSettings();
     await initUiScale();
@@ -190,6 +192,20 @@
           title={$tStore('about.update.badge' as any)}
         >
           ⬇ {tf('about.update.headerCta' as any, $updaterStatus.version)}
+        </button>
+      {/if}
+      {#if $proposalsSummary.open_manual > 0 || $proposalsSummary.auto_decided_recent > 0 || $proposalsSummary.attention}
+        <!-- T-000264: the rule-proposals chip. Shows while there is anything
+             to tell: open manual-actionable count, or the persisted
+             auto-decided counter, or the attention state alone (a conflict
+             with nothing clickable still must surface). -->
+        <button
+          class="proposals-chip titlebar-btn"
+          class:attention={$proposalsSummary.attention}
+          onclick={() => navigateTo('rules')}
+          title={$tStore('rules.chip.tooltip' as any)}
+        >
+          📜 {#if $proposalsSummary.open_manual > 0}{$proposalsSummary.open_manual}{/if}{#if $proposalsSummary.auto_decided_recent > 0}<span class="auto-count">{tf('rules.chip.autoCount' as any, $proposalsSummary.auto_decided_recent)}</span>{/if}
         </button>
       {/if}
       <button
@@ -443,6 +459,26 @@
   .titlebar-btn.active {
     background-color: var(--border);
     color: var(--accent);
+  }
+
+  .proposals-chip {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 10px;
+    color: inherit;
+    font-weight: 600;
+  }
+  .proposals-chip:hover {
+    background: rgba(255, 255, 255, 0.18);
+  }
+  .proposals-chip.attention {
+    border-color: #e5534b;
+    color: #ffb3ae;
+  }
+  .proposals-chip .auto-count {
+    opacity: 0.75;
+    font-weight: 400;
+    margin-left: 4px;
   }
 
   .update-cta {

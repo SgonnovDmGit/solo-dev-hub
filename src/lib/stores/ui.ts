@@ -9,10 +9,23 @@ export interface ScreenState {
 
 export type ToastType = 'success' | 'error' | 'info' | 'warning';
 
+export interface ToastAction {
+  /** Already-translated button label. */
+  label: string;
+  /** Already-translated confirmation dialog strings. */
+  confirmTitle: string;
+  confirmMessage: string;
+  /** Runs after the user confirms; resolve true to dismiss the toast. */
+  run: () => boolean | Promise<boolean>;
+}
+
 export interface Toast {
   id: number;
   message: string;
   type: ToastType;
+  /** T-000263: an action the toast offers next to its text (a stale
+   *  `.approved` marker's deletion today). */
+  action?: ToastAction;
 }
 
 let toastCounter = 0;
@@ -40,9 +53,9 @@ export function goBack(): void {
 }
 export const toasts = writable<Toast[]>([]);
 
-export function addToast(message: string, type: ToastType = 'info', opts?: { persist?: boolean }): void {
+export function addToast(message: string, type: ToastType = 'info', opts?: { persist?: boolean; action?: ToastAction }): void {
   const id = ++toastCounter;
-  toasts.update((list) => [...list, { id, message, type }]);
+  toasts.update((list) => [...list, { id, message, type, action: opts?.action }]);
 
   // B-000027: errors/warnings persist until the user dismisses them (they may be
   // long and need reading/copying). Transient success/info auto-dismiss after 5s.

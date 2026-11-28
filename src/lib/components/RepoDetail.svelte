@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { formatSyncIssues } from '$lib/utils/sync-issues';
+  import { formatSyncIssues, toastSyncIssues } from '$lib/utils/sync-issues';
   import { open } from '@tauri-apps/plugin-dialog';
   import { allRepos, assignRepo, loadAllRepos, isSyncing, adminRepos } from '$lib/stores/repos';
   import { projects, loadProjects } from '$lib/stores/projects';
   import { currentScreen, selectedRepoId, deployDrillTarget } from '$lib/stores/ui';
   import { loadBugsForRepo as storeLoadBugsForRepo, clearBugs } from '$lib/stores/bugs';
-  import { setRepoLocalPath, cloneRepoTo, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch, getRepoStructure, listJoinRequests, approveJoinRequest, sharedParticipantsActivity, setProjectAutoSync } from '$lib/api/tauri-commands';
-  import type { RepoRename, ProjectStructure, JoinRequest, ParticipantActivity, SyncIssue } from '$lib/types';
+  import { setRepoLocalPath, cloneRepoTo, getRepoStatsSummary, deleteRepository, setDeployTarget, listTemplateLanguages, initDocsForRepo, updateRepoDescription, listRenamesForRepo, checkGitAvailableForRepo, getAutocommitBranch, setAutocommitBranch, getRepoCurrentBranch, getRepoStructure, listJoinRequests, approveJoinRequest, sharedParticipantsActivity, setProjectAutoSync, chronologyGate, activateChronology } from '$lib/api/tauri-commands';
+  import type { RepoRename, ProjectStructure, JoinRequest, ParticipantActivity, SyncIssue, ChronologyGate } from '$lib/types';
   import { deleteRepoOnGitHub, splitRepoFullName, listBranches, type BranchInfo } from '$lib/api/github';
   import { addToast } from '$lib/stores/ui';
   import { getRoleLabel, getDisplayName, type Role } from '$lib/types';
@@ -78,6 +78,9 @@
   );
   let structure = $state<ProjectStructure | null>(null);
   let joinRequests = $state<JoinRequest[]>([]);
+  // T-000266: chronology gate of this repo (owner's install only).
+  let chronoGate = $state<ChronologyGate | null>(null);
+  let activatingChrono = $state(false);
   // The repo `structure` and `joinRequests` were loaded for; null while loading.
   let sharedDataRepoId = $state<number | null>(null);
   let approving = $state<string | null>(null);
@@ -143,19 +146,22 @@
     }
     const owner = isOwnerInstall;
     try {
-      const [s, r] = await Promise.all([
+      const [s, r, g] = await Promise.all([
         getRepoStructure(id),
         owner ? listJoinRequests(id) : Promise.resolve([] as JoinRequest[]),
+        owner ? chronologyGate(id).catch(() => null) : Promise.resolve(null),
       ]);
       if (repo?.id === id) {
         structure = s;
         joinRequests = r;
+        chronoGate = g;
         sharedDataRepoId = id;
       }
     } catch {
       if (repo?.id === id) {
         structure = null;
         joinRequests = [];
+        chronoGate = null;
         sharedDataRepoId = null;
       }
     }
@@ -168,6 +174,7 @@
     void $selectedRepoId;
     structure = null;
     joinRequests = [];
+    chronoGate = null;
     sharedDataRepoId = null;
     preflightErrors = [];
   });
@@ -219,6 +226,23 @@
       addToast($tStore('shared.approveFailed' as any).replace('{0}', String(err)), 'error');
     } finally {
       approving = null;
+    }
+  }
+
+  // T-000266: the owner confirmed the activation — one commit on dev.
+  async function handleActivateChronology() {
+    if (!repo || activatingChrono || sharedDataRepoId !== repo.id) return;
+    const repoId = sharedDataRepoId;
+    activatingChrono = true;
+    try {
+      const res = await activateChronology(repoId);
+      const key = res.pushed ? 'shared.chrono.done' : 'shared.chrono.donePending';
+      addToast($tStore(key as any), 'success');
+      await handleSharedChanged();
+    } catch (err) {
+      addToast($tStore('shared.chrono.failed' as any).replace('{0}', String(err)), 'error');
+    } finally {
+      activatingChrono = false;
     }
   }
 
@@ -588,10 +612,7 @@
       // pending hand-backs across the portfolio first.
       toastRulesFindings(outcome.rules);
       if (outcome.rules.errors.length > 0) {
-        addToast(
-          $tStore('toast.ruleApplyErrors' as any).replace('{0}', formatSyncIssues(outcome.rules.errors)),
-          'error'
-        );
+        toastSyncIssues($tStore('toast.ruleApplyErrors' as any), outcome.rules.errors, 'error');
       }
     } catch (err) {
       addToast(String(err), 'error');
@@ -969,6 +990,9 @@
         {approving}
         onApprove={handleApprove}
         activity={activityMap}
+        gate={chronoGate}
+        activating={activatingChrono}
+        onActivate={handleActivateChronology}
       />
     {:else if activeTab === 'deploy'}
       {#if repo.github_name && repo.deploy_target}

@@ -35,6 +35,7 @@ export const SYNC_ISSUE_CODES = [
   'shared_pending_approval',
   'shared_merge_deferred',
   'shared_no_login',
+  'shared_clock_degraded',
   'clone_target_invalid',
   'clone_failed',
   'clone_attach_failed',
@@ -64,6 +65,9 @@ export interface SyncIssue {
   subject: string;
   target?: string;
   detail?: string;
+  /** T-000263: the repo an actionable issue can be acted on in
+   *  (`rule_unknown_skill` today); absent on every other code. */
+  repo_id?: number;
 }
 
 export interface SyncResult {
@@ -234,6 +238,24 @@ export interface ApproveJoinResult {
   /** The approval commit is on `origin/<dev>` already; `false` = it rides the next sync. */
   published: boolean;
   /** Why the approval is only local (diverged dev, refused push, no git…). */
+  note: string | null;
+}
+
+/** T-000266: chronology-activation readiness of a shared repo (spec D1a gate). */
+export interface ChronologyGate {
+  /** The protocol already rides the refs — the question is settled. */
+  active: boolean;
+  /** Every participant publishes a chronology-capable version — the button may be pressed. */
+  ready: boolean;
+  /** Human-readable blockers: who is missing or too old. */
+  blockers: string[];
+}
+
+/** T-000266: result of the activation commit. */
+export interface ActivationOutcome {
+  commit: string | null;
+  /** The activation commit is on origin already; false = it rides the next sync. */
+  pushed: boolean;
   note: string | null;
 }
 

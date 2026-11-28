@@ -1,9 +1,24 @@
 <script lang="ts">
-  import { toasts, dismissToast } from '$lib/stores/ui';
+  import { toasts, dismissToast, type Toast } from '$lib/stores/ui';
   import { tStore } from '$lib/i18n';
+  import ConfirmDialog from './ConfirmDialog.svelte';
 
   // B-000027: brief per-toast "copied" feedback on the copy button.
   let copiedId = $state<number | null>(null);
+
+  // T-000263: the toast whose action confirmation is open (one at a time).
+  let confirmingId = $state<number | null>(null);
+
+  async function confirmAction(toast: Toast) {
+    confirmingId = null;
+    if (!toast.action) return;
+    try {
+      if (await toast.action.run()) dismissToast(toast.id);
+    } catch {
+      // The action reports its own failures; a slip through must not take
+      // the toast down with it.
+    }
+  }
 
   async function copyToast(id: number, message: string) {
     try {
@@ -30,6 +45,14 @@
       >
         <span class="toast-message selectable">{toast.message}</span>
         <div class="toast-tools">
+          {#if toast.action}
+            <button
+              class="toast-tool toast-action"
+              onclick={() => (confirmingId = toast.id)}
+            >
+              {toast.action.label}
+            </button>
+          {/if}
           <button
             class="toast-tool"
             onclick={() => copyToast(toast.id, toast.message)}
@@ -48,6 +71,14 @@
           </button>
         </div>
       </div>
+      {#if confirmingId === toast.id && toast.action}
+        <ConfirmDialog
+          title={toast.action.confirmTitle}
+          message={toast.action.confirmMessage}
+          onConfirm={() => void confirmAction(toast)}
+          onCancel={() => (confirmingId = null)}
+        />
+      {/if}
     {/each}
   </div>
 {/if}
@@ -132,6 +163,17 @@
     flex-shrink: 0;
   }
 
+  .toast-action {
+    width: auto;
+    padding: 0 8px;
+    font-size: 11px;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .toast-action:hover {
+    background: rgba(255, 255, 255, 0.12);
+  }
   .toast-tool {
     background: transparent;
     border: none;

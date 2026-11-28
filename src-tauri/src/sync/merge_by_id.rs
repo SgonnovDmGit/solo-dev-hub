@@ -83,19 +83,19 @@ pub fn merge_shared_bytes(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct Ent {
-    key: String,
+pub(crate) struct Ent {
+    pub(crate) key: String,
     /// Line prefix after the indentation: `- `, `- [ ] `, `- [x] `.
-    marker: String,
+    pub(crate) marker: String,
     /// Raw (escape-preserving, trimmed) pipe-separated fields.
-    fields: Vec<String>,
+    pub(crate) fields: Vec<String>,
     /// Key of the nearest preceding `## ` header, `""` before the first one.
-    section: String,
+    pub(crate) section: String,
     /// The original line text without the line ending.
-    raw: String,
+    pub(crate) raw: String,
 }
 
-enum Line {
+pub(crate) enum Line {
     Header {
         key: String,
         text: String,
@@ -107,10 +107,10 @@ enum Line {
     Other(String),
 }
 
-struct Doc {
-    lines: Vec<Line>,
-    ents: Vec<Ent>,
-    by_key: HashMap<String, usize>,
+pub(crate) struct Doc {
+    pub(crate) lines: Vec<Line>,
+    pub(crate) ents: Vec<Ent>,
+    pub(crate) by_key: HashMap<String, usize>,
     /// header key -> full header line
     hdrs: HashMap<String, String>,
     crlf: bool,
@@ -223,7 +223,7 @@ fn detect(kind: SharedFileKind, trimmed: &str) -> Option<(String, Vec<String>)> 
     }
 }
 
-fn parse(kind: SharedFileKind, input: &str) -> Doc {
+pub(crate) fn parse(kind: SharedFileKind, input: &str) -> Doc {
     let (bom, s) = match input.strip_prefix('\u{feff}') {
         Some(rest) => (true, rest),
         None => (false, input),
@@ -293,6 +293,98 @@ fn parse(kind: SharedFileKind, input: &str) -> Doc {
 // Field rules
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// UTC-chronology resolution (T-000267 / spec 2026-11-27-shared-sync-utc-chronology)
+// ---------------------------------------------------------------------------
+
+use crate::sync::edit_clocks::{field_key, row_key, value_hash, ClockEntry, ClockLedger};
+use std::cell::RefCell;
+
+/// The clocked-resolution context: the union ledger of both sides plus the
+/// diagnostics the merge collects for the caller to surface as sync issues.
+/// Post-activation there is no positional fallback — when neither side holds
+/// a valid stamp the merge still terminates (a total function must), but it
+/// ties-breaks deterministically on content and SAYS SO in the diagnostics,
+/// never silently by machine position.
+pub struct Clocks<'a> {
+    pub ledger: &'a ClockLedger,
+    pub diags: RefCell<Vec<String>>,
+    /// UTC seconds at the merge start — the reference for far-future
+    /// quarantine (T-000267): stamps beyond now+skew never decide resolution.
+    pub now: i64,
+}
+
+impl<'a> Clocks<'a> {
+    pub fn new(ledger: &'a ClockLedger) -> Self {
+        Clocks {
+            ledger,
+            diags: RefCell::new(Vec::new()),
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        }
+    }
+    fn diag(&self, msg: String) {
+        self.diags.borrow_mut().push(msg);
+    }
+}
+
+/// The entry of `key` when it validly stamps `value` — the hash must match,
+/// or the stamp belongs to a different value and conservatively counts as
+/// absent (spec D1: separate convergence of content and ledger can never pair
+/// a new stamp with an old value).
+fn valid_stamp<'a>(
+    ledger: &'a ClockLedger,
+    key: &str,
+    value: &str,
+    now: i64,
+) -> Option<&'a ClockEntry> {
+    let e = ledger.get(key)?;
+    if e.is_quarantined(now) {
+        return None;
+    }
+    if !e.del && e.h == value_hash(value.as_bytes()) {
+        Some(e)
+    } else {
+        None
+    }
+}
+
+/// The clocked both-changed arbiter: the side whose value carries the later
+/// valid stamp wins. The ledger holds at most one winner per key, so at most
+/// one side can match in practice; a neither-match is degraded mode — content
+/// order decides (deterministic on every machine, keeping commutativity) and
+/// the key is reported.
+fn pick_clocked(clocks: &Clocks, key: &str, o: &str, t: &str) -> String {
+    let so = valid_stamp(clocks.ledger, key, o, clocks.now);
+    let st = valid_stamp(clocks.ledger, key, t, clocks.now);
+    match (so, st) {
+        (Some(a), Some(b)) => {
+            if b.t > a.t || (b.t == a.t && b.src > a.src) {
+                t.to_string()
+            } else {
+                o.to_string()
+            }
+        }
+        (Some(_), None) => o.to_string(),
+        (None, Some(_)) => t.to_string(),
+        (None, None) => {
+            clocks.diag(format!(
+                "no valid stamp on either side for {} — content order decided",
+                key
+            ));
+            // Deterministic degraded tie-break: never positional. The larger
+            // value wins identically on both machines.
+            if t > o {
+                t.to_string()
+            } else {
+                o.to_string()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Role {
     Other,
@@ -341,7 +433,16 @@ fn status_rank(role: Role, v: &str) -> i32 {
 }
 
 /// Three-way pick of one field. `b` is `None` when the base has no such field.
-fn pick(role: Role, b: Option<&str>, o: &str, t: &str) -> String {
+/// `clocks`/`ckey` carry the UTC-resolution context; the base-match rules above
+/// stay genuine three-way in both modes.
+fn pick(
+    role: Role,
+    b: Option<&str>,
+    o: &str,
+    t: &str,
+    clocks: Option<&Clocks>,
+    ckey: Option<String>,
+) -> String {
     if o == t {
         return o.to_string();
     }
@@ -353,19 +454,24 @@ fn pick(role: Role, b: Option<&str>, o: &str, t: &str) -> String {
             return o.to_string();
         }
     }
-    match role {
-        Role::TaskStatus | Role::BugStatus => {
-            if status_rank(role, t) > status_rank(role, o) {
-                t.to_string()
-            } else {
-                o.to_string()
+    match clocks {
+        // Post-activation: monotonic rules (status rank, max attempts) are
+        // abolished — the later UTC decision wins, whatever direction it moves.
+        Some(c) => pick_clocked(c, &ckey.unwrap_or_default(), o, t),
+        None => match role {
+            Role::TaskStatus | Role::BugStatus => {
+                if status_rank(role, t) > status_rank(role, o) {
+                    t.to_string()
+                } else {
+                    o.to_string()
+                }
             }
-        }
-        Role::Attempts => match (o.trim().parse::<i64>(), t.trim().parse::<i64>()) {
-            (Ok(a), Ok(b)) if b > a => t.to_string(),
-            _ => o.to_string(),
+            Role::Attempts => match (o.trim().parse::<i64>(), t.trim().parse::<i64>()) {
+                (Ok(a), Ok(b)) if b > a => t.to_string(),
+                _ => o.to_string(),
+            },
+            Role::Other => o.to_string(),
         },
-        Role::Other => o.to_string(),
     }
 }
 
@@ -407,10 +513,26 @@ fn build_line(indent_from: &Ent, marker: &str, fields: &[String]) -> String {
     format!("{}{}{}", indent, marker, fields.join(" | "))
 }
 
-fn merge_both(kind: SharedFileKind, b: Option<&Ent>, o: &Ent, t: &Ent) -> Merged {
-    // Fields of different arity (legacy lines): no positional merge possible;
+fn merge_both(
+    kind: SharedFileKind,
+    b: Option<&Ent>,
+    o: &Ent,
+    t: &Ent,
+    clocks: Option<&Clocks>,
+) -> Merged {
+    // Fields of different arity (legacy lines): no positional merge possible.
+    // Clocked mode: the whole row is one unit keyed by `r:<id>` (spec D2 —
+    // legacy rows fall back to row-level stamps). Positional mode unchanged:
     // the side that changed wins, ours on a tie.
     if o.fields.len() != t.fields.len() {
+        if let Some(c) = clocks {
+            let w = pick_clocked(c, &row_key(&o.key), &o.raw, &t.raw);
+            let src_side = if w == t.raw { t } else { o };
+            return Merged {
+                section: src_side.section.clone(),
+                line: w,
+            };
+        }
         let pick_theirs = b.map_or(false, |b| same(b, o));
         let w = if pick_theirs { t } else { o };
         return Merged {
@@ -420,17 +542,25 @@ fn merge_both(kind: SharedFileKind, b: Option<&Ent>, o: &Ent, t: &Ent) -> Merged
     }
     let n = o.fields.len();
     let bf = b.filter(|b| b.fields.len() == n);
+    // Marker and section carry no field index of their own — in clocked mode
+    // they resolve by the row-level stamp (granularity caveat: the row stamp
+    // is the row's latest edit of any kind, documented in the spec's D2).
+    let rowk = clocks.map(|_| row_key(&o.key));
     let marker = pick(
         Role::Other,
         b.map(|b| b.marker.as_str()),
         &o.marker,
         &t.marker,
+        clocks,
+        rowk.clone(),
     );
     let section = pick(
         Role::Other,
         b.map(|b| b.section.as_str()),
         &o.section,
         &t.section,
+        clocks,
+        rowk,
     );
     let fields: Vec<String> = (0..n)
         .map(|i| {
@@ -439,6 +569,8 @@ fn merge_both(kind: SharedFileKind, b: Option<&Ent>, o: &Ent, t: &Ent) -> Merged
                 bf.map(|b| b.fields[i].as_str()),
                 &o.fields[i],
                 &t.fields[i],
+                clocks,
+                clocks.map(|_| field_key(&o.key, i)),
             )
         })
         .collect();
@@ -458,10 +590,52 @@ fn decide(
     b: Option<&Ent>,
     o: Option<&Ent>,
     t: Option<&Ent>,
+    clocks: Option<&Clocks>,
 ) -> Option<Merged> {
     match (o, t) {
-        (Some(o), Some(t)) => Some(merge_both(kind, b, o, t)),
+        (Some(o), Some(t)) => Some(merge_both(kind, b, o, t, clocks)),
         (Some(x), None) | (None, Some(x)) => {
+            if let Some(c) = clocks {
+                // Clocked existence (spec D2): the deletion's tombstone time
+                // against the survivor's row-edit time — the later UTC
+                // decision wins, in EITHER direction (a re-add/reopen after
+                // the deletion legitimately resurrects). The positional
+                // "status/section-only" exception is abolished.
+                let key = row_key(&x.key);
+                let tomb = c
+                    .ledger
+                    .get(&key)
+                    .filter(|e| e.del && !e.is_quarantined(c.now));
+                let edit = valid_stamp(c.ledger, &key, &x.raw, c.now);
+                let keep = match (tomb, edit) {
+                    (Some(d), Some(e)) => e.t > d.t || (e.t == d.t && e.src > d.src),
+                    // A changed survivor with no stamps either way: genuine
+                    // three-way still applies — an UNCHANGED row loses to the
+                    // deletion, a changed one conservatively stays (deletion
+                    // is destructive, resurrection is visible) and reports.
+                    (None, None) => {
+                        if b.map_or(false, |b| same(b, x)) {
+                            return None;
+                        }
+                        c.diag(format!(
+                            "no valid stamp for existence of {} — kept conservatively",
+                            key
+                        ));
+                        true
+                    }
+                    // Only one side stamped: the stamped decision is the
+                    // newer knowledge by construction of the union ledger.
+                    (Some(_), None) => false,
+                    (None, Some(_)) => true,
+                };
+                if !keep {
+                    return None;
+                }
+                return Some(Merged {
+                    section: x.section.clone(),
+                    line: x.raw.clone(),
+                });
+            }
             if let Some(b) = b {
                 if same(b, x) {
                     return None;
@@ -588,7 +762,15 @@ pub fn merge_shared_file(
     ours: &str,
     theirs: &str,
 ) -> Result<String, MergeError> {
-    merge_with_bases(kind, base, ours, theirs, &HashMap::new(), &HashMap::new())
+    merge_with_bases(
+        kind,
+        base,
+        ours,
+        theirs,
+        &HashMap::new(),
+        &HashMap::new(),
+        None,
+    )
 }
 
 /// Per-entity base (T-000226). `versions` are the distinct texts of the file
@@ -661,7 +843,99 @@ pub fn merge_shared_file_with_ancestors(
         &mut ent_overrides,
         &mut hdr_overrides,
     );
-    merge_with_bases(kind, base, ours, theirs, &ent_overrides, &hdr_overrides)
+    merge_with_bases_clocked(
+        kind,
+        base,
+        ours,
+        theirs,
+        &ent_overrides,
+        &hdr_overrides,
+        None,
+    )
+    .map(|(text, _)| text)
+}
+
+/// The clocked entry point (T-000267): the same pipeline, but every
+/// both-changed tie and every deletion-vs-edit decision resolves by the union
+/// ledger's UTC stamps instead of positional rules. Returns the merged text
+/// plus the diagnostics the caller surfaces as sync issues — a merge that had
+/// to decide without valid stamps is degraded, never silent.
+///
+/// Slice 1 scope: entity fields, marker/section (row-level stamp) and
+/// existence. Structure keying (`__structure__`) and prose clocks land in the
+/// next slice — until then ordering and prose follow the positional assembly.
+pub fn merge_shared_file_clocked(
+    kind: SharedFileKind,
+    base: &str,
+    ancestry: Option<&str>,
+    versions: &[String],
+    ours_seq: &[usize],
+    theirs_seq: &[usize],
+    ancestors: &[Option<String>],
+    ours: &str,
+    theirs: &str,
+    ledger: &ClockLedger,
+) -> Result<(String, Vec<String>), MergeError> {
+    let mut ent_overrides = entity_bases(
+        kind, base, ancestry, versions, ours_seq, theirs_seq, ours, theirs,
+    );
+    let mut hdr_overrides = header_bases(
+        kind, base, ancestry, versions, ours_seq, theirs_seq, ours, theirs,
+    );
+    apply_stale_overrides(
+        kind,
+        base,
+        theirs,
+        ancestors,
+        &mut ent_overrides,
+        &mut hdr_overrides,
+    );
+    let clocks = Clocks::new(ledger);
+    let quarantined = ledger.quarantined_keys(clocks.now);
+    if !quarantined.is_empty() {
+        let shown: Vec<&str> = quarantined.iter().take(3).map(|s| s.as_str()).collect();
+        clocks.diag(format!(
+            "{} key(s) frozen by far-future stamps (a wrong-clock machine wrote them) — they decide nothing here: {}{}",
+            quarantined.len(),
+            shown.join(", "),
+            if quarantined.len() > 3 { ", ..." } else { "" }
+        ));
+    }
+    let text = merge_with_bases(
+        kind,
+        base,
+        ours,
+        theirs,
+        &ent_overrides,
+        &hdr_overrides,
+        Some(&clocks),
+    )?;
+    let diags = clocks.diags.into_inner();
+    Ok((text, diags))
+}
+
+/// Thin wrapper over `merge_with_bases` that returns the diagnostics alongside
+/// — the clocked public entry needs both, the positional ones discard them.
+fn merge_with_bases_clocked(
+    kind: SharedFileKind,
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    overrides: &HashMap<String, Option<Ent>>,
+    header_overrides: &HashMap<String, Option<String>>,
+    clocks: Option<&Clocks>,
+) -> Result<(String, Vec<String>), MergeError> {
+    let text = merge_with_bases(
+        kind,
+        base,
+        ours,
+        theirs,
+        overrides,
+        header_overrides,
+        clocks,
+    )?;
+    let diags = clocks.map(|c| c.diags.borrow().clone()).unwrap_or_default();
+    Ok((text, diags))
 }
 
 /// True when `theirs` would overwrite `base` with entity or header content
@@ -964,6 +1238,68 @@ fn header_occurrences(input: &str) -> HashMap<String, Vec<String>> {
     m
 }
 
+/// The structural fingerprint of a parsed document: the ordered sequence of
+/// section-header keys and entity keys — exactly what `__structure__` stamps
+/// bind to. Prose lines are deliberately outside the fingerprint: prose carries
+/// its own content-hash keys and never reorders entities.
+pub(crate) fn skeleton_fingerprint(doc: &Doc) -> String {
+    let mut s = String::new();
+    for l in &doc.lines {
+        match l {
+            Line::Header { key, .. } => {
+                s.push_str("H:");
+                s.push_str(key);
+                s.push('\n');
+            }
+            Line::Ent(i) => {
+                s.push_str("E:");
+                s.push_str(&doc.ents[*i].key);
+                s.push('\n');
+            }
+            _ => {}
+        }
+    }
+    crate::sync::edit_clocks::value_hash(s.as_bytes())
+}
+
+/// Which side's skeleton the assembly follows in clocked mode: the side whose
+/// fingerprint the `__structure__` stamp validly binds to. The ledger holds at
+/// most one structure entry, so at most one side can match; a neither-match is
+/// degraded — ours keeps the skeleton (positional assembly is unchanged) and
+/// the key is reported.
+fn structure_prefers_theirs(clocks: &Clocks, o: &Doc, t: &Doc) -> bool {
+    use crate::sync::edit_clocks::STRUCTURE_KEY;
+    let ho = skeleton_fingerprint(o);
+    let ht = skeleton_fingerprint(t);
+    if ho == ht {
+        return false;
+    }
+    let e = match clocks.ledger.get(STRUCTURE_KEY) {
+        Some(e) if !e.del && !e.is_quarantined(clocks.now) => e,
+        _ => {
+            // Diverging skeletons with no structure stamp at all is degraded
+            // mode: the positional fallback below is ours-relative, so it
+            // must be loud — the caller turns this into a sync issue.
+            clocks.diag(format!(
+                "missing {} stamp for diverging skeletons — ordering is positional",
+                STRUCTURE_KEY
+            ));
+            return false;
+        }
+    };
+    match (e.h == ho, e.h == ht) {
+        (true, _) => false,
+        (false, true) => true,
+        (false, false) => {
+            clocks.diag(format!(
+                "no valid {} stamp for either skeleton — ours keeps the ordering",
+                STRUCTURE_KEY
+            ));
+            false
+        }
+    }
+}
+
 fn merge_with_bases(
     kind: SharedFileKind,
     base: &str,
@@ -971,6 +1307,7 @@ fn merge_with_bases(
     theirs: &str,
     overrides: &HashMap<String, Option<Ent>>,
     header_overrides: &HashMap<String, Option<String>>,
+    clocks: Option<&Clocks>,
 ) -> Result<String, MergeError> {
     // Trivial merges: exactly what git itself would do. The base ones stand
     // for the whole file only while no row or header has a base of its own
@@ -996,6 +1333,15 @@ fn merge_with_bases(
     let o = parse(kind, ours);
     let t = parse(kind, theirs);
 
+    // Clocked structure (spec D2/T-000267 slice 2): the assembly skeleton is
+    // the side with the newer valid `__structure__` stamp — entity resolution
+    // is direction-independent under clocks, so swapping the parses for the
+    // whole pipeline below cannot skew content, only ordering and prose.
+    let (o, t) = match clocks {
+        Some(c) if structure_prefers_theirs(c, &o, &t) => (t, o),
+        _ => (o, t),
+    };
+
     // Decide every entity.
     let mut merged: HashMap<String, Option<Merged>> = HashMap::new();
     for e in o.ents.iter().chain(t.ents.iter()) {
@@ -1008,7 +1354,7 @@ fn merge_with_bases(
         };
         let eo = o.by_key.get(&e.key).map(|&i| &o.ents[i]);
         let et = t.by_key.get(&e.key).map(|&i| &t.ents[i]);
-        merged.insert(e.key.clone(), decide(kind, eb, eo, et));
+        merged.insert(e.key.clone(), decide(kind, eb, eo, et, clocks));
     }
 
     // Step A: ours skeleton.
@@ -1081,7 +1427,18 @@ fn merge_with_bases(
                         Some(h) => h.as_ref(),
                         None => b_hdr.get(key),
                     };
-                    if hb == Some(otext) && text != otext {
+                    let adopt = if hb == Some(otext) && text != otext {
+                        true
+                    } else if let (Some(c), true) = (clocks, text != otext) {
+                        // Clocked rename (T-000267): both sides hold the key
+                        // with different texts and the base rules did not
+                        // decide — the later valid stamp wins, either way.
+                        use crate::sync::edit_clocks::header_key;
+                        pick_clocked(c, &header_key(key), otext, text) == text.as_str()
+                    } else {
+                        false
+                    };
+                    if adopt {
                         if let Some(p) = find_header(&out, key) {
                             out[p].text = text.clone();
                         }
@@ -2120,5 +2477,322 @@ mod tests {
         ));
         // Empty ancestors never flag.
         assert!(!has_stale_remote_state(Todo, &new_row, &old_row, &[]));
+    }
+}
+
+#[cfg(test)]
+mod clocked_tests {
+    use super::*;
+    use crate::sync::edit_clocks::{
+        field_key, header_key, row_key, value_hash, ClockEntry, ClockLedger, STRUCTURE_KEY,
+    };
+
+    fn ent(h_val: &str, t: i64, src: &str, del: bool) -> ClockEntry {
+        ClockEntry {
+            h: value_hash(h_val.as_bytes()),
+            t,
+            src: src.to_string(),
+            del,
+        }
+    }
+
+    fn ledger_of(pairs: &[(&str, ClockEntry)]) -> ClockLedger {
+        let mut l = ClockLedger::new("docs/todo.md");
+        for (k, e) in pairs {
+            l.entries.insert(k.to_string(), e.clone());
+        }
+        l
+    }
+
+    fn merge6(base: &str, ours: &str, theirs: &str, ledger: &ClockLedger) -> (String, Vec<String>) {
+        merge_shared_file_clocked(
+            SharedFileKind::Todo,
+            base,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            ours,
+            theirs,
+            ledger,
+        )
+        .unwrap()
+    }
+
+    const BASE: &str = "## v1
+
+- [ ] T-000001 | task | 1 | low | open | 2026-10-01
+";
+
+    #[test]
+    fn clocked_field_resolution_later_utc_wins_both_orders() {
+        // Both sides moved the status off base "open": ours to in-progress,
+        // theirs to review. The stamp on "review" is later — review must win
+        // whichever side the merge runs on (positional rules would have kept
+        // the merging machine's own value or the higher rank).
+        let ours = "## v1
+
+- [ ] T-000001 | task | 1 | low | in-progress | 2026-10-01
+";
+        let theirs = "## v1
+
+- [ ] T-000001 | task | 1 | low | review | 2026-10-01
+";
+        let fwd = ledger_of(&[(&field_key("T-000001", 4), ent("review", 200, "s2", false))]);
+        let (text, diags) = merge6(BASE, ours, theirs, &fwd);
+        assert!(text.contains("| review |"), "{}", text);
+        assert!(diags.is_empty(), "{:?}", diags);
+    }
+
+    #[test]
+    fn clocked_status_moves_backward_when_later() {
+        // Monotonic ranks are abolished: a reopen (review -> open) with the
+        // later stamp wins even though its rank is LOWER.
+        let base = "## v1
+
+- [ ] T-000001 | task | 1 | low | in-progress | 2026-10-01
+";
+        let ours = "## v1
+
+- [ ] T-000001 | task | 1 | low | review | 2026-10-01
+";
+        let theirs = "## v1
+
+- [ ] T-000001 | task | 1 | low | open | 2026-10-01
+";
+        let l = ledger_of(&[(&field_key("T-000001", 4), ent("open", 300, "s3", false))]);
+        let (text, _) = merge6(base, ours, theirs, &l);
+        assert!(text.contains("| open |"), "{}", text);
+    }
+
+    #[test]
+    fn clocked_existence_tombstone_beats_stale_row_and_loses_to_reopen() {
+        let deleted_side = "## v1
+
+";
+        let live = "- [ ] T-000001 | task | 1 | low | in-progress | 2026-10-01";
+        let ours_with_row = format!(
+            "## v1
+
+{}
+",
+            live
+        );
+        // Case 1: the tombstone is the ledger's latest word — the row stays
+        // deleted even though one side still carries it (changed vs base!).
+        let tomb = ledger_of(&[(&row_key("T-000001"), {
+            let mut e = ent("", 400, "sdel", true);
+            e.h = String::new();
+            e
+        })]);
+        let (text, _) = merge6(BASE, &ours_with_row, deleted_side, &tomb);
+        assert!(!text.contains("T-000001"), "{}", text);
+        // Case 2: the reopen edit is later — the ledger entry is live and
+        // matches the surviving line, so the row is kept.
+        let reopen = ledger_of(&[(&row_key("T-000001"), ent(live, 500, "sre", false))]);
+        let (text2, _) = merge6(BASE, &ours_with_row, deleted_side, &reopen);
+        assert!(text2.contains("T-000001"), "{}", text2);
+    }
+
+    #[test]
+    fn clocked_no_stamps_is_deterministic_and_diagnosed() {
+        let ours = "## v1
+
+- [ ] T-000001 | alpha | 1 | low | open | 2026-10-01
+";
+        let theirs = "## v1
+
+- [ ] T-000001 | beta | 1 | low | open | 2026-10-01
+";
+        let empty = ledger_of(&[]);
+        let (t1, d1) = merge6(BASE, ours, theirs, &empty);
+        let (t2, d2) = merge6(BASE, theirs, ours, &empty);
+        // Degraded mode: same result on both machines (commutativity holds
+        // even without stamps) plus a loud diagnostic — never silent.
+        assert_eq!(t1, t2);
+        assert!(t1.contains("| beta |"), "{}", t1);
+        assert!(!d1.is_empty());
+        assert!(!d2.is_empty());
+    }
+
+    #[test]
+    fn clocked_structure_stamp_moves_the_skeleton() {
+        // Both sides changed the structure off base: ours reordered v2 before
+        // v1, theirs appended a new section v3 at the end. The structure stamp
+        // binds to THEIRS' fingerprint (their structural edit is the later
+        // decision) — the merged skeleton must follow theirs' ordering even
+        // though the assembly is ours-relative without clocks.
+        let base = "## v1
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+
+## v2
+
+- [ ] T-000002 | b | 1 | low | open | 2026-10-01
+";
+        let reordered = "## v2
+
+- [ ] T-000002 | b | 1 | low | open | 2026-10-01
+
+## v1
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+";
+        let appended = "## v1
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+
+## v2
+
+- [ ] T-000002 | b | 1 | low | open | 2026-10-01
+
+## v3
+
+- [ ] T-000003 | c | 1 | low | open | 2026-10-01
+";
+        let fp_theirs = {
+            let d = parse(SharedFileKind::Todo, appended);
+            skeleton_fingerprint(&d)
+        };
+        let l = ledger_of(&[(
+            STRUCTURE_KEY,
+            ClockEntry {
+                h: fp_theirs,
+                t: 500,
+                src: "s".to_string(),
+                del: false,
+            },
+        )]);
+        let (text, _) = merge6(base, reordered, appended, &l);
+        let v1 = text.find("## v1").unwrap();
+        let v2 = text.find("## v2").unwrap();
+        let v3 = match text.find("## v3") {
+            Some(p) => p,
+            None => panic!(
+                "v3 section missing:
+{}",
+                text
+            ),
+        };
+        assert!(v1 < v2 && v2 < v3, "{}", text);
+        // And commutativity: the same merge with the sides swapped yields the
+        // same ordering — the stamp decides, not the machine position.
+        let (text2, _) = merge6(base, appended, reordered, &l);
+        assert_eq!(text, text2);
+    }
+
+    #[test]
+    fn clocked_header_rename_later_stamp_wins() {
+        // Both renamed the same section header differently off base; the
+        // stamp on theirs' text is later — theirs wins regardless of position.
+        let base = "## v1 old
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+";
+        // Anti-degraded ordering: ours' text is lexicographically LARGER, so
+        // the content-order fallback would keep ours — a pass here can only
+        // come from the stamp truly deciding. Header text is the full raw
+        // line, `## ` included — the hash must bind to exactly that.
+        let ours = "## v1 zeta
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+";
+        let theirs = "## v1 beta
+
+- [ ] T-000001 | a | 1 | low | open | 2026-10-01
+";
+        // Section keys derive from the header text; the rename target key is
+        // the base key. The stamp binds to theirs' header TEXT.
+        let key = {
+            let d = parse(SharedFileKind::Todo, base);
+            match &d.lines[0] {
+                Line::Header { key, .. } => key.clone(),
+                _ => panic!("no header"),
+            }
+        };
+        let l = ledger_of(&[(&header_key(&key), ent("## v1 beta", 600, "s", false))]);
+        let (text, _) = merge6(base, ours, theirs, &l);
+        assert!(text.contains("## v1 beta"), "{}", text);
+        assert!(!text.contains("## v1 zeta"), "{}", text);
+    }
+
+    fn far_future() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 48 * 3600
+    }
+
+    #[test]
+    fn quarantined_field_stamp_decides_nothing_and_reports() {
+        // Ours moved the status to zulu, theirs to alpha; the ledger stamps
+        // "alpha" in the FAR FUTURE — a wrong-clock machine. Without
+        // quarantine consumption that poisoned stamp wins every merge
+        // forever. Frozen, it decides nothing: the degraded deterministic
+        // fallback keeps ours ("zulu" > "alpha" in content order would pick
+        // zulu whichever machine merges), and the freeze is reported.
+        let ours = "## v1
+
+- [ ] T-000001 | task | 1 | low | zulu | 2026-10-01
+";
+        let theirs = "## v1
+
+- [ ] T-000001 | task | 1 | low | alpha | 2026-10-01
+";
+        let l = ledger_of(&[(
+            &field_key("T-000001", 4),
+            ent("alpha", far_future(), "bad", false),
+        )]);
+        let (text, diags) = merge6(BASE, ours, theirs, &l);
+        assert!(text.contains("| zulu |"), "{}", text);
+        assert!(!text.contains("| alpha |"), "{}", text);
+        assert!(
+            diags.iter().any(|d| d.contains("far-future")),
+            "the freeze must be reported: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn quarantined_tombstone_cannot_delete_a_honestly_edited_row() {
+        // Ours edited the row (honest stamp t=100), theirs deleted it and a
+        // wrong-clock machine stamped the tombstone in the far future.
+        // Unconsumed, the poisoned tombstone deletes the row on every merge.
+        // Frozen, the honest edit stamp stands alone and the row survives.
+        let live = "- [ ] T-000001 | task | 1 | low | in-progress | 2026-10-01";
+        let ours_with_row = format!(
+            "## v1
+
+{}
+",
+            live
+        );
+        let deleted_side = "## v1
+
+";
+        let tomb = {
+            let mut e = ent("", far_future(), "bad", true);
+            e.h = String::new();
+            e
+        };
+        // One ledger key holds one winner — model the union result directly:
+        // the tombstone is the key's entry (later stamp won the CRDT merge),
+        // so the freeze must come from quarantine, not from losing the union.
+        let l = ledger_of(&[(&row_key("T-000001"), tomb)]);
+        let (text, _) = merge6(BASE, &ours_with_row, deleted_side, &l);
+        // With the tombstone frozen there is no deletion evidence at all;
+        // the row changed vs base, so the conservative survivor rule keeps it.
+        assert!(text.contains("T-000001"), "{}", text);
+        // And sanity: a NON-quarantined tombstone still deletes it.
+        let honest_tomb = {
+            let mut e = ent("", 400, "sdel", true);
+            e.h = String::new();
+            e
+        };
+        let l2 = ledger_of(&[(&row_key("T-000001"), honest_tomb)]);
+        let (text2, _) = merge6(BASE, &ours_with_row, deleted_side, &l2);
+        assert!(!text2.contains("T-000001"), "{}", text2);
     }
 }

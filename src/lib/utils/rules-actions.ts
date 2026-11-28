@@ -1,9 +1,9 @@
-import { tf } from '$lib/i18n';
+import { tf, t } from '$lib/i18n';
 import { addToast } from '$lib/stores/ui';
 import { aiRulesLastSyncAt } from '$lib/stores/settings';
 import { syncGlobalClaudeMd } from '$lib/api/tauri-commands';
 import type { TemplateSaveOutcome } from '$lib/types';
-import { formatSyncIssues } from './sync-issues';
+import { toastSyncIssues } from './sync-issues';
 import { toastRulesFindings } from './rules-report';
 
 /**
@@ -22,7 +22,7 @@ export function reportRuleOutcome(
   addToast(tf('toast.ruleApplied', outcome.skills, outcome.repos), 'success');
   toastRulesFindings(outcome);
   if (outcome.errors.length > 0) {
-    addToast(tf('toast.ruleApplyErrors', formatSyncIssues(outcome.errors)), 'error');
+    toastSyncIssues(t('toast.ruleApplyErrors'), outcome.errors, 'error');
   }
 }
 
@@ -37,7 +37,7 @@ export async function syncRulesFromApp(): Promise<boolean> {
     // T-000207: the render collected pending hand-backs first — name them.
     toastRulesFindings(result.rules);
     if (result.rules.errors.length > 0) {
-      addToast(tf('toast.ruleApplyErrors', formatSyncIssues(result.rules.errors)), 'error');
+      toastSyncIssues(t('toast.ruleApplyErrors'), result.rules.errors, 'error');
     }
     addToast(tf('appDefaults.syncGlobalDone', result.path), 'success');
     return true;

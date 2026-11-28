@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult, SharedPreflight, SharedMergeResult, SharedDisableResult, ApproveJoinResult, JoinRequest, ProjectStructure, ParticipantActivity } from '$lib/types';
+import type { SyncResult, RequirementInfo, RepoRename, CodexEdgeInfo, PeerChannelInfo, InitDocsOutcome, SyncGlobalClaudeResult, SharedPreflight, SharedMergeResult, SharedDisableResult, ApproveJoinResult, JoinRequest, ProjectStructure, ParticipantActivity, ChronologyGate, ActivationOutcome } from '$lib/types';
 
 
 // ── Requirements sync commands ──────────────────────────────────────────────
@@ -101,6 +101,11 @@ export async function setRepoShareSpecs(repoId: number, shareSpecs: boolean): Pr
   return invoke<string | null>('set_repo_share_specs', { repoId, shareSpecs });
 }
 
+/** T-000264: the owner's per-repo choice of who decides rule proposals. */
+export async function setRepoRuleProposalsMode(repoId: number, mode: 'auto' | 'manual'): Promise<void> {
+  return invoke<void>('set_repo_rule_proposals_mode', { repoId, mode });
+}
+
 export async function disableSharedMode(repoId: number): Promise<SharedDisableResult> {
   return invoke<SharedDisableResult>('disable_shared_mode', { repoId });
 }
@@ -111,6 +116,16 @@ export async function disableSharedMode(repoId: number): Promise<SharedDisableRe
  */
 export async function approveJoinRequest(repoId: number, login: string): Promise<ApproveJoinResult> {
   return invoke<ApproveJoinResult>('approve_join_request', { repoId, login });
+}
+
+/** T-000266: the chronology-activation readiness of a shared repo (owner-only concern). */
+export async function chronologyGate(repoId: number): Promise<ChronologyGate> {
+  return invoke<ChronologyGate>('chronology_gate', { repoId });
+}
+
+/** T-000266: the activation commit — protocol + baseline ledgers on dev, one-way. */
+export async function activateChronology(repoId: number): Promise<ActivationOutcome> {
+  return invoke<ActivationOutcome>('activate_chronology', { repoId });
 }
 
 /** Contributor: trust the owner's changed dev branch again. */

@@ -769,6 +769,8 @@ impl AppDb {
             shared_status_detail: status_detail_of(row.get::<_, Option<String>>(4)?.as_deref()),
             // T-000243: the column is NOT NULL DEFAULT 1 (v35).
             share_specs: row.get::<_, i64>(5)? != 0,
+            // T-000264: NOT NULL DEFAULT 'auto' (v38).
+            rule_proposals_mode: row.get(6)?,
         })
     }
 
@@ -776,7 +778,7 @@ impl AppDb {
     pub fn get_shared_state(&self, repo_id: i64) -> SqlResult<RepoSharedState> {
         let conn = self.conn.lock().unwrap();
         match conn.query_row(
-            "SELECT id, shared_mode, shared_role, shared_status, shared_import, share_specs
+            "SELECT id, shared_mode, shared_role, shared_status, shared_import, share_specs, rule_proposals_mode
              FROM repositories WHERE id = ?1",
             rusqlite::params![repo_id],
             Self::row_to_shared_state,
@@ -791,6 +793,7 @@ impl AppDb {
                 // T-000243: the default policy is share; UI pre-configuration
                 // reads this getter, not `list_shared_states`.
                 share_specs: true,
+                rule_proposals_mode: "auto".to_string(),
             }),
             Err(e) => Err(e),
         }
@@ -800,7 +803,7 @@ impl AppDb {
     pub fn list_shared_states(&self) -> SqlResult<Vec<RepoSharedState>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, shared_mode, shared_role, shared_status, shared_import, share_specs FROM repositories
+            "SELECT id, shared_mode, shared_role, shared_status, shared_import, share_specs, rule_proposals_mode FROM repositories
              WHERE shared_mode = 1 OR shared_role IS NOT NULL OR shared_status IS NOT NULL
              ORDER BY id",
         )?;
@@ -827,6 +830,18 @@ impl AppDb {
         conn.execute(
             "UPDATE repositories SET share_specs = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             rusqlite::params![on as i64, repo_id],
+        )?;
+        Ok(())
+    }
+
+    /// T-000264: the per-repo `rule_proposals_mode` switch — who decides rule
+    /// proposals. Same storage nature as `share_specs`: local, on the row,
+    /// independent of `shared_mode`. Validated by the column CHECK ('auto'|'manual').
+    pub fn set_repo_rule_proposals_mode(&self, repo_id: i64, mode: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE repositories SET rule_proposals_mode = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            rusqlite::params![mode, repo_id],
         )?;
         Ok(())
     }
@@ -1893,6 +1908,7 @@ mod tests {
                 shared_status_detail: None,
                 // T-000243: specs default to share, even before shared mode.
                 share_specs: true,
+                rule_proposals_mode: "auto".to_string(),
             }
         );
         // Unknown repo id: still the "not shared" state, no error — and the
@@ -1900,6 +1916,30 @@ mod tests {
         let missing = db.get_shared_state(99999).unwrap();
         assert!(!missing.shared_mode && missing.shared_role.is_none());
         assert!(missing.share_specs);
+    }
+
+    #[test]
+    fn rule_proposals_mode_defaults_to_auto_and_round_trips() {
+        // T-000264: the v38 column defaults to auto (the machine decides
+        // conflict-free proposals), the setter round-trips manual and back,
+        // and the CHECK refuses anything else.
+        let db = make_db();
+        let repo = db
+            .insert_local_repository("/tmp/x", "x", None, None)
+            .unwrap();
+        let st = db.get_shared_state(repo.id).unwrap();
+        assert_eq!(st.rule_proposals_mode, "auto");
+        db.set_repo_rule_proposals_mode(repo.id, "manual").unwrap();
+        assert_eq!(
+            db.get_shared_state(repo.id).unwrap().rule_proposals_mode,
+            "manual"
+        );
+        db.set_repo_rule_proposals_mode(repo.id, "auto").unwrap();
+        assert_eq!(
+            db.get_shared_state(repo.id).unwrap().rule_proposals_mode,
+            "auto"
+        );
+        assert!(db.set_repo_rule_proposals_mode(repo.id, "bogus").is_err());
     }
 
     #[test]

@@ -48,6 +48,15 @@ struct CoreOpts<'a> {
     /// over the committed files must not: it would delete rows that exist only
     /// in the work tree, and the next full run would re-create them.
     cleanup: bool,
+    /// T-000268: the edit-clock ledgers of todo.md and done.md, when the repo
+    /// carries them (post-activation). Their presence switches the
+    /// todo/done split-state resolution from the unconditional done-wins rule
+    /// to the UTC comparison the spec mandates: the later event decides, so a
+    /// reopen after closure legitimately resurrects the todo side.
+    clocks: Option<(
+        &'a crate::sync::edit_clocks::ClockLedger,
+        &'a crate::sync::edit_clocks::ClockLedger,
+    )>,
 }
 
 /// Sync todo.md + done.md from disk into the `tasks` DB table for the given repo.
@@ -76,10 +85,36 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
         }
     };
 
-    let todo_path = Path::new(&local_path).join("docs").join("todo.md");
-    let done_path = Path::new(&local_path).join("docs").join("done.md");
+    // Pre-activation ledgers are written so their honest timestamps accumulate,
+    // but they are inert for MD↔DB resolution until the protocol reaches dev.
+    // No git binary or no readable protocol means inactive here.
+    let active = crate::git_ops::cached_git()
+        .map(|git| crate::sync::shared::chronology_active_for_repo(&git, Path::new(&local_path)))
+        .unwrap_or(false);
+    sync_tasks_for_repo_in_checkout(db, repo_id, &local_path, active)
+}
+
+/// The checkout-bound body of `sync_tasks_for_repo`, with the activation
+/// decision injected. Tests drive the active/inactive edge directly because
+/// their ledger fixtures are plain directories without dev refs.
+fn sync_tasks_for_repo_in_checkout(
+    db: &AppDb,
+    repo_id: i64,
+    local_path: &str,
+    chronology_active: bool,
+) -> Result<SyncTasksReport, String> {
+    let root = Path::new(local_path);
+    let todo_path = root.join("docs").join("todo.md");
+    let done_path = root.join("docs").join("done.md");
     let (todo_text, todo_mtime) = read_with_mtime(&todo_path, "todo.md")?;
     let (done_text, done_mtime) = read_with_mtime(&done_path, "done.md")?;
+
+    // T-000268: the edit-clock ledgers ride next to the files they stamp.
+    // Before activation they are write-only evidence, never a resolution input;
+    // after activation their absence or corruption degrades to the legacy
+    // done-wins rule (corruption itself is reported by the sync layer).
+    let clock_ledgers = clock_ledgers_if_active(root, chronology_active);
+    let clocks = clock_ledgers.as_ref().map(|pair| (&pair.0, &pair.1));
 
     let none = |_: &str| None;
     sync_tasks_core(
@@ -93,8 +128,30 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
             author: &none,
             only_ids: None,
             cleanup: true,
+            clocks,
         },
     )
+}
+
+/// The ledger pair exactly when UTC chronology is active; otherwise `None`,
+/// byte-for-byte the pre-activation behavior of a repo without ledger files.
+fn clock_ledgers_if_active(
+    repo: &Path,
+    active: bool,
+) -> Option<(
+    crate::sync::edit_clocks::ClockLedger,
+    crate::sync::edit_clocks::ClockLedger,
+)> {
+    if !active {
+        return None;
+    }
+    load_clock_ledger(repo, "docs/todo.md").zip(load_clock_ledger(repo, "docs/done.md"))
+}
+
+/// The edit-clock ledger of one shared file, read from the repo's
+/// `.sdh/edit-clocks/` — `None` when absent or unreadable.
+fn load_clock_ledger(repo: &Path, rel: &str) -> Option<crate::sync::edit_clocks::ClockLedger> {
+    crate::sync::edit_clocks::load_worktree_ledger(repo, rel)
 }
 
 /// Text of `path` and its modification day (`YYYY-MM-DD`); `(None, "")` when the
@@ -141,6 +198,7 @@ pub fn sync_tasks_from_contents(
             author: &fixed,
             only_ids: None,
             cleanup: true,
+            clocks: None,
         },
     )
 }
@@ -203,6 +261,10 @@ pub fn sync_tasks_incoming(
             author: author_of,
             only_ids: Some(&changed),
             cleanup: false,
+            // Incoming deltas never consumed ledgers in v1.25.0; T-000285 is
+            // the separate task that will add HEAD-snapshot plumbing. When it
+            // lands it must use the same activation gate as the disk run.
+            clocks: None,
         },
     )
 }
@@ -295,10 +357,35 @@ fn sync_tasks_core(
     // ids present in done.md from the todo side *before* the loops run: the todo
     // branch then never touches such a row at all.
     let done_ids_in_md: HashSet<&str> = done_tasks.iter().map(|t| t.id.as_str()).collect();
+    // T-000268 / spec D2: when both files list the id and the ledgers are
+    // present, the UTC comparison decides which presence is the newer event.
+    // todo wins only strictly newer (ties stay with done, the legacy rule);
+    // a missing entry on either side is degraded — the legacy rule stands,
+    // because guessing here is how rows flap.
+    // T-000268 tail: a quarantined stamp (far-future, wrong-clock machine)
+    // decides nothing here either — the key is frozen out of the comparison
+    // exactly as in the merge resolution, and the legacy rule stands.
+    let now_secs = chrono::Utc::now().timestamp();
+    let todo_wins = |id: &str| -> bool {
+        let Some((tl, dl)) = opts.clocks else {
+            return false;
+        };
+        let live =
+            |e: &&crate::sync::edit_clocks::ClockEntry| !e.del && !e.is_quarantined(now_secs);
+        let te = tl.get(&crate::sync::edit_clocks::row_key(id)).filter(live);
+        let de = dl.get(&crate::sync::edit_clocks::row_key(id)).filter(live);
+        match (te, de) {
+            (Some(t), Some(d)) => t.t > d.t,
+            _ => false,
+        }
+    };
     let todo_tasks: Vec<_> = todo_tasks
         .into_iter()
         .filter(|t| {
             let in_done = done_ids_in_md.contains(t.id.as_str());
+            if in_done && todo_wins(&t.id) {
+                return true; // reopen after closure: the todo side stands
+            }
             if in_done {
                 eprintln!(
                     "[sync_tasks repo={}] {} is in both todo.md and done.md - done wins, skipping the todo side",
@@ -306,6 +393,23 @@ fn sync_tasks_core(
                 );
             }
             !in_done
+        })
+        .collect();
+    // The mirror image of the filter above: where the todo side won, the done
+    // row must not import — otherwise the DB would hold the split state the
+    // stamp comparison just resolved, and H6 would fight the clocks forever.
+    let todo_ids_in_md: HashSet<&str> = todo_tasks.iter().map(|t| t.id.as_str()).collect();
+    let done_tasks: Vec<_> = done_tasks
+        .into_iter()
+        .filter(|t| {
+            if todo_ids_in_md.contains(t.id.as_str()) && todo_wins(&t.id) {
+                eprintln!(
+                    "[sync_tasks repo={}] {} is in both todo.md and done.md - todo wins by the later stamp, skipping the done side",
+                    repo_id, t.id
+                );
+                return false;
+            }
+            true
         })
         .collect();
 
@@ -1355,5 +1459,167 @@ mod tests {
         let again =
             sync_tasks_incoming(&db, rid, (&head, ""), (Some(&head), None), &by_helper).unwrap();
         assert_eq!(again.events_emitted, 0);
+    }
+
+    // T-000268: the clocked todo/done split-state resolution.
+    fn write_clocks(repo_path: &std::path::Path, file: &str, id: &str, t: i64) {
+        use crate::sync::edit_clocks::{
+            ledger_file_name, row_key, ClockEntry, ClockLedger, CLOCKS_DIR,
+        };
+        let mut l = ClockLedger::new(file);
+        l.entries.insert(
+            row_key(id),
+            ClockEntry {
+                h: String::new(),
+                t,
+                src: format!("src{}", t),
+                del: false,
+            },
+        );
+        let dir = repo_path.join(CLOCKS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ledger_file_name(file)), l.serialize().unwrap()).unwrap();
+    }
+
+    fn setup_both_files(id: &str) -> (crate::db::AppDb, tempfile::TempDir, i64) {
+        let db = make_db_for_sync_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_path = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_path.join("docs")).unwrap();
+        std::fs::write(
+            repo_path.join("docs/todo.md"),
+            format!(
+                "- [ ] {} | Ghost task | 2 | high | open | 2026-08-01
+",
+                id
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            repo_path.join("docs/done.md"),
+            format!(
+                "## 2026-08-01
+- {} | Ghost task | v1.0.0
+",
+                id
+            ),
+        )
+        .unwrap();
+        let repo = db
+            .insert_local_repository(repo_path.to_str().unwrap(), "clocked_repo", None, None)
+            .unwrap();
+        (db, tmp, repo.id)
+    }
+
+    fn sync_both_files_fixture(
+        db: &AppDb,
+        tmp: &tempfile::TempDir,
+        repo_id: i64,
+        chronology_active: bool,
+    ) {
+        sync_tasks_for_repo_in_checkout(
+            db,
+            repo_id,
+            tmp.path().to_str().unwrap(),
+            chronology_active,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn clocked_reopen_after_closure_resurrects_the_todo_side() {
+        // The id stands in both files; the todo stamp is strictly newer than
+        // the done stamp — the reopen is the later decision and the todo side
+        // must import (the legacy rule would have suppressed it forever).
+        let (db, tmp, repo_id) = setup_both_files("T-000086");
+        let repo_path = tmp.path().to_path_buf();
+        write_clocks(&repo_path, "docs/todo.md", "T-000086", 500);
+        write_clocks(&repo_path, "docs/done.md", "T-000086", 300);
+        sync_both_files_fixture(&db, &tmp, repo_id, true);
+        let todos = db.list_tasks_by_repo(repo_id, "todo").unwrap();
+        let dones = db.list_tasks_by_repo(repo_id, "done").unwrap();
+        assert_eq!(
+            todos.len(),
+            1,
+            "todo side must stand when its stamp is newer"
+        );
+        assert!(dones.is_empty(), "done side must yield to the later reopen");
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn inactive_chronology_keeps_a_winning_todo_stamp_inert() {
+        // The ledger may already carry a strictly newer todo stamp before the
+        // owner activates chronology. Until activation it is write-only
+        // evidence: the legacy done-wins rule must decide exactly as if the
+        // ledger files were absent.
+        let (db, tmp, repo_id) = setup_both_files("T-000086");
+        let repo_path = tmp.path().to_path_buf();
+        write_clocks(&repo_path, "docs/todo.md", "T-000086", 500);
+        write_clocks(&repo_path, "docs/done.md", "T-000086", 300);
+        sync_both_files_fixture(&db, &tmp, repo_id, false);
+        assert!(
+            db.list_tasks_by_repo(repo_id, "todo").unwrap().is_empty(),
+            "pre-activation stamps must not resurrect the todo side"
+        );
+        assert_eq!(db.list_tasks_by_repo(repo_id, "done").unwrap().len(), 1);
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn clocked_closure_after_reopen_keeps_done_and_legacy_tie_breaks_done() {
+        // Newer done stamp: closure stands. And a tie (same second) stays with
+        // done — the deterministic legacy-compatible tie-break.
+        for (todo_t, done_t) in [(300i64, 500i64), (400, 400)] {
+            let (db, tmp, repo_id) = setup_both_files("T-000086");
+            let repo_path = tmp.path().to_path_buf();
+            write_clocks(&repo_path, "docs/todo.md", "T-000086", todo_t);
+            write_clocks(&repo_path, "docs/done.md", "T-000086", done_t);
+            sync_both_files_fixture(&db, &tmp, repo_id, true);
+            let todos = db.list_tasks_by_repo(repo_id, "todo").unwrap();
+            let dones = db.list_tasks_by_repo(repo_id, "done").unwrap();
+            assert!(
+                todos.is_empty(),
+                "todo must yield at t{} vs t{}",
+                todo_t,
+                done_t
+            );
+            assert_eq!(dones.len(), 1);
+            std::mem::forget(tmp);
+        }
+    }
+
+    #[test]
+    fn quarantined_todo_stamp_does_not_resurrect_the_todo_side() {
+        // A far-future todo stamp (wrong-clock machine) is numerically newer
+        // than any honest stamp — without the quarantine filter it would win
+        // every comparison forever. Frozen out, the comparison is degraded and
+        // the legacy done-wins rule stands.
+        let (db, tmp, repo_id) = setup_both_files("T-000086");
+        let repo_path = tmp.path().to_path_buf();
+        let far_future = chrono::Utc::now().timestamp() + 48 * 3600;
+        write_clocks(&repo_path, "docs/todo.md", "T-000086", far_future);
+        write_clocks(&repo_path, "docs/done.md", "T-000086", 300);
+        sync_both_files_fixture(&db, &tmp, repo_id, true);
+        assert!(
+            db.list_tasks_by_repo(repo_id, "todo").unwrap().is_empty(),
+            "a quarantined todo stamp must decide nothing"
+        );
+        assert_eq!(db.list_tasks_by_repo(repo_id, "done").unwrap().len(), 1);
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn missing_clock_entries_keep_the_legacy_done_wins_rule() {
+        // Ledgers exist but carry no entries for the id — degraded mode must
+        // not guess: the legacy rule stands, exactly as before activation.
+        let (db, tmp, repo_id) = setup_both_files("T-000086");
+        let repo_path = tmp.path().to_path_buf();
+        write_clocks(&repo_path, "docs/todo.md", "T-999999", 500);
+        write_clocks(&repo_path, "docs/done.md", "T-999999", 300);
+        sync_both_files_fixture(&db, &tmp, repo_id, true);
+        assert!(db.list_tasks_by_repo(repo_id, "todo").unwrap().is_empty());
+        assert_eq!(db.list_tasks_by_repo(repo_id, "done").unwrap().len(), 1);
+        std::mem::forget(tmp);
     }
 }

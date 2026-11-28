@@ -223,7 +223,16 @@ fn init_docs_for_repo_in(
 // across the run), keeping the UI responsive during sync.
 #[tauri::command(async)]
 pub fn sync_project(db: State<AppDb>, project_id: i64) -> Result<SyncResult, String> {
-    sync::run_project_sync(&db, project_id)
+    let result = sync::run_project_sync(&db, project_id)?;
+    // T-000264: the auto-decider is a POST-PASS step by spec — it runs only
+    // here, after the pass has ended and every specs_policy_guard in it has
+    // been dropped (the mutex is not recursive; deciding inside the pass
+    // would deadlock). A failed pass decides nothing: the state it leaves
+    // is not a verdict base. The outcome surfaces through the persisted
+    // state the decider writes (acceptance rows, history) — the SyncResult
+    // shape is not mine to widen for it.
+    crate::commands::rule_proposals::auto_decide_rule_proposals(&db);
+    Ok(result)
 }
 
 /// Contributor mode: probe the role-less repos for a shared structure and run

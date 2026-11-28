@@ -244,9 +244,28 @@ pub fn reconcile_bugs_for_repo(db: &AppDb, repo_id: i64) -> Result<(), String> {
         return Ok(());
     };
 
+    // Ledger tombstones are written before activation but stay inert for the
+    // database until the protocol reaches dev. No git binary or no readable
+    // protocol means inactive here.
+    let active = crate::git_ops::cached_git()
+        .map(|git| crate::sync::shared::chronology_active_for_repo(&git, Path::new(local_path)))
+        .unwrap_or(false);
+    reconcile_bugs_in_checkout(db, repo_id, local_path, active)
+}
+
+/// The checkout-bound body of `reconcile_bugs_for_repo`, with the activation
+/// decision injected. Tests drive the active/inactive edge directly because
+/// their ledger fixtures are plain directories without dev refs.
+fn reconcile_bugs_in_checkout(
+    db: &AppDb,
+    repo_id: i64,
+    local_path: &str,
+    chronology_active: bool,
+) -> Result<(), String> {
     // Read MD (missing file = empty rows, all active DB bugs "restored").
     let path = bug_reports_path(local_path);
-    let file_notes: Vec<FileBugNote> = if path.exists() {
+    let file_exists = path.exists();
+    let file_notes: Vec<FileBugNote> = if file_exists {
         let content = crate::export::read_to_string_lossy(&path)
             .map_err(|e| format!("Read {} failed: {}", path.display(), e))?;
         let (notes, warnings) = export::parse_bug_reports(&content);
@@ -257,6 +276,21 @@ pub fn reconcile_bugs_for_repo(db: &AppDb, repo_id: i64) -> Result<(), String> {
     } else {
         Vec::new()
     };
+
+    // T-000268 / spec D2: the edit-clock ledger beside the file. Its tombstones
+    // are how a fleet deletion reaches this install's DATABASE after chronology
+    // activation: without it the regen below resurrects the row, the next
+    // commit re-stamps it fresh, and the fresh stamp defeats the tombstone
+    // forever — the REQ-018 mechanism, one level down. Before activation the
+    // ledger is write-only evidence and is not consumed at all; after
+    // activation, absent/corrupt ledger = degraded mode and the legacy restore
+    // rule stands.
+    let ledger = if chronology_active {
+        crate::sync::edit_clocks::load_worktree_ledger(Path::new(local_path), BUG_REPORTS_REL)
+    } else {
+        None
+    };
+    let now_secs = chrono::Utc::now().timestamp();
 
     // Build lookup by numeric_id.
     let db_bugs = db
@@ -347,10 +381,35 @@ pub fn reconcile_bugs_for_repo(db: &AppDb, repo_id: i64) -> Result<(), String> {
             db.mark_bug_archived_from_md(db_bug.id)
                 .map_err(|e| e.to_string())?;
         } else if db_bug.status != "confirmed" {
-            eprintln!(
-                "[reconcile_bugs repo={}] bug {} deleted from MD by LLM — restore on regen",
-                repo_id, db_bug.display_id
-            );
+            // T-000268 (owner's decision 2026-11-29, spec open question 1
+            // variant b): a tombstone the merge resolution already honoured —
+            // the row is absent from the merged file — is a fleet deletion,
+            // not an LLM slip: the database row follows it, events and all
+            // (ON DELETE CASCADE). A locally authored deletion of an active
+            // row never survives long enough to be stamped, because this
+            // restore runs before the auto-commit in the same pass — so a
+            // tombstone present in the ledger can only have arrived from the
+            // fleet. Guards, each leaving the legacy restore in place: the
+            // file itself is gone (nothing is a row-level verdict then), no
+            // ledger entry, or a quarantined far-future stamp, which decides
+            // nothing anywhere.
+            let fleet_deleted = file_exists
+                && ledger
+                    .as_ref()
+                    .and_then(|l| l.get(&crate::sync::edit_clocks::row_key(&db_bug.display_id)))
+                    .is_some_and(|e| e.del && !e.is_quarantined(now_secs));
+            if fleet_deleted {
+                eprintln!(
+                    "[reconcile_bugs repo={}] bug {} tombstoned fleet-wide — deleting the DB row (owner decision)",
+                    repo_id, db_bug.display_id
+                );
+                db.delete_bug(db_bug.id).map_err(|e| e.to_string())?;
+            } else {
+                eprintln!(
+                    "[reconcile_bugs repo={}] bug {} deleted from MD by LLM — restore on regen",
+                    repo_id, db_bug.display_id
+                );
+            }
         }
     }
 
@@ -634,6 +693,220 @@ mod tests {
     /// Read `docs/bug-reports.md` and return its contents (panics if missing).
     fn read_bug_reports_md(dir: &Path) -> String {
         fs::read_to_string(dir.join("docs").join("bug-reports.md")).unwrap()
+    }
+
+    /// T-000268: write the edit-clock ledger of bug-reports.md into the repo
+    /// worktree with one tombstone per display id, stamped at `t`.
+    fn write_tombstone_ledger(dir: &Path, ids: &[&str], t: i64) {
+        use crate::sync::edit_clocks::{
+            ledger_file_name, row_key, ClockEntry, ClockLedger, CLOCKS_DIR,
+        };
+        let mut ledger = ClockLedger::new("docs/bug-reports.md");
+        for id in ids {
+            ledger.entries.insert(
+                row_key(id),
+                ClockEntry {
+                    h: String::new(),
+                    t,
+                    src: "test".to_string(),
+                    del: true,
+                },
+            );
+        }
+        let dirp = dir.join(CLOCKS_DIR);
+        fs::create_dir_all(&dirp).unwrap();
+        fs::write(
+            dirp.join(ledger_file_name("docs/bug-reports.md")),
+            ledger.serialize().unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// T-000268: one active bug in the DB, migrated, with an MD file that no
+    /// longer lists it — the post-merge state a fleet deletion leaves behind.
+    fn setup_active_bug_missing_from_md() -> (AppDb, TempDir, i64) {
+        let (db, tmp, rid) = setup_repo_with_dir();
+        db.set_bugs_migrated_at(rid, "2026-03-01T00:00:00Z")
+            .unwrap();
+        db.insert_bug(
+            rid,
+            1,
+            "2026-03-01T00:00:00Z",
+            "crashes on save",
+            "major",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        write_bug_reports_md(tmp.path(), &[]);
+        (db, tmp, rid)
+    }
+
+    fn reconcile_fixture(db: &AppDb, tmp: &TempDir, repo_id: i64, chronology_active: bool) {
+        reconcile_bugs_in_checkout(db, repo_id, tmp.path().to_str().unwrap(), chronology_active)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_tombstoned_active_bug_is_deleted_not_restored() {
+        // The fleet deletion won the merge: the row is absent from the merged
+        // file and the ledger carries its tombstone. The DB row must follow —
+        // otherwise the regen resurrects it and the next commit re-stamps it
+        // fresh, defeating the tombstone forever (spec finding #5).
+        let (db, tmp, rid) = setup_active_bug_missing_from_md();
+        write_tombstone_ledger(
+            tmp.path(),
+            &["B-000001"],
+            chrono::Utc::now().timestamp() - 60,
+        );
+
+        reconcile_fixture(&db, &tmp, rid, true);
+
+        assert!(
+            db.get_bug_by_display_id(rid, "B-000001").unwrap().is_none(),
+            "the DB row follows the fleet deletion"
+        );
+        assert!(
+            !read_bug_reports_md(tmp.path()).contains("B-000001"),
+            "the regen must not resurrect the row"
+        );
+    }
+
+    #[test]
+    fn test_inactive_chronology_tombstone_does_not_delete() {
+        // A pre-activation ledger can already carry the tombstone, but it is
+        // write-only evidence until the owner activates chronology. The same
+        // file/DB state must therefore take the legacy restore path.
+        let (db, tmp, rid) = setup_active_bug_missing_from_md();
+        write_tombstone_ledger(
+            tmp.path(),
+            &["B-000001"],
+            chrono::Utc::now().timestamp() - 60,
+        );
+
+        reconcile_fixture(&db, &tmp, rid, false);
+
+        assert!(
+            db.get_bug_by_display_id(rid, "B-000001").unwrap().is_some(),
+            "pre-activation tombstones must not consume DB rows"
+        );
+        assert!(
+            read_bug_reports_md(tmp.path()).contains("B-000001"),
+            "legacy restore regenerates the row into MD"
+        );
+    }
+
+    #[test]
+    fn test_active_bug_missing_without_ledger_entry_is_restored() {
+        // The teeth of the tombstone test: the very same state without the
+        // tombstone is the LLM-slip the restore exists for — the row comes back.
+        let (db, tmp, rid) = setup_active_bug_missing_from_md();
+
+        reconcile_bugs_for_repo(&db, rid).unwrap();
+
+        assert!(
+            db.get_bug_by_display_id(rid, "B-000001").unwrap().is_some(),
+            "the DB row survives — DB is authoritative for active state"
+        );
+        assert!(
+            read_bug_reports_md(tmp.path()).contains("B-000001"),
+            "the regen restores the row into MD"
+        );
+    }
+
+    #[test]
+    fn test_quarantined_tombstone_deletes_nothing() {
+        // A far-future stamp decides nothing anywhere — the key is frozen, so
+        // the disappearance is not a fleet verdict and the restore stands.
+        let (db, tmp, rid) = setup_active_bug_missing_from_md();
+        let far_future = chrono::Utc::now().timestamp() + 48 * 3600;
+        write_tombstone_ledger(tmp.path(), &["B-000001"], far_future);
+
+        reconcile_fixture(&db, &tmp, rid, true);
+
+        assert!(
+            db.get_bug_by_display_id(rid, "B-000001").unwrap().is_some(),
+            "a quarantined tombstone must not delete"
+        );
+        assert!(read_bug_reports_md(tmp.path()).contains("B-000001"));
+    }
+
+    #[test]
+    fn test_confirmed_bug_archives_even_with_a_tombstone() {
+        // Confirmed rows never resurrect — their archive flow already converges.
+        // The tombstone changes nothing: archive-mark, not deletion (the history
+        // of a confirmed bug is kept in the DB).
+        let (db, tmp, rid) = setup_repo_with_dir();
+        db.set_bugs_migrated_at(rid, "2026-03-01T00:00:00Z")
+            .unwrap();
+        db.insert_bug(
+            rid,
+            1,
+            "2026-03-01T00:00:00Z",
+            "fixed crash",
+            "major",
+            "logic",
+            "confirmed",
+            1,
+            None,
+            Some("2026-03-05T00:00:00Z"),
+        )
+        .unwrap();
+        write_bug_reports_md(tmp.path(), &[]);
+        write_tombstone_ledger(
+            tmp.path(),
+            &["B-000001"],
+            chrono::Utc::now().timestamp() - 60,
+        );
+
+        reconcile_fixture(&db, &tmp, rid, true);
+
+        let bug = db
+            .get_bug_by_display_id(rid, "B-000001")
+            .unwrap()
+            .expect("a confirmed bug is archived, never deleted");
+        assert!(
+            bug.archived_from_md_at.is_some(),
+            "archived, as the LLM-ack flow would"
+        );
+    }
+
+    #[test]
+    fn test_tombstone_with_the_md_file_missing_deletes_nothing() {
+        // No file at all is not a row-level verdict — a fresh clone before the
+        // first regen would otherwise massacre the whole table.
+        let (db, tmp, rid) = setup_repo_with_dir();
+        db.set_bugs_migrated_at(rid, "2026-03-01T00:00:00Z")
+            .unwrap();
+        db.insert_bug(
+            rid,
+            1,
+            "2026-03-01T00:00:00Z",
+            "crashes on save",
+            "major",
+            "logic",
+            "created",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        // No bug-reports.md written at all; tombstone ledger present.
+        write_tombstone_ledger(
+            tmp.path(),
+            &["B-000001"],
+            chrono::Utc::now().timestamp() - 60,
+        );
+
+        reconcile_fixture(&db, &tmp, rid, true);
+
+        assert!(
+            db.get_bug_by_display_id(rid, "B-000001").unwrap().is_some(),
+            "a missing file is degraded mode — the legacy restore stands"
+        );
     }
 
     #[test]

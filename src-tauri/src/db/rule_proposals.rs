@@ -34,12 +34,13 @@ fn proposal_from_row(row: &Row) -> SqlResult<RuleProposal> {
         resolved_rev: row.get(12)?,
         remote_ver: row.get(13)?,
         updated_at: row.get(14)?,
+        base_canon_hash: row.get(15)?,
     })
 }
 
 const PROPOSAL_COLS: &str = "repo_id, file_name, login, rule, seq, status, local_state,
      text, at, resolved_action, resolved_by, resolved_at, resolved_rev,
-     remote_ver, updated_at";
+     remote_ver, updated_at, base_canon_hash";
 
 fn acceptance_from_row(row: &Row) -> SqlResult<RuleAcceptance> {
     Ok(RuleAcceptance {
@@ -54,14 +55,15 @@ fn acceptance_from_row(row: &Row) -> SqlResult<RuleAcceptance> {
         pub_state: row.get(8)?,
         base_canon_hash: row.get(9)?,
         canon_hash: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        auto_decided: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
 const ACCEPTANCE_COLS: &str = "repo_id, rule, proposer_login, decided_rev, action,
      receipt_json, proposal_text, status, pub_state, base_canon_hash,
-     canon_hash, created_at, updated_at";
+     canon_hash, auto_decided, created_at, updated_at";
 
 impl AppDb {
     // ---- rule_proposals ---------------------------------------------------
@@ -99,8 +101,8 @@ impl AppDb {
         conn.execute(
             "INSERT INTO rule_proposals (repo_id, file_name, login, rule, seq, status,
                  local_state, text, at, resolved_action, resolved_by, resolved_at,
-                 resolved_rev, remote_ver, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                 resolved_rev, remote_ver, updated_at, base_canon_hash)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
              ON CONFLICT(repo_id, file_name) DO UPDATE SET
                  login=excluded.login, rule=excluded.rule, seq=excluded.seq,
                  status=excluded.status, local_state=excluded.local_state,
@@ -110,7 +112,8 @@ impl AppDb {
                  resolved_at=excluded.resolved_at,
                  resolved_rev=excluded.resolved_rev,
                  remote_ver=excluded.remote_ver,
-                 updated_at=excluded.updated_at",
+                 updated_at=excluded.updated_at,
+                 base_canon_hash=excluded.base_canon_hash",
             rusqlite::params![
                 p.repo_id,
                 p.file_name,
@@ -126,7 +129,8 @@ impl AppDb {
                 p.resolved_at,
                 p.resolved_rev,
                 p.remote_ver,
-                utc_now_rfc3339()
+                utc_now_rfc3339(),
+                p.base_canon_hash,
             ],
         )?;
         Ok(())
@@ -267,15 +271,51 @@ impl AppDb {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let seq = Self::bump_rule_proposal_seq_on(&tx, repo_id, file_name)?;
+        // T-000264: the compare-and-swap base of this proposal chain. The
+        // canon write below replaces the rule text with the proposal itself,
+        // so hashing the canon AT re-proposal time would hash the previous
+        // proposal — a base the owner's canon never matches, and every chain
+        // link after the first would read as a spurious canon-diverged
+        // conflict. The chain therefore inherits the base of its open
+        // unresolved predecessor; a fresh chain (no row, or the last one
+        // withdrawn / resolved) captures the canon as it stands BEFORE the
+        // overwrite. No canon at all is no provable base — NULL, and the
+        // proposal stays manual like every legacy one.
+        let key = format!("skill.{}.md.tmpl", rule);
+        let prior_base: Option<String> = tx
+            .query_row(
+                "SELECT base_canon_hash FROM rule_proposals
+                 WHERE repo_id = ?1 AND file_name = ?2 AND status = 'open'",
+                rusqlite::params![repo_id, file_name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let canon_now: Option<String> = tx
+            .query_row(
+                "SELECT content FROM templates WHERE language_key = '_global' AND file_name = ?1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let base_canon_hash = prior_base.or_else(|| {
+            canon_now.map(|c| {
+                use sha2::Digest;
+                let mut h = sha2::Sha256::new();
+                h.update(c.as_bytes());
+                format!("{:x}", h.finalize())
+            })
+        });
         tx.execute(
             "INSERT INTO rule_proposals (repo_id, file_name, login, rule, seq,
-                 status, local_state, text, at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,'open','pending_apply',?6,?7,?8)
+                 status, local_state, text, at, updated_at, base_canon_hash)
+             VALUES (?1,?2,?3,?4,?5,'open','pending_apply',?6,?7,?8,?9)
              ON CONFLICT(repo_id, file_name) DO UPDATE SET
                  seq=excluded.seq, status=excluded.status,
                  local_state=excluded.local_state, text=excluded.text,
                  at=excluded.at, resolved_action=NULL, resolved_by=NULL,
-                 resolved_at=NULL, resolved_rev=NULL, updated_at=excluded.updated_at",
+                 resolved_at=NULL, resolved_rev=NULL, updated_at=excluded.updated_at,
+                 base_canon_hash=excluded.base_canon_hash",
             rusqlite::params![
                 repo_id,
                 file_name,
@@ -284,7 +324,8 @@ impl AppDb {
                 seq,
                 text,
                 at,
-                utc_now_rfc3339()
+                utc_now_rfc3339(),
+                base_canon_hash,
             ],
         )?;
         // The canon write: the proposal's text is this install's rule now.
@@ -405,8 +446,9 @@ impl AppDb {
         conn.execute(
             "INSERT INTO rule_acceptances (repo_id, rule, proposer_login,
                  decided_rev, action, receipt_json, proposal_text, status,
-                 pub_state, base_canon_hash, canon_hash, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 pub_state, base_canon_hash, canon_hash, auto_decided,
+                 created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             rusqlite::params![
                 a.repo_id,
                 a.rule,
@@ -419,11 +461,65 @@ impl AppDb {
                 a.pub_state,
                 a.base_canon_hash,
                 a.canon_hash,
+                a.auto_decided,
                 utc_now_rfc3339(),
                 utc_now_rfc3339()
             ],
         )?;
         Ok(())
+    }
+
+    /// T-000264: mark the row machine-decided. Runs right after the
+    /// auto-decider's `decide` succeeds — same thread, same sweep, so no
+    /// race with the owner is possible here.
+    pub fn mark_rule_acceptance_auto_decided(
+        &self,
+        repo_id: i64,
+        rule: &str,
+        proposer_login: &str,
+        decided_rev: &str,
+    ) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE rule_acceptances SET auto_decided = 1
+             WHERE repo_id=?1 AND rule=?2 AND proposer_login=?3 AND decided_rev=?4",
+            rusqlite::params![repo_id, rule, proposer_login, decided_rev],
+        )?;
+        Ok(())
+    }
+
+    /// T-000264: receipts whose publication is blocked — the attention
+    /// state of the proposals chip reads this.
+    pub fn count_blocked_rule_receipts(&self) -> SqlResult<u32> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rule_acceptances WHERE pub_state='blocked'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
+    }
+
+    /// T-000264: machine decisions of the last 72 hours — the persisted
+    /// "auto-decided: N" counter, derived from the rows themselves rather
+    /// than a parallel notification store. `created_at`, not `updated_at`:
+    /// the row is born at the decision moment, while updates keep landing
+    /// as the receipt publishes — the window must measure deciding, not
+    /// touching.
+    pub fn count_recent_auto_decided(&self) -> SqlResult<u32> {
+        // The cutoff is computed in Rust: rows are RFC3339 text, and a
+        // SQLite `datetime('now', ...)` string (space-separated, no zone)
+        // would compare against them by byte order — wrong in both
+        // directions. Same-format RFC3339 strings order lexicographically.
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(72)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rule_acceptances
+             WHERE auto_decided=1 AND created_at >= ?1",
+            rusqlite::params![cutoff],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
     }
 
     /// One acceptance by its primary key.
@@ -602,9 +698,42 @@ mod tests {
             pub_state: pub_state.into(),
             base_canon_hash: "h".into(),
             canon_hash: None,
+            auto_decided: false,
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[test]
+    fn scan_missing_root_is_an_error_and_auto_decides_nothing() {
+        let db = db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("missing-checkout");
+        db.set_repo_local_path(1, Some(missing.to_str().unwrap()))
+            .unwrap();
+        db.set_shared_role(1, Some("main")).unwrap();
+
+        let scan = crate::commands::rule_proposals::scan_open_candidates(&db);
+        assert!(
+            scan.scan_errors
+                .iter()
+                .any(|e| e.contains("no local checkout")),
+            "missing root must be a scan error, got {:?}",
+            scan.scan_errors
+        );
+        assert!(scan.candidates.is_empty());
+
+        let outcome = crate::commands::rule_proposals::auto_decide_rule_proposals(&db);
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.held, 0);
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("no local checkout")),
+            "the scan error must reach the auto-decider, got {:?}",
+            outcome.errors
+        );
     }
 
     #[test]
@@ -757,6 +886,104 @@ mod tests {
         assert_eq!(by_rev(&rev(4)).pub_state, "overtaken");
         let other = db.list_rule_acceptances(2).unwrap();
         assert_eq!(other[0].pub_state, "pending");
+    }
+
+    /// T-000264: seed the canon the proposals will be based on.
+    fn seed_canon(db: &AppDb, rule: &str, content: &str) {
+        db.upsert_template_file(
+            "_global",
+            &format!("skill.{}.md.tmpl", rule),
+            content,
+            false,
+        )
+        .unwrap();
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(bytes);
+        format!("{:x}", h.finalize())
+    }
+
+    fn propose(db: &AppDb, text: &str) {
+        db.create_rule_proposal_txn(
+            1,
+            "sdh-a.p.json",
+            "p",
+            "sdh-a",
+            text,
+            "2026-11-08T00:00:00Z",
+            None,
+            "owner",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_first_proposal_captures_the_canon_hash_as_its_base() {
+        let db = db();
+        seed_canon(&db, "sdh-a", "CANON-V1");
+        propose(&db, "T1");
+        let row = db.get_rule_proposal(1, "sdh-a.p.json").unwrap().unwrap();
+        assert_eq!(
+            row.base_canon_hash.as_deref(),
+            Some(sha256_hex(b"CANON-V1").as_str()),
+            "the base is the pre-overwrite canon"
+        );
+    }
+
+    #[test]
+    fn a_chain_re_proposal_inherits_the_base_it_does_not_rehash_itself() {
+        // The canon after the first proposal IS the first proposal's text.
+        // Hashing it again would produce a base the owner's canon never
+        // matches — every chain link would read as a spurious canon-diverged
+        // conflict. The chain keeps the original fleet base instead.
+        let db = db();
+        seed_canon(&db, "sdh-a", "CANON-V1");
+        propose(&db, "T1");
+        propose(&db, "T2");
+        let row = db.get_rule_proposal(1, "sdh-a.p.json").unwrap().unwrap();
+        assert_eq!(row.text, "T2");
+        assert_eq!(
+            row.base_canon_hash.as_deref(),
+            Some(sha256_hex(b"CANON-V1").as_str()),
+            "chain inherits — never the hash of its own predecessor"
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_chain_re_captures_and_a_canonless_proposal_stays_manual() {
+        let db = db();
+        seed_canon(&db, "sdh-a", "CANON-V1");
+        propose(&db, "T1");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE rule_proposals SET status = 'withdrawn' WHERE repo_id = 1",
+                [],
+            )
+            .unwrap();
+        // After withdrawal the chain is over: the next proposal re-captures
+        // the canon as it stands — which is still T1 locally.
+        propose(&db, "T3");
+        let row = db.get_rule_proposal(1, "sdh-a.p.json").unwrap().unwrap();
+        assert_eq!(
+            row.base_canon_hash.as_deref(),
+            Some(sha256_hex(b"T1").as_str()),
+            "a new chain bases itself on the canon of its own moment"
+        );
+    }
+
+    #[test]
+    fn a_proposal_without_any_canon_carries_no_base() {
+        // No template seeded at all: nothing provable, NULL — the auto
+        // decider must treat it like every legacy proposal: manual.
+        let db = db();
+        propose(&db, "T1");
+        let row = db.get_rule_proposal(1, "sdh-a.p.json").unwrap().unwrap();
+        assert_eq!(row.base_canon_hash, None);
     }
 
     #[test]

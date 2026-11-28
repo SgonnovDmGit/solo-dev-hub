@@ -92,6 +92,17 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         "peer_channel_deliveries",
         mig_v37_peer_channel_deliveries,
     ),
+    (38, "rule_proposals_mode", mig_v38_rule_proposals_mode),
+    (
+        39,
+        "proposal_base_canon_hash",
+        mig_v39_proposal_base_canon_hash,
+    ),
+    (
+        40,
+        "acceptance_auto_decided",
+        mig_v40_acceptance_auto_decided,
+    ),
 ];
 
 impl AppDb {
@@ -1206,6 +1217,47 @@ fn mig_v36_rule_proposals(conn: &Connection) -> SqlResult<()> {
     )
 }
 
+fn mig_v40_acceptance_auto_decided(conn: &Connection) -> SqlResult<()> {
+    // T-000264 S5 (v1.25.0): WHO decided — the owner by click or the
+    // post-pass machine. The distinction must live on the row itself,
+    // because the persisted "auto-decided" surface derives from it: a
+    // separate notification store would be a second truth about a fact
+    // the acceptance already knows. 0/1 rather than TEXT: it is a flag.
+    conn.execute_batch(
+        "ALTER TABLE rule_acceptances ADD COLUMN auto_decided
+             INTEGER NOT NULL DEFAULT 0;
+         PRAGMA user_version = 40;",
+    )
+}
+
+fn mig_v39_proposal_base_canon_hash(conn: &Connection) -> SqlResult<()> {
+    // T-000264 (v1.25.0): the proposal's proof of what it is based on —
+    // sha256 of the canon text the contributor's install held when the
+    // proposal chain began. Without it the auto-decider cannot tell "the
+    // canon never moved under this proposal" from "the owner edited since",
+    // so NULL rows (every legacy one) stay manual forever. Nullable rather
+    // than defaulted: an empty string would read as a provable base of "".
+    conn.execute_batch(
+        "ALTER TABLE rule_proposals ADD COLUMN base_canon_hash TEXT;
+         PRAGMA user_version = 39;",
+    )
+}
+
+fn mig_v38_rule_proposals_mode(conn: &Connection) -> SqlResult<()> {
+    // T-000264 (v1.25.0): the owner's answer to "who decides rule
+    // proposals" — per repository, because proposals travel the shared
+    // repo's transport and the canon owner decides per product. 'auto'
+    // (the default): a proposal without a conflict is accepted by the
+    // post-pass machine without a click; 'manual': every proposal waits
+    // for the owner, exactly as before the setting existed.
+    conn.execute_batch(
+        "ALTER TABLE repositories ADD COLUMN rule_proposals_mode
+             TEXT NOT NULL DEFAULT 'auto'
+             CHECK (rule_proposals_mode IN ('auto', 'manual'));
+         PRAGMA user_version = 38;",
+    )
+}
+
 fn mig_v37_peer_channel_deliveries(conn: &Connection) -> SqlResult<()> {
     // T-000257 (v1.24.5): the outbox→inbox mirror's prune may only remove a
     // file THIS install delivered. "Absent from my local outbox" is not proof
@@ -1582,7 +1634,7 @@ mod tests {
             let version: i32 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 37);
+            assert_eq!(version, 40);
         }
 
         // Upgrade path: a v34-shaped DB keeps its rows and they default to 1.
@@ -2001,7 +2053,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 40);
 
         drop(conn);
         let _ = repo;
@@ -2068,7 +2120,7 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 40);
     }
 
     #[test]

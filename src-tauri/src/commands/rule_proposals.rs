@@ -279,16 +279,39 @@ pub(crate) fn catalogs(
     dev_branch: &str,
     db: &AppDb,
 ) -> crate::sync::shared::ProposalCatalogs {
+    catalogs_with_issues(git, root, dev_branch, db).0
+}
+
+/// `catalogs` plus the read issues the shared reader collected. Most command
+/// surfaces already have their own diagnostics channel; the auto-decider must
+/// see them because a skipped artifact can hide the competing proposal that
+/// makes an auto-accept unsafe.
+pub(crate) fn catalogs_with_issues(
+    git: Option<&GitBinary>,
+    root: &Path,
+    dev_branch: &str,
+    db: &AppDb,
+) -> (crate::sync::shared::ProposalCatalogs, Vec<String>) {
     let Some(git) = git else {
-        return crate::sync::shared::ProposalCatalogs::default();
+        return (crate::sync::shared::ProposalCatalogs::default(), Vec::new());
     };
-    let known: std::collections::HashSet<String> = crate::sync::skills::list_skill_templates(db)
-        .map(|v| v.into_iter().map(|(name, _)| name).collect())
-        .unwrap_or_default();
+    let (known, mut issues) = match crate::sync::skills::list_skill_templates(db) {
+        Ok(v) => (
+            v.into_iter()
+                .map(|(name, _)| name)
+                .collect::<std::collections::HashSet<String>>(),
+            Vec::new(),
+        ),
+        Err(e) => (
+            std::collections::HashSet::new(),
+            vec![format!("skill template catalog read failed: {}", e)],
+        ),
+    };
     let known_fn = |r: &str| known.contains(r);
-    let mut issues = Vec::new();
     // The last-seen origin ref is read as-is — commands do not fetch.
-    crate::sync::shared::proposal_catalogs(git, root, dev_branch, &known_fn, &mut issues, true)
+    let cats =
+        crate::sync::shared::proposal_catalogs(git, root, dev_branch, &known_fn, &mut issues, true);
+    (cats, issues)
 }
 
 /// Contributor: own proposal rows joined with what the dev tip and the
@@ -315,6 +338,7 @@ pub(crate) fn list_contributor_proposals(
             at: p.at.clone(),
             seq: p.seq,
             status: p.status.clone(),
+            base_canon_hash: p.base_canon_hash.clone(),
         };
         let rev = match (git, root.as_deref()) {
             (Some(g), Some(r)) => local_rev(g, r, &wire),
@@ -536,6 +560,7 @@ pub(crate) fn prepare_acceptance(
             pub_state: acceptance_pub_state::PENDING.to_string(),
             base_canon_hash: String::new(),
             canon_hash: None,
+            auto_decided: false,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -586,6 +611,7 @@ pub(crate) fn prepare_acceptance(
         pub_state: acceptance_pub_state::PENDING.to_string(),
         base_canon_hash: rp::sha256_hex(canon.as_bytes()),
         canon_hash: None,
+        auto_decided: false,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -871,6 +897,292 @@ pub(crate) fn decide(
     apply_decision(db, &a, dirs::home_dir().as_deref())
 }
 
+// ---------------------------------------------------------------------------
+// T-000264: the post-pass auto-decider (spec D4)
+// ---------------------------------------------------------------------------
+
+/// What one auto-decide sweep did. `accepted` counts the proposals the
+/// machine accepted; `held` the ones a conflict verdict held back (the
+/// attention surface reads the live state, so they need no detail here);
+/// errors never abort the sweep — one bad repo cannot silence the rest.
+pub(crate) struct AutoDecideOutcome {
+    pub accepted: u32,
+    pub held: u32,
+    pub errors: Vec<String>,
+}
+
+pub(crate) struct AutoCandidate {
+    pub repo_id: i64,
+    pub rule: String,
+    pub login: String,
+    pub text: String,
+    pub base_canon_hash: Option<String>,
+    pub rev: String,
+    /// The repo's mode — the machine decides only auto ones, but a manual
+    /// repo's open proposals still COMPETE: they target the same canon on
+    /// this install, and silently picking one side of a disagreement is the
+    /// exact mistake the conflict verdict exists to prevent (spec D4 scans
+    /// the portfolio, not the auto subset).
+    pub auto: bool,
+}
+
+/// The machine half of `rule_proposals_mode = 'auto'` — runs AFTER the
+/// sync pass, when no `specs_policy_guard` is held anywhere up the call
+/// stack (the mutex is not recursive; `decide` takes it per receipt).
+///
+/// The sweep, in spec order:
+/// 1. SCAN FIRST, decide nothing yet: every unresolved open proposal of
+///    every shared repo this install is the main of — across the whole
+///    portfolio, so the traversal order never becomes the policy.
+/// 2. Per candidate the pure verdict (S3): baseless stays manual,
+///    competing texts stay manual, a moved canon stays manual.
+/// 3. `Clean` candidates go through the very same `decide` machine the
+///    owner's click would — same CAS, same receipt, same canon write.
+///
+/// "Unresolved": no union receipt closes the effective version AND no
+/// acceptance row exists for it. The second half is what keeps a manual
+/// `reject` from being re-decided into an `accept` error every pass —
+/// and a stuck accept needs no help from here, because the transport's
+/// `publish_pending_receipts` already resumes those inside the pass.
+/// The portfolio-wide scan shared by the decider and the chip's summary:
+/// every unresolved open proposal of every repo this install is the main
+/// of. "Unresolved": no union receipt closes the effective version AND no
+/// acceptance row exists for it. Both callers must see the same set —
+/// a chip counting what the machine would not look at (or the reverse)
+/// is a lie in either direction.
+pub(crate) struct OpenScan {
+    pub candidates: Vec<AutoCandidate>,
+    /// Every reason the portfolio scan could not see the whole truth. The
+    /// auto-decider treats any entry here as a hard stop: an unreadable repo
+    /// can hide the competing proposal that makes an accept unsafe.
+    pub scan_errors: Vec<String>,
+}
+
+pub(crate) fn scan_open_candidates(db: &AppDb) -> OpenScan {
+    let mut out = OpenScan {
+        candidates: Vec::new(),
+        scan_errors: Vec::new(),
+    };
+    let Some(git) = crate::git_ops::cached_git() else {
+        out.scan_errors.push("git: not available".to_string());
+        return out;
+    };
+    let repos = match db.list_all_repos() {
+        Ok(repos) => repos,
+        Err(e) => {
+            out.scan_errors
+                .push(format!("repositories: list read failed: {}", e));
+            return out;
+        }
+    };
+    for repo in &repos {
+        let label = repo
+            .github_name
+            .clone()
+            .unwrap_or_else(|| format!("repo {}", repo.id));
+        let state = match db.get_shared_state(repo.id) {
+            Ok(state) => state,
+            Err(e) => {
+                out.scan_errors
+                    .push(format!("{}: shared-state read failed: {}", label, e));
+                continue;
+            }
+        };
+        if state.shared_role.as_deref() != Some("main") {
+            continue;
+        }
+        let auto = state.rule_proposals_mode == "auto";
+        let root = match repo_root(repo) {
+            Ok(root) => root,
+            Err(e) => {
+                out.scan_errors.push(e);
+                continue;
+            }
+        };
+        let Some(dev_branch) = dev_branch_for(db, repo.id, &root) else {
+            out.scan_errors
+                .push(format!("{}: shared dev branch unknown", label));
+            continue;
+        };
+        let (cats, catalog_issues) = catalogs_with_issues(Some(&git), &root, &dev_branch, db);
+        if !cats.any {
+            out.scan_errors.push(format!("{}: no dev catalog", label));
+        }
+        for issue in catalog_issues {
+            out.scan_errors
+                .push(format!("{}: catalog read: {}", label, issue));
+        }
+        let acceptances = match db.list_rule_acceptances(repo.id) {
+            Ok(acceptances) => acceptances,
+            Err(e) => {
+                // Scanning with an empty acceptance list is safe only because
+                // the error above stops every auto decision; keeping the
+                // candidates preserves the owner's summary instead of hiding
+                // the visible part of the portfolio too.
+                out.scan_errors
+                    .push(format!("{}: acceptances read failed: {}", label, e));
+                Vec::new()
+            }
+        };
+        for (_, u) in &cats.proposals {
+            let p = &u.proposal;
+            if p.status != crate::models::proposal_status::OPEN {
+                continue;
+            }
+            let receipted = cats.decisions.entries.values().any(|(_, d)| {
+                ss::logins_equal(&d.login, &p.login) && u.effective_shas.contains(&d.decided_rev)
+            });
+            if receipted {
+                continue;
+            }
+            let queued = acceptances.iter().any(|a| {
+                a.rule == p.rule
+                    && ss::logins_equal(&a.proposer_login, &p.login)
+                    && u.effective_shas.contains(&a.decided_rev)
+            });
+            if queued {
+                continue;
+            }
+            let Some(rev) = u.effective_shas.iter().next().cloned() else {
+                continue;
+            };
+            out.candidates.push(AutoCandidate {
+                repo_id: repo.id,
+                rule: p.rule.clone(),
+                login: p.login.clone(),
+                text: p.text.clone(),
+                base_canon_hash: p.base_canon_hash.clone(),
+                rev,
+                auto,
+            });
+        }
+    }
+    out
+}
+
+pub(crate) fn auto_decide_rule_proposals(db: &AppDb) -> AutoDecideOutcome {
+    let mut out = AutoDecideOutcome {
+        accepted: 0,
+        held: 0,
+        errors: Vec::new(),
+    };
+    // Step 1 — the scan (shared with the chip's summary command). Steps
+    // 2+3 — verdicts, then decisions. The competition set of a rule is
+    // the texts of ALL its unresolved candidates portfolio-wide: same
+    // text from two repos is one intent, distinct texts are the conflict.
+    let scan = scan_open_candidates(db);
+    if !scan.scan_errors.is_empty() {
+        // Fail closed: one unreadable repo can hide a competitor for any
+        // rule, because all repos target the same global canon on this
+        // install. With the scan incomplete there is no safe subset to
+        // decide — not even proposals in perfectly readable repos.
+        out.errors.extend(scan.scan_errors);
+        return out;
+    }
+    let candidates = scan.candidates;
+    for c in &candidates {
+        if !c.auto {
+            continue;
+        }
+        let texts: Vec<&str> = candidates
+            .iter()
+            .filter(|o| o.rule == c.rule)
+            .map(|o| o.text.as_str())
+            .collect();
+        let canon = db
+            .get_template_file("_global", &format!("skill.{}.md.tmpl", c.rule))
+            .ok()
+            .flatten()
+            .map(|t| t.content)
+            .unwrap_or_default();
+        let canon_hash = rp::sha256_hex(canon.as_bytes());
+        let verdict = rp::auto_verdict(c.base_canon_hash.as_deref(), &canon_hash, &texts);
+        if verdict != rp::AutoVerdict::Clean {
+            out.held += 1;
+            continue;
+        }
+        match decide(
+            db,
+            c.repo_id,
+            &c.rule,
+            &c.login,
+            &c.rev,
+            decision_action::ACCEPT,
+        ) {
+            Ok(_) => {
+                let _ = db.mark_rule_acceptance_auto_decided(c.repo_id, &c.rule, &c.login, &c.rev);
+                out.accepted += 1;
+            }
+            Err(e) => out.errors.push(format!("{}.{}: {}", c.rule, c.login, e)),
+        }
+    }
+    if out.accepted > 0 || out.held > 0 {
+        eprintln!(
+            "[rule-proposals] auto-decide: {} accepted, {} held, {} errors",
+            out.accepted,
+            out.held,
+            out.errors.len()
+        );
+    }
+    out
+}
+
+/// What the header chip shows. All three numbers derive from live state —
+/// nothing here is a stored counter that could drift from the truth.
+#[derive(serde::Serialize, Clone)]
+pub struct RuleProposalsSummary {
+    /// Proposals waiting for the owner's click: every open one of a manual
+    /// repo, plus the machine-held ones of auto repos (a clean auto
+    /// proposal is the machine's business, not the owner's).
+    pub open_manual: u32,
+    /// Held-by-conflict proposals exist, a receipt's publication is blocked,
+    /// or the portfolio scan itself is incomplete — the chip goes red even
+    /// with nothing to click.
+    pub attention: bool,
+    /// Machine decisions of the last 72 hours — the persisted
+    /// "auto-decided: N" surface.
+    pub auto_decided_recent: u32,
+}
+
+#[tauri::command(async)]
+pub fn rule_proposals_summary(db: State<AppDb>) -> Result<RuleProposalsSummary, String> {
+    let scan = scan_open_candidates(&db);
+    let candidates = &scan.candidates;
+    let mut open_manual = 0u32;
+    let mut held = false;
+    for c in candidates {
+        if !c.auto {
+            open_manual += 1;
+            continue;
+        }
+        let texts: Vec<&str> = candidates
+            .iter()
+            .filter(|o| o.rule == c.rule)
+            .map(|o| o.text.as_str())
+            .collect();
+        let canon = db
+            .get_template_file("_global", &format!("skill.{}.md.tmpl", c.rule))
+            .ok()
+            .flatten()
+            .map(|t| t.content)
+            .unwrap_or_default();
+        let canon_hash = rp::sha256_hex(canon.as_bytes());
+        if rp::auto_verdict(c.base_canon_hash.as_deref(), &canon_hash, &texts)
+            != rp::AutoVerdict::Clean
+        {
+            open_manual += 1;
+            held = true;
+        }
+    }
+    let blocked = db.count_blocked_rule_receipts().unwrap_or(0);
+    let auto_decided_recent = db.count_recent_auto_decided().unwrap_or(0);
+    Ok(RuleProposalsSummary {
+        open_manual,
+        attention: held || blocked > 0 || !scan.scan_errors.is_empty(),
+        auto_decided_recent,
+    })
+}
+
 /// The owner decision command.
 #[tauri::command(async)]
 pub fn decide_rule_proposal(
@@ -971,6 +1283,7 @@ mod tests {
             pub_state: pub_state.into(),
             base_canon_hash: rp::sha256_hex(b"CANON"),
             canon_hash: None,
+            auto_decided: false,
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -992,9 +1305,13 @@ mod tests {
             resolved_at: None,
             resolved_rev: None,
             remote_ver: remote_ver.map(str::to_string),
+            base_canon_hash: None,
             updated_at: String::new(),
         }
     }
+
+    // The fail-closed scan regression lives in `db::rule_proposals::tests` so
+    // the release's focused `db::rule_proposals` filter exercises it.
 
     #[test]
     fn the_gc_drops_only_old_terminal_rows_whose_remote_dominates() {
