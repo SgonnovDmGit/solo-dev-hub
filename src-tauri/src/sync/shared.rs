@@ -10808,6 +10808,7 @@ mod tests {
             shared_status: None,
             shared_status_detail: None,
             share_specs: true,
+            rule_proposals_mode: "auto".to_string(),
         };
         assert!(!is_shared_state(&st(false, None)));
         assert!(is_shared_state(&st(true, None)));

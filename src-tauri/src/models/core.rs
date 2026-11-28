@@ -47,6 +47,11 @@ pub struct RepoSharedState {
     /// `Repository`: it is settable BEFORE shared mode is enabled, so it lives
     /// on the row independent of `shared_mode`.
     pub share_specs: bool,
+    /// T-000264 (v1.25.0): who decides rule proposals — "auto" (the v38
+    /// default: the post-pass machine accepts conflict-free proposals) or
+    /// "manual" (every proposal waits for the owner). Same storage nature
+    /// as `share_specs`: the owner's local choice on the row itself.
+    pub rule_proposals_mode: String,
 }
 
 impl Repository {

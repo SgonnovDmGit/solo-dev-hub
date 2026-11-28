@@ -69,6 +69,37 @@ pub fn set_repo_share_specs(
     shared::set_repo_share_specs(&db, repo_id, share_specs)
 }
 
+/// T-000264: the owner's per-repo rule-proposals mode switch — 'auto' lets
+/// the post-pass machine accept conflict-free proposals without a click,
+/// 'manual' keeps every proposal waiting for the owner. Unlike the specs
+/// switch this needs no policy guard and no capability verification: the mode
+/// is installation-local, changes nothing in the shared content, and is read
+/// only by the post-pass auto-decider, which runs after the sync pass — and
+/// its guard — is over. A contributor / pending install is still refused: it
+/// never decides proposals, so the switch would be a lie there.
+#[tauri::command]
+pub fn set_repo_rule_proposals_mode(
+    db: State<AppDb>,
+    repo_id: i64,
+    mode: String,
+) -> Result<(), String> {
+    if mode != "auto" && mode != "manual" {
+        return Err(format!("mode must be auto|manual, got {}", mode));
+    }
+    let state = db.get_shared_state(repo_id).map_err(|e| e.to_string())?;
+    if matches!(
+        state.shared_role.as_deref(),
+        Some("contributor") | Some("pending")
+    ) {
+        return Err(format!(
+            "the proposals-mode switch belongs to the repo's main: this install participates as a {}",
+            state.shared_role.unwrap_or_default()
+        ));
+    }
+    db.set_repo_rule_proposals_mode(repo_id, &mode)
+        .map_err(|e| e.to_string())
+}
+
 /// Switch shared mode off; the deletion of `.sdh/` is committed and pushed now.
 #[tauri::command(async)]
 pub fn disable_shared_mode(db: State<AppDb>, repo_id: i64) -> Result<SharedDisableResult, String> {
