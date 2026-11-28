@@ -16046,6 +16046,7 @@ mod tests {
                 pub_state: "pending".into(),
                 base_canon_hash: rp::sha256_hex(b"CANON"),
                 canon_hash: None,
+                auto_decided: false,
                 created_at: String::new(),
                 updated_at: String::new(),
             })
@@ -16116,6 +16117,7 @@ mod tests {
                 pub_state: "pending".into(),
                 base_canon_hash: "x".into(),
                 canon_hash: None,
+                auto_decided: false,
                 created_at: String::new(),
                 updated_at: String::new(),
             })

@@ -9,7 +9,7 @@
   import { verifyAdmin } from '$lib/sync-core';
   import { needsOwnAdminCheck } from '$lib/utils/shared-admin';
   import { addToast } from '$lib/stores/ui';
-  import { sharedModePreflight, enableSharedMode, disableSharedMode, setRepoShareSpecs, getRepoSharedState } from '$lib/api/tauri-commands';
+  import { sharedModePreflight, enableSharedMode, disableSharedMode, setRepoShareSpecs, setRepoRuleProposalsMode, getRepoSharedState } from '$lib/api/tauri-commands';
   import { isRepoPublic, splitRepoFullName } from '$lib/api/github';
   import { saveSpecsToggle, chipActionAllowed } from '$lib/utils/specs-toggle';
   import type { IgnoreLine } from '$lib/types';
@@ -52,6 +52,12 @@
   // absence must never be guessed as "on". null = not loaded (or failed to):
   // the checkbox stays disabled, the value is never defaulted.
   let specs = $state<boolean | null>(null);
+  // T-000264: the rule-proposals mode, read through the same shared-state
+  // fetch as specs — one round trip, one source. `null` = not loaded; the
+  // box stays disabled and the value is never defaulted. checked = auto.
+  let proposalsMode = $state<string | null>(null);
+  let proposalsAuto = $state(false);
+  let proposalsModeBusy = $state(false);
   // What the checkbox DISPLAYS. The browser flips a native checkbox before
   // `onchange` runs, so the box is bound to this draft (bind:checked) and every
   // outcome of the save writes it back: a refused or failed save restores the
@@ -66,6 +72,8 @@
       if (!alive) return;
       specs = st.share_specs;
       specsChecked = specs === true;
+      proposalsMode = st.rule_proposals_mode;
+      proposalsAuto = st.rule_proposals_mode === 'auto';
     } catch {
       if (!alive) return;
       specs = null;
@@ -118,6 +126,31 @@
       specsChecked = (res.ok ? res.value : stored) === true;
     } finally {
       specsBusy = false;
+    }
+  }
+
+  async function handleProposalsModeToggle() {
+    // T-000264: same draft-writeback discipline as the specs box — the
+    // browser flips the box first, every outcome writes the stored value
+    // back. Unlike specs there is no GitHub ceremony here: the mode is a
+    // local decision policy of this install, nothing leaks either way.
+    if (proposalsMode === null || proposalsModeBusy || busy || specsBusy) {
+      proposalsAuto = proposalsMode === 'auto';
+      return;
+    }
+    const stored = proposalsMode;
+    const next = stored === 'auto' ? 'manual' : 'auto';
+    proposalsModeBusy = true;
+    try {
+      await setRepoRuleProposalsMode(repoId, next);
+      if (!alive) return;
+      proposalsMode = next;
+      onChanged();
+    } catch (err) {
+      if (alive) addToast($tStore('shared.proposalsMode.saveFailed' as any).replace('{0}', String(err)), 'error');
+    } finally {
+      proposalsModeBusy = false;
+      proposalsAuto = proposalsMode === 'auto';
     }
   }
 
@@ -241,6 +274,20 @@
     onchange={handleSpecsToggle}
   />
   <span class="chip-label">{$tStore('shared.specs.label' as any)}</span>
+</label>
+
+<!-- T-000264: who decides rule proposals. Checked = the post-pass machine
+     accepts conflict-free ones; unchecked = every proposal waits for the
+     owner's click. Same draft-writeback discipline as the specs box. -->
+<label class="chip" class:on={proposalsAuto} title={$tStore('shared.proposalsMode.hint' as any)}>
+  <input
+    class="specs-check"
+    type="checkbox"
+    bind:checked={proposalsAuto}
+    disabled={proposalsMode === null || proposalsModeBusy || busy || specsBusy}
+    onchange={handleProposalsModeToggle}
+  />
+  <span class="chip-label">{$tStore('shared.proposalsMode.label' as any)}</span>
 </label>
 
 {#if showEnable}

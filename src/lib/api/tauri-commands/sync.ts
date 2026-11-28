@@ -101,6 +101,11 @@ export async function setRepoShareSpecs(repoId: number, shareSpecs: boolean): Pr
   return invoke<string | null>('set_repo_share_specs', { repoId, shareSpecs });
 }
 
+/** T-000264: the owner's per-repo choice of who decides rule proposals. */
+export async function setRepoRuleProposalsMode(repoId: number, mode: 'auto' | 'manual'): Promise<void> {
+  return invoke<void>('set_repo_rule_proposals_mode', { repoId, mode });
+}
+
 export async function disableSharedMode(repoId: number): Promise<SharedDisableResult> {
   return invoke<SharedDisableResult>('disable_shared_mode', { repoId });
 }

@@ -1,4 +1,6 @@
 export const ru = {
+  'rules.chip.tooltip': 'Заявки на правила: число — ждущие решения владельца; «авто» — решённые машиной за 72ч. Красный — конфликт или сбой публикации квитанции.',
+  'rules.chip.autoCount': 'авто {0}',
   'rules.title': 'Правила',
   'rules.summary': 'Правил: {0} · изменено: {1} · конфликтов: {2} · копии в {3} репо',
   'rules.summaryClean': 'Правил: {0} · все по канону · копии в {1} репо',
@@ -101,6 +103,8 @@ export const ru = {
 } as const;
 
 export const en: Record<keyof typeof ru, string> = {
+  'rules.chip.tooltip': 'Rule proposals: the number waits for the owner; "auto" is machine-decided within 72h. Red — a conflict or a receipt publication failure.',
+  'rules.chip.autoCount': 'auto {0}',
   'rules.title': 'Rules',
   'rules.summary': 'Rules: {0} · changed: {1} · conflicts: {2} · copies in {3} repos',
   'rules.summaryClean': 'Rules: {0} · all match the canon · copies in {1} repos',

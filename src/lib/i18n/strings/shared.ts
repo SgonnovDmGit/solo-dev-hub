@@ -14,6 +14,9 @@ export const ru = {
   'shared.specs.hint': 'Настройка общего режима (доступна и до его включения). Выкл: новые файлы docs/superpowers/ и docs/codex/ не коммитятся и не передаются; уже закоммиченные остаются в репо с историей — флаг не снимает их с трекинга и не переписывает историю. Вкл возобновляет передачу. Задачи, сделанное и баги передаются при любом значении.',
   'shared.specs.saveFailed': 'Не удалось сохранить настройку спеков: {0}',
   'shared.specs.loadFailed': 'Не удалось прочитать настройку спеков этого репо.',
+  'shared.proposalsMode.label': 'Авто-решение заявок на правила',
+  'shared.proposalsMode.hint': 'Вкл: после каждой синхронизации заявка без конфликтов принимается машиной без клика — конфликт это разные тексты одного правила в портфеле или канон, изменившийся с базы заявки; конфликтные ждут владельца. Выкл: каждая заявка ждёт решения владельца. Заявки без хэша базы (старые) всегда ручные.',
+  'shared.proposalsMode.saveFailed': 'Не удалось сохранить режим заявок: {0}',
 
   // ── Preflight / enabling ───────────────────────────────────────────────────
   'shared.preflight.missingProject': 'Общий режим не включён: репо не входит в проект. Назначьте проект в чипе «Проект».',
@@ -137,6 +140,9 @@ export const en: Record<keyof typeof ru, string> = {
   'shared.specs.hint': 'A shared-mode setting (available before enabling it too). Off: new docs/superpowers/ and docs/codex/ files are not committed and not sent; the already committed ones stay in the repo with their history — the flag neither untracks them nor rewrites history. On resumes sharing. Tasks, done items and bugs travel whatever the value.',
   'shared.specs.saveFailed': 'Could not save the specs setting: {0}',
   'shared.specs.loadFailed': 'Could not read this repo\'s specs setting.',
+  'shared.proposalsMode.label': 'Auto-decide rule proposals',
+  'shared.proposalsMode.hint': 'On: after every sync a conflict-free proposal is accepted by the machine without a click — a conflict is differing texts of one rule across the portfolio, or a canon changed since the proposal base; conflicted ones wait for the owner. Off: every proposal waits for the owner. Proposals without a base hash (legacy) stay manual forever.',
+  'shared.proposalsMode.saveFailed': 'Could not save the proposals mode: {0}',
 
   'shared.preflight.missingProject': 'Shared mode not enabled: the repo is not in a project. Assign a project in the "Project" chip.',
   'shared.preflight.missingDevBranch': 'Shared mode not enabled: the owner\'s branch is not set. Enter it (for example dev) in the "Auto-commit" chip.',

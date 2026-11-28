@@ -295,6 +295,7 @@ pub fn run() {
             commands::rule_proposals::list_rule_acceptances,
             commands::rule_proposals::withdraw_rule_proposal,
             commands::rule_proposals::decide_rule_proposal,
+        commands::rule_proposals::rule_proposals_summary,
             commands::rule_proposals::resolve_rule_acceptance_conflict,
             // Deploy (0.7.0 / v0.18.0 multi-env)
             commands::deploy::set_deploy_target,

@@ -198,6 +198,10 @@ pub struct RuleAcceptance {
     pub base_canon_hash: String,
     /// sha256 of the canon this row applied, once it did.
     pub canon_hash: Option<String>,
+    /// T-000264: the post-pass machine took this decision, not the owner's
+    /// click — the persisted "auto-decided" surface derives from the flag.
+    #[serde(default)]
+    pub auto_decided: bool,
     pub created_at: String,
     pub updated_at: String,
 }

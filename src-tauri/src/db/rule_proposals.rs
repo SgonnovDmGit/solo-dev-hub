@@ -55,14 +55,15 @@ fn acceptance_from_row(row: &Row) -> SqlResult<RuleAcceptance> {
         pub_state: row.get(8)?,
         base_canon_hash: row.get(9)?,
         canon_hash: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        auto_decided: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
 const ACCEPTANCE_COLS: &str = "repo_id, rule, proposer_login, decided_rev, action,
      receipt_json, proposal_text, status, pub_state, base_canon_hash,
-     canon_hash, created_at, updated_at";
+     canon_hash, auto_decided, created_at, updated_at";
 
 impl AppDb {
     // ---- rule_proposals ---------------------------------------------------
@@ -445,8 +446,9 @@ impl AppDb {
         conn.execute(
             "INSERT INTO rule_acceptances (repo_id, rule, proposer_login,
                  decided_rev, action, receipt_json, proposal_text, status,
-                 pub_state, base_canon_hash, canon_hash, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 pub_state, base_canon_hash, canon_hash, auto_decided,
+                 created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             rusqlite::params![
                 a.repo_id,
                 a.rule,
@@ -459,11 +461,62 @@ impl AppDb {
                 a.pub_state,
                 a.base_canon_hash,
                 a.canon_hash,
+                a.auto_decided,
                 utc_now_rfc3339(),
                 utc_now_rfc3339()
             ],
         )?;
         Ok(())
+    }
+
+    /// T-000264: mark the row machine-decided. Runs right after the
+    /// auto-decider's `decide` succeeds — same thread, same sweep, so no
+    /// race with the owner is possible here.
+    pub fn mark_rule_acceptance_auto_decided(
+        &self,
+        repo_id: i64,
+        rule: &str,
+        proposer_login: &str,
+        decided_rev: &str,
+    ) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE rule_acceptances SET auto_decided = 1
+             WHERE repo_id=?1 AND rule=?2 AND proposer_login=?3 AND decided_rev=?4",
+            rusqlite::params![repo_id, rule, proposer_login, decided_rev],
+        )?;
+        Ok(())
+    }
+
+    /// T-000264: receipts whose publication is blocked — the attention
+    /// state of the proposals chip reads this.
+    pub fn count_blocked_rule_receipts(&self) -> SqlResult<u32> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rule_acceptances WHERE pub_state='blocked'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
+    }
+
+    /// T-000264: machine decisions of the last 72 hours — the persisted
+    /// "auto-decided: N" counter, derived from the rows themselves rather
+    /// than a parallel notification store.
+    pub fn count_recent_auto_decided(&self) -> SqlResult<u32> {
+        // The cutoff is computed in Rust: rows are RFC3339 text, and a
+        // SQLite `datetime('now', ...)` string (space-separated, no zone)
+        // would compare against them by byte order — wrong in both
+        // directions. Same-format RFC3339 strings order lexicographically.
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(72)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rule_acceptances
+             WHERE auto_decided=1 AND updated_at >= ?1",
+            rusqlite::params![cutoff],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
     }
 
     /// One acceptance by its primary key.
@@ -642,6 +695,7 @@ mod tests {
             pub_state: pub_state.into(),
             base_canon_hash: "h".into(),
             canon_hash: None,
+            auto_decided: false,
             created_at: String::new(),
             updated_at: String::new(),
         }

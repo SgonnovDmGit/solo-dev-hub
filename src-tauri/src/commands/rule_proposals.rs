@@ -537,6 +537,7 @@ pub(crate) fn prepare_acceptance(
             pub_state: acceptance_pub_state::PENDING.to_string(),
             base_canon_hash: String::new(),
             canon_hash: None,
+            auto_decided: false,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -587,6 +588,7 @@ pub(crate) fn prepare_acceptance(
         pub_state: acceptance_pub_state::PENDING.to_string(),
         base_canon_hash: rp::sha256_hex(canon.as_bytes()),
         canon_hash: None,
+        auto_decided: false,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -886,19 +888,19 @@ pub(crate) struct AutoDecideOutcome {
     pub errors: Vec<String>,
 }
 
-struct AutoCandidate {
-    repo_id: i64,
-    rule: String,
-    login: String,
-    text: String,
-    base_canon_hash: Option<String>,
-    rev: String,
+pub(crate) struct AutoCandidate {
+    pub repo_id: i64,
+    pub rule: String,
+    pub login: String,
+    pub text: String,
+    pub base_canon_hash: Option<String>,
+    pub rev: String,
     /// The repo's mode — the machine decides only auto ones, but a manual
     /// repo's open proposals still COMPETE: they target the same canon on
     /// this install, and silently picking one side of a disagreement is the
     /// exact mistake the conflict verdict exists to prevent (spec D4 scans
     /// the portfolio, not the auto subset).
-    auto: bool,
+    pub auto: bool,
 }
 
 /// The machine half of `rule_proposals_mode = 'auto'` — runs AFTER the
@@ -919,25 +921,17 @@ struct AutoCandidate {
 /// `reject` from being re-decided into an `accept` error every pass —
 /// and a stuck accept needs no help from here, because the transport's
 /// `publish_pending_receipts` already resumes those inside the pass.
-pub(crate) fn auto_decide_rule_proposals(db: &AppDb) -> AutoDecideOutcome {
-    let mut out = AutoDecideOutcome {
-        accepted: 0,
-        held: 0,
-        errors: Vec::new(),
-    };
+/// The portfolio-wide scan shared by the decider and the chip's summary:
+/// every unresolved open proposal of every repo this install is the main
+/// of. "Unresolved": no union receipt closes the effective version AND no
+/// acceptance row exists for it. Both callers must see the same set —
+/// a chip counting what the machine would not look at (or the reverse)
+/// is a lie in either direction.
+pub(crate) fn scan_open_candidates(db: &AppDb) -> Vec<AutoCandidate> {
     let Some(git) = crate::git_ops::cached_git() else {
-        return out;
+        return Vec::new();
     };
-    let repos = match db.list_all_repos() {
-        Ok(r) => r,
-        Err(e) => {
-            out.errors.push(e.to_string());
-            return out;
-        }
-    };
-    // Step 1 — the portfolio-wide scan. Every repo where this install is
-    // the main contributes its open proposals to the competition set —
-    // the mode gates only DECIDING, never what counts as a competitor.
+    let repos = db.list_all_repos().unwrap_or_default();
     let mut candidates: Vec<AutoCandidate> = Vec::new();
     for repo in &repos {
         let Ok(state) = db.get_shared_state(repo.id) else {
@@ -988,9 +982,20 @@ pub(crate) fn auto_decide_rule_proposals(db: &AppDb) -> AutoDecideOutcome {
             });
         }
     }
-    // Step 2+3 — verdicts, then decisions. The competition set of a rule
-    // is the texts of ALL its unresolved candidates portfolio-wide: same
+    candidates
+}
+
+pub(crate) fn auto_decide_rule_proposals(db: &AppDb) -> AutoDecideOutcome {
+    let mut out = AutoDecideOutcome {
+        accepted: 0,
+        held: 0,
+        errors: Vec::new(),
+    };
+    // Step 1 — the scan (shared with the chip's summary command). Steps
+    // 2+3 — verdicts, then decisions. The competition set of a rule is
+    // the texts of ALL its unresolved candidates portfolio-wide: same
     // text from two repos is one intent, distinct texts are the conflict.
+    let candidates = scan_open_candidates(db);
     for c in &candidates {
         if !c.auto {
             continue;
@@ -1013,7 +1018,10 @@ pub(crate) fn auto_decide_rule_proposals(db: &AppDb) -> AutoDecideOutcome {
             continue;
         }
         match decide(db, c.repo_id, &c.rule, &c.login, &c.rev, decision_action::ACCEPT) {
-            Ok(_) => out.accepted += 1,
+            Ok(_) => {
+                let _ = db.mark_rule_acceptance_auto_decided(c.repo_id, &c.rule, &c.login, &c.rev);
+                out.accepted += 1;
+            }
             Err(e) => out
                 .errors
                 .push(format!("{}.{}: {}", c.rule, c.login, e)),
@@ -1028,6 +1036,60 @@ pub(crate) fn auto_decide_rule_proposals(db: &AppDb) -> AutoDecideOutcome {
         );
     }
     out
+}
+
+/// What the header chip shows. All three numbers derive from live state —
+/// nothing here is a stored counter that could drift from the truth.
+#[derive(serde::Serialize, Clone)]
+pub struct RuleProposalsSummary {
+    /// Proposals waiting for the owner's click: every open one of a manual
+    /// repo, plus the machine-held ones of auto repos (a clean auto
+    /// proposal is the machine's business, not the owner's).
+    pub open_manual: u32,
+    /// Held-by-conflict proposals exist or a receipt's publication is
+    /// blocked — the chip goes red even with nothing to click.
+    pub attention: bool,
+    /// Machine decisions of the last 72 hours — the persisted
+    /// "auto-decided: N" surface.
+    pub auto_decided_recent: u32,
+}
+
+#[tauri::command(async)]
+pub fn rule_proposals_summary(db: State<AppDb>) -> Result<RuleProposalsSummary, String> {
+    let candidates = scan_open_candidates(&db);
+    let mut open_manual = 0u32;
+    let mut held = false;
+    for c in &candidates {
+        if !c.auto {
+            open_manual += 1;
+            continue;
+        }
+        let texts: Vec<&str> = candidates
+            .iter()
+            .filter(|o| o.rule == c.rule)
+            .map(|o| o.text.as_str())
+            .collect();
+        let canon = db
+            .get_template_file("_global", &format!("skill.{}.md.tmpl", c.rule))
+            .ok()
+            .flatten()
+            .map(|t| t.content)
+            .unwrap_or_default();
+        let canon_hash = rp::sha256_hex(canon.as_bytes());
+        if rp::auto_verdict(c.base_canon_hash.as_deref(), &canon_hash, &texts)
+            != rp::AutoVerdict::Clean
+        {
+            open_manual += 1;
+            held = true;
+        }
+    }
+    let blocked = db.count_blocked_rule_receipts().unwrap_or(0);
+    let auto_decided_recent = db.count_recent_auto_decided().unwrap_or(0);
+    Ok(RuleProposalsSummary {
+        open_manual,
+        attention: held || blocked > 0,
+        auto_decided_recent,
+    })
 }
 
 /// The owner decision command.
@@ -1130,6 +1192,7 @@ mod tests {
             pub_state: pub_state.into(),
             base_canon_hash: rp::sha256_hex(b"CANON"),
             canon_hash: None,
+            auto_decided: false,
             created_at: String::new(),
             updated_at: String::new(),
         }

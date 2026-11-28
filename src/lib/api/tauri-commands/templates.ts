@@ -9,6 +9,7 @@ import type {
   RuleConflictSide,
   RuleProposalView,
   RuleAcceptance,
+  RuleProposalsSummary,
 } from '$lib/types';
 
 
@@ -76,6 +77,12 @@ export async function removeUnknownSkillMarker(repoId: number, fileName: string)
  *  tip, the contributor's off its own rows; the sweeps ran first. */
 export async function listRuleProposals(repoId: number): Promise<RuleProposalView[]> {
   return invoke<RuleProposalView[]>('list_rule_proposals', { repoId });
+}
+
+/** T-000264: the header chip's summary — open manual-actionable count,
+ *  attention state, recent machine decisions. */
+export async function ruleProposalsSummary(): Promise<RuleProposalsSummary> {
+  return invoke<RuleProposalsSummary>('rule_proposals_summary');
 }
 
 /** Owner: the decision pipeline rows for the repo. */
