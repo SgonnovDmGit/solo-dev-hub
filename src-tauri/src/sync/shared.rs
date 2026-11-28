@@ -14807,6 +14807,19 @@ mod tests {
         let fx = two_installs();
         fx.make_participant_via_syncs();
         // The fleet still runs the pre-chronology build: the gate must block.
+        // The syncs publish the binary's own version, which is 1.25.0+ since
+        // the chronology release itself — the pre-chronology fleet is
+        // simulated explicitly, or the test breaks on every version bump.
+        for login in ["owner", "helper"] {
+            write(
+                &fx.main_dir,
+                &format!(".sdh/app-versions/{}.json", login),
+                "{\"app_version\":\"1.24.6\"}\n",
+            );
+        }
+        g(&fx.main_dir, &["add", ".sdh/app-versions"]);
+        g(&fx.main_dir, &["commit", "-q", "-m", "pre-chronology versions"]);
+        g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
         let gate = chronology_gate(&fx.main_db, &gb(), fx.main_repo).unwrap();
         assert!(!gate.active);
         assert!(
