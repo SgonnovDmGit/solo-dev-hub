@@ -422,6 +422,12 @@
           "nullable": false,
           "default": "1",
           "comment": "v35 (T-000243) — per-repo opt-out for sharing docs/superpowers/ in contributor mode. 1 (default) = the folder travels with the shared set; 0 = specs stay local-only. Independent of shared_mode: settable before sharing is enabled, so it lives on the row, not in shared_import JSON."
+        },
+        {
+          "name": "rule_proposals_mode",
+          "type": "TEXT",
+          "nullable": false,
+          "default": "'auto'"
         }
       ],
       "indexes": [
@@ -484,9 +490,18 @@
             "role",
             "shared_role"
           ]
+        },
+        {
+          "name": "-",
+          "type": "CHECK",
+          "def": "CHECK (rule_proposals_mode IN ('auto', 'manual'))",
+          "table": "repositories",
+          "columns": [
+            "rule_proposals_mode"
+          ]
         }
       ],
-      "def": "CREATE TABLE \"repositories\" (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,\n            github_name TEXT UNIQUE,\n            github_url TEXT,\n            role TEXT CHECK(role IN ('server','client','test_client','admin_client','microservice','landing','tool','other')),\n            description TEXT,\n            language TEXT,\n            last_pushed_at DATETIME,\n            added_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n            local_path TEXT,\n            github_id INTEGER,\n            deploy_target TEXT\n         , sort_order INTEGER NOT NULL DEFAULT 0, bugs_migrated_at TEXT, tasks_migrated_at TEXT, deploy_repo_config TEXT NOT NULL DEFAULT '{}', autocommit_branch TEXT, codex_source_path TEXT, shared_mode INTEGER NOT NULL DEFAULT 0, shared_role TEXT\n             CHECK (shared_role IN ('main','contributor','pending')), shared_status TEXT, shared_import TEXT, share_specs INTEGER NOT NULL DEFAULT 1)"
+      "def": "CREATE TABLE \"repositories\" (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,\n            github_name TEXT UNIQUE,\n            github_url TEXT,\n            role TEXT CHECK(role IN ('server','client','test_client','admin_client','microservice','landing','tool','other')),\n            description TEXT,\n            language TEXT,\n            last_pushed_at DATETIME,\n            added_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n            local_path TEXT,\n            github_id INTEGER,\n            deploy_target TEXT\n         , sort_order INTEGER NOT NULL DEFAULT 0, bugs_migrated_at TEXT, tasks_migrated_at TEXT, deploy_repo_config TEXT NOT NULL DEFAULT '{}', autocommit_branch TEXT, codex_source_path TEXT, shared_mode INTEGER NOT NULL DEFAULT 0, shared_role TEXT\n             CHECK (shared_role IN ('main','contributor','pending')), shared_status TEXT, shared_import TEXT, share_specs INTEGER NOT NULL DEFAULT 1, rule_proposals_mode\n             TEXT NOT NULL DEFAULT 'auto'\n             CHECK (rule_proposals_mode IN ('auto', 'manual')))"
     },
     {
       "name": "repo_renames",
@@ -2099,6 +2114,11 @@
           "type": "TEXT",
           "nullable": false,
           "comment": "RFC 3339 UTC of the last local row update."
+        },
+        {
+          "name": "base_canon_hash",
+          "type": "TEXT",
+          "nullable": true
         }
       ],
       "indexes": [
@@ -2184,7 +2204,7 @@
           ]
         }
       ],
-      "def": "CREATE TABLE rule_proposals (\n             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             file_name TEXT NOT NULL,\n             login TEXT NOT NULL,\n             rule TEXT NOT NULL,\n             seq INTEGER NOT NULL,\n             status TEXT NOT NULL CHECK (status IN ('open','withdrawn')),\n             local_state TEXT NOT NULL CHECK (local_state IN ('pending_apply','applied')),\n             text TEXT NOT NULL,\n             at TEXT NOT NULL,\n             resolved_action TEXT,\n             resolved_by TEXT,\n             resolved_at TEXT,\n             resolved_rev TEXT,\n             remote_ver TEXT,\n             updated_at TEXT NOT NULL,\n             PRIMARY KEY (repo_id, file_name)\n         )"
+      "def": "CREATE TABLE rule_proposals (\n             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             file_name TEXT NOT NULL,\n             login TEXT NOT NULL,\n             rule TEXT NOT NULL,\n             seq INTEGER NOT NULL,\n             status TEXT NOT NULL CHECK (status IN ('open','withdrawn')),\n             local_state TEXT NOT NULL CHECK (local_state IN ('pending_apply','applied')),\n             text TEXT NOT NULL,\n             at TEXT NOT NULL,\n             resolved_action TEXT,\n             resolved_by TEXT,\n             resolved_at TEXT,\n             resolved_rev TEXT,\n             remote_ver TEXT,\n             updated_at TEXT NOT NULL, base_canon_hash TEXT,\n             PRIMARY KEY (repo_id, file_name)\n         )"
     },
     {
       "name": "rule_proposal_seq",
@@ -2343,6 +2363,12 @@
           "name": "updated_at",
           "type": "TEXT",
           "nullable": false
+        },
+        {
+          "name": "auto_decided",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "0"
         }
       ],
       "indexes": [
@@ -2457,7 +2483,7 @@
           ]
         }
       ],
-      "def": "CREATE TABLE rule_acceptances (\n             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             rule TEXT NOT NULL,\n             proposer_login TEXT NOT NULL,\n             decided_rev TEXT NOT NULL,\n             action TEXT NOT NULL CHECK (action IN ('accept','reject')),\n             receipt_json TEXT NOT NULL,\n             proposal_text TEXT NOT NULL,\n             status TEXT NOT NULL CHECK (status IN ('prepared','decided','applied','rendered','conflicted','expired','superseded')),\n             pub_state TEXT NOT NULL CHECK (pub_state IN ('pending','blocked','published','overtaken')),\n             base_canon_hash TEXT NOT NULL,\n             canon_hash TEXT,\n             created_at TEXT NOT NULL,\n             updated_at TEXT NOT NULL,\n             PRIMARY KEY (repo_id, rule, proposer_login, decided_rev)\n         )"
+      "def": "CREATE TABLE rule_acceptances (\n             repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,\n             rule TEXT NOT NULL,\n             proposer_login TEXT NOT NULL,\n             decided_rev TEXT NOT NULL,\n             action TEXT NOT NULL CHECK (action IN ('accept','reject')),\n             receipt_json TEXT NOT NULL,\n             proposal_text TEXT NOT NULL,\n             status TEXT NOT NULL CHECK (status IN ('prepared','decided','applied','rendered','conflicted','expired','superseded')),\n             pub_state TEXT NOT NULL CHECK (pub_state IN ('pending','blocked','published','overtaken')),\n             base_canon_hash TEXT NOT NULL,\n             canon_hash TEXT,\n             created_at TEXT NOT NULL,\n             updated_at TEXT NOT NULL, auto_decided\n             INTEGER NOT NULL DEFAULT 0,\n             PRIMARY KEY (repo_id, rule, proposer_login, decided_rev)\n         )"
     },
     {
       "name": "rule_events",

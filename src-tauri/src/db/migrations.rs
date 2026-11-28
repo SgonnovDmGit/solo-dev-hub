@@ -93,8 +93,16 @@ const MIGRATIONS: &[(i32, &str, MigrationFn)] = &[
         mig_v37_peer_channel_deliveries,
     ),
     (38, "rule_proposals_mode", mig_v38_rule_proposals_mode),
-    (39, "proposal_base_canon_hash", mig_v39_proposal_base_canon_hash),
-    (40, "acceptance_auto_decided", mig_v40_acceptance_auto_decided),
+    (
+        39,
+        "proposal_base_canon_hash",
+        mig_v39_proposal_base_canon_hash,
+    ),
+    (
+        40,
+        "acceptance_auto_decided",
+        mig_v40_acceptance_auto_decided,
+    ),
 ];
 
 impl AppDb {

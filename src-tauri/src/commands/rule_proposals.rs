@@ -309,14 +309,8 @@ pub(crate) fn catalogs_with_issues(
     };
     let known_fn = |r: &str| known.contains(r);
     // The last-seen origin ref is read as-is — commands do not fetch.
-    let cats = crate::sync::shared::proposal_catalogs(
-        git,
-        root,
-        dev_branch,
-        &known_fn,
-        &mut issues,
-        true,
-    );
+    let cats =
+        crate::sync::shared::proposal_catalogs(git, root, dev_branch, &known_fn, &mut issues, true);
     (cats, issues)
 }
 
@@ -1107,14 +1101,19 @@ pub(crate) fn auto_decide_rule_proposals(db: &AppDb) -> AutoDecideOutcome {
             out.held += 1;
             continue;
         }
-        match decide(db, c.repo_id, &c.rule, &c.login, &c.rev, decision_action::ACCEPT) {
+        match decide(
+            db,
+            c.repo_id,
+            &c.rule,
+            &c.login,
+            &c.rev,
+            decision_action::ACCEPT,
+        ) {
             Ok(_) => {
                 let _ = db.mark_rule_acceptance_auto_decided(c.repo_id, &c.rule, &c.login, &c.rev);
                 out.accepted += 1;
             }
-            Err(e) => out
-                .errors
-                .push(format!("{}.{}: {}", c.rule, c.login, e)),
+            Err(e) => out.errors.push(format!("{}.{}: {}", c.rule, c.login, e)),
         }
     }
     if out.accepted > 0 || out.held > 0 {

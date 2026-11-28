@@ -396,9 +396,7 @@ fn reconcile_bugs_in_checkout(
             let fleet_deleted = file_exists
                 && ledger
                     .as_ref()
-                    .and_then(|l| {
-                        l.get(&crate::sync::edit_clocks::row_key(&db_bug.display_id))
-                    })
+                    .and_then(|l| l.get(&crate::sync::edit_clocks::row_key(&db_bug.display_id)))
                     .is_some_and(|e| e.del && !e.is_quarantined(now_secs));
             if fleet_deleted {
                 eprintln!(
@@ -700,7 +698,9 @@ mod tests {
     /// T-000268: write the edit-clock ledger of bug-reports.md into the repo
     /// worktree with one tombstone per display id, stamped at `t`.
     fn write_tombstone_ledger(dir: &Path, ids: &[&str], t: i64) {
-        use crate::sync::edit_clocks::{ledger_file_name, row_key, ClockEntry, ClockLedger, CLOCKS_DIR};
+        use crate::sync::edit_clocks::{
+            ledger_file_name, row_key, ClockEntry, ClockLedger, CLOCKS_DIR,
+        };
         let mut ledger = ClockLedger::new("docs/bug-reports.md");
         for id in ids {
             ledger.entries.insert(
@@ -726,7 +726,8 @@ mod tests {
     /// longer lists it — the post-merge state a fleet deletion leaves behind.
     fn setup_active_bug_missing_from_md() -> (AppDb, TempDir, i64) {
         let (db, tmp, rid) = setup_repo_with_dir();
-        db.set_bugs_migrated_at(rid, "2026-03-01T00:00:00Z").unwrap();
+        db.set_bugs_migrated_at(rid, "2026-03-01T00:00:00Z")
+            .unwrap();
         db.insert_bug(
             rid,
             1,
@@ -744,19 +745,9 @@ mod tests {
         (db, tmp, rid)
     }
 
-    fn reconcile_fixture(
-        db: &AppDb,
-        tmp: &TempDir,
-        repo_id: i64,
-        chronology_active: bool,
-    ) {
-        reconcile_bugs_in_checkout(
-            db,
-            repo_id,
-            tmp.path().to_str().unwrap(),
-            chronology_active,
-        )
-        .unwrap();
+    fn reconcile_fixture(db: &AppDb, tmp: &TempDir, repo_id: i64, chronology_active: bool) {
+        reconcile_bugs_in_checkout(db, repo_id, tmp.path().to_str().unwrap(), chronology_active)
+            .unwrap();
     }
 
     #[test]
@@ -766,7 +757,11 @@ mod tests {
         // otherwise the regen resurrects it and the next commit re-stamps it
         // fresh, defeating the tombstone forever (spec finding #5).
         let (db, tmp, rid) = setup_active_bug_missing_from_md();
-        write_tombstone_ledger(tmp.path(), &["B-000001"], chrono::Utc::now().timestamp() - 60);
+        write_tombstone_ledger(
+            tmp.path(),
+            &["B-000001"],
+            chrono::Utc::now().timestamp() - 60,
+        );
 
         reconcile_fixture(&db, &tmp, rid, true);
 
@@ -786,7 +781,11 @@ mod tests {
         // write-only evidence until the owner activates chronology. The same
         // file/DB state must therefore take the legacy restore path.
         let (db, tmp, rid) = setup_active_bug_missing_from_md();
-        write_tombstone_ledger(tmp.path(), &["B-000001"], chrono::Utc::now().timestamp() - 60);
+        write_tombstone_ledger(
+            tmp.path(),
+            &["B-000001"],
+            chrono::Utc::now().timestamp() - 60,
+        );
 
         reconcile_fixture(&db, &tmp, rid, false);
 
@@ -841,7 +840,8 @@ mod tests {
         // The tombstone changes nothing: archive-mark, not deletion (the history
         // of a confirmed bug is kept in the DB).
         let (db, tmp, rid) = setup_repo_with_dir();
-        db.set_bugs_migrated_at(rid, "2026-03-01T00:00:00Z").unwrap();
+        db.set_bugs_migrated_at(rid, "2026-03-01T00:00:00Z")
+            .unwrap();
         db.insert_bug(
             rid,
             1,
@@ -856,7 +856,11 @@ mod tests {
         )
         .unwrap();
         write_bug_reports_md(tmp.path(), &[]);
-        write_tombstone_ledger(tmp.path(), &["B-000001"], chrono::Utc::now().timestamp() - 60);
+        write_tombstone_ledger(
+            tmp.path(),
+            &["B-000001"],
+            chrono::Utc::now().timestamp() - 60,
+        );
 
         reconcile_fixture(&db, &tmp, rid, true);
 
@@ -864,7 +868,10 @@ mod tests {
             .get_bug_by_display_id(rid, "B-000001")
             .unwrap()
             .expect("a confirmed bug is archived, never deleted");
-        assert!(bug.archived_from_md_at.is_some(), "archived, as the LLM-ack flow would");
+        assert!(
+            bug.archived_from_md_at.is_some(),
+            "archived, as the LLM-ack flow would"
+        );
     }
 
     #[test]
@@ -872,7 +879,8 @@ mod tests {
         // No file at all is not a row-level verdict — a fresh clone before the
         // first regen would otherwise massacre the whole table.
         let (db, tmp, rid) = setup_repo_with_dir();
-        db.set_bugs_migrated_at(rid, "2026-03-01T00:00:00Z").unwrap();
+        db.set_bugs_migrated_at(rid, "2026-03-01T00:00:00Z")
+            .unwrap();
         db.insert_bug(
             rid,
             1,
@@ -887,7 +895,11 @@ mod tests {
         )
         .unwrap();
         // No bug-reports.md written at all; tombstone ledger present.
-        write_tombstone_ledger(tmp.path(), &["B-000001"], chrono::Utc::now().timestamp() - 60);
+        write_tombstone_ledger(
+            tmp.path(),
+            &["B-000001"],
+            chrono::Utc::now().timestamp() - 60,
+        );
 
         reconcile_fixture(&db, &tmp, rid, true);
 

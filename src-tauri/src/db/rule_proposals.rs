@@ -715,7 +715,9 @@ mod tests {
 
         let scan = crate::commands::rule_proposals::scan_open_candidates(&db);
         assert!(
-            scan.scan_errors.iter().any(|e| e.contains("no local checkout")),
+            scan.scan_errors
+                .iter()
+                .any(|e| e.contains("no local checkout")),
             "missing root must be a scan error, got {:?}",
             scan.scan_errors
         );
@@ -725,7 +727,10 @@ mod tests {
         assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.held, 0);
         assert!(
-            outcome.errors.iter().any(|e| e.contains("no local checkout")),
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("no local checkout")),
             "the scan error must reach the auto-decider, got {:?}",
             outcome.errors
         );

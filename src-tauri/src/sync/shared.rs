@@ -1312,12 +1312,7 @@ fn last_version_sha(git: &GitBinary, root: &Path, rev: &str, path: &str) -> Opti
 /// the deletion stands — re-adding it would be the oscillation the REQ-018
 /// archaeology documented — and a live winner adopts only when the
 /// remote's content IS that winner.
-fn clock_verdict_for_adopt(
-    git: &GitBinary,
-    root: &Path,
-    remote: &str,
-    path: &str,
-) -> Option<bool> {
+fn clock_verdict_for_adopt(git: &GitBinary, root: &Path, remote: &str, path: &str) -> Option<bool> {
     use crate::sync::edit_clocks::{
         ledger_file_name, value_hash, ClockLedger, CLOCKS_DIR, FILE_KEY,
     };
@@ -2070,30 +2065,27 @@ fn shared_plan_changes(
         // and only post-activation; sole-writer paths keep their ownership
         // semantics, which the spec places outside LWW. `None` means no
         // stamp evidence and the positional arms below decide as before.
-        let fclock: Option<crate::sync::edit_clocks::ClockEntry> = if chronology
-            && wt != br
-            && kind_for_path(path).is_none()
-            && !sole_writer(path)
-        {
-            let (union, udiags) = union_clock_for(git, root, &ctx, path);
-            clock_diags.extend(udiags);
-            match union.get(crate::sync::edit_clocks::FILE_KEY).cloned() {
-                Some(e) if e.is_quarantined(unix_now()) => {
-                    // T-000267 quarantine consumption: a far-future stamp on
-                    // the file key freezes it — the winner decides nothing
-                    // (a wrong-clock machine must not rule the fleet), the
-                    // positional fallback takes over, and the freeze is loud.
-                    clock_diags.push(format!(
-                        "{}: file key frozen by a far-future stamp — positional fallback",
-                        path
-                    ));
-                    None
+        let fclock: Option<crate::sync::edit_clocks::ClockEntry> =
+            if chronology && wt != br && kind_for_path(path).is_none() && !sole_writer(path) {
+                let (union, udiags) = union_clock_for(git, root, &ctx, path);
+                clock_diags.extend(udiags);
+                match union.get(crate::sync::edit_clocks::FILE_KEY).cloned() {
+                    Some(e) if e.is_quarantined(unix_now()) => {
+                        // T-000267 quarantine consumption: a far-future stamp on
+                        // the file key freezes it — the winner decides nothing
+                        // (a wrong-clock machine must not rule the fleet), the
+                        // positional fallback takes over, and the freeze is loud.
+                        clock_diags.push(format!(
+                            "{}: file key frozen by a far-future stamp — positional fallback",
+                            path
+                        ));
+                        None
+                    }
+                    other => other,
                 }
-                other => other,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let plan = match (wt, br) {
             (Some(w), Some(b)) => {
                 if w == b {
@@ -2319,26 +2311,26 @@ fn shared_plan_changes(
                 } else if is_approved_request(path, ctx.approved) {
                     Plan::Delete
                 } else {
-                // We deleted it iff the branch is a pure follower of this
-                // path's history with us: every blob it ever held is a
-                // subsequence of ours, so its current copy is a version WE
-                // delivered and later retracted — a file born after the fork
-                // that reached the branch through our own deliveries counts
-                // the same (T-000257 could not see it behind the merge base).
-                // A byte-identical re-add is NOT a follower: the re-add commit
-                // is an extra entry in the branch's history ours never had,
-                // so the foreign work lives on (the A/D guard, T-000257; the
-                // re-dropped `.ack/` markers of T-000245).
-                let follows = hist.as_ref().is_some_and(|(o, t)| {
-                    !o.is_empty()
-                        && t.first().map(String::as_str) == Some(b)
-                        && is_subsequence(t, o)
-                });
-                if follows {
-                    Plan::Delete
-                } else {
-                    Plan::Skip
-                }
+                    // We deleted it iff the branch is a pure follower of this
+                    // path's history with us: every blob it ever held is a
+                    // subsequence of ours, so its current copy is a version WE
+                    // delivered and later retracted — a file born after the fork
+                    // that reached the branch through our own deliveries counts
+                    // the same (T-000257 could not see it behind the merge base).
+                    // A byte-identical re-add is NOT a follower: the re-add commit
+                    // is an extra entry in the branch's history ours never had,
+                    // so the foreign work lives on (the A/D guard, T-000257; the
+                    // re-dropped `.ack/` markers of T-000245).
+                    let follows = hist.as_ref().is_some_and(|(o, t)| {
+                        !o.is_empty()
+                            && t.first().map(String::as_str) == Some(b)
+                            && is_subsequence(t, o)
+                    });
+                    if follows {
+                        Plan::Delete
+                    } else {
+                        Plan::Skip
+                    }
                 }
             }
             (None, None) => Plan::Skip,
@@ -5560,31 +5552,31 @@ fn adopt_remote_re_adds(
             // The clock verdict is unconditional post-activation (T-000274).
             Some(adopt) => adopt,
             None => match merge_base {
-            None => true,
-            Some(mb) => {
-                let out = spawn_cmd(&git.0)
-                    .args([
-                        "log",
-                        "-1",
-                        "--format=%H",
-                        remote,
-                        "--not",
-                        mb,
-                        "--",
-                        path.as_str(),
-                    ])
-                    .current_dir(root)
-                    .output()
-                    .map_err(|e| format!("git log failed to start: {}", e))?;
-                if !out.status.success() {
-                    return Err(format!(
-                        "git log exit {}: {}",
-                        out.status,
-                        String::from_utf8_lossy(&out.stderr)
-                    ));
+                None => true,
+                Some(mb) => {
+                    let out = spawn_cmd(&git.0)
+                        .args([
+                            "log",
+                            "-1",
+                            "--format=%H",
+                            remote,
+                            "--not",
+                            mb,
+                            "--",
+                            path.as_str(),
+                        ])
+                        .current_dir(root)
+                        .output()
+                        .map_err(|e| format!("git log failed to start: {}", e))?;
+                    if !out.status.success() {
+                        return Err(format!(
+                            "git log exit {}: {}",
+                            out.status,
+                            String::from_utf8_lossy(&out.stderr)
+                        ));
+                    }
+                    !String::from_utf8_lossy(&out.stdout).trim().is_empty()
                 }
-                !String::from_utf8_lossy(&out.stdout).trim().is_empty()
-            }
             },
         };
         if !touched {
@@ -14278,7 +14270,9 @@ mod tests {
             "corruption must not propagate"
         );
         assert!(
-            diags.iter().any(|d| d.contains("corrupt") && d.contains(CLOCK_REL)),
+            diags
+                .iter()
+                .any(|d| d.contains("corrupt") && d.contains(CLOCK_REL)),
             "the freeze explains itself through the diagnostics: {:?}",
             diags
         );
@@ -14578,10 +14572,7 @@ mod tests {
     /// and the branch names so each test arranges the artifact and the
     /// ledgers; returns the plumbing target branch's post-plumb state of
     /// the artifact plus the diagnostics.
-    fn clocked_file_plumb(
-        with_protocol: bool,
-        setup: impl Fn(&Path),
-    ) -> (bool, Vec<String>) {
+    fn clocked_file_plumb(with_protocol: bool, setup: impl Fn(&Path)) -> (bool, Vec<String>) {
         use crate::sync::edit_clocks::render_protocol;
         let dir = tempfile::TempDir::new().unwrap();
         let d = dir.path();
@@ -14605,10 +14596,7 @@ mod tests {
         g(d, &["commit", "-q", "-m", "setup"]);
         // Everything the setup wrote lands on dev; the `other` branch is
         // arranged by the setup through explicit branch commits.
-        let spec = vec![
-            "docs/InOutBox".to_string(),
-            ".sdh/edit-clocks".to_string(),
-        ];
+        let spec = vec!["docs/InOutBox".to_string(), ".sdh/edit-clocks".to_string()];
         let mut diags = Vec::new();
         plumb_into_branch(&gb(), d, "other", &spec, "me", &[], &None, &mut diags).unwrap();
         let present = git_sync::blob_sha_at(&gb(), d, "other", REQ_REL)
@@ -14640,7 +14628,10 @@ mod tests {
         g(&aw, &["add", "-A"]);
         // `--allow-empty`: arranging neither artifact nor ledger means the
         // branch simply stays — the state is what matters, not the commit.
-        g(&aw, &["commit", "-q", "--allow-empty", "-m", "arrange other"]);
+        g(
+            &aw,
+            &["commit", "-q", "--allow-empty", "-m", "arrange other"],
+        );
         g(d, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
         drop(outside);
     }
@@ -14652,7 +14643,11 @@ mod tests {
         // ledger). Plumbing must NOT publish — and must say why.
         let dir_setup = |d: &Path| {
             write(d, REQ_REL, "the request body");
-            write(d, &req_clock_rel(), &file_ledger(100, "src-ours", Some("the request body")));
+            write(
+                d,
+                &req_clock_rel(),
+                &file_ledger(100, "src-ours", Some("the request body")),
+            );
             arrange_other(d, None, Some(&file_ledger(300, "src-fleet", None)));
         };
         let (present, diags) = clocked_file_plumb(true, dir_setup);
@@ -14739,7 +14734,11 @@ mod tests {
         // reproducing the oscillation the archaeology documented.
         let dir_setup = |d: &Path| {
             write(d, REQ_REL, "the request body");
-            write(d, &req_clock_rel(), &file_ledger(100, "src-ours", Some("the request body")));
+            write(
+                d,
+                &req_clock_rel(),
+                &file_ledger(100, "src-ours", Some("the request body")),
+            );
             arrange_other(d, None, Some(&file_ledger(300, "src-fleet", None)));
         };
         let (present, _diags) = clocked_file_plumb(false, dir_setup);
@@ -14818,7 +14817,10 @@ mod tests {
             );
         }
         g(&fx.main_dir, &["add", ".sdh/app-versions"]);
-        g(&fx.main_dir, &["commit", "-q", "-m", "pre-chronology versions"]);
+        g(
+            &fx.main_dir,
+            &["commit", "-q", "-m", "pre-chronology versions"],
+        );
         g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
         let gate = chronology_gate(&fx.main_db, &gb(), fx.main_repo).unwrap();
         assert!(!gate.active);
@@ -14875,7 +14877,16 @@ mod tests {
             let clock_rel = format!("{}/{}", CLOCKS_DIR, ledger_file_name(rel));
             write(&fx.main_dir, &clock_rel, &l.serialize().unwrap());
         }
-        g(&fx.main_dir, &["add", ".sdh/app-versions", "docs/todo.md", "docs/backend-requirements", ".sdh/edit-clocks"]);
+        g(
+            &fx.main_dir,
+            &[
+                "add",
+                ".sdh/app-versions",
+                "docs/todo.md",
+                "docs/backend-requirements",
+                ".sdh/edit-clocks",
+            ],
+        );
         g(&fx.main_dir, &["commit", "-q", "-m", "versions"]);
         g(&fx.main_dir, &["push", "-q", "origin", "dev"]);
         let gate = chronology_gate(&fx.main_db, &gb(), fx.main_repo).unwrap();
@@ -16897,7 +16908,17 @@ mod tests {
         g(d, &["commit", "-q", "-m", "newer canon"]);
         let spec = vec!["docs/sdh_skills".to_string()];
         let held = BTreeSet::from(["docs/sdh_skills/sdh-alpha.md".to_string()]);
-        plumb_into_branch(&gb(), d, "helper-dev", &spec, "me", &[], &Some(held), &mut Vec::new()).unwrap();
+        plumb_into_branch(
+            &gb(),
+            d,
+            "helper-dev",
+            &spec,
+            "me",
+            &[],
+            &Some(held),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             g(d, &["show", "helper-dev:docs/sdh_skills/sdh-alpha.md"]),
             "PROPOSED",

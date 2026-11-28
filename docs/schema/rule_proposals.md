@@ -23,7 +23,7 @@ CREATE TABLE rule_proposals (
              resolved_at TEXT,
              resolved_rev TEXT,
              remote_ver TEXT,
-             updated_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL, base_canon_hash TEXT,
              PRIMARY KEY (repo_id, file_name)
          )
 ```
@@ -49,6 +49,7 @@ CREATE TABLE rule_proposals (
 | resolved_rev    | TEXT    |         | true     |          |                                 | The proposal blob sha the receipt was taken against (CAS).                                                                                           |
 | remote_ver      | TEXT    |         | true     |          |                                 | `{seq,status,sha}` of the last origin-confirmed remote version — the dominance check the terminal-row GC requires before deleting.                   |
 | updated_at      | TEXT    |         | false    |          |                                 | RFC 3339 UTC of the last local row update.                                                                                                           |
+| base_canon_hash | TEXT    |         | true     |          |                                 |                                                                                                                                                      |
 
 ## Constraints
 

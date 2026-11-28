@@ -2741,7 +2741,10 @@ mod clocked_tests {
 
 - [ ] T-000001 | task | 1 | low | alpha | 2026-10-01
 ";
-        let l = ledger_of(&[(&field_key("T-000001", 4), ent("alpha", far_future(), "bad", false))]);
+        let l = ledger_of(&[(
+            &field_key("T-000001", 4),
+            ent("alpha", far_future(), "bad", false),
+        )]);
         let (text, diags) = merge6(BASE, ours, theirs, &l);
         assert!(text.contains("| zulu |"), "{}", text);
         assert!(!text.contains("| alpha |"), "{}", text);
@@ -2792,5 +2795,4 @@ mod clocked_tests {
         let (text2, _) = merge6(BASE, &ours_with_row, deleted_side, &l2);
         assert!(!text2.contains("T-000001"), "{}", text2);
     }
-
 }

@@ -2,6 +2,20 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Russian version: [Changelog.ru.md](Changelog.ru.md).
 
+## [1.25.0] — 2026-11-28
+
+### Added
+- **UTC chronology for the shared sync — the time axis shared files never had (T-000265–T-000268, T-000273, T-000274).** The root cause of the three fleet symptoms (rolled-back todo edits, stuck skill approvals, REQ receipts never arriving) was structural: branches without common ancestry since 2026-11-01, a positional resolver, last-WRITER-wins instead of last-CHANGE-wins. The release builds the missing axis: a committed edit-clock ledger `.sdh/edit-clocks/` per shared file (sha-bound stamps, tombstones that never garbage-collect, quarantine for far-future stamps), a fleet-wide activation protocol `.sdh/protocol.json` with a one-time baseline stamping, UTC-LWW resolution in `merge_by_id` and for whole-file shared paths (REQ/InOutBox) — the REQ-018 existence ping-pong is proven converged in e2e. Pre-activation nothing changes: stamps are written but inert. Flow: `docs/flows/contributor-mode.md`.
+- **Rule proposals can be decided by the machine (T-000264).** New per-repository setting `rule_proposals_mode` (default `auto`): after every sync pass the post-pass sweep accepts every conflict-free proposal with no owner click — through the very same decide machine the click uses, same CAS, same receipt, same canon write. A conflict — differing texts of one rule across the portfolio, or the canon moved since the proposal's base — stays manual forever, as does every legacy proposal without a base hash. The header chip counts manual-actionable proposals, carries the persisted auto-decided counter and turns red on conflicts or blocked receipt publications; the mode toggle lives next to the specs switch. Flow: `docs/flows/rule-proposals.md`.
+
+### Fixed
+- **Fleet-wide bug deletion finally propagates (T-000268).** A bug hard-deleted on one install was silently restored by every other install's mirror reconciliation — deletion had no transport. Disappearing rows now leave tombstones in the edit-clock ledger, and a tombstoned row is deleted from every database with its events cascaded. Guards keep the legacy restore when the file is absent, the ledger entry is missing, or the stamp is quarantined. Flow: `docs/flows/bug-tracking.md`.
+- **A stuck `.approved` marker is removable from the app (T-000263).** The "marked but no such rule" issue used to be fixable only by hand-deleting the file on every install. The issue toast now carries a "Delete marker" action with confirmation — the canon is re-checked under lock so a marker whose rule did arrive is refused, and the rule copy next to the marker is never touched.
+- **Review hardening of the chronology contract (post-review fixes).** Three confirmed review findings fixed before shipping: the ledger union now orders ties totally over `(t, src, h, del)` — commutativity held only while timestamps differed; MD↔DB clock consumption is inert until the owner activates the fleet, as specified; the auto-decider fails closed when any repo of the portfolio scan is unreadable instead of treating a partial scan as proof of no competition. The remainder of the review is filed as v1.25.1 tasks.
+
+### Tests
+- 1059 Rust (`cargo test --lib`) on Windows — one channel-timing test in the untouched `skills` module flaked once under the full parallel load and passes isolated; the activation-gate test needed a version-independence fix (it assumed a pre-1.25 binary). The change's git-spawning e2e ran by hand: the fleet bug-deletion round-trip (~20 min), the auto-mode proposal round-trip with an idempotent re-sweep (~8 min), the REQ-018 existence ping-pong convergence — the rest of the ignored suite runs on the Linux CI. 231 vitest, svelte-check clean.
+
 ## [1.24.6] — 2026-11-23
 
 ### Fixed

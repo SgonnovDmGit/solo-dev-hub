@@ -202,10 +202,7 @@ pub fn stamp_whole_file_change(
             // A live winner with a different hash, or a tombstone winner,
             // never suppresses: a re-add after a deletion must stamp.
             let h = value_hash(n);
-            if ledger
-                .get(FILE_KEY)
-                .is_some_and(|e| !e.del && e.h == h)
-            {
+            if ledger.get(FILE_KEY).is_some_and(|e| !e.del && e.h == h) {
                 return false;
             }
             ledger.stamp(FILE_KEY, entry(h, now, src, false))
@@ -458,29 +455,64 @@ mod tests {
         use crate::sync::edit_clocks::FILE_KEY;
         let mut l = ledger();
         // add
-        assert!(stamp_whole_file_change(None, Some(b"v1"), &mut l, 100, "c1"));
+        assert!(stamp_whole_file_change(
+            None,
+            Some(b"v1"),
+            &mut l,
+            100,
+            "c1"
+        ));
         let e = l.get(FILE_KEY).unwrap();
         assert!(!e.del);
         assert_eq!(e.h, value_hash(b"v1"));
         assert_eq!(e.t, 100);
         // byte-identical transport copy: no diff, no restamp
-        assert!(!stamp_whole_file_change(Some(b"v1"), Some(b"v1"), &mut l, 150, "cX"));
+        assert!(!stamp_whole_file_change(
+            Some(b"v1"),
+            Some(b"v1"),
+            &mut l,
+            150,
+            "cX"
+        ));
         assert_eq!(l.get(FILE_KEY).unwrap().t, 100);
         // edit
-        assert!(stamp_whole_file_change(Some(b"v1"), Some(b"v2"), &mut l, 200, "c2"));
+        assert!(stamp_whole_file_change(
+            Some(b"v1"),
+            Some(b"v2"),
+            &mut l,
+            200,
+            "c2"
+        ));
         assert_eq!(l.get(FILE_KEY).unwrap().h, value_hash(b"v2"));
         assert_eq!(l.get(FILE_KEY).unwrap().t, 200);
         // delete: tombstone
-        assert!(stamp_whole_file_change(Some(b"v2"), None, &mut l, 300, "c3"));
+        assert!(stamp_whole_file_change(
+            Some(b"v2"),
+            None,
+            &mut l,
+            300,
+            "c3"
+        ));
         assert!(l.get(FILE_KEY).unwrap().del);
         assert_eq!(l.get(FILE_KEY).unwrap().t, 300);
         // a stale edit pass (t=250) cannot overwrite the tombstone
-        assert!(!stamp_whole_file_change(Some(b"v1"), Some(b"v9"), &mut l, 250, "c4"));
+        assert!(!stamp_whole_file_change(
+            Some(b"v1"),
+            Some(b"v9"),
+            &mut l,
+            250,
+            "c4"
+        ));
         assert!(l.get(FILE_KEY).unwrap().del);
         // a genuine later re-add wins
-        assert!(stamp_whole_file_change(None, Some(b"v3"), &mut l, 400, "c5"));
+        assert!(stamp_whole_file_change(
+            None,
+            Some(b"v3"),
+            &mut l,
+            400,
+            "c5"
+        ));
         assert!(!l.get(FILE_KEY).unwrap().del);
         assert_eq!(l.get(FILE_KEY).unwrap().h, value_hash(b"v3"));
     }
-
 }

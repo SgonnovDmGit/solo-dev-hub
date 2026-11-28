@@ -197,7 +197,11 @@ pub const ERR_MARKER_RULE_KNOWN: &str = "rule_marker_now_known";
 /// update seeded it), the marker is a live hand-back of that rule and
 /// deleting it would silently drop the edit — so the delete re-checks the
 /// canon under the rules lock rather than trusting the toast's stale premise.
-pub fn remove_unknown_skill_marker(db: &AppDb, repo_id: i64, file_name: &str) -> Result<(), String> {
+pub fn remove_unknown_skill_marker(
+    db: &AppDb,
+    repo_id: i64,
+    file_name: &str,
+) -> Result<(), String> {
     // The name is a file name, never a path: anything else is rejected before
     // it can reach the filesystem.
     let valid = file_name.ends_with(&format!(".md{}", APPROVED_SUFFIX))
@@ -2467,7 +2471,12 @@ mod tests {
         let canary = tmp.path().join("docs").join("todo.md");
         fs::write(&canary, "canary").unwrap();
 
-        for bad in ["../todo.md.approved", "..\\x.md.approved", "a/b.md.approved", ".md.approved"] {
+        for bad in [
+            "../todo.md.approved",
+            "..\\x.md.approved",
+            "a/b.md.approved",
+            ".md.approved",
+        ] {
             assert!(
                 remove_unknown_skill_marker(&db, repo.id, bad).is_err(),
                 "{bad} must be rejected"

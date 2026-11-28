@@ -21,7 +21,8 @@ CREATE TABLE rule_acceptances (
              base_canon_hash TEXT NOT NULL,
              canon_hash TEXT,
              created_at TEXT NOT NULL,
-             updated_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL, auto_decided
+             INTEGER NOT NULL DEFAULT 0,
              PRIMARY KEY (repo_id, rule, proposer_login, decided_rev)
          )
 ```
@@ -45,6 +46,7 @@ CREATE TABLE rule_acceptances (
 | canon_hash      | TEXT    |         | true     |          |                                 | sha256 of the canon text actually applied; NULL until applied.                                                                                                               |
 | created_at      | TEXT    |         | false    |          |                                 |                                                                                                                                                                              |
 | updated_at      | TEXT    |         | false    |          |                                 |                                                                                                                                                                              |
+| auto_decided    | INTEGER | 0       | false    |          |                                 |                                                                                                                                                                              |
 
 ## Constraints
 

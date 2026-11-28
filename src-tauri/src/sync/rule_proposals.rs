@@ -155,7 +155,10 @@ pub fn validate_proposal_file(
             && h.bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
         if !ok {
-            return Err(format!("{}: base_canon_hash is not a sha256 hex", file_name));
+            return Err(format!(
+                "{}: base_canon_hash is not a sha256 hex",
+                file_name
+            ));
         }
     }
     Ok(())
@@ -281,7 +284,6 @@ pub fn effective_version(local: &RuleProposalFile, dev: &RuleProposalFile) -> Ef
         Effective::Remote
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // T-000264: the auto-decision conflict detector (spec D4)
@@ -428,7 +430,8 @@ mod tests {
         );
     }
 
-    #[test]    fn filenames_roundtrip_and_reject_each_others_grammar() {
+    #[test]
+    fn filenames_roundtrip_and_reject_each_others_grammar() {
         let p = proposal_file_name("sdh-alpha", "Helper");
         assert_eq!(p, "sdh-alpha.helper.json");
         assert_eq!(

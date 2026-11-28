@@ -89,9 +89,7 @@ pub fn sync_tasks_for_repo(db: &AppDb, repo_id: i64) -> Result<SyncTasksReport, 
     // but they are inert for MD↔DB resolution until the protocol reaches dev.
     // No git binary or no readable protocol means inactive here.
     let active = crate::git_ops::cached_git()
-        .map(|git| {
-            crate::sync::shared::chronology_active_for_repo(&git, Path::new(&local_path))
-        })
+        .map(|git| crate::sync::shared::chronology_active_for_repo(&git, Path::new(&local_path)))
         .unwrap_or(false);
     sync_tasks_for_repo_in_checkout(db, repo_id, &local_path, active)
 }
@@ -116,9 +114,7 @@ fn sync_tasks_for_repo_in_checkout(
     // after activation their absence or corruption degrades to the legacy
     // done-wins rule (corruption itself is reported by the sync layer).
     let clock_ledgers = clock_ledgers_if_active(root, chronology_active);
-    let clocks = clock_ledgers
-        .as_ref()
-        .map(|pair| (&pair.0, &pair.1));
+    let clocks = clock_ledgers.as_ref().map(|pair| (&pair.0, &pair.1));
 
     let none = |_: &str| None;
     sync_tasks_core(
@@ -374,15 +370,10 @@ fn sync_tasks_core(
         let Some((tl, dl)) = opts.clocks else {
             return false;
         };
-        let live = |e: &&crate::sync::edit_clocks::ClockEntry| {
-            !e.del && !e.is_quarantined(now_secs)
-        };
-        let te = tl
-            .get(&crate::sync::edit_clocks::row_key(id))
-            .filter(live);
-        let de = dl
-            .get(&crate::sync::edit_clocks::row_key(id))
-            .filter(live);
+        let live =
+            |e: &&crate::sync::edit_clocks::ClockEntry| !e.del && !e.is_quarantined(now_secs);
+        let te = tl.get(&crate::sync::edit_clocks::row_key(id)).filter(live);
+        let de = dl.get(&crate::sync::edit_clocks::row_key(id)).filter(live);
         match (te, de) {
             (Some(t), Some(d)) => t.t > d.t,
             _ => false,
