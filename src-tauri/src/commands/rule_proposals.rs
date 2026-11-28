@@ -872,6 +872,164 @@ pub(crate) fn decide(
     apply_decision(db, &a, dirs::home_dir().as_deref())
 }
 
+// ---------------------------------------------------------------------------
+// T-000264: the post-pass auto-decider (spec D4)
+// ---------------------------------------------------------------------------
+
+/// What one auto-decide sweep did. `accepted` counts the proposals the
+/// machine accepted; `held` the ones a conflict verdict held back (the
+/// attention surface reads the live state, so they need no detail here);
+/// errors never abort the sweep — one bad repo cannot silence the rest.
+pub(crate) struct AutoDecideOutcome {
+    pub accepted: u32,
+    pub held: u32,
+    pub errors: Vec<String>,
+}
+
+struct AutoCandidate {
+    repo_id: i64,
+    rule: String,
+    login: String,
+    text: String,
+    base_canon_hash: Option<String>,
+    rev: String,
+    /// The repo's mode — the machine decides only auto ones, but a manual
+    /// repo's open proposals still COMPETE: they target the same canon on
+    /// this install, and silently picking one side of a disagreement is the
+    /// exact mistake the conflict verdict exists to prevent (spec D4 scans
+    /// the portfolio, not the auto subset).
+    auto: bool,
+}
+
+/// The machine half of `rule_proposals_mode = 'auto'` — runs AFTER the
+/// sync pass, when no `specs_policy_guard` is held anywhere up the call
+/// stack (the mutex is not recursive; `decide` takes it per receipt).
+///
+/// The sweep, in spec order:
+/// 1. SCAN FIRST, decide nothing yet: every unresolved open proposal of
+///    every shared repo this install is the main of — across the whole
+///    portfolio, so the traversal order never becomes the policy.
+/// 2. Per candidate the pure verdict (S3): baseless stays manual,
+///    competing texts stay manual, a moved canon stays manual.
+/// 3. `Clean` candidates go through the very same `decide` machine the
+///    owner's click would — same CAS, same receipt, same canon write.
+///
+/// "Unresolved": no union receipt closes the effective version AND no
+/// acceptance row exists for it. The second half is what keeps a manual
+/// `reject` from being re-decided into an `accept` error every pass —
+/// and a stuck accept needs no help from here, because the transport's
+/// `publish_pending_receipts` already resumes those inside the pass.
+pub(crate) fn auto_decide_rule_proposals(db: &AppDb) -> AutoDecideOutcome {
+    let mut out = AutoDecideOutcome {
+        accepted: 0,
+        held: 0,
+        errors: Vec::new(),
+    };
+    let Some(git) = crate::git_ops::cached_git() else {
+        return out;
+    };
+    let repos = match db.list_all_repos() {
+        Ok(r) => r,
+        Err(e) => {
+            out.errors.push(e.to_string());
+            return out;
+        }
+    };
+    // Step 1 — the portfolio-wide scan. Every repo where this install is
+    // the main contributes its open proposals to the competition set —
+    // the mode gates only DECIDING, never what counts as a competitor.
+    let mut candidates: Vec<AutoCandidate> = Vec::new();
+    for repo in &repos {
+        let Ok(state) = db.get_shared_state(repo.id) else {
+            continue;
+        };
+        if state.shared_role.as_deref() != Some("main") {
+            continue;
+        }
+        let auto = state.rule_proposals_mode == "auto";
+        let Some(root) = repo_root(repo).ok() else {
+            continue;
+        };
+        let Some(dev_branch) = dev_branch_for(db, repo.id, &root) else {
+            continue;
+        };
+        let cats = catalogs(Some(&git), &root, &dev_branch, db);
+        let acceptances = db.list_rule_acceptances(repo.id).unwrap_or_default();
+        for (_, u) in &cats.proposals {
+            let p = &u.proposal;
+            if p.status != crate::models::proposal_status::OPEN {
+                continue;
+            }
+            let receipted = cats.decisions.entries.values().any(|(_, d)| {
+                ss::logins_equal(&d.login, &p.login) && u.effective_shas.contains(&d.decided_rev)
+            });
+            if receipted {
+                continue;
+            }
+            let queued = acceptances.iter().any(|a| {
+                a.rule == p.rule
+                    && ss::logins_equal(&a.proposer_login, &p.login)
+                    && u.effective_shas.contains(&a.decided_rev)
+            });
+            if queued {
+                continue;
+            }
+            let Some(rev) = u.effective_shas.iter().next().cloned() else {
+                continue;
+            };
+            candidates.push(AutoCandidate {
+                repo_id: repo.id,
+                rule: p.rule.clone(),
+                login: p.login.clone(),
+                text: p.text.clone(),
+                base_canon_hash: p.base_canon_hash.clone(),
+                rev,
+                auto,
+            });
+        }
+    }
+    // Step 2+3 — verdicts, then decisions. The competition set of a rule
+    // is the texts of ALL its unresolved candidates portfolio-wide: same
+    // text from two repos is one intent, distinct texts are the conflict.
+    for c in &candidates {
+        if !c.auto {
+            continue;
+        }
+        let texts: Vec<&str> = candidates
+            .iter()
+            .filter(|o| o.rule == c.rule)
+            .map(|o| o.text.as_str())
+            .collect();
+        let canon = db
+            .get_template_file("_global", &format!("skill.{}.md.tmpl", c.rule))
+            .ok()
+            .flatten()
+            .map(|t| t.content)
+            .unwrap_or_default();
+        let canon_hash = rp::sha256_hex(canon.as_bytes());
+        let verdict = rp::auto_verdict(c.base_canon_hash.as_deref(), &canon_hash, &texts);
+        if verdict != rp::AutoVerdict::Clean {
+            out.held += 1;
+            continue;
+        }
+        match decide(db, c.repo_id, &c.rule, &c.login, &c.rev, decision_action::ACCEPT) {
+            Ok(_) => out.accepted += 1,
+            Err(e) => out
+                .errors
+                .push(format!("{}.{}: {}", c.rule, c.login, e)),
+        }
+    }
+    if out.accepted > 0 || out.held > 0 {
+        eprintln!(
+            "[rule-proposals] auto-decide: {} accepted, {} held, {} errors",
+            out.accepted,
+            out.held,
+            out.errors.len()
+        );
+    }
+    out
+}
+
 /// The owner decision command.
 #[tauri::command(async)]
 pub fn decide_rule_proposal(
