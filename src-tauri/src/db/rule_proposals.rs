@@ -502,7 +502,10 @@ impl AppDb {
 
     /// T-000264: machine decisions of the last 72 hours — the persisted
     /// "auto-decided: N" counter, derived from the rows themselves rather
-    /// than a parallel notification store.
+    /// than a parallel notification store. `created_at`, not `updated_at`:
+    /// the row is born at the decision moment, while updates keep landing
+    /// as the receipt publishes — the window must measure deciding, not
+    /// touching.
     pub fn count_recent_auto_decided(&self) -> SqlResult<u32> {
         // The cutoff is computed in Rust: rows are RFC3339 text, and a
         // SQLite `datetime('now', ...)` string (space-separated, no zone)
@@ -512,7 +515,7 @@ impl AppDb {
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM rule_acceptances
-             WHERE auto_decided=1 AND updated_at >= ?1",
+             WHERE auto_decided=1 AND created_at >= ?1",
             rusqlite::params![cutoff],
             |r| r.get(0),
         )?;

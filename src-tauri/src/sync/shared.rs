@@ -16005,6 +16005,70 @@ mod tests {
         assert_eq!(p.resolved_by.as_deref(), Some("owner"));
     }
 
+    /// T-000264 S6: the auto-mode round trip — the machine, not a click.
+    /// Same fixture as the manual accept test, but the decision falls out
+    /// of `auto_decide_rule_proposals`: the scan must find the proposal,
+    /// the chain-inherited base must match the owner's canon, the receipt
+    /// must travel back, and the row must carry the machine's mark.
+    #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
+    #[test]
+    fn an_auto_mode_proposal_is_decided_by_the_machine_and_the_receipt_reaches_the_contributor() {
+        let fx = two_installs();
+        fx.make_participant();
+        seed_rule(&fx.main_db);
+        seed_rule(&fx.helper_db);
+        propose(&fx, "PROPOSED");
+        fx.sync_helper();
+        fx.sync_main();
+        // No click anywhere — the post-pass sweep is what the production
+        // hook calls; invoking it here directly tests the machine itself.
+        let outcome = crate::commands::rule_proposals::auto_decide_rule_proposals(&fx.main_db);
+        assert_eq!(outcome.accepted, 1, "{:?}", outcome.errors);
+        assert_eq!(outcome.held, 0);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let rev = proposal_dev_sha(&fx.main_dir);
+        let a = fx
+            .main_db
+            .get_rule_acceptance(fx.main_repo, "sdh-alpha", "helper", &rev)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.status, "rendered", "{:?}", a);
+        assert!(a.auto_decided, "the row must carry the machine's mark");
+        // Canon applied from the immutable snapshot, receipt on dev —
+        // the same machine the manual click would have driven.
+        assert_eq!(
+            fx.main_db
+                .get_template_file("_global", "skill.sdh-alpha.md.tmpl")
+                .unwrap()
+                .unwrap()
+                .content,
+            "PROPOSED"
+        );
+        let receipt = dev_text(&fx.main_dir, &receipt_path(&rev)).expect("receipt on dev");
+        let d: crate::models::RuleDecisionFile = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(d.action, "accept");
+        assert_eq!(d.decided_rev, rev);
+        // Publish + contributor resolution — the round trip completes.
+        fx.sync_main();
+        let repo = fx.main_db.get_repository(fx.main_repo).unwrap();
+        sweep_rule_publications(&fx.main_db, &gb(), &repo, &fx.main_dir, "dev");
+        fx.sync_helper();
+        let p = fx
+            .helper_db
+            .get_rule_proposal(fx.helper_repo, "sdh-alpha.helper.json")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.resolved_action.as_deref(), Some("accept"));
+        assert_eq!(p.resolved_by.as_deref(), Some("owner"));
+        // A second sweep is a no-op: the acceptance row exists, so the
+        // proposal never re-enters the candidate set (idempotence is what
+        // makes the per-pass hook safe).
+        let again = crate::commands::rule_proposals::auto_decide_rule_proposals(&fx.main_db);
+        assert_eq!(again.accepted, 0);
+        assert_eq!(again.held, 0);
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+    }
+
     #[ignore = "spawns git: slow on Windows; run with --include-ignored (CI does)"]
     #[test]
     fn a_prepared_row_resumes_decided_when_the_receipt_is_already_there() {
